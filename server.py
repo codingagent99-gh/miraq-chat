@@ -802,8 +802,8 @@ def _format_order_history_message(orders: List[dict]) -> str:
         line_items = order.get("line_items", [])
         valid_item_names = [item.get("name") for item in line_items if item.get("name")]
         item_names = ", ".join(valid_item_names[:3])
-        if len(line_items) > len(valid_item_names[:3]):
-            item_names += f" +{len(line_items) - len(valid_item_names[:3])} more"
+        if len(valid_item_names) > 3:
+            item_names += f" +{len(valid_item_names) - 3} more"
         
         msg += (
             f"**#{order_number}** — {status} "
