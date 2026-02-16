@@ -61,6 +61,16 @@ def classify(utterance: str) -> ClassifiedResult:
     ):
         intent, confidence = Intent.QUICK_ORDER, 0.93
 
+    elif re.search(
+        r"\b(order\s*history|past\s*orders?|previous\s*orders?|my\s*orders?)\b", text
+    ):
+        intent, confidence = Intent.ORDER_HISTORY, 0.92
+        entities.order_count = 10
+
+    elif re.search(r"\bwhat\b.*\bordered\b.*\bbefore\b", text):
+        intent, confidence = Intent.ORDER_HISTORY, 0.91
+        entities.order_count = 10
+
     elif re.search(r"\b(last|latest|most\s*recent|previous)\b.*\border\b", text):
         intent, confidence = Intent.LAST_ORDER, 0.94
         entities.order_count = 1
@@ -76,16 +86,6 @@ def classify(utterance: str) -> ClassifiedResult:
     elif re.search(r"\bmy\s+(last|previous|recent)\s+order\b", text):
         intent, confidence = Intent.LAST_ORDER, 0.94
         entities.order_count = 1
-
-    elif re.search(
-        r"\b(order\s*history|past\s*orders?|previous\s*orders?|my\s*orders?)\b", text
-    ):
-        intent, confidence = Intent.ORDER_HISTORY, 0.92
-        entities.order_count = 10
-
-    elif re.search(r"\bwhat\b.*\bordered\b.*\bbefore\b", text):
-        intent, confidence = Intent.ORDER_HISTORY, 0.91
-        entities.order_count = 10
 
     # 1. ORDER & ACCOUNT (existing — tracking/status)
     elif re.search(r"\b(track|tracking)\b.*\border\b|\border\b.*\btrack", text):
@@ -358,6 +358,10 @@ def _extract_order_item(text: str, entities: ExtractedEntities):
     Example: "buy Allspice" → order_item_name = "Allspice"
              "I want to order Waterfall tiles" → order_item_name = "Waterfall"
     """
+    # Skip if this is clearly an order history/tracking query
+    if re.search(r"\b(history|track|tracking|status|before|past|previous|last)\b", text):
+        return
+    
     # Match "order/buy/purchase [this item] <product_name>"
     patterns = [
         r"\b(?:order|buy|purchase|get|want)\b.*?\b(?:this\s+item\s+)?([A-Z][a-zA-Z]+)",
@@ -372,6 +376,7 @@ def _extract_order_item(text: str, entities: ExtractedEntities):
                 "this", "that", "item", "product", "tile", "tiles",
                 "some", "the", "a", "an", "my", "again", "more",
                 "it", "them", "these", "those", "last", "previous",
+                "history", "track", "tracking", "status", "before", "past",
             }
             if candidate not in skip_words and len(candidate) > 2:
                 entities.order_item_name = candidate.title()
