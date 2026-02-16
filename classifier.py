@@ -362,8 +362,11 @@ def _extract_order_item(text: str, entities: ExtractedEntities):
     if not re.search(r"\b(order|buy|purchase|get|want)\b", text):
         return
     
+    # Keywords that indicate order history/tracking rather than new orders
+    ORDER_HISTORY_KEYWORDS = r"\b(history|track|tracking|status|before|past|previous|show|tell|about|detail)\b"
+    
     # Skip if this is clearly an order history/tracking/show query
-    if re.search(r"\b(history|track|tracking|status|before|past|previous|last|show|tell|about|detail)\b", text):
+    if re.search(ORDER_HISTORY_KEYWORDS, text):
         return
     
     # Match "order/buy/purchase [this item] <product_name>"
@@ -379,8 +382,7 @@ def _extract_order_item(text: str, entities: ExtractedEntities):
             skip_words = {
                 "this", "that", "item", "product", "tile", "tiles",
                 "some", "the", "a", "an", "my", "again", "more",
-                "it", "them", "these", "those", "last", "previous",
-                "history", "track", "tracking", "status", "before", "past",
+                "it", "them", "these", "those",
             }
             if candidate not in skip_words and len(candidate) > 2:
                 entities.order_item_name = candidate.title()
