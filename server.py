@@ -215,38 +215,36 @@ def generate_bot_message(
             return _format_order_history_message(order_data)
         elif intent == Intent.LAST_ORDER and order_data:
             # Format last order message
-            if order_data:
-                order = order_data[0]
-                order_id = order.get("id", "")
-                order_number = order.get("number", str(order_id))
-                status = order.get("status", "unknown").title()
-                total = order.get("total", "0")
-                date_created = order.get("date_created", "")
-                
-                # Format date
-                date_str = date_created[:10] if len(date_created) >= 10 else date_created
-                try:
-                    from datetime import datetime
-                    dt = datetime.fromisoformat(date_created.replace("Z", "+00:00"))
-                    date_str = dt.strftime("%b %d, %Y")
-                except:
-                    pass
-                
-                msg = f"📦 **Your Last Order** (#{order_number})\n\n"
-                msg += f"**Status:** {status}\n"
-                msg += f"**Date:** {date_str}\n"
-                msg += f"**Total:** ${total}\n\n"
-                
-                line_items = order.get("line_items", [])
-                if line_items:
-                    msg += "**Items:**\n"
-                    for item in line_items:
-                        qty = item.get("quantity", 0)
-                        name = item.get("name", "")
-                        item_total = item.get("total", "0")
-                        msg += f"  • {name} × {qty} — ${item_total}\n"
-                
-                return msg
+            order = order_data[0]
+            order_id = order.get("id", "")
+            order_number = order.get("number", str(order_id))
+            status = order.get("status", "unknown").title()
+            total = order.get("total", "0")
+            date_created = order.get("date_created", "")
+            
+            # Format date
+            date_str = date_created[:10] if len(date_created) >= 10 else date_created
+            try:
+                dt = datetime.fromisoformat(date_created.replace("Z", "+00:00"))
+                date_str = dt.strftime("%b %d, %Y")
+            except:
+                pass
+            
+            msg = f"📦 **Your Last Order** (#{order_number})\n\n"
+            msg += f"**Status:** {status}\n"
+            msg += f"**Date:** {date_str}\n"
+            msg += f"**Total:** ${total}\n\n"
+            
+            line_items = order.get("line_items", [])
+            if line_items:
+                msg += "**Items:**\n"
+                for item in line_items:
+                    qty = item.get("quantity", 0)
+                    name = item.get("name", "")
+                    item_total = item.get("total", "0")
+                    msg += f"  • {name} × {qty} — ${item_total}\n"
+            
+            return msg
         
         # Fallback messages when no order data
         if count == 0:
@@ -767,7 +765,6 @@ def _format_order_history_message(orders: List[dict]) -> str:
         # Format date
         date_str = date_created[:10] if len(date_created) >= 10 else date_created
         try:
-            from datetime import datetime
             dt = datetime.fromisoformat(date_created.replace("Z", "+00:00"))
             date_str = dt.strftime("%b %d, %Y")
         except:
