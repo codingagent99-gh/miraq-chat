@@ -222,17 +222,9 @@ def generate_bot_message(
             total = order.get("total", "0")
             date_created = order.get("date_created", "")
             
-            # Format date
-            date_str = date_created[:10] if len(date_created) >= 10 else date_created
-            try:
-                dt = datetime.fromisoformat(date_created.replace("Z", "+00:00"))
-                date_str = dt.strftime("%b %d, %Y")
-            except (ValueError, AttributeError):
-                pass
-            
             msg = f"📦 **Your Last Order** (#{order_number})\n\n"
             msg += f"**Status:** {status}\n"
-            msg += f"**Date:** {date_str}\n"
+            msg += f"**Date:** {_format_order_date(date_created)}\n"
             msg += f"**Total:** ${total}\n\n"
             
             line_items = order.get("line_items", [])
@@ -747,6 +739,25 @@ def get_session(session_id):
 # HELPERS
 # ═══════════════════════════════════════════
 
+def _format_order_date(date_created: str) -> str:
+    """
+    Format a WooCommerce date string to readable format.
+    
+    Args:
+        date_created: ISO format date string from WooCommerce API
+        
+    Returns:
+        Formatted date string (e.g., "Feb 10, 2026") or truncated original if parsing fails
+    """
+    date_str = date_created[:10] if len(date_created) >= 10 else date_created
+    try:
+        dt = datetime.fromisoformat(date_created.replace("Z", "+00:00"))
+        date_str = dt.strftime("%b %d, %Y")
+    except (ValueError, AttributeError):
+        pass
+    return date_str
+
+
 def _resolve_user_placeholders(api_calls: List[WooAPICall], customer_id: int):
     """
     Replace CURRENT_USER_ID placeholders with actual customer ID.
@@ -787,26 +798,17 @@ def _format_order_history_message(orders: List[dict]) -> str:
         total = order.get("total", "0")
         date_created = order.get("date_created", "")
         
-        # Format date
-        date_str = date_created[:10] if len(date_created) >= 10 else date_created
-        try:
-            dt = datetime.fromisoformat(date_created.replace("Z", "+00:00"))
-            date_str = dt.strftime("%b %d, %Y")
-        except (ValueError, AttributeError):
-            pass
-        
-        # Get item names
+        # Get item names with accurate count
         line_items = order.get("line_items", [])
-        item_names = ", ".join(
-            item.get("name") for item in line_items[:3] if item.get("name")
-        )
-        if len(line_items) > 3:
-            item_names += f" +{len(line_items) - 3} more"
+        valid_item_names = [item.get("name") for item in line_items if item.get("name")]
+        item_names = ", ".join(valid_item_names[:3])
+        if len(line_items) > len(valid_item_names[:3]):
+            item_names += f" +{len(line_items) - len(valid_item_names[:3])} more"
         
         msg += (
             f"**#{order_number}** — {status} "
             f"— ${total} "
-            f"— {date_str}\n"
+            f"— {_format_order_date(date_created)}\n"
             f"  Items: {item_names}\n\n"
         )
     
