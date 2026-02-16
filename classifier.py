@@ -358,8 +358,12 @@ def _extract_order_item(text: str, entities: ExtractedEntities):
     Example: "buy Allspice" → order_item_name = "Allspice"
              "I want to order Waterfall tiles" → order_item_name = "Waterfall"
     """
-    # Skip if this is clearly an order history/tracking query
-    if re.search(r"\b(history|track|tracking|status|before|past|previous|last)\b", text):
+    # Skip if this is clearly NOT an order query
+    if not re.search(r"\b(order|buy|purchase|get|want)\b", text):
+        return
+    
+    # Skip if this is clearly an order history/tracking/show query
+    if re.search(r"\b(history|track|tracking|status|before|past|previous|last|show|tell|about|detail)\b", text):
         return
     
     # Match "order/buy/purchase [this item] <product_name>"
@@ -382,7 +386,7 @@ def _extract_order_item(text: str, entities: ExtractedEntities):
                 entities.order_item_name = candidate.title()
                 break
 
-    # Also check if a known product series is mentioned
+    # Also check if a known product series is mentioned WITH order/buy/purchase verbs
     if not entities.order_item_name:
         for series in PRODUCT_SERIES:
             if series in text.lower():
