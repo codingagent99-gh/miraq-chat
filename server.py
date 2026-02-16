@@ -198,36 +198,79 @@ def generate_bot_message(
     entities: ExtractedEntities,
     products: List[dict],
     confidence: float,
+    order_data: List[dict] = None,
 ) -> str:
     """Generate a natural language bot response."""
 
+    if order_data is None:
+        order_data = []
+    
     count = len(products)
 
     # ── Order-specific handling ──
-    # For order intents (LAST_ORDER, ORDER_HISTORY, REORDER), when products is empty,
-    # it likely means we got order data instead
-    if intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.REORDER, Intent.QUICK_ORDER) and count == 0:
-        if intent == Intent.LAST_ORDER:
-            return (
-                "I can show you your most recent order! 📦\n\n"
-                "Please make sure you're logged in so I can retrieve your order history."
-            )
-        elif intent == Intent.ORDER_HISTORY:
-            return (
-                f"I can show you your order history! 📋\n\n"
-                "Please make sure you're logged in so I can retrieve your past orders."
-            )
-        elif intent == Intent.REORDER:
-            return (
-                "I can help you reorder your last purchase! 🔄\n\n"
-                "Please make sure you're logged in so I can access your order history."
-            )
-        elif intent == Intent.QUICK_ORDER:
-            search_term = entities.order_item_name or entities.product_name or "that item"
-            return (
-                f"I couldn't find a product matching **{search_term}**. 😕\n\n"
-                "Try searching by a different name or browse our categories."
-            )
+    # For order intents (LAST_ORDER, ORDER_HISTORY, REORDER), handle order data first
+    if intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.REORDER, Intent.QUICK_ORDER):
+        # If we have actual order data, format it
+        if intent == Intent.ORDER_HISTORY and order_data:
+            return _format_order_history_message(order_data)
+        elif intent == Intent.LAST_ORDER and order_data:
+            # Format last order message
+            if order_data:
+                order = order_data[0]
+                order_id = order.get("id", "")
+                order_number = order.get("number", str(order_id))
+                status = order.get("status", "unknown").title()
+                total = order.get("total", "0")
+                date_created = order.get("date_created", "")
+                
+                # Format date
+                date_str = date_created[:10] if len(date_created) >= 10 else date_created
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(date_created.replace("Z", "+00:00"))
+                    date_str = dt.strftime("%b %d, %Y")
+                except:
+                    pass
+                
+                msg = f"📦 **Your Last Order** (#{order_number})\n\n"
+                msg += f"**Status:** {status}\n"
+                msg += f"**Date:** {date_str}\n"
+                msg += f"**Total:** ${total}\n\n"
+                
+                line_items = order.get("line_items", [])
+                if line_items:
+                    msg += "**Items:**\n"
+                    for item in line_items:
+                        qty = item.get("quantity", 0)
+                        name = item.get("name", "")
+                        item_total = item.get("total", "0")
+                        msg += f"  • {name} × {qty} — ${item_total}\n"
+                
+                return msg
+        
+        # Fallback messages when no order data
+        if count == 0:
+            if intent == Intent.LAST_ORDER:
+                return (
+                    "I can show you your most recent order! 📦\n\n"
+                    "Please make sure you're logged in so I can retrieve your order history."
+                )
+            elif intent == Intent.ORDER_HISTORY:
+                return (
+                    f"I can show you your order history! 📋\n\n"
+                    "Please make sure you're logged in so I can retrieve your past orders."
+                )
+            elif intent == Intent.REORDER:
+                return (
+                    "I can help you reorder your last purchase! 🔄\n\n"
+                    "Please make sure you're logged in so I can access your order history."
+                )
+            elif intent == Intent.QUICK_ORDER:
+                search_term = entities.order_item_name or entities.product_name or "that item"
+                return (
+                    f"I couldn't find a product matching **{search_term}**. 😕\n\n"
+                    "Try searching by a different name or browse our categories."
+                )
 
     # For QUICK_ORDER, show the matched product with order context
     if intent == Intent.QUICK_ORDER and count > 0:
@@ -566,15 +609,30 @@ def chat():
     # ─── Step 2: Build API calls ───
     api_calls = build_api_calls(result)
 
+    # ─── Step 2.5: Resolve user context placeholders ───
+    customer_id = user_context.get("customer_id")
+    if customer_id:
+        _resolve_user_placeholders(api_calls, customer_id)
+
     # ─── Step 3: Execute API calls ───
     all_products_raw = []
+    order_data = []
     api_responses = woo_client.execute_all(api_calls)
+
+    ORDER_INTENTS = {Intent.ORDER_HISTORY, Intent.LAST_ORDER, Intent.REORDER, 
+                     Intent.ORDER_TRACKING, Intent.ORDER_STATUS}
 
     for resp in api_responses:
         if resp.get("success") and isinstance(resp.get("data"), list):
-            all_products_raw.extend(resp["data"])
+            if intent in ORDER_INTENTS:
+                order_data.extend(resp["data"])
+            else:
+                all_products_raw.extend(resp["data"])
         elif resp.get("success") and isinstance(resp.get("data"), dict):
-            all_products_raw.append(resp["data"])
+            if intent in ORDER_INTENTS:
+                order_data.append(resp["data"])
+            else:
+                all_products_raw.append(resp["data"])
 
     # ─── Step 4: Format products ───
     products = [format_product(p) for p in all_products_raw]
@@ -583,7 +641,7 @@ def chat():
     products = [p for p in products if p.get("name")]
 
     # ─── Step 5: Generate bot message ───
-    bot_message = generate_bot_message(intent, entities, products, confidence)
+    bot_message = generate_bot_message(intent, entities, products, confidence, order_data)
 
     # ─── Step 6: Generate suggestions ───
     suggestions = generate_suggestions(intent, entities, products)
@@ -674,6 +732,64 @@ def get_session(session_id):
 # ═══════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════
+
+def _resolve_user_placeholders(api_calls: List[WooAPICall], customer_id: int):
+    """Replace CURRENT_USER_ID placeholders with actual customer ID."""
+    PLACEHOLDERS = {"CURRENT_USER_ID", "CURRENT_USER", "current_user_id", "current_user"}
+    for call in api_calls:
+        if isinstance(call.params, dict):
+            for key in list(call.params.keys()):
+                if isinstance(call.params[key], str) and call.params[key] in PLACEHOLDERS:
+                    call.params[key] = customer_id
+        if isinstance(call.body, dict):
+            for key in list(call.body.keys()):
+                if isinstance(call.body[key], str) and call.body[key] in PLACEHOLDERS:
+                    call.body[key] = customer_id
+
+
+def _format_order_history_message(orders: List[dict]) -> str:
+    """Generate a bot message for order history from raw WooCommerce order data."""
+    if not orders:
+        return (
+            "You don't have any orders yet. 📦\n\n"
+            "Browse our collection and place your first order!"
+        )
+    
+    msg = f"📋 **Your Order History** ({len(orders)} orders)\n\n"
+    
+    for order in orders:
+        order_id = order.get("id", "")
+        order_number = order.get("number", str(order_id))
+        status = order.get("status", "unknown").title()
+        total = order.get("total", "0")
+        date_created = order.get("date_created", "")
+        
+        # Format date
+        date_str = date_created[:10] if len(date_created) >= 10 else date_created
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(date_created.replace("Z", "+00:00"))
+            date_str = dt.strftime("%b %d, %Y")
+        except:
+            pass
+        
+        # Get item names
+        line_items = order.get("line_items", [])
+        item_names = ", ".join(
+            item.get("name", "") for item in line_items[:3]
+        )
+        if len(line_items) > 3:
+            item_names += f" +{len(line_items) - 3} more"
+        
+        msg += (
+            f"**#{order_number}** — {status} "
+            f"— ${total} "
+            f"— {date_str}\n"
+            f"  Items: {item_names}\n\n"
+        )
+    
+    return msg
+
 
 def _entities_to_dict(entities: ExtractedEntities) -> dict:
     """Convert entities to a clean dict for metadata."""
