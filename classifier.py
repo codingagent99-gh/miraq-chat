@@ -61,8 +61,16 @@ def classify(utterance: str) -> ClassifiedResult:
     ):
         intent, confidence = Intent.QUICK_ORDER, 0.93
 
+    # 1. ORDER TRACKING & STATUS (must come before ORDER_HISTORY)
+    elif re.search(r"\b(track|tracking)\b.*\border\b|\border\b.*\btrack", text):
+        intent, confidence = Intent.ORDER_TRACKING, 0.93
+
+    elif re.search(r"\b(status|where)\b.*\border\b|\border\b.*\bstatus\b", text):
+        intent, confidence = Intent.ORDER_STATUS, 0.93
+
+    # 2. ORDER HISTORY & LAST ORDER
     elif re.search(
-        r"\b(order\s*history|past\s*orders?|previous\s*orders?|my\s*orders?)\b", text
+        r"\b(order\s*history|past\s*orders?|previous\s*orders?)\b", text
     ):
         intent, confidence = Intent.ORDER_HISTORY, 0.92
         entities.order_count = 10
@@ -86,13 +94,6 @@ def classify(utterance: str) -> ClassifiedResult:
     elif re.search(r"\bmy\s+(last|previous|recent)\s+order\b", text):
         intent, confidence = Intent.LAST_ORDER, 0.94
         entities.order_count = 1
-
-    # 1. ORDER & ACCOUNT (existing — tracking/status)
-    elif re.search(r"\b(track|tracking)\b.*\border\b|\border\b.*\btrack", text):
-        intent, confidence = Intent.ORDER_TRACKING, 0.93
-
-    elif re.search(r"\b(status|where)\b.*\border\b|\border\b.*\bstatus\b", text):
-        intent, confidence = Intent.ORDER_STATUS, 0.93
 
     elif re.search(
         r"\b(order|buy|purchase|add to cart|checkout)\b.*\b(this|item|it)\b", text
@@ -121,7 +122,7 @@ def classify(utterance: str) -> ClassifiedResult:
         intent, confidence = Intent.DISCOUNT_INQUIRY, 0.88
         entities.on_sale = True
 
-    elif re.search(r"\bpromotion\b", text):
+    elif re.search(r"\bpromotions?\b", text):
         intent, confidence = Intent.PROMOTIONS, 0.88
         entities.on_sale = True
 
