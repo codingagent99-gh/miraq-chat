@@ -64,6 +64,7 @@ class Intent(Enum):
     LAST_ORDER             = "last_order"
     REORDER                = "reorder"
     ORDER_ITEM             = "order_item"
+    QUICK_ORDER            = "quick_order"
 
     UNKNOWN                = "unknown"
 
