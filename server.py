@@ -512,6 +512,25 @@ INTENT_LABELS = {
 }
 
 # ═══════════════════════════════════════════
+# CONSTANTS FOR ORDER & USER HANDLING
+# ═══════════════════════════════════════════
+
+ORDER_INTENTS = {
+    Intent.ORDER_HISTORY,
+    Intent.LAST_ORDER,
+    Intent.REORDER,
+    Intent.ORDER_TRACKING,
+    Intent.ORDER_STATUS,
+}
+
+USER_PLACEHOLDERS = {
+    "CURRENT_USER_ID",
+    "CURRENT_USER",
+    "current_user_id",
+    "current_user",
+}
+
+# ═══════════════════════════════════════════
 # FLASK APP
 # ═══════════════════════════════════════════
 
@@ -616,9 +635,6 @@ def chat():
     all_products_raw = []
     order_data = []
     api_responses = woo_client.execute_all(api_calls)
-
-    ORDER_INTENTS = {Intent.ORDER_HISTORY, Intent.LAST_ORDER, Intent.REORDER, 
-                     Intent.ORDER_TRACKING, Intent.ORDER_STATUS}
 
     for resp in api_responses:
         if resp.get("success") and isinstance(resp.get("data"), list):
@@ -742,15 +758,14 @@ def _resolve_user_placeholders(api_calls: List[WooAPICall], customer_id: int):
         api_calls: List of WooAPICall objects to process
         customer_id: The actual customer ID to substitute for placeholders
     """
-    PLACEHOLDERS = {"CURRENT_USER_ID", "CURRENT_USER", "current_user_id", "current_user"}
     for call in api_calls:
         if isinstance(call.params, dict):
-            for key in list(call.params.keys()):
-                if isinstance(call.params[key], str) and call.params[key] in PLACEHOLDERS:
+            for key in call.params:
+                if isinstance(call.params[key], str) and call.params[key] in USER_PLACEHOLDERS:
                     call.params[key] = customer_id
         if isinstance(call.body, dict):
-            for key in list(call.body.keys()):
-                if isinstance(call.body[key], str) and call.body[key] in PLACEHOLDERS:
+            for key in call.body:
+                if isinstance(call.body[key], str) and call.body[key] in USER_PLACEHOLDERS:
                     call.body[key] = customer_id
 
 
