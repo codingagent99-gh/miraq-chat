@@ -116,4 +116,92 @@ TRAINING_DATA = [
         "intent": "place_order",
         "entities": {},
     },
+
+    # ───── Order History ─────
+    {
+        "utterance": "show my order history",
+        "intent": "order_history",
+        "entities": {},
+    },
+    {
+        "utterance": "what have I ordered before?",
+        "intent": "order_history",
+        "entities": {},
+    },
+    {
+        "utterance": "my past orders",
+        "intent": "order_history",
+        "entities": {},
+    },
+    {
+        "utterance": "show my last 5 orders",
+        "intent": "order_history",
+        "entities": {"order_count": 5},
+    },
+
+    # ───── Last Order ─────
+    {
+        "utterance": "show my last order",
+        "intent": "last_order",
+        "entities": {},
+    },
+    {
+        "utterance": "what did I order last?",
+        "intent": "last_order",
+        "entities": {},
+    },
+    {
+        "utterance": "my most recent order",
+        "intent": "last_order",
+        "entities": {},
+    },
+
+    # ───── Reorder ─────
+    {
+        "utterance": "repeat my last order",
+        "intent": "reorder",
+        "entities": {"reorder": True},
+    },
+    {
+        "utterance": "reorder my previous order",
+        "intent": "reorder",
+        "entities": {"reorder": True},
+    },
+    {
+        "utterance": "order again",
+        "intent": "reorder",
+        "entities": {"reorder": True},
+    },
+    {
+        "utterance": "buy again",
+        "intent": "reorder",
+        "entities": {"reorder": True},
+    },
+
+    # ───── Quick Order ─────
+    {
+        "utterance": "order this item Ansel",
+        "intent": "quick_order",
+        "entities": {"order_item_name": "Ansel"},
+    },
+    {
+        "utterance": "buy Allspice",
+        "intent": "quick_order",
+        "entities": {"order_item_name": "Allspice"},
+    },
+    {
+        "utterance": "I want to order Waterfall tiles",
+        "intent": "quick_order",
+        "entities": {"order_item_name": "Waterfall"},
+    },
+    {
+        "utterance": "order Cairo",
+        "intent": "quick_order",
+        "entities": {"order_item_name": "Cairo"},
+    },
+    {
+        "utterance": "purchase Divine",
+        "intent": "quick_order",
+        "entities": {"order_item_name": "Divine"},
+    },
 ]

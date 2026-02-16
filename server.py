@@ -203,6 +203,53 @@ def generate_bot_message(
 
     count = len(products)
 
+    # ── Order-specific handling ──
+    # For order intents (LAST_ORDER, ORDER_HISTORY, REORDER), when products is empty,
+    # it likely means we got order data instead
+    if intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.REORDER, Intent.QUICK_ORDER) and count == 0:
+        if intent == Intent.LAST_ORDER:
+            return (
+                "I can show you your most recent order! 📦\n\n"
+                "Please make sure you're logged in so I can retrieve your order history."
+            )
+        elif intent == Intent.ORDER_HISTORY:
+            return (
+                f"I can show you your order history! 📋\n\n"
+                "Please make sure you're logged in so I can retrieve your past orders."
+            )
+        elif intent == Intent.REORDER:
+            return (
+                "I can help you reorder your last purchase! 🔄\n\n"
+                "Please make sure you're logged in so I can access your order history."
+            )
+        elif intent == Intent.QUICK_ORDER:
+            search_term = entities.order_item_name or entities.product_name or "that item"
+            return (
+                f"I couldn't find a product matching **{search_term}**. 😕\n\n"
+                "Try searching by a different name or browse our categories."
+            )
+
+    # For QUICK_ORDER, show the matched product with order context
+    if intent == Intent.QUICK_ORDER and count > 0:
+        if count == 1:
+            p = products[0]
+            msg = f"Perfect! I found **{p['name']}** for you! 🎯\n\n"
+            if p.get("price", 0) > 0:
+                msg += f"💰 Price: ${p['price']:.2f}\n"
+            if p.get("short_description"):
+                msg += f"\n{p['short_description']}\n"
+            msg += "\nWould you like to add this to your cart?"
+            return msg
+        else:
+            msg = f"I found **{count}** products matching your search! 🔍\n\n"
+            for p in products[:5]:
+                price_str = f"${p['price']:.2f}" if p.get("price", 0) > 0 else "Contact for price"
+                msg += f"• **{p['name']}** — {price_str}\n"
+            if count > 5:
+                msg += f"\n...and {count - 5} more products."
+            msg += "\n\nWhich one would you like to order?"
+            return msg
+
     # ── No products found ──
     if count == 0:
         search = (
@@ -280,6 +327,21 @@ def generate_suggestions(
 ) -> List[str]:
     """Generate follow-up suggestions based on context."""
     suggestions = []
+
+    # Order-specific suggestions
+    if intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.REORDER):
+        suggestions.append("Show my order history")
+        suggestions.append("Reorder my last purchase")
+        suggestions.append("Track my order")
+        suggestions.append("Show me what's on sale")
+        return suggestions[:4]
+
+    if intent == Intent.QUICK_ORDER:
+        suggestions.append("Show me all products")
+        suggestions.append("What categories do you have?")
+        suggestions.append("Show me quick ship products")
+        suggestions.append("What's on sale?")
+        return suggestions[:4]
 
     # Product-specific suggestions
     if products and len(products) == 1:
@@ -398,6 +460,11 @@ INTENT_LABELS = {
     Intent.ORDER_TRACKING:        "order",
     Intent.ORDER_STATUS:          "order",
     Intent.PLACE_ORDER:           "order",
+    Intent.ORDER_HISTORY:         "order",
+    Intent.LAST_ORDER:            "order",
+    Intent.REORDER:               "order",
+    Intent.ORDER_ITEM:            "order",
+    Intent.QUICK_ORDER:           "order",
     Intent.PRODUCT_VARIATIONS:    "variations",
     Intent.SAMPLE_REQUEST:        "sample",
     Intent.UNKNOWN:               "unknown",
@@ -626,6 +693,9 @@ def _entities_to_dict(entities: ExtractedEntities) -> dict:
     if entities.on_sale:         d["on_sale"] = True
     if entities.tag_slugs:       d["tags"] = entities.tag_slugs
     if entities.order_id:        d["order_id"] = entities.order_id
+    if entities.order_count:     d["order_count"] = entities.order_count
+    if entities.reorder:         d["reorder"] = entities.reorder
+    if entities.order_item_name: d["order_item_name"] = entities.order_item_name
     return d
 
 # ═══════════════════���═══════════════════════

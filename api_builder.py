@@ -84,6 +84,21 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             requires_resolution=["order_item_step2"],
         ))
 
+    elif intent == Intent.QUICK_ORDER:
+        # Search for the product by name, then create an order
+        search_term = e.order_item_name or e.product_name or ""
+        calls.append(WooAPICall(
+            method="GET",
+            endpoint=f"{BASE}/products",
+            params={
+                "search": search_term,
+                "status": "publish",
+                "per_page": 5,
+            },
+            description=f"Find product '{search_term}' for quick order",
+            requires_resolution=["create_order_from_product"],
+        ))
+
     # ═══════════════════════════════════════════
     # ★ CATEGORY-BASED BROWSING
     # ═══════════════════════════════════════════

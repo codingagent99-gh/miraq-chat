@@ -59,7 +59,7 @@ def classify(utterance: str) -> ClassifiedResult:
     ) and entities.order_item_name and not re.search(
         r"\b(track|tracking|status|where|last|history|previous|past)\b", text
     ):
-        intent, confidence = Intent.ORDER_ITEM, 0.93
+        intent, confidence = Intent.QUICK_ORDER, 0.93
 
     elif re.search(r"\b(last|latest|most\s*recent|previous)\b.*\border\b", text):
         intent, confidence = Intent.LAST_ORDER, 0.94
@@ -230,10 +230,10 @@ def classify(utterance: str) -> ClassifiedResult:
     elif re.search(r"\btiles?\b", text):
         intent, confidence = Intent.PRODUCT_LIST, 0.75
 
-    # ★ NEW: Check if ORDER_ITEM should be used
+    # ★ NEW: Check if QUICK_ORDER should be used
     # (for queries like "buy Allspice" or "I want to order Waterfall tiles")
     if intent == Intent.UNKNOWN and entities.order_item_name:
-        intent, confidence = Intent.ORDER_ITEM, 0.90
+        intent, confidence = Intent.QUICK_ORDER, 0.90
 
     return ClassifiedResult(
         intent=intent,

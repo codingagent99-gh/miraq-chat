@@ -69,6 +69,9 @@ def process(utterance: str):
     if e.on_sale:         parts.append(f"on_sale=True")
     if e.tag_slugs:       parts.append(f"tags={e.tag_slugs}")
     if e.order_id:        parts.append(f"order_id={e.order_id}")
+    if e.order_count:     parts.append(f"order_count={e.order_count}")
+    if e.reorder:         parts.append(f"reorder={e.reorder}")
+    if e.order_item_name: parts.append(f"order_item_name={e.order_item_name}")
     if parts:
         print(f"📦  Entities:   {', '.join(parts)}")
 
@@ -141,6 +144,24 @@ if __name__ == "__main__":
         "How do I track my order?",
         "Can I get status of my order #1234?",
         "Please order this item",
+
+        # ── Order History & Reorder ──
+        "show my order history",
+        "what have I ordered before?",
+        "my past orders",
+        "show my last order",
+        "what did I order last?",
+        "my most recent order",
+        "repeat my last order",
+        "reorder my previous order",
+        "order again",
+
+        # ── Quick Order ──
+        "order this item Ansel",
+        "buy Allspice",
+        "I want to order Waterfall tiles",
+        "order Cairo",
+        "purchase Divine",
     ]
 
     for t in tests:
