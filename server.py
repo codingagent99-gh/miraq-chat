@@ -752,21 +752,22 @@ def _resolve_user_placeholders(api_calls: List[WooAPICall], customer_id: int):
     Replace CURRENT_USER_ID placeholders with actual customer ID.
     
     Modifies api_calls in-place, replacing any placeholder strings in params or body
-    with the provided customer_id.
+    with the provided customer_id (converted to string for API compatibility).
     
     Args:
         api_calls: List of WooAPICall objects to process
         customer_id: The actual customer ID to substitute for placeholders
     """
+    customer_id_str = str(customer_id)
     for call in api_calls:
         if isinstance(call.params, dict):
             for key in call.params:
                 if isinstance(call.params[key], str) and call.params[key] in USER_PLACEHOLDERS:
-                    call.params[key] = customer_id
+                    call.params[key] = customer_id_str
         if isinstance(call.body, dict):
             for key in call.body:
                 if isinstance(call.body[key], str) and call.body[key] in USER_PLACEHOLDERS:
-                    call.body[key] = customer_id
+                    call.body[key] = customer_id_str
 
 
 def _format_order_history_message(orders: List[dict]) -> str:
@@ -797,7 +798,7 @@ def _format_order_history_message(orders: List[dict]) -> str:
         # Get item names
         line_items = order.get("line_items", [])
         item_names = ", ".join(
-            item.get("name", "") for item in line_items[:3]
+            str(item.get("name") or "") for item in line_items[:3] if item.get("name")
         )
         if len(line_items) > 3:
             item_names += f" +{len(line_items) - 3} more"
