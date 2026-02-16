@@ -240,7 +240,7 @@ def generate_bot_message(
                 msg += "**Items:**\n"
                 for item in line_items:
                     qty = item.get("quantity", 0)
-                    name = item.get("name", "")
+                    name = item.get("name") or "Unknown Item"
                     item_total = item.get("total", "0")
                     msg += f"  • {name} × {qty} — ${item_total}\n"
             
@@ -798,7 +798,7 @@ def _format_order_history_message(orders: List[dict]) -> str:
         # Get item names
         line_items = order.get("line_items", [])
         item_names = ", ".join(
-            str(item.get("name") or "") for item in line_items[:3] if item.get("name")
+            str(item.get("name")) for item in line_items[:3] if item.get("name")
         )
         if len(line_items) > 3:
             item_names += f" +{len(line_items) - 3} more"
