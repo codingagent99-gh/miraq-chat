@@ -522,6 +522,9 @@ USER_PLACEHOLDERS = {
     "current_user",
 }
 
+# Order message formatting constants
+MAX_DISPLAYED_ITEMS = 3  # Maximum number of items to show before truncating with '+N more'
+
 # ═══════════════════════════════════════════
 # FLASK APP
 # ═══════════════════════════════════════════
@@ -767,7 +770,8 @@ def _resolve_user_placeholders(api_calls: List[WooAPICall], customer_id: int):
     
     Args:
         api_calls: List of WooAPICall objects to process
-        customer_id: The actual customer ID to substitute for placeholders
+        customer_id: The actual customer ID (integer) to substitute for placeholders.
+                     Will be converted to string internally for WooCommerce API compatibility.
     """
     customer_id_str = str(customer_id)
     for call in api_calls:
@@ -782,7 +786,21 @@ def _resolve_user_placeholders(api_calls: List[WooAPICall], customer_id: int):
 
 
 def _format_order_history_message(orders: List[dict]) -> str:
-    """Generate a bot message for order history from raw WooCommerce order data."""
+    """
+    Generate a bot message for order history from raw WooCommerce order data.
+    
+    Args:
+        orders: List of WooCommerce order dictionaries. Each order should contain:
+            - id (int): Order ID
+            - number (str): Order number
+            - status (str): Order status (e.g., 'completed', 'processing')
+            - total (str): Order total amount
+            - date_created (str): ISO format date string
+            - line_items (list): List of items with 'name', 'quantity', 'total'
+    
+    Returns:
+        str: Formatted message showing order history or empty message if no orders
+    """
     if not orders:
         return (
             "You don't have any orders yet. 📦\n\n"
@@ -801,9 +819,9 @@ def _format_order_history_message(orders: List[dict]) -> str:
         # Get item names with accurate count
         line_items = order.get("line_items", [])
         valid_item_names = [item.get("name") for item in line_items if item.get("name")]
-        item_names = ", ".join(valid_item_names[:3])
-        if len(valid_item_names) > 3:
-            item_names += f" +{len(valid_item_names) - 3} more"
+        item_names = ", ".join(valid_item_names[:MAX_DISPLAYED_ITEMS])
+        if len(valid_item_names) > MAX_DISPLAYED_ITEMS:
+            item_names += f" +{len(valid_item_names) - MAX_DISPLAYED_ITEMS} more"
         
         msg += (
             f"**#{order_number}** — {status} "
