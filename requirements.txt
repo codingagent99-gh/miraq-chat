@@ -1,0 +1,46 @@
+# ─────────────────────────────────────────────
+# WGC Tiles Store Intent Classifier
+# Python 3.10+ required
+# ─────────────────────────────────────────────
+
+# Core HTTP client for WooCommerce API
+requests>=2.31.0,<3.0.0
+
+# Environment variable management (API keys)
+python-dotenv>=1.0.0,<2.0.0
+
+# Optional: Fuzzy string matching for typo-tolerant product search
+# (used by dhn_search_key field in your products)
+thefuzz>=0.22.1,<1.0.0
+python-Levenshtein>=0.25.0,<1.0.0
+
+# Optional: For future ML-based classifier upgrade
+# scikit-learn>=1.4.0,<2.0.0
+# spacy>=3.7.0,<4.0.0
+# transformers>=4.38.0,<5.0.0
+# torch>=2.2.0,<3.0.0
+
+# ─────────────────────────────────────────────
+# Development & Testing
+# ─────────────────────────────────────────────
+pytest>=8.0.0,<9.0.0
+pytest-cov>=4.1.0,<6.0.0
+
+# Optional: API server (if you want to expose as REST endpoint)
+# fastapi>=0.110.0,<1.0.0
+# uvicorn>=0.27.0,<1.0.0
+
+# Core
+requests>=2.31.0,<3.0.0
+python-dotenv>=1.0.0,<2.0.0
+
+# Web server
+flask>=3.0.0,<4.0.0
+flask-cors>=4.0.0,<5.0.0
+
+# Optional: Fuzzy matching
+thefuzz>=0.22.1,<1.0.0
+python-Levenshtein>=0.25.0,<1.0.0
+
+# Testing
+pytest>=8.0.0,<9.0.0
