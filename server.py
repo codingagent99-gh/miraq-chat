@@ -227,7 +227,7 @@ def generate_bot_message(
             try:
                 dt = datetime.fromisoformat(date_created.replace("Z", "+00:00"))
                 date_str = dt.strftime("%b %d, %Y")
-            except:
+            except (ValueError, AttributeError):
                 pass
             
             msg = f"📦 **Your Last Order** (#{order_number})\n\n"
@@ -732,7 +732,16 @@ def get_session(session_id):
 # ═══════════════════════════════════════════
 
 def _resolve_user_placeholders(api_calls: List[WooAPICall], customer_id: int):
-    """Replace CURRENT_USER_ID placeholders with actual customer ID."""
+    """
+    Replace CURRENT_USER_ID placeholders with actual customer ID.
+    
+    Modifies api_calls in-place, replacing any placeholder strings in params or body
+    with the provided customer_id.
+    
+    Args:
+        api_calls: List of WooAPICall objects to process
+        customer_id: The actual customer ID to substitute for placeholders
+    """
     PLACEHOLDERS = {"CURRENT_USER_ID", "CURRENT_USER", "current_user_id", "current_user"}
     for call in api_calls:
         if isinstance(call.params, dict):
@@ -767,7 +776,7 @@ def _format_order_history_message(orders: List[dict]) -> str:
         try:
             dt = datetime.fromisoformat(date_created.replace("Z", "+00:00"))
             date_str = dt.strftime("%b %d, %Y")
-        except:
+        except (ValueError, AttributeError):
             pass
         
         # Get item names
