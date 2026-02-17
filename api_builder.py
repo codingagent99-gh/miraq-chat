@@ -1,14 +1,53 @@
 """
-Builds WooCommerce API calls using your actual store structure.
-Includes CATEGORY-based and ORDER HISTORY/REORDER API calls.
+Builds WooCommerce API calls using live StoreLoader data.
+No hardcoded tag/attribute IDs — everything resolved through StoreLoader.
 """
 
-from typing import List
+from typing import List, Optional
 from models import Intent, ClassifiedResult, WooAPICall, ExtractedEntities
-from store_registry import TAGS, ATTRIBUTES, get_store_loader
+from store_registry import get_store_loader
 
 
 BASE = "https://wgc.net.in/hn/wp-json/wc/v3"
+
+
+def _loader():
+    """Convenience accessor for StoreLoader."""
+    return get_store_loader()
+
+
+def _tag_id(slug: str) -> Optional[int]:
+    """Get tag ID by slug from live data."""
+    l = _loader()
+    return l.get_tag_id_by_slug(slug) if l else None
+
+
+def _attr_id(slug: str) -> Optional[int]:
+    """Get attribute ID by slug from live data."""
+    l = _loader()
+    return l.get_attribute_id(slug) if l else None
+
+
+def _first_tag_id(tag_ids: list) -> Optional[int]:
+    """Return first tag ID from a list, or None."""
+    return tag_ids[0] if tag_ids else None
+
+
+def _attr_filter_params(attr_slug: str, term_ids: List[int], tag_ids: List[int]) -> dict:
+    """
+    Build the right WooCommerce filter params for an attribute.
+    Uses attribute+attribute_term when term IDs are resolved (accurate).
+    Falls back to tag= when only tag IDs are available.
+    """
+    params = {}
+    if term_ids:
+        attr_id = _attr_id(attr_slug)
+        if attr_id:
+            params["attribute"] = attr_slug
+            params["attribute_term"] = ",".join(str(i) for i in term_ids)
+    elif tag_ids:
+        params["tag"] = str(_first_tag_id(tag_ids))
+    return params
 
 
 def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
@@ -18,123 +57,79 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
     calls = []
 
     # ═══════════════════════════════════════════
-    # ★ ORDER HISTORY / REORDER / ORDER ITEM (NEW)
+    # ORDER HISTORY / REORDER / ORDER ITEM
     # ═══════════════════════════════════════════
 
     if intent == Intent.LAST_ORDER:
-        # GET /orders — fetch the most recent order for this customer
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/orders",
-            params={
-                "customer": "CURRENT_USER_ID",
-                "per_page": 1,
-                "orderby": "date",
-                "order": "desc",
-            },
+            params={"customer": "CURRENT_USER_ID", "per_page": 1, "orderby": "date", "order": "desc"},
             description="Get the customer's most recent order",
             requires_resolution=["customer_id"],
         ))
 
     elif intent == Intent.ORDER_HISTORY:
-        # GET /orders — fetch recent orders for this customer
         count = e.order_count or 10
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/orders",
-            params={
-                "customer": "CURRENT_USER_ID",
-                "per_page": count,
-                "orderby": "date",
-                "order": "desc",
-            },
+            params={"customer": "CURRENT_USER_ID", "per_page": count, "orderby": "date", "order": "desc"},
             description=f"Get customer's last {count} orders",
             requires_resolution=["customer_id"],
         ))
 
     elif intent == Intent.REORDER:
-        # Step 1: Fetch the last order to get its line_items
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/orders",
-            params={
-                "customer": "CURRENT_USER_ID",
-                "per_page": 1,
-                "orderby": "date",
-                "order": "desc",
-            },
-            description="Fetch last order for reorder (step 1: get line items)",
+            params={"customer": "CURRENT_USER_ID", "per_page": 1, "orderby": "date", "order": "desc"},
+            description="Fetch last order for reorder (step 1)",
             requires_resolution=["customer_id", "reorder_step2"],
         ))
-        # Step 2 (POST to create order) will be built dynamically
-        # in the server after we resolve the line_items from step 1
 
     elif intent == Intent.ORDER_ITEM:
-        # Search for the product by name, then create an order
         product_name = e.order_item_name or e.product_name or ""
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={
-                "search": product_name,
-                "status": "publish",
-                "per_page": 5,
-            },
+            params={"search": product_name, "status": "publish", "per_page": 5},
             description=f"Find product '{product_name}' for ordering",
             requires_resolution=["order_item_step2"],
         ))
 
     elif intent == Intent.QUICK_ORDER:
-        # Search for the product by name, then create an order
         search_term = e.order_item_name or e.product_name or ""
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={
-                "search": search_term,
-                "status": "publish",
-                "per_page": 5,
-            },
+            params={"search": search_term, "status": "publish", "per_page": 5},
             description=f"Find product '{search_term}' for quick order",
             requires_resolution=["create_order_from_product"],
         ))
 
     # ═══════════════════════════════════════════
-    # ★ CATEGORY-BASED BROWSING
+    # CATEGORY-BASED BROWSING
     # ═══════════════════════════════════════════
 
     elif intent == Intent.CATEGORY_BROWSE:
-        params = {
-            "per_page": 20,
-            "status": "publish",
-            "category": str(e.category_id),
-        }
+        params = {"per_page": 20, "status": "publish", "category": str(e.category_id)}
         if e.on_sale:
             params["on_sale"] = "true"
-        if e.color_tone:
-            tag_id = _get_tag_id(e.tag_slugs)
-            if tag_id:
-                params["tag"] = str(tag_id)
+        if e.tag_ids:
+            params["tag"] = str(e.tag_ids[0])
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
             params=params,
-            description=(
-                f"Browse category '{e.category_name}' "
-                f"(id={e.category_id}, slug={e.category_slug})"
-            ),
+            description=f"Browse category '{e.category_name}' (id={e.category_id})",
         ))
 
     elif intent == Intent.CATEGORY_LIST:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products/categories",
-            params={
-                "per_page": 100,
-                "hide_empty": True,
-                "orderby": "name",
-                "order": "asc",
-            },
+            params={"per_page": 100, "hide_empty": True, "orderby": "name", "order": "asc"},
             description="List all product categories",
         ))
 
@@ -146,70 +141,61 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={
-                "per_page": 20,
-                "status": "publish",
-                "stock_status": "instock",
-                "orderby": "menu_order",
-                "order": "asc",
-            },
+            params={"per_page": 20, "status": "publish", "stock_status": "instock",
+                    "orderby": "menu_order", "order": "asc"},
             description="List all published, in-stock products",
         ))
 
     elif intent == Intent.PRODUCT_SEARCH:
-        params = {
-            "per_page": 20,
-            "status": "publish",
-            "search": e.product_name or e.search_term or "",
-        }
-        if e.product_slug:
-            params["sku"] = f"{e.product_slug}-series"
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/products",
-            params=params,
-            description=f"Search products matching '{e.product_name}'",
-        ))
+        has_attributes = any([e.finish, e.color_tone, e.tile_size, e.thickness, e.visual, e.origin, e.application])
+        if e.product_id:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/{e.product_id}",
+                params={},
+                description=f"Fetch product id={e.product_id} ('{e.product_name}')",
+            ))
+            if has_attributes:
+                calls.append(WooAPICall(
+                    method="GET",
+                    endpoint=f"{BASE}/products/{e.product_id}/variations",
+                    params={"per_page": 100, "status": "publish"},
+                    description=f"Fetch variations for id={e.product_id}",
+                ))
+        else:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products",
+                params={"per_page": 20, "status": "publish", "search": e.product_name or e.search_term or ""},
+                description=f"Search products matching '{e.product_name}'",
+            ))
 
     elif intent == Intent.PRODUCT_DETAIL:
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/products",
-            params={
-                "search": e.product_name,
-                "status": "publish",
-                "per_page": 5,
-            },
-            description=f"Get details for '{e.product_name}' series",
-        ))
-
-    elif intent == Intent.PRODUCT_CATALOG:
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/products/categories",
-            params={"per_page": 100, "hide_empty": True},
-            description="Get all product categories",
-        ))
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/products/tags",
-            params={"per_page": 100, "hide_empty": True},
-            description="Get all product tags",
-        ))
-
-    elif intent == Intent.PRODUCT_TYPES:
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/products/attributes/{ATTRIBUTES['pa_visual']['id']}/terms",
-            params={"per_page": 100},
-            description="List all visual/type options",
-        ))
+        if e.product_id:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/{e.product_id}",
+                params={},
+                description=f"Get details for product id={e.product_id}",
+            ))
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/{e.product_id}/variations",
+                params={"per_page": 100, "status": "publish"},
+                description=f"Get variations for '{e.product_name}'",
+            ))
+        else:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products",
+                params={"search": e.product_name, "status": "publish", "per_page": 5},
+                description=f"Search product '{e.product_name}'",
+            ))
 
     elif intent == Intent.PRODUCT_BY_COLLECTION:
-        tag_id = _get_tag_id(e.tag_slugs)
         params = {"per_page": 20, "status": "publish", "stock_status": "instock"}
-        if tag_id:
-            params["tag"] = str(tag_id)
+        if e.tag_ids:
+            params["tag"] = str(e.tag_ids[0])
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
@@ -218,10 +204,11 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         ))
 
     elif intent == Intent.PRODUCT_BY_ORIGIN:
-        tag_id = _get_tag_id(e.tag_slugs)
         params = {"per_page": 20, "status": "publish"}
-        if tag_id:
-            params["tag"] = str(tag_id)
+        if e.attribute_term_ids and e.attribute_slug:
+            params.update(_attr_filter_params(e.attribute_slug, e.attribute_term_ids, []))
+        elif e.tag_ids:
+            params["tag"] = str(e.tag_ids[0])
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
@@ -230,23 +217,23 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         ))
 
     elif intent == Intent.PRODUCT_QUICK_SHIP:
+        params = {"per_page": 20, "status": "publish", "stock_status": "instock"}
+        qs_tag_id = _tag_id("quick-ship")
+        if qs_tag_id:
+            params["tag"] = str(qs_tag_id)
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={
-                "per_page": 20,
-                "status": "publish",
-                "stock_status": "instock",
-                "tag": str(TAGS["quick-ship"]["id"]),
-            },
+            params=params,
             description="Quick ship / in-stock products",
         ))
 
     elif intent == Intent.PRODUCT_BY_VISUAL:
-        tag_id = _get_tag_id(e.tag_slugs)
         params = {"per_page": 20, "status": "publish"}
-        if tag_id:
-            params["tag"] = str(tag_id)
+        if e.attribute_term_ids and e.attribute_slug:
+            params.update(_attr_filter_params(e.attribute_slug, e.attribute_term_ids, []))
+        elif e.tag_ids:
+            params["tag"] = str(e.tag_ids[0])
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
@@ -263,15 +250,41 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
                 description=f"Find '{e.product_name}' to get related_ids",
             ))
 
+    elif intent == Intent.PRODUCT_CATALOG:
+        calls.append(WooAPICall(
+            method="GET",
+            endpoint=f"{BASE}/products/categories",
+            params={"per_page": 100, "hide_empty": True},
+            description="Get all product categories",
+        ))
+        calls.append(WooAPICall(
+            method="GET",
+            endpoint=f"{BASE}/products/tags",
+            params={"per_page": 100, "hide_empty": True},
+            description="Get all product tags",
+        ))
+
+    elif intent == Intent.PRODUCT_TYPES:
+        attr_id = _attr_id("pa_visual")
+        if attr_id:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/attributes/{attr_id}/terms",
+                params={"per_page": 100},
+                description="List all visual/type options",
+            ))
+
     # ═══════════════════════════════════════════
-    # ATTRIBUTE FILTERS
+    # ATTRIBUTE FILTERS — use attribute+term when available
     # ═══════════════════════════════════════════
 
     elif intent == Intent.FILTER_BY_FINISH:
-        tag_id = _get_tag_id(e.tag_slugs)
         params = {"per_page": 20, "status": "publish"}
-        if tag_id:
-            params["tag"] = str(tag_id)
+        params.update(_attr_filter_params(
+            e.attribute_slug or "pa_finish",
+            e.attribute_term_ids,
+            e.tag_ids,
+        ))
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
@@ -280,22 +293,33 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         ))
 
     elif intent == Intent.FILTER_BY_SIZE:
+        params = {"per_page": 20, "status": "publish"}
+        params.update(_attr_filter_params(
+            e.attribute_slug or "pa_tile-size",
+            e.attribute_term_ids,
+            [],
+        ))
+        # Fallback: text search if no term IDs resolved
+        if "attribute" not in params and e.tile_size:
+            params["search"] = e.tile_size.replace('"', '')
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={
-                "per_page": 100,
-                "status": "publish",
-                "search": e.tile_size.replace('"', '') if e.tile_size else "",
-            },
+            params=params,
             description=f"Filter by tile size: {e.tile_size}",
         ))
 
     elif intent == Intent.FILTER_BY_COLOR:
-        tag_id = _get_tag_id(e.tag_slugs)
         params = {"per_page": 20, "status": "publish"}
-        if tag_id:
-            params["tag"] = str(tag_id)
+        if e.tag_ids:
+            params["tag"] = str(e.tag_ids[0])
+        elif e.color_tone:
+            # Try live tag search as fallback
+            l = _loader()
+            if l:
+                tag_ids = l.get_tag_ids_for_keyword(e.color_tone.lower())
+                if tag_ids:
+                    params["tag"] = str(tag_ids[0])
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
@@ -304,10 +328,12 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         ))
 
     elif intent == Intent.FILTER_BY_THICKNESS:
-        tag_id = _get_tag_id(e.tag_slugs)
         params = {"per_page": 20, "status": "publish"}
-        if tag_id:
-            params["tag"] = str(tag_id)
+        params.update(_attr_filter_params(
+            e.attribute_slug or "pa_thickness",
+            e.attribute_term_ids,
+            e.tag_ids,
+        ))
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
@@ -315,11 +341,27 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             description=f"Filter by thickness: {e.thickness}",
         ))
 
-    elif intent == Intent.FILTER_BY_ORIGIN:
-        tag_id = _get_tag_id(e.tag_slugs)
+    elif intent == Intent.FILTER_BY_APPLICATION:
         params = {"per_page": 20, "status": "publish"}
-        if tag_id:
-            params["tag"] = str(tag_id)
+        params.update(_attr_filter_params(
+            e.attribute_slug or "pa_application",
+            e.attribute_term_ids,
+            [],
+        ))
+        # Fallback: text search
+        if "attribute" not in params and e.application:
+            params["search"] = e.application
+        calls.append(WooAPICall(
+            method="GET",
+            endpoint=f"{BASE}/products",
+            params=params,
+            description=f"Filter by application: {e.application}",
+        ))
+
+    elif intent == Intent.FILTER_BY_ORIGIN:
+        params = {"per_page": 20, "status": "publish"}
+        if e.tag_ids:
+            params["tag"] = str(e.tag_ids[0])
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
@@ -327,83 +369,95 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             description=f"Filter by origin: {e.origin}",
         ))
 
-    elif intent == Intent.FILTER_BY_APPLICATION:
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/products",
-            params={
-                "per_page": 100,
-                "status": "publish",
-                "search": e.application or "",
-            },
-            description=f"Filter by application: {e.application}",
-        ))
-
     elif intent == Intent.SIZE_LIST:
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/products/attributes/{ATTRIBUTES['pa_tile-size']['id']}/terms",
-            params={"per_page": 100},
-            description="List all available tile sizes",
-        ))
+        attr_id = _attr_id("pa_tile-size")
+        if attr_id:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/attributes/{attr_id}/terms",
+                params={"per_page": 100},
+                description="List all available tile sizes",
+            ))
 
     # ═══════════════════════════════════════════
     # PRODUCT SUBTYPES
     # ═══════════════════════════════════════════
 
     elif intent == Intent.MOSAIC_PRODUCTS:
+        search_term = f"{e.product_name} mosaic" if e.product_name else "mosaic"
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={"per_page": 20, "status": "publish", "search": "mosaic"},
-            description="List all mosaic products",
+            params={"per_page": 20, "status": "publish", "search": search_term},
+            description=f"Search mosaic products: '{search_term}'",
         ))
 
     elif intent == Intent.TRIM_PRODUCTS:
+        search_term = f"{e.product_name} bullnose" if e.product_name else "bullnose"
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={"per_page": 20, "status": "publish", "search": "bullnose"},
-            description="List all trim/bullnose products",
+            params={"per_page": 20, "status": "publish", "search": search_term},
+            description=f"List trim products",
         ))
 
     elif intent == Intent.CHIP_CARD:
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/products",
-            params={
-                "per_page": 50,
-                "status": "publish",
-                "tag": str(TAGS["chip-card"]["id"]),
-            },
-            description="List all chip card products",
-        ))
+        if e.product_name:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products",
+                params={"per_page": 10, "status": "publish",
+                        "search": f"{e.product_name} chip card"},
+                description=f"Find chip card for '{e.product_name}'",
+            ))
+        else:
+            cc_tag_id = _tag_id("chip-card")
+            params = {"per_page": 50, "status": "publish"}
+            if cc_tag_id:
+                params["tag"] = str(cc_tag_id)
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products",
+                params=params,
+                description="List all chip card products",
+            ))
 
     # ═══════════════════════════════════════════
     # VARIATIONS
     # ═══════════════════════════════════════════
 
     elif intent == Intent.PRODUCT_VARIATIONS:
-        if e.product_name:
+        if e.product_id:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/{e.product_id}",
+                params={},
+                description=f"Get parent product '{e.product_name}'",
+            ))
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/{e.product_id}/variations",
+                params={"per_page": 100, "status": "publish"},
+                description=f"Get all variations for '{e.product_name}'",
+            ))
+        elif e.product_name:
             calls.append(WooAPICall(
                 method="GET",
                 endpoint=f"{BASE}/products",
-                params={
-                    "search": e.product_name,
-                    "status": "publish",
-                    "type": "variable",
-                    "per_page": 5,
-                },
+                params={"search": e.product_name, "status": "publish",
+                        "type": "variable", "per_page": 5},
                 description=f"Find variable product '{e.product_name}'",
             ))
 
     elif intent == Intent.SAMPLE_REQUEST:
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/products/attributes/{ATTRIBUTES['pa_sample-size']['id']}/terms",
-            params={"per_page": 100},
-            description="List available sample sizes",
-        ))
+        attr_id = _attr_id("pa_sample-size")
+        if attr_id:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/attributes/{attr_id}/terms",
+                params={"per_page": 100},
+                description="List available sample sizes",
+            ))
 
     # ═══════════════════════════════════════════
     # DISCOUNTS & PROMOTIONS
@@ -450,7 +504,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         ))
 
     # ═══════════════════════════════════════════
-    # ACCOUNT & ORDERING (existing)
+    # ACCOUNT & ORDERING
     # ═══════════════════════════════════════════
 
     elif intent == Intent.SAVE_FOR_LATER:
@@ -482,12 +536,8 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             calls.append(WooAPICall(
                 method="GET",
                 endpoint=f"{BASE}/orders",
-                params={
-                    "customer": "CURRENT_USER_ID",
-                    "per_page": 5,
-                    "orderby": "date",
-                    "order": "desc",
-                },
+                params={"customer": "CURRENT_USER_ID", "per_page": 5,
+                        "orderby": "date", "order": "desc"},
                 description="List recent orders (no order ID provided)",
             ))
 
@@ -503,11 +553,14 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             endpoint=f"{BASE}/orders",
             params={},
             body={
-                "status": "pending",
+                "status": "processing",
                 "customer_id": "CURRENT_USER_ID",
+                "payment_method": "cod",
+                "payment_method_title": "Cash on Delivery",
+                "set_paid": False,
                 "line_items": line_items,
             },
-            description="Create new order",
+            description="Create new order (COD)",
         ))
 
     # ═══════════════════════════════════════════
@@ -529,11 +582,3 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
 
     result.api_calls = calls
     return calls
-
-
-def _get_tag_id(tag_slugs: list):
-    """Get the first resolved tag ID from slug list."""
-    for slug in tag_slugs:
-        if slug in TAGS:
-            return TAGS[slug]["id"]
-    return None

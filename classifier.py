@@ -1,16 +1,12 @@
 """
 Intent Classifier optimized for WGC Tiles Store.
-Now includes CATEGORY-AWARE classification and ORDER HISTORY/REORDER.
+All attribute/tag lookups use live StoreLoader data — no hardcoded maps.
 """
 
 import re
-from typing import Optional
+from typing import Optional, List
 from models import Intent, ExtractedEntities, ClassifiedResult
-from store_registry import (
-    TAGS, PRODUCT_SERIES, COLOR_MAP, FINISH_MAP,
-    VISUAL_MAP, ORIGIN_MAP, SIZE_KEYWORD_MAP, THICKNESS_MAP,
-    get_store_loader,
-)
+from store_registry import get_store_loader
 
 
 def classify(utterance: str) -> ClassifiedResult:
@@ -28,26 +24,16 @@ def classify(utterance: str) -> ClassifiedResult:
     _extract_origin(text, entities)
     _extract_size(text, entities)
     _extract_thickness(text, entities)
+    _extract_application(text, entities)
     _extract_collection_year(text, entities)
     _extract_order_id(text, entities)
     _extract_quantity(text, entities)
-
-    # ★ NEW: Extract category from live WooCommerce data
     _extract_category(text, entities)
-
-    # ★ NEW: Extract order-related entities
     _extract_order_item(text, entities)
 
     # ─── Intent Classification (priority order) ───
 
-    # ═══════════════════════════════════════════
-    # ★ 0. ORDER HISTORY / REORDER (NEW — highest priority for order queries)
-    #    Must come BEFORE order tracking/status to avoid misclassification.
-    #    "show my last order" → LAST_ORDER (not ORDER_TRACKING)
-    #    "repeat my last order" → REORDER
-    #    "order this item Ansel" → ORDER_ITEM
-    # ═══════════════════════════════════════════
-
+    # 0. ORDER HISTORY / REORDER
     if re.search(r"\b(repeat|reorder|re-order|order\s*again)\b", text):
         intent, confidence = Intent.REORDER, 0.95
         entities.reorder = True
@@ -61,7 +47,7 @@ def classify(utterance: str) -> ClassifiedResult:
     ):
         intent, confidence = Intent.QUICK_ORDER, 0.93
 
-    # 1. ORDER TRACKING & STATUS (must come before ORDER_HISTORY)
+    # 1. ORDER TRACKING & STATUS
     elif re.search(r"\b(track|tracking)\b.*\border\b|\border\b.*\btrack", text):
         intent, confidence = Intent.ORDER_TRACKING, 0.93
 
@@ -69,9 +55,7 @@ def classify(utterance: str) -> ClassifiedResult:
         intent, confidence = Intent.ORDER_STATUS, 0.93
 
     # 2. ORDER HISTORY & LAST ORDER
-    elif re.search(
-        r"\b(order\s*history|past\s*orders?|previous\s*orders?)\b", text
-    ):
+    elif re.search(r"\b(order\s*history|past\s*orders?|previous\s*orders?)\b", text):
         intent, confidence = Intent.ORDER_HISTORY, 0.92
         entities.order_count = 10
 
@@ -116,7 +100,6 @@ def classify(utterance: str) -> ClassifiedResult:
     elif re.search(r"\bclearance\b", text):
         intent, confidence = Intent.CLEARANCE_PRODUCTS, 0.92
         entities.on_sale = True
-        entities.tag_slugs.append("clearance")
 
     elif re.search(r"\b(discount|sale|deals?)\b", text):
         intent, confidence = Intent.DISCOUNT_INQUIRY, 0.88
@@ -130,12 +113,23 @@ def classify(utterance: str) -> ClassifiedResult:
     elif re.search(r"\bsample\b", text):
         intent, confidence = Intent.SAMPLE_REQUEST, 0.90
 
-    elif re.search(r"\bchip\s*card\b", text):
+    elif re.search(r"\bchip\s*cards?\b", text):
         intent, confidence = Intent.CHIP_CARD, 0.92
-        entities.tag_slugs.append("chip-card")
-        entities.tag_ids.append(48)
+        loader = get_store_loader()
+        if loader:
+            tid = loader.get_chip_card_tag_id()
+            if tid:
+                entities.tag_ids.append(tid)
+                entities.tag_slugs.append("chip-card")
 
-    # 4. PRODUCT VARIATIONS
+    # 4. MOSAIC / TRIM
+    elif re.search(r"\bmosaics?\b", text):
+        intent, confidence = Intent.MOSAIC_PRODUCTS, 0.91
+
+    elif re.search(r"\b(trim|bullnose)\b", text):
+        intent, confidence = Intent.TRIM_PRODUCTS, 0.90
+
+    # 4b. PRODUCT VARIATIONS
     elif re.search(
         r"\b(colors?|variants?|variations?|options?|finishes)\b.*\b(come|available|does|do)\b",
         text,
@@ -161,15 +155,14 @@ def classify(utterance: str) -> ClassifiedResult:
         intent, confidence = Intent.PRODUCT_QUICK_SHIP, 0.91
         entities.quick_ship = True
 
-    # ★ 7. CATEGORY MATCH
+    # 7. CATEGORY MATCH
     elif entities.category_id is not None:
         intent, confidence = Intent.CATEGORY_BROWSE, 0.94
 
-    # ★ Category listing request
     elif re.search(r"\b(what|list|show|all)\b.*\bcategor(y|ies)\b", text):
         intent, confidence = Intent.CATEGORY_LIST, 0.91
 
-    # 8. ATTRIBUTE FILTERS (only if no category matched)
+    # 8. ATTRIBUTE FILTERS
     elif entities.finish and not entities.product_name:
         intent, confidence = Intent.FILTER_BY_FINISH, 0.89
 
@@ -200,14 +193,6 @@ def classify(utterance: str) -> ClassifiedResult:
     elif entities.collection_year:
         intent, confidence = Intent.PRODUCT_BY_COLLECTION, 0.89
 
-    # 12. MOSAIC / TRIM
-    elif re.search(r"\bmosaic\b", text):
-        intent, confidence = Intent.MOSAIC_PRODUCTS, 0.91
-        entities.tag_slugs.append("mosaic-look")
-
-    elif re.search(r"\b(trim|bullnose)\b", text):
-        intent, confidence = Intent.TRIM_PRODUCTS, 0.90
-
     # 13. PRODUCT SEARCH BY NAME
     elif entities.product_name:
         if re.search(r"\b(tell|about|detail|info|specs?|specification)\b", text):
@@ -231,8 +216,7 @@ def classify(utterance: str) -> ClassifiedResult:
     elif re.search(r"\btiles?\b", text):
         intent, confidence = Intent.PRODUCT_LIST, 0.75
 
-    # ★ NEW: Check if QUICK_ORDER should be used
-    # (for queries like "buy Allspice" or "I want to order Waterfall tiles")
+    # Final fallback: QUICK_ORDER if order_item_name extracted but nothing matched
     if intent == Intent.UNKNOWN and entities.order_item_name:
         intent, confidence = Intent.QUICK_ORDER, 0.90
 
@@ -248,9 +232,8 @@ def classify(utterance: str) -> ClassifiedResult:
 # ─────────────────────────────────────────────
 
 def _extract_category(text: str, entities: ExtractedEntities):
-    """Check if the user's text matches any WooCommerce category."""
     loader = get_store_loader()
-    if loader is None:
+    if not loader:
         return
     match = loader.get_category_for_text(text)
     if match:
@@ -260,85 +243,247 @@ def _extract_category(text: str, entities: ExtractedEntities):
 
 
 def _extract_product_name(text: str, entities: ExtractedEntities):
-    for series in PRODUCT_SERIES:
-        if series in text:
-            entities.product_name = series.title()
-            entities.product_slug = series
+    loader = get_store_loader()
+    if loader:
+        match = loader.get_product_for_text(text)
+        if match:
+            entities.product_name = match["name"]
+            entities.product_slug = match.get("slug", "")
+            entities.product_id = match.get("id")
             if "mosaic" in text:
-                entities.product_slug = f"{series}-mosaic"
+                entities.product_slug = f"{match['slug']}-mosaic"
             elif "chip card" in text:
-                entities.product_slug = f"{series}-chip-card"
+                entities.product_slug = f"{match['slug']}-chip-card"
             elif "ymal" in text:
-                entities.product_slug = f"{series}-ymal"
-            break
+                entities.product_slug = f"{match['slug']}-ymal"
 
 
 def _extract_color(text: str, entities: ExtractedEntities):
-    for keyword, slug in COLOR_MAP.items():
-        if keyword in text:
+    """
+    Match color keywords against live tags.
+    Looks for tags whose name contains color tone words.
+    e.g. "gray" → finds "Gray Tones" tag, "white" → "White Tones" tag
+    """
+    # Color keyword → search term for live tag lookup
+    COLOR_KEYWORDS = [
+        "white", "grey", "gray", "beige", "black", "brown",
+        "taupe", "multi", "cream", "ivory", "blue", "green",
+        "red", "yellow", "pink", "orange", "purple",
+    ]
+    loader = get_store_loader()
+    for keyword in COLOR_KEYWORDS:
+        if re.search(rf"\b{keyword}\b", text):
             entities.color_tone = keyword.title()
-            entities.tag_slugs.append(slug)
-            entities.tag_ids.append(TAGS[slug]["id"])
+            if loader:
+                # Find matching tag IDs from live data
+                tag_ids = loader.get_tag_ids_for_keyword(keyword)
+                entities.tag_ids.extend(tag_ids)
+                # Also record slugs for any matched tags
+                for tid in tag_ids:
+                    tag = loader.tag_by_id.get(tid)
+                    if tag:
+                        entities.tag_slugs.append(tag["slug"])
             break
 
 
 def _extract_finish(text: str, entities: ExtractedEntities):
-    for keyword, slug in FINISH_MAP.items():
-        if keyword in text:
-            entities.finish = keyword.title()
-            entities.tag_slugs.append(slug)
-            entities.tag_ids.append(TAGS[slug]["id"])
+    """
+    Match finish keywords against live pa_finish attribute terms.
+    Falls back to tag search if attribute terms not found.
+    """
+    FINISH_KEYWORDS = {
+        "matte": "matte", "matt": "matte", "matte finish": "matte",
+        "polished": "polished", "glossy": "polished", "gloss": "polished",
+        "honed": "honed", "satin": "satin", "lappato": "lappato",
+        "structured": "structured", "textured": "textured",
+        "natural": "natural", "brushed": "brushed",
+    }
+    loader = get_store_loader()
+    for keyword, normalized in FINISH_KEYWORDS.items():
+        if re.search(rf"\b{re.escape(keyword)}\b", text):
+            entities.finish = normalized.title()
+            entities.attribute_slug = "pa_finish"
+            if loader:
+                term_ids = loader.get_attribute_term_ids("pa_finish", normalized)
+                if term_ids:
+                    entities.attribute_term_ids = term_ids
+                else:
+                    # Fallback: tag search
+                    tag_ids = loader.get_tag_ids_for_keyword(keyword)
+                    entities.tag_ids.extend(tag_ids)
             break
 
 
 def _extract_visual(text: str, entities: ExtractedEntities):
-    for keyword, slug in VISUAL_MAP.items():
-        if keyword in text:
-            entities.visual = keyword.title()
-            entities.tag_slugs.append(slug)
-            entities.tag_ids.append(TAGS[slug]["id"])
+    """Match visual/look keywords against live pa_visual attribute terms and tags."""
+    VISUAL_KEYWORDS = {
+        "stone": "stone", "marble": "marble", "mosaic": "mosaic",
+        "terrazzo": "terrazzo", "gauge": "gauge panel",
+        "pattern": "pattern", "decor": "decor", "shape": "shapes",
+        "metallic": "metallic", "concrete": "concrete", "wood": "wood",
+        "travertine": "travertine", "slate": "slate",
+    }
+    loader = get_store_loader()
+    for keyword, normalized in VISUAL_KEYWORDS.items():
+        if re.search(rf"\b{re.escape(keyword)}\b", text):
+            entities.visual = normalized.title()
+            if loader:
+                # Try attribute terms first
+                term_ids = loader.get_attribute_term_ids("pa_visual", normalized)
+                if term_ids:
+                    entities.attribute_slug = "pa_visual"
+                    entities.attribute_term_ids = term_ids
+                else:
+                    # Fall back to tag search
+                    tag_ids = loader.get_tag_ids_for_keyword(keyword)
+                    entities.tag_ids.extend(tag_ids)
+                    for tid in tag_ids:
+                        tag = loader.tag_by_id.get(tid)
+                        if tag:
+                            entities.tag_slugs.append(tag["slug"])
             break
 
 
 def _extract_origin(text: str, entities: ExtractedEntities):
-    for keyword, slug in ORIGIN_MAP.items():
-        if keyword in text:
-            entities.origin = keyword.title()
-            entities.tag_slugs.append(slug)
-            entities.tag_ids.append(TAGS[slug]["id"])
+    """Match origin keywords against live tags."""
+    ORIGIN_KEYWORDS = {
+        "italy": "italy", "italian": "italy",
+        "turkey": "turkey", "turkish": "turkey",
+        "spain": "spain", "spanish": "spain",
+        "china": "china", "chinese": "china",
+        "india": "india", "indian": "india",
+        "portugal": "portugal", "portuguese": "portugal",
+    }
+    loader = get_store_loader()
+    for keyword, normalized in ORIGIN_KEYWORDS.items():
+        if re.search(rf"\b{re.escape(keyword)}\b", text):
+            entities.origin = normalized.title()
+            if loader:
+                tag_ids = loader.get_tag_ids_for_keyword(normalized)
+                # Also try "made in X"
+                if not tag_ids:
+                    tag_ids = loader.get_tag_ids_for_keyword(f"made in {normalized}")
+                entities.tag_ids.extend(tag_ids)
+                for tid in tag_ids:
+                    tag = loader.tag_by_id.get(tid)
+                    if tag:
+                        entities.tag_slugs.append(tag["slug"])
             break
 
 
 def _extract_size(text: str, entities: ExtractedEntities):
-    size_match = re.search(r'(\d+)\s*[xX×]\s*(\d+)', text)
+    """
+    Extract tile size from user text and resolve to live pa_tile-size term IDs.
+    Handles: "24x48", "24 by 48", "24x48 tiles", "large format", "large", "small"
+    """
+    loader = get_store_loader()
+
+    # 1. Numeric size pattern: "24x48", "24 x 48", "24 by 48", "24×48"
+    size_match = re.search(r'(\d+)\s*(?:x|by|×|X)\s*(\d+)', text)
     if size_match:
-        key = f"{size_match.group(1)}x{size_match.group(2)}"
-        if key in SIZE_KEYWORD_MAP:
-            entities.tile_size = SIZE_KEYWORD_MAP[key]
-    for keyword, size_val in SIZE_KEYWORD_MAP.items():
-        if keyword in text and not entities.tile_size:
-            entities.tile_size = size_val
-            break
+        w, h = size_match.group(1), size_match.group(2)
+        size_str = f"{w}x{h}"
+        entities.tile_size = f'{w}"x{h}"' if len(w) > 1 else size_str
+        entities.attribute_slug = "pa_tile-size"
+        if loader:
+            term_ids = loader.get_attribute_term_ids("pa_tile-size", size_str)
+            if not term_ids:
+                # Try with quotes e.g. "24\"x48\""
+                term_ids = loader.get_attribute_term_ids("pa_tile-size", f'{w}"x{h}"')
+            entities.attribute_term_ids = term_ids
+        return
+
+    # 2. Descriptive size keywords — search live terms
+    SIZE_KEYWORDS = {
+        "large format": ["large", "48", "110"],
+        "large": ["48x48", "48x110", "large"],
+        "small": ["small", "12x", "mosaic"],
+        "extra large": ["extra large", "large format"],
+        "medium": ["medium", "24x"],
+    }
+    if loader:
+        all_terms = loader.get_all_attribute_terms("pa_tile-size")
+        for phrase, hints in SIZE_KEYWORDS.items():
+            if re.search(rf"\b{re.escape(phrase)}\b", text):
+                matched_ids = []
+                for term in all_terms:
+                    term_name = term.get("name", "").lower()
+                    if any(h in term_name for h in hints):
+                        matched_ids.append(term["id"])
+                if matched_ids:
+                    entities.tile_size = phrase.title()
+                    entities.attribute_slug = "pa_tile-size"
+                    entities.attribute_term_ids = matched_ids
+                    return
 
 
 def _extract_thickness(text: str, entities: ExtractedEntities):
-    for keyword, slug in THICKNESS_MAP.items():
-        if keyword in text:
-            entities.thickness = keyword
-            entities.tag_slugs.append(slug)
-            entities.tag_ids.append(TAGS[slug]["id"])
-            break
+    """Match thickness values against live pa_thickness attribute terms."""
+    THICKNESS_PATTERNS = [
+        r'(\d+(?:\.\d+)?\s*mm)',
+        r'(\d+/\d+"?)',   # e.g. "7/16" or "11/32""
+        r'(\d+(?:\.\d+)?\s*cm)',
+    ]
+    loader = get_store_loader()
+    for pattern in THICKNESS_PATTERNS:
+        match = re.search(pattern, text)
+        if match:
+            raw = match.group(1).strip()
+            entities.thickness = raw
+            entities.attribute_slug = "pa_thickness"
+            if loader:
+                term_ids = loader.get_attribute_term_ids("pa_thickness", raw)
+                if term_ids:
+                    entities.attribute_term_ids = term_ids
+                else:
+                    # Also search live tags for thickness
+                    tag_ids = loader.get_tag_ids_for_keyword(raw)
+                    entities.tag_ids.extend(tag_ids)
+            return
+
+
+def _extract_application(text: str, entities: ExtractedEntities):
+    """
+    NEW: Match application/use keywords against live pa_application attribute terms.
+    e.g. "interior wall", "floor", "outdoor", "countertop"
+    """
+    APPLICATION_KEYWORDS = [
+        "interior wall", "exterior wall",
+        "interior floor", "exterior floor",
+        "wall and floor", "floor and wall",
+        "countertop", "counter top",
+        "bathroom", "kitchen", "outdoor",
+        "interior", "exterior",
+        "floor", "wall",
+        "pool", "shower", "backsplash",
+    ]
+    loader = get_store_loader()
+    # Try longest match first
+    for keyword in APPLICATION_KEYWORDS:
+        if re.search(rf"\b{re.escape(keyword)}\b", text):
+            entities.application = keyword.title()
+            entities.attribute_slug = "pa_application"
+            if loader:
+                term_ids = loader.get_attribute_term_ids("pa_application", keyword)
+                if term_ids:
+                    entities.attribute_term_ids = term_ids
+            return
 
 
 def _extract_collection_year(text: str, entities: ExtractedEntities):
+    """Match collection year against live tags."""
+    loader = get_store_loader()
     year_match = re.search(r'\b(20[12]\d)\s*(collection|series)?\b', text)
     if year_match:
         year = year_match.group(1)
         entities.collection_year = year
-        slug = f"{year}-collection"
-        if slug in TAGS:
-            entities.tag_slugs.append(slug)
-            entities.tag_ids.append(TAGS[slug]["id"])
+        if loader:
+            tag_ids = loader.get_tag_ids_for_keyword(year)
+            entities.tag_ids.extend(tag_ids)
+            for tid in tag_ids:
+                tag = loader.tag_by_id.get(tid)
+                if tag:
+                    entities.tag_slugs.append(tag["slug"])
 
 
 def _extract_order_id(text: str, entities: ExtractedEntities):
@@ -354,23 +499,14 @@ def _extract_quantity(text: str, entities: ExtractedEntities):
 
 
 def _extract_order_item(text: str, entities: ExtractedEntities):
-    """
-    ★ NEW: Extract a product name from "order/buy/purchase <product>" queries.
-    Example: "buy Allspice" → order_item_name = "Allspice"
-             "I want to order Waterfall tiles" → order_item_name = "Waterfall"
-    """
-    # Skip if this is clearly NOT an order query
+    """Extract a product name from order/buy/purchase queries."""
     if not re.search(r"\b(order|buy|purchase|get|want)\b", text):
         return
-    
-    # Keywords that indicate order history/tracking rather than new orders
+
     ORDER_HISTORY_KEYWORDS = r"\b(history|track|tracking|status|before|past|previous|show|tell|about|detail)\b"
-    
-    # Skip if this is clearly an order history/tracking/show query
     if re.search(ORDER_HISTORY_KEYWORDS, text):
         return
-    
-    # Match "order/buy/purchase [this item] <product_name>"
+
     patterns = [
         r"\b(?:order|buy|purchase|get|want)\b.*?\b(?:this\s+item\s+)?([A-Z][a-zA-Z]+)",
         r"\bi\s+want\s+(?:to\s+)?(?:order|buy|purchase|get)\s+(\w+)",
@@ -379,7 +515,6 @@ def _extract_order_item(text: str, entities: ExtractedEntities):
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             candidate = match.group(1).strip().lower()
-            # Skip common non-product words
             skip_words = {
                 "this", "that", "item", "product", "tile", "tiles",
                 "some", "the", "a", "an", "my", "again", "more",
@@ -387,11 +522,11 @@ def _extract_order_item(text: str, entities: ExtractedEntities):
             }
             if candidate not in skip_words and len(candidate) > 2:
                 entities.order_item_name = candidate.title()
-                break
+                return
 
-    # Also check if a known product series is mentioned WITH order/buy/purchase verbs
-    if not entities.order_item_name:
-        for series in PRODUCT_SERIES:
-            if series in text.lower():
-                entities.order_item_name = series.title()
-                break
+    # Also check if a known product is mentioned with order verbs
+    loader = get_store_loader()
+    if loader and not entities.order_item_name:
+        match = loader.get_product_for_text(text)
+        if match:
+            entities.order_item_name = match["name"]

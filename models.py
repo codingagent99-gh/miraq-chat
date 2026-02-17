@@ -101,6 +101,10 @@ class ExtractedEntities:
     tag_slugs: List[str] = field(default_factory=list)
     tag_ids: List[int] = field(default_factory=list)
 
+    # Attribute term resolution (for WooCommerce attribute=&attribute_term= filtering)
+    attribute_slug: Optional[str] = None          # e.g. "pa_tile-size"
+    attribute_term_ids: List[int] = field(default_factory=list)  # resolved term IDs
+
     # Filters
     on_sale: Optional[bool] = None
     in_stock: Optional[bool] = None

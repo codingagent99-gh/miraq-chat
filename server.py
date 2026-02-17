@@ -29,7 +29,7 @@ from models import Intent, ExtractedEntities, ClassifiedResult, WooAPICall
 from classifier import classify
 from api_builder import build_api_calls
 from store_registry import set_store_loader, get_store_loader
-from services.store_loader import StoreLoader
+from store_loader import StoreLoader
 
 # ═══════════════════════════════════════════
 # CONFIG
@@ -173,6 +173,99 @@ def _format_attributes(attrs: list) -> list:
     return result
 
 
+def format_variation(raw: dict, parent: dict = None) -> dict:
+    """Convert a raw WooCommerce variation to clean response format."""
+    price = _safe_float(raw.get("price", ""))
+    regular_price = _safe_float(raw.get("regular_price", ""))
+    sale_price_raw = raw.get("sale_price", "")
+    sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
+
+    # Build attribute label from variation attributes e.g. "Matte / 24x48 / Grey"
+    attrs = raw.get("attributes", [])
+    attr_label = " / ".join(
+        a.get("option", "") for a in attrs if a.get("option")
+    )
+    parent_name = parent.get("name", "") if parent else ""
+    name = f"{parent_name} — {attr_label}" if attr_label else parent_name
+
+    images = raw.get("image", {})
+    image_url = images.get("src", "") if isinstance(images, dict) else ""
+
+    return {
+        "id": raw.get("id"),
+        "parent_id": raw.get("parent_id") or (parent.get("id") if parent else None),
+        "name": name,
+        "slug": raw.get("slug", ""),
+        "sku": raw.get("sku", ""),
+        "permalink": parent.get("permalink", "") if parent else "",
+        "price": price,
+        "regular_price": regular_price,
+        "sale_price": sale_price,
+        "on_sale": raw.get("on_sale", False),
+        "in_stock": raw.get("stock_status") == "instock",
+        "stock_status": raw.get("stock_status", ""),
+        "images": [image_url] if image_url else (parent.get("images", []) if parent else []),
+        "attributes": attrs,
+        "type": "variation",
+        "variation_label": attr_label,
+    }
+
+
+def _filter_variations_by_entities(
+    variations: List[dict], entities: ExtractedEntities
+) -> List[dict]:
+    """
+    Filter variation list by the attributes the user specified.
+    Each variation has attributes like:
+      [{"name": "Finish", "option": "Matte"}, {"name": "Tile Size", "option": '24"x48"'}]
+    """
+    # Build a set of (attr_name_lower, option_lower) pairs the user asked for
+    filters: List[tuple] = []
+
+    if entities.finish:
+        filters.append(("finish", entities.finish.lower()))
+        # Common synonyms handled by normalising both sides to lowercase
+        FINISH_SYNONYMS = {"matt": "matte", "glossy": "polished", "gloss": "polished"}
+        normalized = FINISH_SYNONYMS.get(entities.finish.lower(), entities.finish.lower())
+        if normalized != entities.finish.lower():
+            filters.append(("finish", normalized))
+
+    if entities.color_tone:
+        filters.append(("colors", entities.color_tone.lower()))
+        filters.append(("colors 2", entities.color_tone.lower()))
+
+    if entities.tile_size:
+        filters.append(("tile size", entities.tile_size.lower()))
+
+    if entities.thickness:
+        filters.append(("thickness", entities.thickness.lower()))
+
+    if entities.origin:
+        filters.append(("origin", entities.origin.lower()))
+
+    if entities.visual:
+        filters.append(("visual", entities.visual.lower()))
+
+    if not filters:
+        return variations
+
+    matched = []
+    for var in variations:
+        var_attrs = {
+            a.get("name", "").lower(): a.get("option", "").lower()
+            for a in var.get("attributes", [])
+        }
+        # Variation matches if ALL specified filters are satisfied
+        if all(
+            any(f_val in var_attrs.get(f_name, "") for f_name in var_attrs if f_name == attr_name or f_name.startswith(attr_name))
+            or any(f_val in opt for opt in var_attrs.values())
+            for attr_name, f_val in filters
+        ):
+            matched.append(var)
+
+    return matched if matched else variations  # if nothing matched, return all (don't blank out)
+
+
 def _safe_float(val) -> float:
     """Safely convert to float."""
     try:
@@ -209,7 +302,7 @@ def generate_bot_message(
 
     # ── Order-specific handling ──
     # For order intents (LAST_ORDER, ORDER_HISTORY, REORDER), handle order data first
-    if intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.REORDER, Intent.QUICK_ORDER):
+    if intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.REORDER):
         # If we have actual order data, format it
         if intent == Intent.ORDER_HISTORY and order_data:
             return _format_order_history_message(order_data)
@@ -257,7 +350,7 @@ def generate_bot_message(
 
             if new_order and new_order.get("id"):
                 new_number = new_order.get("number", str(new_order.get("id", "")))
-                msg += f"\n✅ New order **#{new_number}** created successfully with status **Pending**."
+                msg += f"\n✅ New order **#{new_number}** created successfully with status **Processing**."
             else:
                 msg += "\n⚠️ Items identified — but the new order could not be created automatically. Please place the order manually or contact support."
 
@@ -287,36 +380,28 @@ def generate_bot_message(
                     "Try searching by a different name or browse our categories."
                 )
 
-    # For QUICK_ORDER, confirm order if placed, otherwise show matched products
-    if intent == Intent.QUICK_ORDER and count > 0:
-        p = products[0]
+    # For QUICK_ORDER / ORDER_ITEM / PLACE_ORDER — confirm order if placed, else show product
+    if intent in (Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER):
+        # Order was successfully created — show confirmation
         if order_data:
-            new_order = order_data[0]
-            new_number = new_order.get("number", str(new_order.get("id", "")))
-            msg = f"✅ **Order placed successfully!**\n\n"
-            msg += f"**Product:** {p['name']}\n"
-            if p.get("price", 0) > 0:
-                msg += f"**Price:** ${p['price']:.2f}\n"
-            msg += f"**Order #:** {new_number}\n"
-            msg += f"**Status:** Pending\n"
-            return msg
-        # No order created (e.g. not logged in) — show product and prompt
-        if count == 1:
-            msg = f"Perfect! I found **{p['name']}** for you! 🎯\n\n"
+            placed = order_data[-1]
+            order_number = placed.get("number") or placed.get("id", "N/A")
+            p_name = products[0]["name"] if products else "your item"
+            total = placed.get("total", "0.00")
+            return (
+                f"✅ **Order #{order_number} placed successfully!**\n\n"
+                f"**Product:** {p_name}\n"
+                f"**Total:** ${float(total):.2f}\n"
+                f"**Payment:** Cash on Delivery\n"
+                f"**Status:** Processing"
+            )
+        # Product found but no customer — prompt login
+        if count > 0:
+            p = products[0]
+            msg = f"Found **{p['name']}** 🎯\n\n"
             if p.get("price", 0) > 0:
                 msg += f"💰 Price: ${p['price']:.2f}\n"
-            if p.get("short_description"):
-                msg += f"\n{p['short_description']}\n"
-            msg += "\nWould you like to add this to your cart?"
-            return msg
-        else:
-            msg = f"I found **{count}** products matching your search! 🔍\n\n"
-            for p in products[:5]:
-                price_str = f"${p['price']:.2f}" if p.get("price", 0) > 0 else "Contact for price"
-                msg += f"• **{p['name']}** — {price_str}\n"
-            if count > 5:
-                msg += f"\n...and {count - 5} more products."
-            msg += "\n\nWhich one would you like to order?"
+            msg += "\n⚠️ Please log in to place an order."
             return msg
 
     # ── No products found ──
@@ -334,6 +419,62 @@ def generate_bot_message(
             "• Available categories\n"
             "• Specific finishes or colors"
         )
+
+    # ── Variation results (parent + filtered variations) ──
+    if intent in (Intent.PRODUCT_SEARCH, Intent.PRODUCT_DETAIL, Intent.PRODUCT_VARIATIONS) \
+            and entities.product_id and count > 0:
+        parent = products[0]
+        variations = [p for p in products[1:] if p.get("type") == "variation"]
+        has_attributes = any([
+            entities.finish, entities.color_tone, entities.tile_size,
+            entities.thickness, entities.visual, entities.origin,
+        ])
+
+        if intent == Intent.PRODUCT_VARIATIONS or (not has_attributes):
+            # "What variations does Lager have?" or plain "show me lager"
+            msg = f"🎯 **{parent['name']}**\n"
+            if parent.get("price", 0) > 0:
+                msg += f"💰 Starting from ${parent['price']:.2f}\n"
+            if parent.get("short_description"):
+                msg += f"\n{parent['short_description']}\n"
+            if variations:
+                msg += f"\n**Available variations ({len(variations)}):**\n"
+                for v in variations[:10]:
+                    label = v.get("variation_label") or v.get("name", "")
+                    price_str = f"${v['price']:.2f}" if v.get("price", 0) > 0 else "Contact for price"
+                    stock = "✅" if v.get("in_stock") else "❌"
+                    msg += f"  {stock} {label} — {price_str}\n"
+                if len(variations) > 10:
+                    msg += f"  ...and {len(variations) - 10} more variations.\n"
+            elif parent.get("attributes"):
+                msg += "\n**Available options:**\n"
+                for attr in parent["attributes"][:4]:
+                    opts = ", ".join(attr["options"][:6])
+                    msg += f"  • **{attr['name']}:** {opts}\n"
+            return msg
+
+        else:
+            # User asked with attributes e.g. "lager matte 24x48"
+            attr_desc = " / ".join(filter(None, [
+                entities.finish, entities.tile_size,
+                entities.color_tone, entities.thickness,
+            ]))
+            if not variations:
+                return (
+                    f"I found **{parent['name']}** but couldn't find variations matching "
+                    f"**{attr_desc}**. 😕\n\n"
+                    f"Try asking: *'What variations does {parent['name']} come in?'*"
+                )
+            msg = f"🎯 **{parent['name']}** — {attr_desc}\n\n"
+            msg += f"Found **{len(variations)}** matching variation(s):\n\n"
+            for v in variations[:10]:
+                label = v.get("variation_label") or v.get("name", "")
+                price_str = f"${v['price']:.2f}" if v.get("price", 0) > 0 else "Contact for price"
+                stock = "✅ In stock" if v.get("in_stock") else "❌ Out of stock"
+                msg += f"• **{label}** — {price_str} — {stock}\n"
+            if len(variations) > 10:
+                msg += f"\n...and {len(variations) - 10} more."
+            return msg
 
     # ── Single product found ──
     if count == 1:
@@ -561,6 +702,11 @@ USER_PLACEHOLDERS = {
 # Order message formatting constants
 MAX_DISPLAYED_ITEMS = 3  # Maximum number of items to show before truncating with '+N more'
 
+# Default payment method used when none is specified in the request.
+# Change to "bacs" (bank transfer) or "stripe" etc. as needed.
+DEFAULT_PAYMENT_METHOD = "cod"
+DEFAULT_PAYMENT_METHOD_TITLE = "Cash on Delivery"
+
 # ═══════════════════════════════════════════
 # FLASK APP
 # ═══════════════════════════════════════════
@@ -662,6 +808,11 @@ def chat():
     if customer_id:
         _resolve_user_placeholders(api_calls, customer_id)
 
+    # ─── Step 2.6: Extract last_product context (for "order this" resolution) ───
+    # The frontend sends the last displayed product so vague order phrases
+    # like "order this" / "buy it" resolve correctly without a product search.
+    last_product_ctx = user_context.get("last_product")  # {id, name} or None
+
     # ─── Step 3: Execute API calls ───
     all_products_raw = []
     order_data = []
@@ -699,11 +850,14 @@ def chat():
                     endpoint=f"{WOO_BASE_URL}/orders",
                     params={},
                     body={
-                        "status": "pending",
+                        "status": "processing",
                         "customer_id": customer_id,
+                        "payment_method": DEFAULT_PAYMENT_METHOD,
+                        "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
+                        "set_paid": False,
                         "line_items": new_line_items,
                     },
-                    description="Create reorder from last order line items",
+                    description="Create reorder from last order line items (COD, on-hold)",
                 )
                 reorder_resp = woo_client.execute(reorder_call)
                 if reorder_resp.get("success") and isinstance(reorder_resp.get("data"), dict):
@@ -711,29 +865,108 @@ def chat():
 
     # ─── Step 3.6: QUICK_ORDER / ORDER_ITEM / PLACE_ORDER — create order from matched product ───
     if intent in (Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER) and customer_id:
+        # Resolve which product to order:
+        # Priority 1 — product returned by the search API call this turn
+        # Priority 2 — last_product sent by the frontend (handles "order this" / "buy it")
+        _order_product_id = None
+        _order_product_name = None
+
         if all_products_raw:
-            product = all_products_raw[0]
-            product_id = product.get("id")
-            if product_id:
-                order_call = WooAPICall(
-                    method="POST",
-                    endpoint=f"{WOO_BASE_URL}/orders",
-                    params={},
-                    body={
-                        "status": "pending",
-                        "customer_id": customer_id,
-                        "line_items": [
-                            {
-                                "product_id": product_id,
-                                "quantity": entities.quantity or 1,
-                            }
-                        ],
-                    },
-                    description=f"Create order for product '{product.get('name', product_id)}'",
-                )
-                order_resp = woo_client.execute(order_call)
-                if order_resp.get("success") and isinstance(order_resp.get("data"), dict):
-                    order_data.append(order_resp["data"])
+            _p = all_products_raw[0]
+            _order_product_id = _p.get("id")
+            _order_product_name = _p.get("name", str(_order_product_id))
+        elif last_product_ctx and last_product_ctx.get("id"):
+            _order_product_id = last_product_ctx["id"]
+            _order_product_name = last_product_ctx.get("name", str(last_product_ctx["id"]))
+
+        if _order_product_id:
+            order_call = WooAPICall(
+                method="POST",
+                endpoint=f"{WOO_BASE_URL}/orders",
+                params={},
+                body={
+                    "status": "processing",
+                    "customer_id": customer_id,
+                    "payment_method": DEFAULT_PAYMENT_METHOD,
+                    "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
+                    "set_paid": False,
+                    "line_items": [{"product_id": _order_product_id, "quantity": entities.quantity or 1}],
+                },
+                description=f"Create order for product '{_order_product_name}' (COD, processing)",
+            )
+            order_resp = woo_client.execute(order_call)
+            if order_resp.get("success") and isinstance(order_resp.get("data"), dict):
+                order_data.append(order_resp["data"])
+
+    # ─── Step 3.7: Variation product handling ───
+    # When api_builder issued GET /products/{id} + GET /products/{id}/variations,
+    # we need to separate, filter, and format them properly.
+    VARIATION_INTENTS = {Intent.PRODUCT_SEARCH, Intent.PRODUCT_DETAIL, Intent.PRODUCT_VARIATIONS}
+
+    if intent in VARIATION_INTENTS and entities.product_id:
+        parent_product_raw = None
+        variations_raw = []
+
+        for resp in api_responses:
+            if not resp.get("success"):
+                continue
+            data = resp.get("data")
+            if isinstance(data, dict) and data.get("id") == entities.product_id:
+                parent_product_raw = data
+            elif isinstance(data, list) and data and data[0].get("parent_id") is not None:
+                variations_raw = data
+
+        if parent_product_raw:
+            parent_formatted = format_product(parent_product_raw)
+            has_attributes = any([
+                entities.finish, entities.color_tone, entities.tile_size,
+                entities.thickness, entities.visual, entities.origin,
+            ])
+
+            if variations_raw and has_attributes:
+                # Filter variations to only those matching user's attributes
+                filtered_vars = _filter_variations_by_entities(variations_raw, entities)
+                variation_products = [format_variation(v, parent_product_raw) for v in filtered_vars]
+                products = [parent_formatted] + variation_products
+            elif variations_raw:
+                # No attribute filter — return parent + all variations
+                variation_products = [format_variation(v, parent_product_raw) for v in variations_raw]
+                products = [parent_formatted] + variation_products
+            else:
+                # Simple product or variations call not made
+                products = [parent_formatted]
+
+            bot_message = generate_bot_message(intent, entities, products, confidence, order_data)
+            suggestions = generate_suggestions(intent, entities, products)
+            filters = build_filters(intent, entities, api_calls)
+            elapsed = time.time() - start_time
+            metadata = {
+                "confidence": round(confidence, 2),
+                "products_count": len(products),
+                "provider": "wgc_intent_classifier",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "response_time_ms": round(elapsed * 1000),
+                "intent_raw": intent.value,
+                "entities": _entities_to_dict(entities),
+                "variations_found": len(variations_raw),
+                "variations_matched": len(products) - 1 if variations_raw else 0,
+            }
+            if session_id and session_id in sessions:
+                sessions[session_id]["history"].append({
+                    "role": "bot", "message": bot_message, "intent": intent.value,
+                    "products_count": len(products),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+            return jsonify({
+                "success": True,
+                "bot_message": bot_message,
+                "intent": INTENT_LABELS.get(intent, "unknown"),
+                "products": products,
+                "filters_applied": filters,
+                "suggestions": suggestions,
+                "session_id": session_id,
+                "metadata": metadata,
+            }), 200
 
     # ─── Step 4: Format products ───
     products = [format_product(p) for p in all_products_raw]
@@ -783,6 +1016,20 @@ def chat():
         "session_id": session_id,
         "metadata": metadata,
     }
+
+    # Attach order confirmation for order-creating intents
+    ORDER_CREATE_INTENTS = {Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER, Intent.REORDER}
+    if intent in ORDER_CREATE_INTENTS and order_data:
+        placed = order_data[-1]
+        response["order"] = {
+            "id": placed.get("id"),
+            "order_number": str(placed.get("number", placed.get("id", ""))),
+            "status": placed.get("status", "processing"),
+            "total": float(placed.get("total", 0)),
+            "payment_url": placed.get("payment_url"),
+            "date_created": placed.get("date_created"),
+        }
+        response["payment_url"] = placed.get("payment_url")
 
     return jsonify(response), 200
 
@@ -836,18 +1083,18 @@ def get_session(session_id):
 
 def _format_order_date(date_created: str) -> str:
     """
-    Format a WooCommerce date string to readable format.
-    
+    Format a WooCommerce date string to readable date + time format.
+
     Args:
         date_created: ISO format date string from WooCommerce API
-        
+
     Returns:
-        Formatted date string (e.g., "Feb 10, 2026") or truncated original if parsing fails
+        Formatted string e.g. "Feb 10, 2026 at 3:45 PM" or fallback if parsing fails
     """
     date_str = date_created[:10] if len(date_created) >= 10 else date_created
     try:
         dt = datetime.fromisoformat(date_created.replace("Z", "+00:00"))
-        date_str = dt.strftime("%b %d, %Y")
+        date_str = dt.strftime("%b %d, %Y at %I:%M %p").replace(" 0", " ")
     except (ValueError, AttributeError):
         pass
     return date_str
@@ -916,9 +1163,8 @@ def _format_order_history_message(orders: List[dict]) -> str:
             item_names += f" +{len(valid_item_names) - MAX_DISPLAYED_ITEMS} more"
         
         msg += (
-            f"**#{order_number}** — {status} "
-            f"— ${total} "
-            f"— {_format_order_date(date_created)}\n"
+            f"**#{order_number}** — {status} — ${total}\n"
+            f"  🕐 {_format_order_date(date_created)}\n"
             f"  Items: {item_names}\n\n"
         )
     
@@ -953,14 +1199,18 @@ def _entities_to_dict(entities: ExtractedEntities) -> dict:
 # ═══════════════════════════════════════════
 
 def initialize_store():
-    """Load store data from WooCommerce at startup."""
+    """Load store data from WooCommerce at startup, then start background refresh."""
     loader = StoreLoader()
     try:
         loader.load_all()
         set_store_loader(loader)
+        # Start background refresh every 6 hours so data stays current
+        loader.start_background_refresh()
     except Exception as e:
         print(f"⚠️  Store loader error: {e}")
-        print("   Continuing with static registry only.")
+        print("   Server will respond with limited functionality until store data loads.")
+        # Still register the (partially loaded) loader so StoreLoader methods work
+        set_store_loader(loader)
 
 
 if __name__ == "__main__":
