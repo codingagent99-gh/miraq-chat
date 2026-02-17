@@ -237,6 +237,31 @@ def generate_bot_message(
                     msg += f"  • {name} × {qty} — ${item_total}\n"
             
             return msg
+
+        elif intent == Intent.REORDER and order_data:
+            # Show what was reordered and confirm the new order was placed
+            source_order = order_data[0]
+            source_number = source_order.get("number", str(source_order.get("id", "")))
+            line_items = source_order.get("line_items", [])
+
+            # order_data[1] is the newly created order (if step 2 succeeded)
+            new_order = order_data[1] if len(order_data) > 1 else None
+
+            msg = f"🔄 **Reorder placed** (based on order #{source_number})\n\n"
+            if line_items:
+                msg += "**Items reordered:**\n"
+                for item in line_items:
+                    qty = item.get("quantity", 1)
+                    name = item.get("name") or "Unknown Item"
+                    msg += f"  • {name} × {qty}\n"
+
+            if new_order and new_order.get("id"):
+                new_number = new_order.get("number", str(new_order.get("id", "")))
+                msg += f"\n✅ New order **#{new_number}** created successfully with status **Pending**."
+            else:
+                msg += "\n⚠️ Items identified — but the new order could not be created automatically. Please place the order manually or contact support."
+
+            return msg
         
         # Fallback messages when no order data
         if count == 0:
@@ -262,10 +287,21 @@ def generate_bot_message(
                     "Try searching by a different name or browse our categories."
                 )
 
-    # For QUICK_ORDER, show the matched product with order context
+    # For QUICK_ORDER, confirm order if placed, otherwise show matched products
     if intent == Intent.QUICK_ORDER and count > 0:
+        p = products[0]
+        if order_data:
+            new_order = order_data[0]
+            new_number = new_order.get("number", str(new_order.get("id", "")))
+            msg = f"✅ **Order placed successfully!**\n\n"
+            msg += f"**Product:** {p['name']}\n"
+            if p.get("price", 0) > 0:
+                msg += f"**Price:** ${p['price']:.2f}\n"
+            msg += f"**Order #:** {new_number}\n"
+            msg += f"**Status:** Pending\n"
+            return msg
+        # No order created (e.g. not logged in) — show product and prompt
         if count == 1:
-            p = products[0]
             msg = f"Perfect! I found **{p['name']}** for you! 🎯\n\n"
             if p.get("price", 0) > 0:
                 msg += f"💰 Price: ${p['price']:.2f}\n"
@@ -642,6 +678,62 @@ def chat():
                 order_data.append(resp["data"])
             else:
                 all_products_raw.append(resp["data"])
+
+    # ─── Step 3.5: REORDER step 2 — create new order from last order's line_items ───
+    if intent == Intent.REORDER and order_data:
+        source_order = order_data[0]
+        source_line_items = source_order.get("line_items", [])
+        if source_line_items and customer_id:
+            new_line_items = [
+                {
+                    "product_id": item["product_id"],
+                    "quantity": item.get("quantity", 1),
+                    **({"variation_id": item["variation_id"]} if item.get("variation_id") else {}),
+                }
+                for item in source_line_items
+                if item.get("product_id")
+            ]
+            if new_line_items:
+                reorder_call = WooAPICall(
+                    method="POST",
+                    endpoint=f"{WOO_BASE_URL}/orders",
+                    params={},
+                    body={
+                        "status": "pending",
+                        "customer_id": customer_id,
+                        "line_items": new_line_items,
+                    },
+                    description="Create reorder from last order line items",
+                )
+                reorder_resp = woo_client.execute(reorder_call)
+                if reorder_resp.get("success") and isinstance(reorder_resp.get("data"), dict):
+                    order_data.append(reorder_resp["data"])
+
+    # ─── Step 3.6: QUICK_ORDER / ORDER_ITEM / PLACE_ORDER — create order from matched product ───
+    if intent in (Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER) and customer_id:
+        if all_products_raw:
+            product = all_products_raw[0]
+            product_id = product.get("id")
+            if product_id:
+                order_call = WooAPICall(
+                    method="POST",
+                    endpoint=f"{WOO_BASE_URL}/orders",
+                    params={},
+                    body={
+                        "status": "pending",
+                        "customer_id": customer_id,
+                        "line_items": [
+                            {
+                                "product_id": product_id,
+                                "quantity": entities.quantity or 1,
+                            }
+                        ],
+                    },
+                    description=f"Create order for product '{product.get('name', product_id)}'",
+                )
+                order_resp = woo_client.execute(order_call)
+                if order_resp.get("success") and isinstance(order_resp.get("data"), dict):
+                    order_data.append(order_resp["data"])
 
     # ─── Step 4: Format products ───
     products = [format_product(p) for p in all_products_raw]
