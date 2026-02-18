@@ -456,8 +456,20 @@ def generate_bot_message(
         if order_data:
             placed = order_data[-1]
             order_number = placed.get("number") or placed.get("id", "N/A")
-            p_name = products[0]["name"] if products else "your item"
+            # Try products list first, then fall back to order line_items, then "your item"
+            if products:
+                p_name = products[0]["name"]
+            elif placed.get("line_items"):
+                p_name = placed["line_items"][0].get("name") or "your item"
+            else:
+                p_name = "your item"
             total = placed.get("total", "0.00")
+            # If order total is zero but line items have totals, use line item total
+            if float(total) == 0.0 and placed.get("line_items"):
+                # Use "or '0'" to handle None or empty string from WooCommerce response
+                line_total = sum(float(item.get("total", "0") or "0") for item in placed["line_items"])
+                if line_total > 0:
+                    total = str(line_total)
             return (
                 f"✅ **Order #{order_number} placed successfully!**\n\n"
                 f"**Product:** {p_name}\n"
@@ -1027,6 +1039,32 @@ def chat():
         elif last_product_ctx and last_product_ctx.get("id"):
             _order_product_id = last_product_ctx["id"]
             _order_product_name = last_product_ctx.get("name", str(last_product_ctx["id"]))
+            # Inject a minimal product dict so bot message and response include the product info
+            all_products_raw.append({
+                "id": _order_product_id,
+                "name": _order_product_name,
+                "price": "",
+                "regular_price": "",
+                "sale_price": "",
+                "slug": "",
+                "sku": "",
+                "permalink": "",
+                "on_sale": False,
+                "stock_status": "instock",
+                "total_sales": 0,
+                "description": "",
+                "short_description": "",
+                "images": [],
+                "categories": [],
+                "tags": [],
+                "attributes": [],
+                "variations": [],
+                "type": "simple",
+                "average_rating": "0.00",
+                "rating_count": 0,
+                "weight": "",
+                "dimensions": {"length": "", "width": "", "height": ""},
+            })
 
         if _order_product_id:
             order_call = WooAPICall(
