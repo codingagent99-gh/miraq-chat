@@ -26,8 +26,8 @@ def live_store_loader():
     loader = StoreLoader()
     try:
         loader.load_all()
-    except Exception as e:
-        pytest.skip(f"Could not load store data from WooCommerce: {e}")
+    except Exception:
+        pytest.skip("Could not load store data from WooCommerce - check API credentials and connectivity")
     set_store_loader(loader)
     yield loader
     set_store_loader(None)
