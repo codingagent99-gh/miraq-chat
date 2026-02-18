@@ -990,11 +990,14 @@ def chat():
                     if created_order.get("line_items"):
                         product_name = created_order["line_items"][0].get("name") or product_name
                     
+                    # Get currency symbol from order response or default to $
+                    currency_symbol = created_order.get("currency_symbol", "$")
+                    
                     bot_message = (
                         f"✅ **Order #{order_number} placed successfully!**\n\n"
                         f"**Product:** {product_name}\n"
                         f"**Quantity:** {pending_quantity}\n"
-                        f"**Total:** ${float(total):.2f}\n"
+                        f"**Total:** {currency_symbol}{float(total):.2f}\n"
                         f"**Payment Mode:** Cash on Delivery\n"
                         f"**Status:** Processing"
                     )

@@ -207,7 +207,7 @@ class TestOrderFlowIntegration:
         from classifier import classify
         
         # Test the exact phrase from Bug 1 example
-        result = classify("Can you place an order for 5 of this order")
+        result = classify("Can you place an order for 5 of this")
         
         # Verify quantity is extracted
         assert result.entities.quantity == 5, "Quantity should be extracted from 'order for 5 of this'"

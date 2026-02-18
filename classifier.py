@@ -499,7 +499,7 @@ def _extract_quantity(text: str, entities: ExtractedEntities):
         entities.quantity = int(match.group(1))
         return
     # Fallback: "order/buy N of" or "N of this/these/them"
-    match = re.search(r'\b(?:order|buy|purchase|place.*order.*for)\s+(\d+)\b', text)
+    match = re.search(r'\b(?:order|buy|purchase|place\s+(?:an?\s+)?order\s+for)\s+(\d+)\b', text)
     if match:
         entities.quantity = int(match.group(1))
         return
