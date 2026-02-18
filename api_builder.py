@@ -289,7 +289,8 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
     elif intent == Intent.FILTER_BY_SIZE:
         # Use custom API for attribute filtering
         # Strip quotes from tile_size to get clean size like 12x12
-        term_value = e.tile_size.replace('"', '') if e.tile_size else ""
+        # Quotes appear as part of the size format (e.g., 12"x12"), not as delimiters
+        term_value = e.tile_size.replace('"', '').replace("'", '') if e.tile_size else ""
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",

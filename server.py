@@ -210,7 +210,7 @@ def format_custom_product(raw: dict) -> dict:
                 # terms is a dict like {term_id: "term_name", ...}
                 attrs.append({
                     "name": slug.replace("pa_", "").replace("-", " ").title(),
-                    "options": list(terms.values()) if isinstance(terms, dict) else [],
+                    "options": list(terms.values()),
                 })
     
     return {
@@ -1043,6 +1043,7 @@ def chat():
 
     # ─── Step 4: Format products ───
     # Determine which formatter to use
+    # Note: Each request handles a single intent, so all API calls will be of the same type
     use_custom_formatter = any(c.is_custom_api for c in api_calls)
     
     if use_custom_formatter:
