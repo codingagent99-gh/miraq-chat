@@ -48,12 +48,15 @@ BROWSER_HEADERS = {
 # Intent Labels
 # ─────────────────────────────────────────────
 INTENT_LABELS = {
+    Intent.PRODUCT_LIST:          "browse",
     Intent.PRODUCT_SEARCH:        "search",
-    Intent.PRODUCT_DETAIL:        "details",
+    Intent.PRODUCT_DETAIL:        "detail",
     Intent.PRODUCT_CATALOG:       "catalog",
-    Intent.QUICK_SHIP:            "quick_ship",
-    Intent.ON_SALE:               "sale",
-    Intent.NEW_ARRIVALS:          "new",
+    Intent.PRODUCT_TYPES:         "catalog",
+    Intent.PRODUCT_BY_COLLECTION: "browse",
+    Intent.PRODUCT_BY_ORIGIN:     "filter",
+    Intent.PRODUCT_BY_VISUAL:     "filter",
+    Intent.PRODUCT_QUICK_SHIP:    "filter",
     Intent.RELATED_PRODUCTS:      "related",
     Intent.CATEGORY_BROWSE:       "category",
     Intent.CATEGORY_LIST:         "categories",

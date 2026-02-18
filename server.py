@@ -37,775 +37,31 @@ from conversation_flow import (
 )
 from chat_logger import get_logger, sanitize_url, sanitize_log_string
 
+# ─── New module imports ───
+from config.settings import (
+    WOO_BASE_URL, PORT, DEBUG,
+    INTENT_LABELS, ORDER_INTENTS, ORDER_CREATE_INTENTS,
+    DEFAULT_PAYMENT_METHOD, DEFAULT_PAYMENT_METHOD_TITLE,
+)
+from services import (
+    WooClient, format_product, format_custom_product, format_variation,
+    filter_variations_by_entities, generate_bot_message, generate_suggestions,
+    create_flow_confirmed_order, create_reorder, create_quick_order,
+)
+from core import (
+    sessions, get_session, create_or_update_session, session_exists,
+    build_filters, entities_to_dict, resolve_user_placeholders,
+)
+
 # ─── Initialize logger ───
 logger = get_logger("miraq_chat")
-# ═══════════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════════
-
-WOO_BASE_URL = os.getenv("WOO_BASE_URL", "https://wgc.net.in/hn/wp-json/wc/v3")
-WOO_CONSUMER_KEY = os.getenv("WOO_CONSUMER_KEY", "")
-WOO_CONSUMER_SECRET = os.getenv("WOO_CONSUMER_SECRET", "")
-PORT = int(os.getenv("PORT", 5009))
-DEBUG = os.getenv("DEBUG", "false").lower() == "true"
-
-BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/121.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-# ═══════════════════════════════════════════
-# SESSION STORE (in-memory for now)
-# ═══════════════════════════════════════════
-
-sessions: Dict[str, Dict] = {}
 
 # ═══════════════════════════════════════════
 # WOOCOMMERCE API CLIENT
 # ═══════════════════════════════════════════
 
-class WooClient:
-    """Executes WooCommerce API calls with browser UA + query-string auth."""
-
-    def __init__(self):
-        self.session = http_requests.Session()
-        self.session.headers.update(BROWSER_HEADERS)
-
-    def execute(self, api_call: WooAPICall) -> dict:
-        """Execute a single API call and return raw response."""
-        params = dict(api_call.params)
-        
-        # Only add auth params for standard WooCommerce API, not for custom API
-        is_custom_api = "/custom-api/" in api_call.endpoint
-        if not is_custom_api:
-            params["consumer_key"] = WOO_CONSUMER_KEY
-            params["consumer_secret"] = WOO_CONSUMER_SECRET
-
-        # Log API call (sanitize sensitive data)
-        sanitized_endpoint = sanitize_url(api_call.endpoint)
-        logger.info(f"WooCommerce API call: {api_call.method} {sanitized_endpoint}")
-
-        try:
-            if api_call.method == "GET":
-                resp = self.session.get(
-                    api_call.endpoint,
-                    params=params,
-                    timeout=30,
-                )
-            else:
-                # For non-GET methods, only add auth if not custom API
-                auth_params = {} if is_custom_api else {
-                    "consumer_key": WOO_CONSUMER_KEY,
-                    "consumer_secret": WOO_CONSUMER_SECRET,
-                }
-                resp = self.session.request(
-                    method=api_call.method,
-                    url=api_call.endpoint,
-                    params=auth_params,
-                    json=api_call.body,
-                    timeout=30,
-                )
-            resp.raise_for_status()
-            logger.info(f"WooCommerce API response: status={resp.status_code}, success=True")
-            return {
-                "success": True,
-                "data": resp.json(),
-                "total": resp.headers.get("X-WP-Total"),
-                "total_pages": resp.headers.get("X-WP-TotalPages"),
-            }
-        except Exception as e:
-            logger.error(f"WooCommerce API error: {api_call.method} {sanitized_endpoint} | error={str(e)}", exc_info=True)
-            return {"success": False, "data": [], "error": str(e)}
-
-    def execute_all(self, api_calls: List[WooAPICall]) -> List[dict]:
-        results = []
-        for call in api_calls:
-            result = self.execute(call)
-            results.append(result)
-        return results
-
-
 woo_client = WooClient()
 
-# ═══════════════════════════════════════════
-# PRODUCT FORMATTER
-# ═══════════════════════════════════════════
-
-def format_product(raw: dict) -> dict:
-    """Convert raw WooCommerce product to clean response format."""
-    images = raw.get("images", [])
-    image_urls = [img.get("src", "") for img in images if img.get("src")]
-
-    categories = raw.get("categories", [])
-    cat_names = [c.get("name", "") for c in categories]
-
-    tags = raw.get("tags", [])
-    tag_names = [t.get("name", "") for t in tags]
-
-    # Parse prices safely
-    price = _safe_float(raw.get("price", ""))
-    regular_price = _safe_float(raw.get("regular_price", ""))
-    sale_price_raw = raw.get("sale_price", "")
-    sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
-
-    return {
-        "id": raw.get("id"),
-        "name": raw.get("name", ""),
-        "slug": raw.get("slug", ""),
-        "sku": raw.get("sku", ""),
-        "permalink": raw.get("permalink", ""),
-        "price": price,
-        "regular_price": regular_price,
-        "sale_price": sale_price,
-        "on_sale": raw.get("on_sale", False),
-        "in_stock": raw.get("stock_status") == "instock",
-        "stock_status": raw.get("stock_status", ""),
-        "total_sales": raw.get("total_sales", 0),
-        "description": _clean_html(raw.get("description", "")),
-        "short_description": _clean_html(raw.get("short_description", "")),
-        "categories": cat_names,
-        "tags": tag_names,
-        "images": image_urls,
-        "average_rating": raw.get("average_rating", "0.00"),
-        "rating_count": raw.get("rating_count", 0),
-        "weight": raw.get("weight", ""),
-        "dimensions": raw.get("dimensions", {"length": "", "width": "", "height": ""}),
-        "attributes": _format_attributes(raw.get("attributes", [])),
-        "variations": raw.get("variations", []),
-        "type": raw.get("type", "simple"),
-    }
-
-
-def _format_attributes(attrs: list) -> list:
-    """Format product attributes for response."""
-    result = []
-    for attr in attrs:
-        if attr.get("visible", False):
-            result.append({
-                "name": attr.get("name", ""),
-                "options": attr.get("options", []),
-            })
-    return result
-
-
-def format_custom_product(raw: dict) -> dict:
-    """Convert raw custom API product to clean response format."""
-    # Images are already a list of URLs (not objects like standard WC)
-    image_urls = raw.get("images", [])
-    
-    # Categories are already a list of strings (not objects)
-    cat_names = raw.get("categories", [])
-    
-    # Parse prices safely
-    price = _safe_float(raw.get("price", ""))
-    regular_price = _safe_float(raw.get("regular_price", ""))
-    sale_price_raw = raw.get("sale_price", "")
-    sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
-    
-    # Derive on_sale from sale_price being non-empty
-    on_sale = bool(sale_price_raw and sale_price_raw != "")
-    
-    # Attributes come as a dict {slug: {}} rather than a list
-    # Convert to list format for consistency
-    attributes_dict = raw.get("attributes", {})
-    attributes = []
-    for slug, attr_data in attributes_dict.items():
-        if isinstance(attr_data, dict):
-            # Extract options if available, otherwise empty list
-            options = attr_data.get("options", []) if attr_data else []
-            # Convert slug to readable name (e.g., pa_finish -> Finish)
-            name = slug.replace("pa_", "").replace("-", " ").title()
-            attributes.append({
-                "name": name,
-                "options": options,
-            })
-    
-    return {
-        "id": raw.get("id"),
-        "name": raw.get("name", ""),
-        "slug": raw.get("slug", ""),
-        "sku": raw.get("sku", ""),
-        "permalink": raw.get("permalink", ""),
-        "price": price,
-        "regular_price": regular_price,
-        "sale_price": sale_price,
-        "on_sale": on_sale,
-        "in_stock": raw.get("stock_status") == "instock",
-        "stock_status": raw.get("stock_status", ""),
-        "total_sales": 0,  # Not provided by custom API
-        "description": _clean_html(raw.get("description", "")),
-        "short_description": _clean_html(raw.get("short_description", "")),
-        "categories": cat_names,
-        "tags": [],  # Not provided by custom API
-        "images": image_urls,
-        "average_rating": "0.00",  # Not provided by custom API
-        "rating_count": 0,  # Not provided by custom API
-        "weight": "",  # Not provided by custom API
-        "dimensions": {"length": "", "width": "", "height": ""},  # Not provided by custom API
-        "attributes": attributes,
-        "variations": [],  # Not provided by custom API
-        "type": "simple",  # Not provided by custom API
-    }
-
-
-def format_variation(raw: dict, parent: dict = None) -> dict:
-    """Convert a raw WooCommerce variation to clean response format."""
-    price = _safe_float(raw.get("price", ""))
-    regular_price = _safe_float(raw.get("regular_price", ""))
-    sale_price_raw = raw.get("sale_price", "")
-    sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
-
-    # Build attribute label from variation attributes e.g. "Matte / 24x48 / Grey"
-    attrs = raw.get("attributes", [])
-    attr_label = " / ".join(
-        a.get("option", "") for a in attrs if a.get("option")
-    )
-    parent_name = parent.get("name", "") if parent else ""
-    name = f"{parent_name} — {attr_label}" if attr_label else parent_name
-
-    images = raw.get("image", {})
-    image_url = images.get("src", "") if isinstance(images, dict) else ""
-
-    return {
-        "id": raw.get("id"),
-        "parent_id": raw.get("parent_id") or (parent.get("id") if parent else None),
-        "name": name,
-        "slug": raw.get("slug", ""),
-        "sku": raw.get("sku", ""),
-        "permalink": parent.get("permalink", "") if parent else "",
-        "price": price,
-        "regular_price": regular_price,
-        "sale_price": sale_price,
-        "on_sale": raw.get("on_sale", False),
-        "in_stock": raw.get("stock_status") == "instock",
-        "stock_status": raw.get("stock_status", ""),
-        "images": [image_url] if image_url else (parent.get("images", []) if parent else []),
-        "attributes": attrs,
-        "type": "variation",
-        "variation_label": attr_label,
-    }
-
-
-def _filter_variations_by_entities(
-    variations: List[dict], entities: ExtractedEntities
-) -> List[dict]:
-    """
-    Filter variation list by the attributes the user specified.
-    Each variation has attributes like:
-      [{"name": "Finish", "option": "Matte"}, {"name": "Tile Size", "option": '24"x48"'}]
-    """
-    # Build a set of (attr_name_lower, option_lower) pairs the user asked for
-    filters: List[tuple] = []
-
-    if entities.finish:
-        filters.append(("finish", entities.finish.lower()))
-        # Common synonyms handled by normalising both sides to lowercase
-        FINISH_SYNONYMS = {"matt": "matte", "glossy": "polished", "gloss": "polished"}
-        normalized = FINISH_SYNONYMS.get(entities.finish.lower(), entities.finish.lower())
-        if normalized != entities.finish.lower():
-            filters.append(("finish", normalized))
-
-    if entities.color_tone:
-        filters.append(("colors", entities.color_tone.lower()))
-        filters.append(("colors 2", entities.color_tone.lower()))
-
-    if entities.tile_size:
-        filters.append(("tile size", entities.tile_size.lower()))
-
-    if entities.thickness:
-        filters.append(("thickness", entities.thickness.lower()))
-
-    if entities.origin:
-        filters.append(("origin", entities.origin.lower()))
-
-    if entities.visual:
-        filters.append(("visual", entities.visual.lower()))
-
-    if not filters:
-        return variations
-
-    matched = []
-    for var in variations:
-        var_attrs = {
-            a.get("name", "").lower(): a.get("option", "").lower()
-            for a in var.get("attributes", [])
-        }
-        # Variation matches if ALL specified filters are satisfied
-        if all(
-            any(f_val in var_attrs.get(f_name, "") for f_name in var_attrs if f_name == attr_name or f_name.startswith(attr_name))
-            or any(f_val in opt for opt in var_attrs.values())
-            for attr_name, f_val in filters
-        ):
-            matched.append(var)
-
-    return matched if matched else variations  # if nothing matched, return all (don't blank out)
-
-
-def _safe_float(val) -> float:
-    """Safely convert to float."""
-    try:
-        return float(val) if val not in ("", None) else 0.0
-    except (ValueError, TypeError):
-        return 0.0
-
-
-def _clean_html(html: str) -> str:
-    """Strip HTML tags from description."""
-    if not html:
-        return ""
-    clean = re.sub(r'<[^>]+>', '', html)
-    clean = re.sub(r'\s+', ' ', clean).strip()
-    return clean
-
-# ═══════════════════════════════════════════
-# BOT MESSAGE GENERATOR
-# ═══════════════════════════════════════════
-
-def generate_bot_message(
-    intent: Intent,
-    entities: ExtractedEntities,
-    products: List[dict],
-    confidence: float,
-    order_data: List[dict] = None,
-) -> str:
-    """Generate a natural language bot response."""
-
-    if order_data is None:
-        order_data = []
-    
-    count = len(products)
-
-    # ── Order-specific handling ──
-    # For order intents (LAST_ORDER, ORDER_HISTORY, REORDER), handle order data first
-    if intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.REORDER):
-        # If we have actual order data, format it
-        if intent == Intent.ORDER_HISTORY and order_data:
-            return _format_order_history_message(order_data)
-        elif intent == Intent.LAST_ORDER and order_data:
-            # Format last order message
-            order = order_data[0]
-            order_id = order.get("id", "")
-            order_number = order.get("number", str(order_id))
-            status = order.get("status", "unknown").title()
-            total = order.get("total", "0")
-            date_created = order.get("date_created", "")
-            
-            msg = f"📦 **Your Last Order** (#{order_number})\n\n"
-            msg += f"**Status:** {status}\n"
-            msg += f"**Date:** {_format_order_date(date_created)}\n"
-            msg += f"**Total:** ${total}\n\n"
-            
-            line_items = order.get("line_items", [])
-            if line_items:
-                msg += "**Items:**\n"
-                for item in line_items:
-                    qty = item.get("quantity", 0)
-                    name = item.get("name") or "Unknown Item"
-                    item_total = item.get("total", "0")
-                    msg += f"  • {name} × {qty} — ${item_total}\n"
-            
-            return msg
-
-        elif intent == Intent.REORDER and order_data:
-            # Show what was reordered and confirm the new order was placed
-            source_order = order_data[0]
-            source_number = source_order.get("number", str(source_order.get("id", "")))
-            line_items = source_order.get("line_items", [])
-
-            # order_data[1] is the newly created order (if step 2 succeeded)
-            new_order = order_data[1] if len(order_data) > 1 else None
-
-            msg = f"🔄 **Reorder placed** (based on order #{source_number})\n\n"
-            if line_items:
-                msg += "**Items reordered:**\n"
-                for item in line_items:
-                    qty = item.get("quantity", 1)
-                    name = item.get("name") or "Unknown Item"
-                    msg += f"  • {name} × {qty}\n"
-
-            if new_order and new_order.get("id"):
-                new_number = new_order.get("number", str(new_order.get("id", "")))
-                msg += f"\n✅ New order **#{new_number}** created successfully with status **Processing**."
-            else:
-                msg += "\n⚠️ Items identified — but the new order could not be created automatically. Please place the order manually or contact support."
-
-            return msg
-        
-        # Fallback messages when no order data
-        if count == 0:
-            if intent == Intent.LAST_ORDER:
-                return (
-                    "I can show you your most recent order! 📦\n\n"
-                    "Please make sure you're logged in so I can retrieve your order history."
-                )
-            elif intent == Intent.ORDER_HISTORY:
-                return (
-                    f"I can show you your order history! 📋\n\n"
-                    "Please make sure you're logged in so I can retrieve your past orders."
-                )
-            elif intent == Intent.REORDER:
-                return (
-                    "I can help you reorder your last purchase! 🔄\n\n"
-                    "Please make sure you're logged in so I can access your order history."
-                )
-            elif intent == Intent.QUICK_ORDER:
-                search_term = entities.order_item_name or entities.product_name or "that item"
-                return (
-                    f"I couldn't find a product matching **{search_term}**. 😕\n\n"
-                    "Try searching by a different name or browse our categories."
-                )
-
-    # For QUICK_ORDER / ORDER_ITEM / PLACE_ORDER — confirm order if placed, else show product
-    if intent in (Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER):
-        # Order was successfully created — show confirmation
-        if order_data:
-            placed = order_data[-1]
-            order_number = placed.get("number") or placed.get("id", "N/A")
-            # Try products list first, then fall back to order line_items, then "your item"
-            if products:
-                p_name = products[0]["name"]
-            elif placed.get("line_items"):
-                p_name = placed["line_items"][0].get("name") or "your item"
-            else:
-                p_name = "your item"
-            total = placed.get("total", "0.00")
-            # If order total is zero but line items have totals, use line item total
-            if float(total) == 0.0 and placed.get("line_items"):
-                # Use "or '0'" to handle None or empty string from WooCommerce response
-                line_total = sum(float(item.get("total", "0") or "0") for item in placed["line_items"])
-                if line_total > 0:
-                    total = str(line_total)
-            return (
-                f"✅ **Order #{order_number} placed successfully!**\n\n"
-                f"**Product:** {p_name}\n"
-                f"**Total:** ${float(total):.2f}\n"
-                f"**Payment Mode:** Cash on Delivery\n"
-                f"**Status:** Processing"
-            )
-        # Product found but no customer — prompt login
-        if count > 0:
-            p = products[0]
-            msg = f"Found **{p['name']}** 🎯\n\n"
-            if p.get("price", 0) > 0:
-                msg += f"💰 Price: ${p['price']:.2f}\n"
-            msg += "\n⚠️ Please log in to place an order."
-            return msg
-
-    # ── No products found ──
-    if count == 0:
-        search = (
-            entities.product_name or entities.category_name
-            or entities.visual or entities.finish
-            or entities.color_tone or entities.search_term
-            or "your criteria"
-        )
-        return (
-            f"I couldn't find any products matching **{search}**. 😕\n\n"
-            "Try broadening your search or ask me about:\n"
-            "• Our tile collections\n"
-            "• Available categories\n"
-            "• Specific finishes or colors"
-        )
-
-    # ── Variation results (parent + filtered variations) ──
-    if intent in (Intent.PRODUCT_SEARCH, Intent.PRODUCT_DETAIL, Intent.PRODUCT_VARIATIONS) \
-            and entities.product_id and count > 0:
-        parent = products[0]
-        variations = [p for p in products[1:] if p.get("type") == "variation"]
-        has_attributes = any([
-            entities.finish, entities.color_tone, entities.tile_size,
-            entities.thickness, entities.visual, entities.origin,
-        ])
-
-        if intent == Intent.PRODUCT_VARIATIONS or (not has_attributes):
-            # "What variations does Lager have?" or plain "show me lager"
-            msg = f"🎯 **{parent['name']}**\n"
-            if parent.get("price", 0) > 0:
-                msg += f"💰 Starting from ${parent['price']:.2f}\n"
-            if parent.get("short_description"):
-                msg += f"\n{parent['short_description']}\n"
-            if variations:
-                msg += f"\n**Available variations ({len(variations)}):**\n"
-                for v in variations[:10]:
-                    label = v.get("variation_label") or v.get("name", "")
-                    price_str = f"${v['price']:.2f}" if v.get("price", 0) > 0 else "Contact for price"
-                    stock = "✅" if v.get("in_stock") else "❌"
-                    msg += f"  {stock} {label} — {price_str}\n"
-                if len(variations) > 10:
-                    msg += f"  ...and {len(variations) - 10} more variations.\n"
-            elif parent.get("attributes"):
-                msg += "\n**Available options:**\n"
-                for attr in parent["attributes"][:4]:
-                    opts = ", ".join(attr["options"][:6])
-                    msg += f"  • **{attr['name']}:** {opts}\n"
-            return msg
-
-        else:
-            # User asked with attributes e.g. "lager matte 24x48"
-            attr_desc = " / ".join(filter(None, [
-                entities.finish, entities.tile_size,
-                entities.color_tone, entities.thickness,
-            ]))
-            if not variations:
-                return (
-                    f"I found **{parent['name']}** but couldn't find variations matching "
-                    f"**{attr_desc}**. 😕\n\n"
-                    f"Try asking: *'What variations does {parent['name']} come in?'*"
-                )
-            msg = f"🎯 **{parent['name']}** — {attr_desc}\n\n"
-            msg += f"Found **{len(variations)}** matching variation(s):\n\n"
-            for v in variations[:10]:
-                label = v.get("variation_label") or v.get("name", "")
-                price_str = f"${v['price']:.2f}" if v.get("price", 0) > 0 else "Contact for price"
-                stock = "✅ In stock" if v.get("in_stock") else "❌ Out of stock"
-                msg += f"• **{label}** — {price_str} — {stock}\n"
-            if len(variations) > 10:
-                msg += f"\n...and {len(variations) - 10} more."
-            return msg
-
-    # ── Single product found ──
-    if count == 1:
-        p = products[0]
-        msg = f"I found the perfect match! 🎯\n\n**{p['name']}**\n"
-        if p.get("price", 0) > 0:
-            msg += f"💰 Price: ${p['price']:.2f}\n"
-        else:
-            msg += f"💰 Price: $0.00\n"
-        if p.get("on_sale") and p.get("sale_price"):
-            msg += f"🏷️ Sale Price: ${p['sale_price']:.2f}\n"
-        if p.get("short_description"):
-            msg += f"\n{p['short_description']}\n"
-        if p.get("attributes"):
-            for attr in p["attributes"][:3]:
-                opts = ", ".join(attr["options"][:5])
-                msg += f"• **{attr['name']}:** {opts}\n"
-        return msg
-
-    # ── Multiple products ──
-    msg = ""
-
-    if intent == Intent.CATEGORY_BROWSE:
-        msg += f"Here are **{count}** products in the **{entities.category_name}** category! 📂\n\n"
-    elif intent == Intent.PRODUCT_BY_VISUAL:
-        msg += f"Found **{count}** products with **{entities.visual}** look! 🎨\n\n"
-    elif intent == Intent.FILTER_BY_FINISH:
-        msg += f"Here are **{count}** products with **{entities.finish}** finish! ✨\n\n"
-    elif intent == Intent.FILTER_BY_COLOR:
-        msg += f"Found **{count}** products in **{entities.color_tone}** tones! 🎨\n\n"
-    elif intent == Intent.PRODUCT_SEARCH:
-        msg += f"Found **{count}** products matching your search! 🔍\n\n"
-    elif intent == Intent.CHIP_CARD:
-        msg += f"Here are **{count}** chip cards available! 🃏\n\n"
-    elif intent == Intent.MOSAIC_PRODUCTS:
-        msg += f"Found **{count}** mosaic products! 🧩\n\n"
-    elif intent == Intent.CATEGORY_LIST:
-        msg += f"Here are our product categories! 📂\n\n"
-    else:
-        msg += f"Here are **{count}** products I found! 🛍️\n\n"
-
-    # List first 5 products
-    for p in products[:5]:
-        price_str = f"${p['price']:.2f}" if p.get("price", 0) > 0 else "Contact for price"
-        msg += f"• **{p['name']}** — {price_str}\n"
-
-    if count > 5:
-        msg += f"\n...and {count - 5} more products."
-
-    return msg
-
-# ═══════════════════════════════════════════
-# SUGGESTION GENERATOR
-# ═══════════════════════════════════════════
-
-def generate_suggestions(
-    intent: Intent,
-    entities: ExtractedEntities,
-    products: List[dict],
-) -> List[str]:
-    """Generate follow-up suggestions based on context."""
-    suggestions = []
-
-    # Order-specific suggestions
-    if intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.REORDER):
-        suggestions.append("Show my order history")
-        suggestions.append("Reorder my last purchase")
-        suggestions.append("Track my order")
-        suggestions.append("Show me what's on sale")
-        return suggestions[:4]
-
-    if intent == Intent.QUICK_ORDER:
-        suggestions.append("Show me all products")
-        suggestions.append("What categories do you have?")
-        suggestions.append("Show me quick ship products")
-        suggestions.append("What's on sale?")
-        return suggestions[:4]
-
-    # Product-specific suggestions
-    if products and len(products) == 1:
-        p = products[0]
-        name = p.get("name", "")
-        base_name = name.split(" ")[0] if name else ""
-
-        if "Chip Card" not in name:
-            suggestions.append(f"Show me {base_name} Chip Card")
-        if "Mosaic" not in name:
-            suggestions.append(f"Show me {base_name} Mosaic")
-        suggestions.append(f"What colors does {base_name} come in?")
-        suggestions.append(f"What goes with {base_name}?")
-
-    elif products and len(products) > 1:
-        # Suggest browsing related
-        if intent == Intent.CATEGORY_BROWSE and entities.category_name:
-            suggestions.append(f"Show me more {entities.category_name} products")
-        suggestions.append("Show me what's on sale")
-        suggestions.append("Show me quick ship products")
-
-    # General suggestions
-    if intent == Intent.PRODUCT_SEARCH:
-        suggestions.append("Show me all chip cards")
-    if intent not in (Intent.CATEGORY_LIST, Intent.PRODUCT_CATALOG):
-        suggestions.append("What categories do you have?")
-
-    # Always include a fallback
-    if not suggestions:
-        suggestions = [
-            "Show me all products",
-            "What categories do you have?",
-            "Show me what's on sale",
-            "Quick ship tiles",
-        ]
-
-    return suggestions[:4]  # Max 4 suggestions
-
-# ═══════════════════════════════════════════
-# INTENT → SEARCH FILTERS MAPPER
-# ═══════════════════════════════════════════
-
-def build_filters(
-    intent: Intent,
-    entities: ExtractedEntities,
-    api_calls: List[WooAPICall],
-) -> dict:
-    """Build the filters_applied dict for the response."""
-    filters = {
-        "search": None,
-        "category": None,
-        "tag": None,
-        "min_price": None,
-        "max_price": None,
-        "on_sale": None,
-        "orderby": "date",
-        "order": "desc",
-    }
-
-    # Extract from API call params
-    if api_calls:
-        params = api_calls[0].params
-        filters["search"] = params.get("search")
-        filters["category"] = params.get("category")
-        filters["tag"] = params.get("tag")
-        filters["on_sale"] = params.get("on_sale")
-        if params.get("orderby"):
-            filters["orderby"] = params["orderby"]
-        if params.get("order"):
-            filters["order"] = params["order"]
-
-    # Override with entity data if more specific
-    if entities.category_name and not filters["category"]:
-        filters["category"] = entities.category_name
-    if entities.on_sale:
-        filters["on_sale"] = True
-
-    return filters
-
-# ═══════════════════════════════════════════
-# INTENT → SIMPLE LABEL
-# ═══════════════════════════════════════════
-
-INTENT_LABELS = {
-    Intent.PRODUCT_LIST:          "browse",
-    Intent.PRODUCT_SEARCH:        "search",
-    Intent.PRODUCT_DETAIL:        "detail",
-    Intent.PRODUCT_CATALOG:       "catalog",
-    Intent.PRODUCT_TYPES:         "catalog",
-    Intent.PRODUCT_BY_COLLECTION: "browse",
-    Intent.PRODUCT_BY_ORIGIN:     "filter",
-    Intent.PRODUCT_BY_VISUAL:     "filter",
-    Intent.PRODUCT_QUICK_SHIP:    "filter",
-    Intent.RELATED_PRODUCTS:      "related",
-    Intent.CATEGORY_BROWSE:       "category",
-    Intent.CATEGORY_LIST:         "categories",
-    Intent.FILTER_BY_FINISH:      "filter",
-    Intent.FILTER_BY_SIZE:        "filter",
-    Intent.FILTER_BY_COLOR:       "filter",
-    Intent.FILTER_BY_THICKNESS:   "filter",
-    Intent.FILTER_BY_EDGE:        "filter",
-    Intent.FILTER_BY_APPLICATION: "filter",
-    Intent.FILTER_BY_MATERIAL:    "filter",
-    Intent.FILTER_BY_ORIGIN:      "filter",
-    Intent.SIZE_LIST:             "info",
-    Intent.MOSAIC_PRODUCTS:       "search",
-    Intent.TRIM_PRODUCTS:         "search",
-    Intent.CHIP_CARD:             "search",
-    Intent.DISCOUNT_INQUIRY:      "deals",
-    Intent.BULK_DISCOUNT:         "deals",
-    Intent.CLEARANCE_PRODUCTS:    "deals",
-    Intent.PROMOTIONS:            "deals",
-    Intent.COUPON_INQUIRY:        "deals",
-    Intent.SAVE_FOR_LATER:        "account",
-    Intent.WISHLIST:              "account",
-    Intent.ORDER_TRACKING:        "order",
-    Intent.ORDER_STATUS:          "order",
-    Intent.PLACE_ORDER:           "order",
-    Intent.ORDER_HISTORY:         "order",
-    Intent.LAST_ORDER:            "order",
-    Intent.REORDER:               "order",
-    Intent.ORDER_ITEM:            "order",
-    Intent.QUICK_ORDER:           "order",
-    Intent.PRODUCT_VARIATIONS:    "variations",
-    Intent.SAMPLE_REQUEST:        "sample",
-    Intent.UNKNOWN:               "unknown",
-}
-
-# ═══════════════════════════════════════════
-# CONSTANTS FOR ORDER & USER HANDLING
-# ═══════════════════════════════════════════
-
-ORDER_INTENTS = {
-    Intent.ORDER_HISTORY,
-    Intent.LAST_ORDER,
-    Intent.REORDER,
-    Intent.ORDER_TRACKING,
-    Intent.ORDER_STATUS,
-}
-
-ORDER_CREATE_INTENTS = {
-    Intent.QUICK_ORDER,
-    Intent.ORDER_ITEM,
-    Intent.PLACE_ORDER,
-}
-
-USER_PLACEHOLDERS = {
-    "CURRENT_USER_ID",
-    "CURRENT_USER",
-    "current_user_id",
-    "current_user",
-}
-
-# Order message formatting constants
-MAX_DISPLAYED_ITEMS = 3  # Maximum number of items to show before truncating with '+N more'
-
-# Default payment method used when none is specified in the request.
-# Change to "bacs" (bank transfer) or "stripe" etc. as needed.
-DEFAULT_PAYMENT_METHOD = "cod"
-DEFAULT_PAYMENT_METHOD_TITLE = "Cash on Delivery"
-
-# ═══════════════════════════════════════════
 # FLASK APP
 # ═══════════════════════════════════════════
 
@@ -958,25 +214,10 @@ def chat():
             if pending_product_id and customer_id:
                 logger.info(f"Step 0: Order confirmed via flow | product_id={pending_product_id} | quantity={pending_quantity}")
                 
-                # Build the order directly
-                order_call = WooAPICall(
-                    method="POST",
-                    endpoint=f"{WOO_BASE_URL}/orders",
-                    params={},
-                    body={
-                        "status": "processing",
-                        "customer_id": customer_id,
-                        "payment_method": DEFAULT_PAYMENT_METHOD,
-                        "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
-                        "set_paid": False,
-                        "line_items": [{"product_id": pending_product_id, "quantity": pending_quantity}],
-                    },
-                    description=f"Create order for '{pending_product_name}' (confirmed via flow)",
-                )
-                order_resp = woo_client.execute(order_call)
+                # Use the order_service to create the order
+                created_order = create_flow_confirmed_order(woo_client, customer_id, pending_product_id, pending_product_name, pending_quantity)
                 
-                if order_resp.get("success") and isinstance(order_resp.get("data"), dict):
-                    created_order = order_resp["data"]
+                if created_order:
                     order_number = created_order.get("number") or created_order.get("id", "N/A")
                     total = created_order.get("total", "0.00")
                     
@@ -1081,7 +322,7 @@ def chat():
     customer_id = user_context.get("customer_id")
     if customer_id:
         logger.info(f"Step 2.5: Resolved customer_id={customer_id}")
-        _resolve_user_placeholders(api_calls, customer_id)
+        resolve_user_placeholders(api_calls, customer_id)
 
     # ─── Step 2.6: Extract last_product context (for "order this" resolution) ───
     # The frontend sends the last displayed product so vague order phrases
@@ -1132,38 +373,12 @@ def chat():
         source_line_items = source_order.get("line_items", [])
         logger.info(f"Step 3.5: Reorder attempt | source_order_id={source_order.get('id')} | line_items_count={len(source_line_items)}")
         if source_line_items and customer_id:
-            new_line_items = [
-                {
-                    "product_id": item["product_id"],
-                    "quantity": item.get("quantity", 1),
-                    **({"variation_id": item["variation_id"]} if item.get("variation_id") else {}),
-                }
-                for item in source_line_items
-                if item.get("product_id")
-            ]
-            if new_line_items:
-                reorder_call = WooAPICall(
-                    method="POST",
-                    endpoint=f"{WOO_BASE_URL}/orders",
-                    params={},
-                    body={
-                        "status": "processing",
-                        "customer_id": customer_id,
-                        "payment_method": DEFAULT_PAYMENT_METHOD,
-                        "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
-                        "set_paid": False,
-                        "line_items": new_line_items,
-                    },
-                    description="Create reorder from last order line items (COD, on-hold)",
-                )
-                reorder_resp = woo_client.execute(reorder_call)
-                if reorder_resp.get("success") and isinstance(reorder_resp.get("data"), dict):
-                    order_data.append(reorder_resp["data"])
-                    new_order = reorder_resp["data"]
-                    logger.info(f"Step 3.5: Reorder created successfully | order_id={new_order.get('id')} | order_number={new_order.get('number')}")
-                else:
-                    error_msg = sanitize_log_string(str(reorder_resp.get('error', 'Unknown')))
-                    logger.warning(f"Step 3.5: Reorder failed | error={error_msg}")
+            new_order = create_reorder(woo_client, customer_id, source_order)
+            if new_order:
+                order_data.append(new_order)
+                logger.info(f"Step 3.5: Reorder created successfully | order_id={new_order.get('id')} | order_number={new_order.get('number')}")
+            else:
+                logger.warning("Step 3.5: Reorder failed")
 
     # ─── Step 3.6: QUICK_ORDER / ORDER_ITEM / PLACE_ORDER — create order from matched product ───
     # Bug Fix: Skip Step 3.6 if an order was already created in Step 3
@@ -1216,24 +431,9 @@ def chat():
 
         if _order_product_id:
             logger.info(f"Step 3.6: Creating WooCommerce order | product_id={_order_product_id} | quantity={entities.quantity or 1} | customer_id={customer_id}")
-            order_call = WooAPICall(
-                method="POST",
-                endpoint=f"{WOO_BASE_URL}/orders",
-                params={},
-                body={
-                    "status": "processing",
-                    "customer_id": customer_id,
-                    "payment_method": DEFAULT_PAYMENT_METHOD,
-                    "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
-                    "set_paid": False,
-                    "line_items": [{"product_id": _order_product_id, "quantity": entities.quantity or 1}],
-                },
-                description=f"Create order for product '{_order_product_name}' (COD, processing)",
-            )
-            order_resp = woo_client.execute(order_call)
-            if order_resp.get("success") and isinstance(order_resp.get("data"), dict):
-                order_data.append(order_resp["data"])
-                created_order = order_resp["data"]
+            created_order = create_quick_order(woo_client, customer_id, _order_product_id, _order_product_name, entities.quantity or 1)
+            if created_order:
+                order_data.append(created_order)
                 line_items_summary = [
                     f"{item.get('name', 'Unknown')} x{item.get('quantity', 1)}"
                     for item in created_order.get("line_items", [])
@@ -1244,8 +444,7 @@ def chat():
                     f"line_items={line_items_summary}"
                 )
             else:
-                error_msg = sanitize_log_string(str(order_resp.get('error', 'Unknown')))
-                logger.error(f"Step 3.6: WooCommerce order creation failed | error={error_msg}")
+                logger.error("Step 3.6: WooCommerce order creation failed")
         else:
             logger.warning("Step 3.6: Skipped order creation (no product_id resolved)")
 
@@ -1276,7 +475,7 @@ def chat():
 
             if variations_raw and has_attributes:
                 # Filter variations to only those matching user's attributes
-                filtered_vars = _filter_variations_by_entities(variations_raw, entities)
+                filtered_vars = filter_variations_by_entities(variations_raw, entities)
                 variation_products = [format_variation(v, parent_product_raw) for v in filtered_vars]
                 products = [parent_formatted] + variation_products
             elif variations_raw:
@@ -1298,7 +497,7 @@ def chat():
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "response_time_ms": round(elapsed * 1000),
                 "intent_raw": intent.value,
-                "entities": _entities_to_dict(entities),
+                "entities": entities_to_dict(entities),
                 "variations_found": len(variations_raw),
                 "variations_matched": len(products) - 1 if variations_raw else 0,
             }
@@ -1391,7 +590,7 @@ def chat():
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "response_time_ms": round(elapsed * 1000),
         "intent_raw": intent.value,
-        "entities": _entities_to_dict(entities),
+        "entities": entities_to_dict(entities),
     }
 
     # ─── Step 9: Update session history ───
@@ -1498,122 +697,6 @@ def get_session(session_id):
     return jsonify({"error": "Session not found"}), 404
 
 
-# ═══════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════
-
-def _format_order_date(date_created: str) -> str:
-    """
-    Format a WooCommerce date string to readable date + time format.
-
-    Args:
-        date_created: ISO format date string from WooCommerce API
-
-    Returns:
-        Formatted string e.g. "Feb 10, 2026 at 3:45 PM" or fallback if parsing fails
-    """
-    date_str = date_created[:10] if len(date_created) >= 10 else date_created
-    try:
-        dt = datetime.fromisoformat(date_created.replace("Z", "+00:00"))
-        date_str = dt.strftime("%b %d, %Y at %I:%M %p").replace(" 0", " ")
-    except (ValueError, AttributeError):
-        pass
-    return date_str
-
-
-def _resolve_user_placeholders(api_calls: List[WooAPICall], customer_id: int):
-    """
-    Replace CURRENT_USER_ID placeholders with actual customer ID.
-    
-    Modifies api_calls in-place, replacing any placeholder strings in params or body
-    with the provided customer_id (converted to string for API compatibility).
-    
-    Args:
-        api_calls: List of WooAPICall objects to process
-        customer_id: The actual customer ID (integer) to substitute for placeholders.
-                     Will be converted to string internally for WooCommerce API compatibility.
-    """
-    customer_id_str = str(customer_id)
-    for call in api_calls:
-        if isinstance(call.params, dict):
-            for key in call.params:
-                if isinstance(call.params[key], str) and call.params[key] in USER_PLACEHOLDERS:
-                    call.params[key] = customer_id_str
-        if isinstance(call.body, dict):
-            for key in call.body:
-                if isinstance(call.body[key], str) and call.body[key] in USER_PLACEHOLDERS:
-                    call.body[key] = customer_id_str
-
-
-def _format_order_history_message(orders: List[dict]) -> str:
-    """
-    Generate a bot message for order history from raw WooCommerce order data.
-    
-    Args:
-        orders: List of WooCommerce order dictionaries. Each order should contain:
-            - id (int): Order ID
-            - number (str): Order number
-            - status (str): Order status (e.g., 'completed', 'processing')
-            - total (str): Order total amount
-            - date_created (str): ISO format date string
-            - line_items (list): List of items with 'name', 'quantity', 'total'
-    
-    Returns:
-        str: Formatted message showing order history or empty message if no orders
-    """
-    if not orders:
-        return (
-            "You don't have any orders yet. 📦\n\n"
-            "Browse our collection and place your first order!"
-        )
-    
-    msg = f"📋 **Your Order History** ({len(orders)} orders)\n\n"
-    
-    for order in orders:
-        order_id = order.get("id", "")
-        order_number = order.get("number", str(order_id))
-        status = order.get("status", "unknown").title()
-        total = order.get("total", "0")
-        date_created = order.get("date_created", "")
-        
-        # Get item names with accurate count
-        line_items = order.get("line_items", [])
-        valid_item_names = [item.get("name") for item in line_items if item.get("name")]
-        item_names = ", ".join(valid_item_names[:MAX_DISPLAYED_ITEMS])
-        if len(valid_item_names) > MAX_DISPLAYED_ITEMS:
-            item_names += f" +{len(valid_item_names) - MAX_DISPLAYED_ITEMS} more"
-        
-        msg += (
-            f"**#{order_number}** — {status} — ${total}\n"
-            f"  🕐 {_format_order_date(date_created)}\n"
-            f"  Items: {item_names}\n\n"
-        )
-    
-    return msg
-
-
-def _entities_to_dict(entities: ExtractedEntities) -> dict:
-    """Convert entities to a clean dict for metadata."""
-    d = {}
-    if entities.product_name:    d["product_name"] = entities.product_name
-    if entities.product_slug:    d["product_slug"] = entities.product_slug
-    if entities.category_id:     d["category_id"] = entities.category_id
-    if entities.category_name:   d["category_name"] = entities.category_name
-    if entities.visual:          d["visual"] = entities.visual
-    if entities.finish:          d["finish"] = entities.finish
-    if entities.tile_size:       d["tile_size"] = entities.tile_size
-    if entities.color_tone:      d["color_tone"] = entities.color_tone
-    if entities.thickness:       d["thickness"] = entities.thickness
-    if entities.origin:          d["origin"] = entities.origin
-    if entities.collection_year: d["collection_year"] = entities.collection_year
-    if entities.quick_ship:      d["quick_ship"] = True
-    if entities.on_sale:         d["on_sale"] = True
-    if entities.tag_slugs:       d["tags"] = entities.tag_slugs
-    if entities.order_id:        d["order_id"] = entities.order_id
-    if entities.order_count:     d["order_count"] = entities.order_count
-    if entities.reorder:         d["reorder"] = entities.reorder
-    if entities.order_item_name: d["order_item_name"] = entities.order_item_name
-    return d
 
 # ═══════════════════���═══════════════════════
 # STARTUP
