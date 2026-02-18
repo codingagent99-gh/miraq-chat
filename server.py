@@ -30,7 +30,11 @@ from classifier import classify
 from api_builder import build_api_calls
 from store_registry import set_store_loader, get_store_loader
 from store_loader import StoreLoader
-
+from conversation_flow import (
+    FlowState, ConversationContext,
+    should_disambiguate, get_disambiguation_message,
+    handle_flow_state, LOW_CONFIDENCE_THRESHOLD,
+)
 # ═══════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════
@@ -860,11 +864,82 @@ def chat():
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
+    # ─── Step 0: Check conversation flow state ───
+    flow_state_str = user_context.get("flow_state", "idle")
+    try:
+        current_flow_state = FlowState(flow_state_str)
+    except ValueError:
+        current_flow_state = FlowState.IDLE
+
+    # Build context dict from user_context for the flow handler
+    flow_context = {
+        "pending_product_name": user_context.get("pending_product_name"),
+        "pending_product_id": user_context.get("pending_product_id"),
+        "pending_quantity": user_context.get("pending_quantity"),
+    }
+
+    # If we're in a multi-turn flow, let the flow handler try first
+    if current_flow_state != FlowState.IDLE:
+        flow_result = handle_flow_state(
+            state=current_flow_state,
+            message=message,
+            entities=flow_context,
+            confidence=0.0,
+        )
+        if flow_result and not flow_result.get("pass_through"):
+            # Flow handler consumed the message — return immediately
+            elapsed = time.time() - start_time
+            return jsonify({
+                "success": True,
+                "bot_message": flow_result["bot_message"],
+                "intent": "guided_flow",
+                "products": [],
+                "filters_applied": {},
+                "suggestions": flow_result.get("suggestions", []),
+                "session_id": session_id,
+                "metadata": {
+                    "flow_state": flow_result.get("flow_state", "idle"),
+                    "response_time_ms": round((time.time() - start_time) * 1000),
+                    "provider": "conversation_flow",
+                },
+                "flow_state": flow_result.get("flow_state", "idle"),
+            }), 200
+
+        elif flow_result and flow_result.get("override_message"):
+            # Flow wants to redirect to a different utterance
+            message = flow_result["override_message"]
+
+        elif flow_result and flow_result.get("create_order"):
+            # Flow confirmed order — build order with pending context
+            pass  # Falls through to normal pipeline with order intent
+
     # ─── Step 1: Classify intent ───
     result = classify(message)
     intent = result.intent
     entities = result.entities
     confidence = result.confidence
+
+    # ─── Step 1.5: Disambiguation check ───
+    if should_disambiguate(intent.value, confidence):
+        disambig = get_disambiguation_message()
+        elapsed = time.time() - start_time
+        return jsonify({
+            "success": True,
+            "bot_message": disambig["bot_message"],
+            "intent": "disambiguation",
+            "products": [],
+            "filters_applied": {},
+            "suggestions": disambig["suggestions"],
+            "session_id": session_id,
+            "metadata": {
+                "flow_state": disambig["flow_state"],
+                "confidence": round(confidence, 2),
+                "original_intent": intent.value,
+                "response_time_ms": round((time.time() - start_time) * 1000),
+                "provider": "conversation_flow",
+            },
+            "flow_state": disambig["flow_state"],
+        }), 200
 
     # ─── Step 2: Build API calls ───
     api_calls = build_api_calls(result)
@@ -1097,20 +1172,36 @@ def chat():
         "metadata": metadata,
     }
 
-    # Attach order confirmation for order-creating intents
-    ORDER_CREATE_INTENTS = {Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER, Intent.REORDER}
-    if intent in ORDER_CREATE_INTENTS and order_data:
-        placed = order_data[-1]
-        response["order"] = {
-            "id": placed.get("id"),
-            "order_number": str(placed.get("number", placed.get("id", ""))),
-            "status": placed.get("status", "processing"),
-            "total": float(placed.get("total", 0)),
-            "payment_url": placed.get("payment_url"),
-            "date_created": placed.get("date_created"),
-        }
-        response["payment_url"] = placed.get("payment_url")
+    # ─── Step 5.5: Detect when quantity is needed for ordering ───
+    ORDER_CREATE_INTENTS = {Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER}
+    if intent in ORDER_CREATE_INTENTS and not entities.quantity and products:
+        # We found the product but no quantity — ask
+        product = products[0]
+        elapsed = time.time() - start_time
+        return jsonify({
+            "success": True,
+            "bot_message": f"Sure, I can order **{product['name']}** for you! How many do you need? 🛒",
+            "intent": INTENT_LABELS.get(intent, "order"),
+            "products": products[:1],
+            "filters_applied": {},
+            "suggestions": ["1", "5", "10", "25"],
+            "session_id": session_id,
+            "metadata": {
+                "flow_state": FlowState.AWAITING_QUANTITY.value,
+                "pending_product_name": product["name"],
+                "pending_product_id": product.get("id"),
+                "response_time_ms": round((time.time() - start_time) * 1000),
+            },
+            "flow_state": FlowState.AWAITING_QUANTITY.value,
+        }), 200
 
+    # ─── Step 10.5: After successful response, add "anything else?" flow ───
+    # Append to the response dict before returning:
+    if intent in ORDER_CREATE_INTENTS and order_data:
+        response["flow_state"] = FlowState.AWAITING_ANYTHING_ELSE.value
+    else:
+        response["flow_state"] = FlowState.IDLE.value
+        
     return jsonify(response), 200
 
 
