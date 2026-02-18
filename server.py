@@ -1113,7 +1113,9 @@ def chat():
                 else:
                     all_products_raw.extend(data)
             elif isinstance(data, dict):
-                if intent in ORDER_INTENTS:
+                # Bug Fix: Check if this is an order response (has order-specific keys)
+                is_order_response = "line_items" in data and "status" in data
+                if is_order_response or intent in ORDER_INTENTS:
                     order_data.append(data)
                 else:
                     all_products_raw.append(data)
@@ -1164,14 +1166,16 @@ def chat():
                     logger.warning(f"Step 3.5: Reorder failed | error={error_msg}")
 
     # ─── Step 3.6: QUICK_ORDER / ORDER_ITEM / PLACE_ORDER — create order from matched product ───
-    if intent in (Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER) and customer_id and entities.quantity:
+    # Bug Fix: Skip Step 3.6 if an order was already created in Step 3
+    if intent in (Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER) and customer_id and entities.quantity and not order_data:
         # Resolve which product to order:
         # Priority 1 — product returned by the search API call this turn
         # Priority 2 — last_product sent by the frontend (handles "order this" / "buy it")
         _order_product_id = None
         _order_product_name = None
 
-        if all_products_raw:
+        # Bug Fix: Guard against using order responses as products
+        if all_products_raw and not ("line_items" in all_products_raw[0] and "status" in all_products_raw[0]):
             _p = all_products_raw[0]
             _order_product_id = _p.get("id")
             _order_product_name = _p.get("name", str(_order_product_id))
