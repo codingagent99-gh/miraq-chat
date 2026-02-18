@@ -71,8 +71,10 @@ class WooClient:
     def execute(self, api_call: WooAPICall) -> dict:
         """Execute a single API call and return raw response."""
         params = dict(api_call.params)
-        # Only add WooCommerce auth for standard WC API calls
-        if not api_call.is_custom_api:
+        
+        # Only add auth params for standard WooCommerce API, not for custom API
+        is_custom_api = "/custom-api/" in api_call.endpoint
+        if not is_custom_api:
             params["consumer_key"] = WOO_CONSUMER_KEY
             params["consumer_secret"] = WOO_CONSUMER_SECRET
 
@@ -84,13 +86,11 @@ class WooClient:
                     timeout=30,
                 )
             else:
-                # Build auth params for non-custom API calls
-                auth_params = {}
-                if not api_call.is_custom_api:
-                    auth_params = {
-                        "consumer_key": WOO_CONSUMER_KEY,
-                        "consumer_secret": WOO_CONSUMER_SECRET,
-                    }
+                # For non-GET methods, only add auth if not custom API
+                auth_params = {} if is_custom_api else {
+                    "consumer_key": WOO_CONSUMER_KEY,
+                    "consumer_secret": WOO_CONSUMER_SECRET,
+                }
                 resp = self.session.request(
                     method=api_call.method,
                     url=api_call.endpoint,
@@ -180,38 +180,36 @@ def _format_attributes(attrs: list) -> list:
 
 
 def format_custom_product(raw: dict) -> dict:
-    """Convert custom API product to clean response format."""
-    # Images are already flat URL strings
-    images = raw.get("images", [])
+    """Convert raw custom API product to clean response format."""
+    # Images are already a list of URLs (not objects like standard WC)
+    image_urls = raw.get("images", [])
     
-    # Add featured_image to front if present and not already in list
-    featured = raw.get("featured_image", "")
-    if featured and featured not in images:
-        images = [featured] + images
+    # Categories are already a list of strings (not objects)
+    cat_names = raw.get("categories", [])
     
-    # Categories are already flat name strings
-    categories = raw.get("categories", [])
-    
-    # Parse prices
+    # Parse prices safely
     price = _safe_float(raw.get("price", ""))
     regular_price = _safe_float(raw.get("regular_price", ""))
     sale_price_raw = raw.get("sale_price", "")
     sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
     
-    # Compute on_sale from sale_price
-    on_sale = bool(sale_price and sale_price > 0)
+    # Derive on_sale from sale_price being non-empty
+    on_sale = bool(sale_price_raw and sale_price_raw != "")
     
-    # Format attributes from dict format
-    attrs = []
-    raw_attrs = raw.get("attributes", {})
-    if isinstance(raw_attrs, dict):
-        for slug, terms in raw_attrs.items():
-            if isinstance(terms, dict) and terms:
-                # terms is a dict like {term_id: "term_name", ...}
-                attrs.append({
-                    "name": slug.replace("pa_", "").replace("-", " ").title(),
-                    "options": list(terms.values()),
-                })
+    # Attributes come as a dict {slug: {}} rather than a list
+    # Convert to list format for consistency
+    attributes_dict = raw.get("attributes", {})
+    attributes = []
+    for slug, attr_data in attributes_dict.items():
+        if isinstance(attr_data, dict):
+            # Extract options if available, otherwise empty list
+            options = attr_data.get("options", []) if attr_data else []
+            # Convert slug to readable name (e.g., pa_finish -> Finish)
+            name = slug.replace("pa_", "").replace("-", " ").title()
+            attributes.append({
+                "name": name,
+                "options": options,
+            })
     
     return {
         "id": raw.get("id"),
@@ -225,19 +223,19 @@ def format_custom_product(raw: dict) -> dict:
         "on_sale": on_sale,
         "in_stock": raw.get("stock_status") == "instock",
         "stock_status": raw.get("stock_status", ""),
-        "total_sales": 0,
+        "total_sales": 0,  # Not provided by custom API
         "description": _clean_html(raw.get("description", "")),
         "short_description": _clean_html(raw.get("short_description", "")),
-        "categories": categories,
-        "tags": [],
-        "images": images,
-        "average_rating": "0.00",
-        "rating_count": 0,
-        "weight": "",
-        "dimensions": {"length": "", "width": "", "height": ""},
-        "attributes": attrs,
-        "variations": [],
-        "type": "simple",
+        "categories": cat_names,
+        "tags": [],  # Not provided by custom API
+        "images": image_urls,
+        "average_rating": "0.00",  # Not provided by custom API
+        "rating_count": 0,  # Not provided by custom API
+        "weight": "",  # Not provided by custom API
+        "dimensions": {"length": "", "width": "", "height": ""},  # Not provided by custom API
+        "attributes": attributes,
+        "variations": [],  # Not provided by custom API
+        "type": "simple",  # Not provided by custom API
     }
 
 
@@ -460,7 +458,7 @@ def generate_bot_message(
                 f"✅ **Order #{order_number} placed successfully!**\n\n"
                 f"**Product:** {p_name}\n"
                 f"**Total:** ${float(total):.2f}\n"
-                f"**Payment:** Cash on Delivery\n"
+                f"**Payment Mode:** Cash on Delivery\n"
                 f"**Status:** Processing"
             )
         # Product found but no customer — prompt login
@@ -889,9 +887,12 @@ def chat():
     for resp in api_responses:
         if resp.get("success"):
             data = resp.get("data")
-            # Custom API: products nested under "products" key
-            if isinstance(data, dict) and "products" in data and isinstance(data["products"], list):
-                all_products_raw.extend(data["products"])
+            # Handle custom API response format (has "products" key)
+            if isinstance(data, dict) and "products" in data:
+                if intent in ORDER_INTENTS:
+                    order_data.extend(data["products"])
+                else:
+                    all_products_raw.extend(data["products"])
             elif isinstance(data, list):
                 if intent in ORDER_INTENTS:
                     order_data.extend(data)
@@ -1042,14 +1043,13 @@ def chat():
             }), 200
 
     # ─── Step 4: Format products ───
-    # Determine which formatter to use
-    # Note: Each request handles a single intent, so all API calls will be of the same type
-    use_custom_formatter = any(c.is_custom_api for c in api_calls)
-    
-    if use_custom_formatter:
-        products = [format_custom_product(p) for p in all_products_raw]
-    else:
-        products = [format_product(p) for p in all_products_raw]
+    products = []
+    for p in all_products_raw:
+        # Detect custom API format by checking for "featured_image" key
+        if "featured_image" in p:
+            products.append(format_custom_product(p))
+        else:
+            products.append(format_product(p))
 
     # Filter out private/draft products
     products = [p for p in products if p.get("name")]
