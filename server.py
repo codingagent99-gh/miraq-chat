@@ -466,6 +466,7 @@ def generate_bot_message(
             total = placed.get("total", "0.00")
             # If order total is zero but line items have totals, use line item total
             if float(total) == 0.0 and placed.get("line_items"):
+                # Use "or '0'" to handle None or empty string from WooCommerce response
                 line_total = sum(float(item.get("total", "0") or "0") for item in placed["line_items"])
                 if line_total > 0:
                     total = str(line_total)
