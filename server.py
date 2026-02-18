@@ -1039,8 +1039,9 @@ def chat():
                 else:
                     all_products_raw.append(data)
         else:
-            # Log API call failure
-            logger.warning(f"Step 3: API call failed | error={resp.get('error', 'Unknown')}")
+            # Log API call failure (sanitize error message to prevent log injection)
+            error_msg = sanitize_log_string(str(resp.get('error', 'Unknown')))
+            logger.warning(f"Step 3: API call failed | error={error_msg}")
     
     logger.info(f"Step 3: API execution complete | all_products_raw count={len(all_products_raw)} | order_data count={len(order_data)}")
 
@@ -1080,7 +1081,8 @@ def chat():
                     new_order = reorder_resp["data"]
                     logger.info(f"Step 3.5: Reorder created successfully | order_id={new_order.get('id')} | order_number={new_order.get('number')}")
                 else:
-                    logger.warning(f"Step 3.5: Reorder failed | error={reorder_resp.get('error', 'Unknown')}")
+                    error_msg = sanitize_log_string(str(reorder_resp.get('error', 'Unknown')))
+                    logger.warning(f"Step 3.5: Reorder failed | error={error_msg}")
 
     # ─── Step 3.6: QUICK_ORDER / ORDER_ITEM / PLACE_ORDER — create order from matched product ───
     if intent in (Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER) and customer_id:
@@ -1159,7 +1161,8 @@ def chat():
                     f"line_items={line_items_summary}"
                 )
             else:
-                logger.error(f"Step 3.6: WooCommerce order creation failed | error={order_resp.get('error', 'Unknown')}")
+                error_msg = sanitize_log_string(str(order_resp.get('error', 'Unknown')))
+                logger.error(f"Step 3.6: WooCommerce order creation failed | error={error_msg}")
         else:
             logger.warning("Step 3.6: Skipped order creation (no product_id resolved)")
 
