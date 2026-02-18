@@ -211,6 +211,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
             params={"attribute": "pa_origin", "term": origin_term},
             description=f"Products from {e.origin}",
+            is_custom_api=True,
         ))
 
     elif intent == Intent.PRODUCT_QUICK_SHIP:
@@ -232,6 +233,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
             params={"attribute": "pa_visual", "term": visual_term},
             description=f"Products with '{e.visual}' visual/look",
+            is_custom_api=True,
         ))
 
     elif intent == Intent.RELATED_PRODUCTS:
@@ -278,6 +280,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
             params={"attribute": "pa_finish", "term": finish_term},
             description=f"Filter by finish: {e.finish}",
+            is_custom_api=True,
         ))
 
     elif intent == Intent.FILTER_BY_SIZE:
@@ -287,6 +290,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
             params={"attribute": "pa_tile-size", "term": size_term},
             description=f"Filter by tile size: {e.tile_size}",
+            is_custom_api=True,
         ))
 
     elif intent == Intent.FILTER_BY_COLOR:
@@ -296,6 +300,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
             params={"attribute": "pa_colors", "term": color_term},
             description=f"Filter by color: {e.color_tone}",
+            is_custom_api=True,
         ))
 
     elif intent == Intent.FILTER_BY_THICKNESS:
@@ -305,6 +310,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
             params={"attribute": "pa_thickness", "term": thickness_term},
             description=f"Filter by thickness: {e.thickness}",
+            is_custom_api=True,
         ))
 
     elif intent == Intent.FILTER_BY_EDGE:
@@ -323,6 +329,18 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
             params={"attribute": "pa_application", "term": application_term},
             description=f"Filter by application: {e.application}",
+            is_custom_api=True,
+        ))
+
+    elif intent == Intent.FILTER_BY_EDGE:
+        # Use custom API for attribute filtering
+        term_value = e.edge.lower() if e.edge else ""
+        calls.append(WooAPICall(
+            method="GET",
+            endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
+            params={"attribute": "pa_edge", "term": term_value},
+            description=f"Filter by edge: {e.edge}",
+            is_custom_api=True,
         ))
 
     elif intent == Intent.FILTER_BY_MATERIAL:
