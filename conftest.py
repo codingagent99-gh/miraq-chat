@@ -6,6 +6,7 @@ to support classifier entity extraction tests.
 """
 
 import pytest
+import re
 from store_registry import set_store_loader, get_store_loader
 from typing import Dict, List, Optional
 
@@ -102,7 +103,6 @@ class MockStoreLoader:
             name = product["name"]
             self.product_by_name_lower[name.lower()] = product
             # Tokenize product names
-            import re
             stop = {"tile", "tiles", "the", "a", "an", "and", "or", "of", "series"}
             for token in re.split(r'[\s\-_/]+', name.lower()):
                 token = token.strip()
@@ -139,7 +139,6 @@ class MockStoreLoader:
 
     def _generate_category_keywords(self, cat_entry: Dict):
         """Generate NLP keywords from category name/slug."""
-        import re
         cat_id = cat_entry["id"]
         name = cat_entry["name"].lower().strip()
         slug = cat_entry["slug"]
@@ -211,7 +210,6 @@ class MockStoreLoader:
 
     def get_tag_ids_for_keyword(self, keyword: str) -> List[int]:
         """Find tag IDs matching a keyword."""
-        import re
         needle = keyword.lower().strip()
         results = []
         seen = set()
@@ -227,7 +225,6 @@ class MockStoreLoader:
 
     def get_attribute_term_ids(self, attr_slug: str, user_value: str) -> List[int]:
         """Find attribute term IDs matching a user value."""
-        import re
         attr = self.attribute_by_slug.get(attr_slug)
         if not attr:
             return []

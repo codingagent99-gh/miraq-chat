@@ -363,5 +363,5 @@ class TestRelatedProducts:
 def test_count():
     """Verify we have a reasonable number of tests."""
     # This test just ensures the test suite is comprehensive
-    # We have ~57 tests across all classes
+    # We have 48 tests across all classes
     pass
