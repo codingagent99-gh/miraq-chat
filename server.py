@@ -71,8 +71,12 @@ class WooClient:
     def execute(self, api_call: WooAPICall) -> dict:
         """Execute a single API call and return raw response."""
         params = dict(api_call.params)
-        params["consumer_key"] = WOO_CONSUMER_KEY
-        params["consumer_secret"] = WOO_CONSUMER_SECRET
+        
+        # Only add auth params for standard WooCommerce API, not for custom API
+        is_custom_api = "/custom-api/" in api_call.endpoint
+        if not is_custom_api:
+            params["consumer_key"] = WOO_CONSUMER_KEY
+            params["consumer_secret"] = WOO_CONSUMER_SECRET
 
         try:
             if api_call.method == "GET":
@@ -82,13 +86,15 @@ class WooClient:
                     timeout=30,
                 )
             else:
+                # For non-GET methods, only add auth if not custom API
+                auth_params = {} if is_custom_api else {
+                    "consumer_key": WOO_CONSUMER_KEY,
+                    "consumer_secret": WOO_CONSUMER_SECRET,
+                }
                 resp = self.session.request(
                     method=api_call.method,
                     url=api_call.endpoint,
-                    params={
-                        "consumer_key": WOO_CONSUMER_KEY,
-                        "consumer_secret": WOO_CONSUMER_SECRET,
-                    },
+                    params=auth_params,
                     json=api_call.body,
                     timeout=30,
                 )
@@ -171,6 +177,66 @@ def _format_attributes(attrs: list) -> list:
                 "options": attr.get("options", []),
             })
     return result
+
+
+def format_custom_product(raw: dict) -> dict:
+    """Convert raw custom API product to clean response format."""
+    # Images are already a list of URLs (not objects like standard WC)
+    image_urls = raw.get("images", [])
+    
+    # Categories are already a list of strings (not objects)
+    cat_names = raw.get("categories", [])
+    
+    # Parse prices safely
+    price = _safe_float(raw.get("price", ""))
+    regular_price = _safe_float(raw.get("regular_price", ""))
+    sale_price_raw = raw.get("sale_price", "")
+    sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
+    
+    # Derive on_sale from sale_price being non-empty
+    on_sale = bool(sale_price_raw and sale_price_raw != "")
+    
+    # Attributes come as a dict {slug: {}} rather than a list
+    # Convert to list format for consistency
+    attributes_dict = raw.get("attributes", {})
+    attributes = []
+    for slug, attr_data in attributes_dict.items():
+        if isinstance(attr_data, dict):
+            # Extract options if available, otherwise empty list
+            options = attr_data.get("options", []) if attr_data else []
+            # Convert slug to readable name (e.g., pa_finish -> Finish)
+            name = slug.replace("pa_", "").replace("-", " ").title()
+            attributes.append({
+                "name": name,
+                "options": options,
+            })
+    
+    return {
+        "id": raw.get("id"),
+        "name": raw.get("name", ""),
+        "slug": raw.get("slug", ""),
+        "sku": raw.get("sku", ""),
+        "permalink": raw.get("permalink", ""),
+        "price": price,
+        "regular_price": regular_price,
+        "sale_price": sale_price,
+        "on_sale": on_sale,
+        "in_stock": raw.get("stock_status") == "instock",
+        "stock_status": raw.get("stock_status", ""),
+        "total_sales": 0,  # Not provided by custom API
+        "description": _clean_html(raw.get("description", "")),
+        "short_description": _clean_html(raw.get("short_description", "")),
+        "categories": cat_names,
+        "tags": [],  # Not provided by custom API
+        "images": image_urls,
+        "average_rating": "0.00",  # Not provided by custom API
+        "rating_count": 0,  # Not provided by custom API
+        "weight": "",  # Not provided by custom API
+        "dimensions": {"length": "", "width": "", "height": ""},  # Not provided by custom API
+        "attributes": attributes,
+        "variations": [],  # Not provided by custom API
+        "type": "simple",  # Not provided by custom API
+    }
 
 
 def format_variation(raw: dict, parent: dict = None) -> dict:
@@ -819,16 +885,24 @@ def chat():
     api_responses = woo_client.execute_all(api_calls)
 
     for resp in api_responses:
-        if resp.get("success") and isinstance(resp.get("data"), list):
-            if intent in ORDER_INTENTS:
-                order_data.extend(resp["data"])
-            else:
-                all_products_raw.extend(resp["data"])
-        elif resp.get("success") and isinstance(resp.get("data"), dict):
-            if intent in ORDER_INTENTS:
-                order_data.append(resp["data"])
-            else:
-                all_products_raw.append(resp["data"])
+        if resp.get("success"):
+            data = resp.get("data")
+            # Handle custom API response format (has "products" key)
+            if isinstance(data, dict) and "products" in data:
+                if intent in ORDER_INTENTS:
+                    order_data.extend(data["products"])
+                else:
+                    all_products_raw.extend(data["products"])
+            elif isinstance(data, list):
+                if intent in ORDER_INTENTS:
+                    order_data.extend(data)
+                else:
+                    all_products_raw.extend(data)
+            elif isinstance(data, dict):
+                if intent in ORDER_INTENTS:
+                    order_data.append(data)
+                else:
+                    all_products_raw.append(data)
 
     # ─── Step 3.5: REORDER step 2 — create new order from last order's line_items ───
     if intent == Intent.REORDER and order_data:
@@ -969,7 +1043,13 @@ def chat():
             }), 200
 
     # ─── Step 4: Format products ───
-    products = [format_product(p) for p in all_products_raw]
+    products = []
+    for p in all_products_raw:
+        # Detect custom API format by checking for "featured_image" key
+        if "featured_image" in p:
+            products.append(format_custom_product(p))
+        else:
+            products.append(format_product(p))
 
     # Filter out private/draft products
     products = [p for p in products if p.get("name")]
