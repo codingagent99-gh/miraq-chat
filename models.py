@@ -130,6 +130,7 @@ class WooAPICall:
     body: Optional[dict] = None
     description: str = ""
     requires_resolution: List[str] = field(default_factory=list)
+    is_custom_api: bool = False
 
 
 @dataclass

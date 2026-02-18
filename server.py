@@ -71,8 +71,10 @@ class WooClient:
     def execute(self, api_call: WooAPICall) -> dict:
         """Execute a single API call and return raw response."""
         params = dict(api_call.params)
-        params["consumer_key"] = WOO_CONSUMER_KEY
-        params["consumer_secret"] = WOO_CONSUMER_SECRET
+        # Only add WooCommerce auth for standard WC API calls
+        if not api_call.is_custom_api:
+            params["consumer_key"] = WOO_CONSUMER_KEY
+            params["consumer_secret"] = WOO_CONSUMER_SECRET
 
         try:
             if api_call.method == "GET":
@@ -82,13 +84,17 @@ class WooClient:
                     timeout=30,
                 )
             else:
+                # Build auth params for non-custom API calls
+                auth_params = {}
+                if not api_call.is_custom_api:
+                    auth_params = {
+                        "consumer_key": WOO_CONSUMER_KEY,
+                        "consumer_secret": WOO_CONSUMER_SECRET,
+                    }
                 resp = self.session.request(
                     method=api_call.method,
                     url=api_call.endpoint,
-                    params={
-                        "consumer_key": WOO_CONSUMER_KEY,
-                        "consumer_secret": WOO_CONSUMER_SECRET,
-                    },
+                    params=auth_params,
                     json=api_call.body,
                     timeout=30,
                 )
@@ -171,6 +177,68 @@ def _format_attributes(attrs: list) -> list:
                 "options": attr.get("options", []),
             })
     return result
+
+
+def format_custom_product(raw: dict) -> dict:
+    """Convert custom API product to clean response format."""
+    # Images are already flat URL strings
+    images = raw.get("images", [])
+    
+    # Add featured_image to front if present and not already in list
+    featured = raw.get("featured_image", "")
+    if featured and featured not in images:
+        images = [featured] + images
+    
+    # Categories are already flat name strings
+    categories = raw.get("categories", [])
+    
+    # Parse prices
+    price = _safe_float(raw.get("price", ""))
+    regular_price = _safe_float(raw.get("regular_price", ""))
+    sale_price_raw = raw.get("sale_price", "")
+    sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
+    
+    # Compute on_sale from sale_price
+    on_sale = bool(sale_price and sale_price > 0)
+    
+    # Format attributes from dict format
+    attrs = []
+    raw_attrs = raw.get("attributes", {})
+    if isinstance(raw_attrs, dict):
+        for slug, terms in raw_attrs.items():
+            if isinstance(terms, dict) and terms:
+                # terms is a dict like {term_id: "term_name", ...}
+                attrs.append({
+                    "name": slug.replace("pa_", "").replace("-", " ").title(),
+                    "options": list(terms.values()) if isinstance(terms, dict) else [],
+                })
+    
+    return {
+        "id": raw.get("id"),
+        "name": raw.get("name", ""),
+        "slug": raw.get("slug", ""),
+        "sku": raw.get("sku", ""),
+        "permalink": raw.get("permalink", ""),
+        "price": price,
+        "regular_price": regular_price,
+        "sale_price": sale_price,
+        "on_sale": on_sale,
+        "in_stock": raw.get("stock_status") == "instock",
+        "stock_status": raw.get("stock_status", ""),
+        "total_sales": 0,
+        "description": _clean_html(raw.get("description", "")),
+        "short_description": _clean_html(raw.get("short_description", "")),
+        "categories": categories,
+        "tags": [],
+        "images": images,
+        "average_rating": "0.00",
+        "rating_count": 0,
+        "weight": "",
+        "dimensions": {"length": "", "width": "", "height": ""},
+        "attributes": attrs,
+        "variations": [],
+        "type": "simple",
+    }
 
 
 def format_variation(raw: dict, parent: dict = None) -> dict:
@@ -819,16 +887,21 @@ def chat():
     api_responses = woo_client.execute_all(api_calls)
 
     for resp in api_responses:
-        if resp.get("success") and isinstance(resp.get("data"), list):
-            if intent in ORDER_INTENTS:
-                order_data.extend(resp["data"])
-            else:
-                all_products_raw.extend(resp["data"])
-        elif resp.get("success") and isinstance(resp.get("data"), dict):
-            if intent in ORDER_INTENTS:
-                order_data.append(resp["data"])
-            else:
-                all_products_raw.append(resp["data"])
+        if resp.get("success"):
+            data = resp.get("data")
+            # Custom API: products nested under "products" key
+            if isinstance(data, dict) and "products" in data and isinstance(data["products"], list):
+                all_products_raw.extend(data["products"])
+            elif isinstance(data, list):
+                if intent in ORDER_INTENTS:
+                    order_data.extend(data)
+                else:
+                    all_products_raw.extend(data)
+            elif isinstance(data, dict):
+                if intent in ORDER_INTENTS:
+                    order_data.append(data)
+                else:
+                    all_products_raw.append(data)
 
     # ─── Step 3.5: REORDER step 2 — create new order from last order's line_items ───
     if intent == Intent.REORDER and order_data:
@@ -969,7 +1042,13 @@ def chat():
             }), 200
 
     # ─── Step 4: Format products ───
-    products = [format_product(p) for p in all_products_raw]
+    # Determine which formatter to use
+    use_custom_formatter = any(c.is_custom_api for c in api_calls)
+    
+    if use_custom_formatter:
+        products = [format_custom_product(p) for p in all_products_raw]
+    else:
+        products = [format_product(p) for p in all_products_raw]
 
     # Filter out private/draft products
     products = [p for p in products if p.get("name")]
