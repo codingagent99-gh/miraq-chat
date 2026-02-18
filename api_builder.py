@@ -9,6 +9,7 @@ from store_registry import get_store_loader
 
 
 BASE = "https://wgc.net.in/hn/wp-json/wc/v3"
+CUSTOM_API_BASE = "https://wgc.net.in/hn/wp-json/custom-api/v1"
 
 
 def _loader():
@@ -204,15 +205,11 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         ))
 
     elif intent == Intent.PRODUCT_BY_ORIGIN:
-        params = {"per_page": 20, "status": "publish"}
-        if e.attribute_term_ids and e.attribute_slug:
-            params.update(_attr_filter_params(e.attribute_slug, e.attribute_term_ids, []))
-        elif e.tag_ids:
-            params["tag"] = str(e.tag_ids[0])
+        origin_term = e.origin or ""
         calls.append(WooAPICall(
             method="GET",
-            endpoint=f"{BASE}/products",
-            params=params,
+            endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
+            params={"attribute": "pa_origin", "term": origin_term},
             description=f"Products from {e.origin}",
         ))
 
@@ -229,15 +226,11 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         ))
 
     elif intent == Intent.PRODUCT_BY_VISUAL:
-        params = {"per_page": 20, "status": "publish"}
-        if e.attribute_term_ids and e.attribute_slug:
-            params.update(_attr_filter_params(e.attribute_slug, e.attribute_term_ids, []))
-        elif e.tag_ids:
-            params["tag"] = str(e.tag_ids[0])
+        visual_term = e.visual or ""
         calls.append(WooAPICall(
             method="GET",
-            endpoint=f"{BASE}/products",
-            params=params,
+            endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
+            params={"attribute": "pa_visual", "term": visual_term},
             description=f"Products with '{e.visual}' visual/look",
         ))
 
@@ -279,93 +272,74 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
     # ═══════════════════════════════════════════
 
     elif intent == Intent.FILTER_BY_FINISH:
-        params = {"per_page": 20, "status": "publish"}
-        params.update(_attr_filter_params(
-            e.attribute_slug or "pa_finish",
-            e.attribute_term_ids,
-            e.tag_ids,
-        ))
+        finish_term = e.finish or ""
         calls.append(WooAPICall(
             method="GET",
-            endpoint=f"{BASE}/products",
-            params=params,
+            endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
+            params={"attribute": "pa_finish", "term": finish_term},
             description=f"Filter by finish: {e.finish}",
         ))
 
     elif intent == Intent.FILTER_BY_SIZE:
-        params = {"per_page": 20, "status": "publish"}
-        params.update(_attr_filter_params(
-            e.attribute_slug or "pa_tile-size",
-            e.attribute_term_ids,
-            [],
-        ))
-        # Fallback: text search if no term IDs resolved
-        if "attribute" not in params and e.tile_size:
-            params["search"] = e.tile_size.replace('"', '')
+        size_term = e.tile_size.replace('"', '') if e.tile_size else ""
         calls.append(WooAPICall(
             method="GET",
-            endpoint=f"{BASE}/products",
-            params=params,
+            endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
+            params={"attribute": "pa_tile-size", "term": size_term},
             description=f"Filter by tile size: {e.tile_size}",
         ))
 
     elif intent == Intent.FILTER_BY_COLOR:
-        params = {"per_page": 20, "status": "publish"}
-        if e.tag_ids:
-            params["tag"] = str(e.tag_ids[0])
-        elif e.color_tone:
-            # Try live tag search as fallback
-            l = _loader()
-            if l:
-                tag_ids = l.get_tag_ids_for_keyword(e.color_tone.lower())
-                if tag_ids:
-                    params["tag"] = str(tag_ids[0])
+        color_term = e.color_tone or ""
         calls.append(WooAPICall(
             method="GET",
-            endpoint=f"{BASE}/products",
-            params=params,
+            endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
+            params={"attribute": "pa_colors", "term": color_term},
             description=f"Filter by color: {e.color_tone}",
         ))
 
     elif intent == Intent.FILTER_BY_THICKNESS:
-        params = {"per_page": 20, "status": "publish"}
-        params.update(_attr_filter_params(
-            e.attribute_slug or "pa_thickness",
-            e.attribute_term_ids,
-            e.tag_ids,
-        ))
+        thickness_term = e.thickness or ""
         calls.append(WooAPICall(
             method="GET",
-            endpoint=f"{BASE}/products",
-            params=params,
+            endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
+            params={"attribute": "pa_thickness", "term": thickness_term},
             description=f"Filter by thickness: {e.thickness}",
         ))
 
-    elif intent == Intent.FILTER_BY_APPLICATION:
-        params = {"per_page": 20, "status": "publish"}
-        params.update(_attr_filter_params(
-            e.attribute_slug or "pa_application",
-            e.attribute_term_ids,
-            [],
-        ))
-        # Fallback: text search
-        if "attribute" not in params and e.application:
-            params["search"] = e.application
+    elif intent == Intent.FILTER_BY_EDGE:
+        edge_term = e.edge or ""
         calls.append(WooAPICall(
             method="GET",
-            endpoint=f"{BASE}/products",
-            params=params,
+            endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
+            params={"attribute": "pa_edge", "term": edge_term},
+            description=f"Filter by edge: {e.edge}",
+        ))
+
+    elif intent == Intent.FILTER_BY_APPLICATION:
+        application_term = e.application or ""
+        calls.append(WooAPICall(
+            method="GET",
+            endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
+            params={"attribute": "pa_application", "term": application_term},
             description=f"Filter by application: {e.application}",
         ))
 
-    elif intent == Intent.FILTER_BY_ORIGIN:
-        params = {"per_page": 20, "status": "publish"}
-        if e.tag_ids:
-            params["tag"] = str(e.tag_ids[0])
+    elif intent == Intent.FILTER_BY_MATERIAL:
+        material_term = e.visual or ""
         calls.append(WooAPICall(
             method="GET",
-            endpoint=f"{BASE}/products",
-            params=params,
+            endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
+            params={"attribute": "pa_visual", "term": material_term},
+            description=f"Filter by material: {e.visual}",
+        ))
+
+    elif intent == Intent.FILTER_BY_ORIGIN:
+        origin_term = e.origin or ""
+        calls.append(WooAPICall(
+            method="GET",
+            endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
+            params={"attribute": "pa_origin", "term": origin_term},
             description=f"Filter by origin: {e.origin}",
         ))
 
