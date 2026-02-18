@@ -35,6 +35,10 @@ from conversation_flow import (
     should_disambiguate, get_disambiguation_message,
     handle_flow_state, LOW_CONFIDENCE_THRESHOLD,
 )
+from chat_logger import get_logger, sanitize_url
+
+# ─── Initialize logger ───
+logger = get_logger("miraq_chat")
 # ═══════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════
@@ -82,6 +86,10 @@ class WooClient:
             params["consumer_key"] = WOO_CONSUMER_KEY
             params["consumer_secret"] = WOO_CONSUMER_SECRET
 
+        # Log API call (sanitize sensitive data)
+        sanitized_endpoint = sanitize_url(api_call.endpoint)
+        logger.info(f"WooCommerce API call: {api_call.method} {sanitized_endpoint}")
+
         try:
             if api_call.method == "GET":
                 resp = self.session.get(
@@ -103,6 +111,7 @@ class WooClient:
                     timeout=30,
                 )
             resp.raise_for_status()
+            logger.info(f"WooCommerce API response: status={resp.status_code}, success=True")
             return {
                 "success": True,
                 "data": resp.json(),
@@ -110,6 +119,7 @@ class WooClient:
                 "total_pages": resp.headers.get("X-WP-TotalPages"),
             }
         except Exception as e:
+            logger.error(f"WooCommerce API error: {api_call.method} {sanitized_endpoint} | error={str(e)}", exc_info=True)
             return {"success": False, "data": [], "error": str(e)}
 
     def execute_all(self, api_calls: List[WooAPICall]) -> List[dict]:
@@ -830,6 +840,7 @@ def chat():
     # ─── Parse request ───
     body = request.get_json(silent=True)
     if not body:
+        logger.warning("POST /chat | Invalid JSON body")
         return jsonify({
             "success": False,
             "bot_message": "Invalid request. Send JSON with 'message' field.",
@@ -844,8 +855,15 @@ def chat():
     message = body.get("message", "").strip()
     session_id = body.get("session_id", "")
     user_context = body.get("user_context", {})
+    
+    # Log incoming request
+    truncated_msg = message[:100] + "..." if len(message) > 100 else message
+    customer_id = user_context.get("customer_id")
+    flow_state = user_context.get("flow_state", "idle")
+    logger.info(f'POST /chat | session={session_id} | message="{truncated_msg}" | customer_id={customer_id} | flow_state={flow_state}')
 
     if not message:
+        logger.warning(f"POST /chat | session={session_id} | Empty message")
         return jsonify({
             "success": False,
             "bot_message": "Please type a message! Try asking about our tiles, categories, or products.",
@@ -882,6 +900,8 @@ def chat():
         current_flow_state = FlowState(flow_state_str)
     except ValueError:
         current_flow_state = FlowState.IDLE
+    
+    logger.info(f"Step 0: Flow state={current_flow_state.value}")
 
     # Build context dict from user_context for the flow handler
     flow_context = {
@@ -900,6 +920,7 @@ def chat():
         )
         if flow_result and not flow_result.get("pass_through"):
             # Flow handler consumed the message — return immediately
+            logger.info(f"Step 0: Flow handler consumed message | new_state={flow_result.get('flow_state', 'idle')}")
             elapsed = time.time() - start_time
             return jsonify({
                 "success": True,
@@ -930,11 +951,24 @@ def chat():
     intent = result.intent
     entities = result.entities
     confidence = result.confidence
+    
+    # Log classification result with key entities
+    entity_summary = {
+        k: v for k, v in {
+            "product_name": entities.product_name,
+            "category_name": entities.category_name,
+            "product_id": entities.product_id,
+            "order_item_name": entities.order_item_name,
+            "quantity": entities.quantity,
+        }.items() if v is not None
+    }
+    logger.info(f"Step 1: Classified intent={intent.value} | confidence={confidence:.2f} | entities={entity_summary}")
 
     # ─── Step 1.5: Disambiguation check ───
     if should_disambiguate(intent.value, confidence):
         disambig = get_disambiguation_message()
         elapsed = time.time() - start_time
+        logger.info(f"Step 1.5: Low confidence, returning disambiguation | confidence={confidence:.2f}")
         return jsonify({
             "success": True,
             "bot_message": disambig["bot_message"],
@@ -955,16 +989,23 @@ def chat():
 
     # ─── Step 2: Build API calls ───
     api_calls = build_api_calls(result)
+    logger.info(f"Step 2: Built {len(api_calls)} API call(s) | endpoints={[f'{c.method} {c.endpoint.split('/')[-1]}' for c in api_calls]}")
 
     # ─── Step 2.5: Resolve user context placeholders ───
     customer_id = user_context.get("customer_id")
     if customer_id:
+        logger.info(f"Step 2.5: Resolved customer_id={customer_id}")
         _resolve_user_placeholders(api_calls, customer_id)
 
     # ─── Step 2.6: Extract last_product context (for "order this" resolution) ───
     # The frontend sends the last displayed product so vague order phrases
     # like "order this" / "buy it" resolve correctly without a product search.
     last_product_ctx = user_context.get("last_product")  # {id, name} or None
+    
+    if last_product_ctx and last_product_ctx.get("id"):
+        logger.info(f"Step 2.6: last_product_ctx found: id={last_product_ctx.get('id')}, name=\"{last_product_ctx.get('name')}\"")
+    else:
+        logger.info("Step 2.6: No last_product_ctx")
 
     # ─── Step 3: Execute API calls ───
     all_products_raw = []
@@ -990,11 +1031,17 @@ def chat():
                     order_data.append(data)
                 else:
                     all_products_raw.append(data)
+        else:
+            # Log API call failure
+            logger.warning(f"Step 3: API call failed | error={resp.get('error', 'Unknown')}")
+    
+    logger.info(f"Step 3: API execution complete | all_products_raw count={len(all_products_raw)} | order_data count={len(order_data)}")
 
     # ─── Step 3.5: REORDER step 2 — create new order from last order's line_items ───
     if intent == Intent.REORDER and order_data:
         source_order = order_data[0]
         source_line_items = source_order.get("line_items", [])
+        logger.info(f"Step 3.5: Reorder attempt | source_order_id={source_order.get('id')} | line_items_count={len(source_line_items)}")
         if source_line_items and customer_id:
             new_line_items = [
                 {
@@ -1023,6 +1070,10 @@ def chat():
                 reorder_resp = woo_client.execute(reorder_call)
                 if reorder_resp.get("success") and isinstance(reorder_resp.get("data"), dict):
                     order_data.append(reorder_resp["data"])
+                    new_order = reorder_resp["data"]
+                    logger.info(f"Step 3.5: Reorder created successfully | order_id={new_order.get('id')} | order_number={new_order.get('number')}")
+                else:
+                    logger.warning(f"Step 3.5: Reorder failed | error={reorder_resp.get('error', 'Unknown')}")
 
     # ─── Step 3.6: QUICK_ORDER / ORDER_ITEM / PLACE_ORDER — create order from matched product ───
     if intent in (Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER) and customer_id:
@@ -1036,9 +1087,11 @@ def chat():
             _p = all_products_raw[0]
             _order_product_id = _p.get("id")
             _order_product_name = _p.get("name", str(_order_product_id))
+            logger.info(f"Step 3.6: Using all_products_raw → product_id={_order_product_id}, product_name=\"{_order_product_name}\"")
         elif last_product_ctx and last_product_ctx.get("id"):
             _order_product_id = last_product_ctx["id"]
             _order_product_name = last_product_ctx.get("name", str(last_product_ctx["id"]))
+            logger.info(f"Step 3.6: Using last_product_ctx → product_id={_order_product_id}, product_name=\"{_order_product_name}\"")
             # Inject a minimal product dict so bot message and response include the product info
             all_products_raw.append({
                 "id": _order_product_id,
@@ -1065,8 +1118,12 @@ def chat():
                 "weight": "",
                 "dimensions": {"length": "", "width": "", "height": ""},
             })
+            logger.info(f"Step 3.6: Injected minimal product dict into all_products_raw (count={len(all_products_raw)})")
+        else:
+            logger.warning("Step 3.6: No product found to order (all_products_raw empty, no last_product_ctx)")
 
         if _order_product_id:
+            logger.info(f"Step 3.6: Creating WooCommerce order | product_id={_order_product_id} | quantity={entities.quantity or 1} | customer_id={customer_id}")
             order_call = WooAPICall(
                 method="POST",
                 endpoint=f"{WOO_BASE_URL}/orders",
@@ -1084,6 +1141,20 @@ def chat():
             order_resp = woo_client.execute(order_call)
             if order_resp.get("success") and isinstance(order_resp.get("data"), dict):
                 order_data.append(order_resp["data"])
+                created_order = order_resp["data"]
+                line_items_summary = [
+                    f"{item.get('name', 'Unknown')} x{item.get('quantity', 1)}"
+                    for item in created_order.get("line_items", [])
+                ]
+                logger.info(
+                    f"Step 3.6: WooCommerce order created | order_id={created_order.get('id')} | "
+                    f"order_number={created_order.get('number')} | total=${created_order.get('total', '0.00')} | "
+                    f"line_items={line_items_summary}"
+                )
+            else:
+                logger.error(f"Step 3.6: WooCommerce order creation failed | error={order_resp.get('error', 'Unknown')}")
+        else:
+            logger.warning("Step 3.6: Skipped order creation (no product_id resolved)")
 
     # ─── Step 3.7: Variation product handling ───
     # When api_builder issued GET /products/{id} + GET /products/{id}/variations,
@@ -1166,9 +1237,40 @@ def chat():
 
     # Filter out private/draft products
     products = [p for p in products if p.get("name")]
+    logger.info(f"Step 4: Formatted {len(products)} products")
 
     # ─── Step 5: Generate bot message ───
     bot_message = generate_bot_message(intent, entities, products, confidence, order_data)
+    
+    # Log product name and total for order intents (critical for debugging "your item" / $0.00 issues)
+    ORDER_CREATE_INTENTS = {Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER}
+    if intent in ORDER_CREATE_INTENTS and order_data:
+        placed_order = order_data[-1]
+        # Extract product name used in bot message
+        if products:
+            used_product_name = products[0]["name"]
+        elif placed_order.get("line_items"):
+            used_product_name = placed_order["line_items"][0].get("name") or "your item"
+        else:
+            used_product_name = "your item"
+        
+        # Extract total
+        total = placed_order.get("total", "0.00")
+        if float(total) == 0.0 and placed_order.get("line_items"):
+            line_total = sum(float(item.get("total", "0") or "0") for item in placed_order["line_items"])
+            if line_total > 0:
+                total = str(line_total)
+                logger.warning(f"Step 5: Order total was $0.00, used line_item total=${line_total:.2f} instead")
+        
+        logger.info(f"Step 5: Bot message generated | product_name=\"{used_product_name}\" | total=${float(total):.2f}")
+        
+        # Warn if fallback to "your item" was used
+        if used_product_name == "your item":
+            logger.warning("Step 5: Used fallback 'your item' - no product name available from products[] or line_items[]")
+        
+        # Warn if $0.00 total detected
+        if float(total) == 0.0:
+            logger.warning("Step 5: Order total is $0.00 - possible pricing issue")
 
     # ─── Step 6: Generate suggestions ───
     suggestions = generate_suggestions(intent, entities, products)
@@ -1239,6 +1341,13 @@ def chat():
         response["flow_state"] = FlowState.AWAITING_ANYTHING_ELSE.value
     else:
         response["flow_state"] = FlowState.IDLE.value
+    
+    # ─── Step 10: Log final response summary ───
+    logger.info(
+        f"Step 10: Response sent | intent={INTENT_LABELS.get(intent, 'unknown')} | "
+        f"products_count={len(products)} | response_time_ms={metadata['response_time_ms']} | "
+        f"flow_state={response['flow_state']}"
+    )
         
     return jsonify(response), 200
 
