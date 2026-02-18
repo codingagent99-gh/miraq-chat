@@ -458,7 +458,7 @@ def generate_bot_message(
                 f"✅ **Order #{order_number} placed successfully!**\n\n"
                 f"**Product:** {p_name}\n"
                 f"**Total:** ${float(total):.2f}\n"
-                f"**Payment:** Cash on Delivery\n"
+                f"**Payment Mode:** Cash on Delivery\n"
                 f"**Status:** Processing"
             )
         # Product found but no customer — prompt login
