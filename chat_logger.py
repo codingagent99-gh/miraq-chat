@@ -15,6 +15,26 @@ from datetime import datetime
 from pathlib import Path
 
 
+def sanitize_log_string(text: str) -> str:
+    """
+    Sanitize string for logging to prevent log injection attacks.
+    Removes newlines, carriage returns, and other control characters.
+    
+    Args:
+        text: String to sanitize
+    
+    Returns:
+        Sanitized string safe for logging
+    """
+    if not text:
+        return text
+    # Replace newlines, carriage returns, and tabs with spaces
+    text = text.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+    # Remove other control characters (ASCII 0-31 except space)
+    text = ''.join(char if ord(char) >= 32 or char == ' ' else ' ' for char in text)
+    return text
+
+
 def setup_logger(name: str = "miraq_chat", log_level: str = "INFO") -> logging.Logger:
     """
     Configure and return a logger with file and console handlers.
@@ -113,6 +133,6 @@ def get_logger(name: str = "miraq_chat") -> logging.Logger:
     logger = logging.getLogger(name)
     if not logger.handlers:
         # Logger not yet configured, set it up with default level
-        from config.settings import LOG_LEVEL
-        setup_logger(name, LOG_LEVEL)
+        log_level = os.getenv("LOG_LEVEL", "INFO")
+        setup_logger(name, log_level)
     return logger

@@ -35,7 +35,7 @@ from conversation_flow import (
     should_disambiguate, get_disambiguation_message,
     handle_flow_state, LOW_CONFIDENCE_THRESHOLD,
 )
-from chat_logger import get_logger, sanitize_url
+from chat_logger import get_logger, sanitize_url, sanitize_log_string
 
 # ─── Initialize logger ───
 logger = get_logger("miraq_chat")
@@ -856,11 +856,12 @@ def chat():
     session_id = body.get("session_id", "")
     user_context = body.get("user_context", {})
     
-    # Log incoming request
+    # Log incoming request (sanitize user input to prevent log injection)
     truncated_msg = message[:100] + "..." if len(message) > 100 else message
+    sanitized_msg = sanitize_log_string(truncated_msg)
     customer_id = user_context.get("customer_id")
     flow_state = user_context.get("flow_state", "idle")
-    logger.info(f'POST /chat | session={session_id} | message="{truncated_msg}" | customer_id={customer_id} | flow_state={flow_state}')
+    logger.info(f'POST /chat | session={session_id} | message="{sanitized_msg}" | customer_id={customer_id} | flow_state={flow_state}')
 
     if not message:
         logger.warning(f"POST /chat | session={session_id} | Empty message")
@@ -1003,7 +1004,7 @@ def chat():
     last_product_ctx = user_context.get("last_product")  # {id, name} or None
     
     if last_product_ctx and last_product_ctx.get("id"):
-        logger.info(f"Step 2.6: last_product_ctx found: id={last_product_ctx.get('id')}, name=\"{last_product_ctx.get('name')}\"")
+        logger.info(f"Step 2.6: last_product_ctx found: id={last_product_ctx.get('id')}, name=\"{sanitize_log_string(last_product_ctx.get('name', ''))}\"")
     else:
         logger.info("Step 2.6: No last_product_ctx")
 
@@ -1087,11 +1088,11 @@ def chat():
             _p = all_products_raw[0]
             _order_product_id = _p.get("id")
             _order_product_name = _p.get("name", str(_order_product_id))
-            logger.info(f"Step 3.6: Using all_products_raw → product_id={_order_product_id}, product_name=\"{_order_product_name}\"")
+            logger.info(f"Step 3.6: Using all_products_raw → product_id={_order_product_id}, product_name=\"{sanitize_log_string(_order_product_name)}\"")
         elif last_product_ctx and last_product_ctx.get("id"):
             _order_product_id = last_product_ctx["id"]
             _order_product_name = last_product_ctx.get("name", str(last_product_ctx["id"]))
-            logger.info(f"Step 3.6: Using last_product_ctx → product_id={_order_product_id}, product_name=\"{_order_product_name}\"")
+            logger.info(f"Step 3.6: Using last_product_ctx → product_id={_order_product_id}, product_name=\"{sanitize_log_string(_order_product_name)}\"")
             # Inject a minimal product dict so bot message and response include the product info
             all_products_raw.append({
                 "id": _order_product_id,
@@ -1274,7 +1275,7 @@ def chat():
             except (ValueError, TypeError) as e:
                 logger.warning(f"Step 5: Error calculating line_item total: {e}")
         
-        logger.info(f"Step 5: Bot message generated | product_name=\"{used_product_name}\" | total=${total:.2f}")
+        logger.info(f"Step 5: Bot message generated | product_name=\"{sanitize_log_string(used_product_name)}\" | total=${total:.2f}")
         
         # Warn if fallback to "your item" was used
         if used_product_name == "your item":
