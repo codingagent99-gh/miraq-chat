@@ -950,8 +950,84 @@ def chat():
             message = flow_result["override_message"]
 
         elif flow_result and flow_result.get("create_order"):
-            # Flow confirmed order — build order with pending context
-            pass  # Falls through to normal pipeline with order intent
+            # Flow confirmed order — use pending context to create the order
+            pending_product_id = user_context.get("pending_product_id")
+            pending_product_name = user_context.get("pending_product_name", "")
+            pending_quantity = user_context.get("pending_quantity", 1)
+            
+            if pending_product_id and customer_id:
+                logger.info(f"Step 0: Order confirmed via flow | product_id={pending_product_id} | quantity={pending_quantity}")
+                
+                # Build the order directly
+                order_call = WooAPICall(
+                    method="POST",
+                    endpoint=f"{WOO_BASE_URL}/orders",
+                    params={},
+                    body={
+                        "status": "processing",
+                        "customer_id": customer_id,
+                        "payment_method": DEFAULT_PAYMENT_METHOD,
+                        "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
+                        "set_paid": False,
+                        "line_items": [{"product_id": pending_product_id, "quantity": pending_quantity}],
+                    },
+                    description=f"Create order for '{pending_product_name}' (confirmed via flow)",
+                )
+                order_resp = woo_client.execute(order_call)
+                
+                if order_resp.get("success") and isinstance(order_resp.get("data"), dict):
+                    created_order = order_resp["data"]
+                    order_number = created_order.get("number") or created_order.get("id", "N/A")
+                    total = created_order.get("total", "0.00")
+                    
+                    # Use line_items total if order total is 0
+                    if float(total) == 0.0 and created_order.get("line_items"):
+                        line_total = sum(float(item.get("total", "0") or "0") for item in created_order["line_items"])
+                        if line_total > 0:
+                            total = str(line_total)
+                    
+                    product_name = pending_product_name or "your item"
+                    if created_order.get("line_items"):
+                        product_name = created_order["line_items"][0].get("name") or product_name
+                    
+                    bot_message = (
+                        f"✅ **Order #{order_number} placed successfully!**\n\n"
+                        f"**Product:** {product_name}\n"
+                        f"**Quantity:** {pending_quantity}\n"
+                        f"**Total:** ${float(total):.2f}\n"
+                        f"**Payment Mode:** Cash on Delivery\n"
+                        f"**Status:** Processing"
+                    )
+                    
+                    elapsed = time.time() - start_time
+                    return jsonify({
+                        "success": True,
+                        "bot_message": bot_message,
+                        "intent": "order",
+                        "products": [],
+                        "filters_applied": {},
+                        "suggestions": ["Show me more products", "Check my orders", "No, that's all"],
+                        "session_id": session_id,
+                        "metadata": {
+                            "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
+                            "response_time_ms": round(elapsed * 1000),
+                        },
+                        "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
+                    }), 200
+                else:
+                    error_msg = str(order_resp.get('error', 'Unknown'))
+                    logger.error(f"Step 0: Order creation failed | error={error_msg}")
+                    return jsonify({
+                        "success": True,
+                        "bot_message": "Sorry, I couldn't place the order. Please try again.",
+                        "intent": "order",
+                        "products": [],
+                        "filters_applied": {},
+                        "suggestions": ["Try again", "Show me products"],
+                        "session_id": session_id,
+                        "metadata": {"flow_state": FlowState.IDLE.value},
+                        "flow_state": FlowState.IDLE.value,
+                    }), 200
 
     # ─── Step 1: Classify intent ───
     result = classify(message)
@@ -1085,7 +1161,7 @@ def chat():
                     logger.warning(f"Step 3.5: Reorder failed | error={error_msg}")
 
     # ─── Step 3.6: QUICK_ORDER / ORDER_ITEM / PLACE_ORDER — create order from matched product ───
-    if intent in (Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER) and customer_id:
+    if intent in (Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER) and customer_id and entities.quantity:
         # Resolve which product to order:
         # Priority 1 — product returned by the search API call this turn
         # Priority 2 — last_product sent by the frontend (handles "order this" / "buy it")
