@@ -784,6 +784,12 @@ ORDER_INTENTS = {
     Intent.ORDER_STATUS,
 }
 
+ORDER_CREATE_INTENTS = {
+    Intent.QUICK_ORDER,
+    Intent.ORDER_ITEM,
+    Intent.PLACE_ORDER,
+}
+
 USER_PLACEHOLDERS = {
     "CURRENT_USER_ID",
     "CURRENT_USER",
@@ -1244,7 +1250,6 @@ def chat():
     bot_message = generate_bot_message(intent, entities, products, confidence, order_data)
     
     # Log product name and total for order intents (critical for debugging "your item" / $0.00 issues)
-    ORDER_CREATE_INTENTS = {Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER}
     if intent in ORDER_CREATE_INTENTS and order_data:
         placed_order = order_data[-1]
         # Extract product name used in bot message
@@ -1326,7 +1331,6 @@ def chat():
     }
 
     # ─── Step 5.5: Detect when quantity is needed for ordering ───
-    ORDER_CREATE_INTENTS = {Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER}
     if intent in ORDER_CREATE_INTENTS and not entities.quantity and products:
         # We found the product but no quantity — ask
         product = products[0]
