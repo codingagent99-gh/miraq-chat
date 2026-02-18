@@ -498,8 +498,8 @@ def _extract_quantity(text: str, entities: ExtractedEntities):
     if match:
         entities.quantity = int(match.group(1))
         return
-    # Fallback: "order/buy N of" or "N of this/these/them"
-    match = re.search(r'\b(?:order|buy|purchase|place\s+(?:an?\s+)?order\s+for)\s+(\d+)\b', text)
+    # Fallback: "order/buy/purchase for N" or "place an order for N"
+    match = re.search(r'\b(?:order|buy|purchase|place\s+(?:an?\s+)?order)(?:\s+for)?\s+(\d+)\b', text)
     if match:
         entities.quantity = int(match.group(1))
         return
@@ -518,6 +518,15 @@ def _extract_order_item(text: str, entities: ExtractedEntities):
     if re.search(ORDER_HISTORY_KEYWORDS, text):
         return
 
+    # First, try to match against known products from StoreLoader
+    loader = get_store_loader()
+    if loader:
+        match = loader.get_product_for_text(text)
+        if match:
+            entities.order_item_name = match["name"]
+            return
+
+    # Fallback: extract product name from patterns
     patterns = [
         r"\b(?:order|buy|purchase|get|want)\b.*?\b(?:this\s+item\s+)?([A-Z][a-zA-Z]+)",
         r"\bi\s+want\s+(?:to\s+)?(?:order|buy|purchase|get)\s+(\w+)",
@@ -529,15 +538,8 @@ def _extract_order_item(text: str, entities: ExtractedEntities):
             skip_words = {
                 "this", "that", "item", "product", "tile", "tiles",
                 "some", "the", "a", "an", "my", "again", "more",
-                "it", "them", "these", "those",
+                "it", "them", "these", "those", "for", "to", "of",
             }
             if candidate not in skip_words and len(candidate) > 2:
                 entities.order_item_name = candidate.title()
                 return
-
-    # Also check if a known product is mentioned with order verbs
-    loader = get_store_loader()
-    if loader and not entities.order_item_name:
-        match = loader.get_product_for_text(text)
-        if match:
-            entities.order_item_name = match["name"]
