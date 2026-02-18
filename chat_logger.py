@@ -63,9 +63,10 @@ def setup_logger(name: str = "miraq_chat", log_level: str = "INFO") -> logging.L
     # Trim microseconds to 3 digits (milliseconds)
     class MillisecondFormatter(logging.Formatter):
         def formatTime(self, record, datefmt=None):
-            ct = self.converter(record.created)
             if datefmt:
-                s = datetime.fromtimestamp(record.created).strftime(datefmt)
+                import time
+                ct = self.converter(record.created)
+                s = time.strftime(datefmt, ct)
                 # Add milliseconds
                 ms = int((record.created - int(record.created)) * 1000)
                 s = f"{s}.{ms:03d}"
