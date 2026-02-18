@@ -1254,22 +1254,34 @@ def chat():
         else:
             used_product_name = "your item"
         
-        # Extract total
-        total = placed_order.get("total", "0.00")
-        if float(total) == 0.0 and placed_order.get("line_items"):
-            line_total = sum(float(item.get("total", "0") or "0") for item in placed_order["line_items"])
-            if line_total > 0:
-                total = str(line_total)
-                logger.warning(f"Step 5: Order total was $0.00, used line_item total=${line_total:.2f} instead")
+        # Extract total with error handling
+        total_str = placed_order.get("total", "0.00")
+        try:
+            total = float(total_str) if total_str else 0.0
+        except (ValueError, TypeError):
+            total = 0.0
+            logger.warning(f"Step 5: Invalid total value '{total_str}', defaulting to 0.00")
         
-        logger.info(f"Step 5: Bot message generated | product_name=\"{used_product_name}\" | total=${float(total):.2f}")
+        if total == 0.0 and placed_order.get("line_items"):
+            try:
+                line_total = sum(
+                    float(item.get("total") or 0)
+                    for item in placed_order["line_items"]
+                )
+                if line_total > 0:
+                    total = line_total
+                    logger.warning(f"Step 5: Order total was $0.00, used line_item total=${line_total:.2f} instead")
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Step 5: Error calculating line_item total: {e}")
+        
+        logger.info(f"Step 5: Bot message generated | product_name=\"{used_product_name}\" | total=${total:.2f}")
         
         # Warn if fallback to "your item" was used
         if used_product_name == "your item":
             logger.warning("Step 5: Used fallback 'your item' - no product name available from products[] or line_items[]")
         
         # Warn if $0.00 total detected
-        if float(total) == 0.0:
+        if total == 0.0:
             logger.warning("Step 5: Order total is $0.00 - possible pricing issue")
 
     # ─── Step 6: Generate suggestions ───

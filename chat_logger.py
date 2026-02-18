@@ -9,6 +9,7 @@ Sets up Python logging with:
 """
 
 import os
+import re
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -36,7 +37,7 @@ def setup_logger(name: str = "miraq_chat", log_level: str = "INFO") -> logging.L
     # Create log format
     log_format = logging.Formatter(
         fmt="[%(asctime)s] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S.%f"
+        datefmt="%Y-%m-%d %H:%M:%S"
     )
     
     # Trim microseconds to 3 digits (milliseconds)
@@ -45,16 +46,16 @@ def setup_logger(name: str = "miraq_chat", log_level: str = "INFO") -> logging.L
             ct = self.converter(record.created)
             if datefmt:
                 s = datetime.fromtimestamp(record.created).strftime(datefmt)
-                # Trim microseconds to milliseconds
-                if ".%f" in datefmt:
-                    s = s[:-3]
+                # Add milliseconds
+                ms = int((record.created - int(record.created)) * 1000)
+                s = f"{s}.{ms:03d}"
                 return s
             else:
                 return super().formatTime(record, datefmt)
     
     formatter = MillisecondFormatter(
         fmt="[%(asctime)s] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S.%f"
+        datefmt="%Y-%m-%d %H:%M:%S"
     )
     
     # ─── File Handler (daily rotation) ───
@@ -93,7 +94,6 @@ def sanitize_url(url: str) -> str:
         return url
     
     # Remove consumer_key and consumer_secret query params
-    import re
     url = re.sub(r'consumer_key=[^&]*', 'consumer_key=***', url)
     url = re.sub(r'consumer_secret=[^&]*', 'consumer_secret=***', url)
     return url
