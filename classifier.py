@@ -493,7 +493,18 @@ def _extract_order_id(text: str, entities: ExtractedEntities):
 
 
 def _extract_quantity(text: str, entities: ExtractedEntities):
+    # Primary: number + unit keyword
     match = re.search(r'(\d+)\s*(qty|quantity|pcs|pieces|units|boxes|sq\s*ft)', text)
+    if match:
+        entities.quantity = int(match.group(1))
+        return
+    # Fallback: "order/buy N of" or "N of this/these/them"
+    match = re.search(r'\b(?:order|buy|purchase|place\s+(?:an?\s+)?order\s+for)\s+(\d+)\b', text)
+    if match:
+        entities.quantity = int(match.group(1))
+        return
+    # Fallback: "N of this/these/them/it"
+    match = re.search(r'\b(\d+)\s+of\s+(?:this|these|them|it|the)\b', text)
     if match:
         entities.quantity = int(match.group(1))
 
