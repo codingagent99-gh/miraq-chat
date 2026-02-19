@@ -15,6 +15,8 @@ from app_config import (
     DEFAULT_PAYMENT_METHOD_TITLE,
     ORDER_INTENTS,
     ORDER_CREATE_INTENTS,
+    LLM_FALLBACK_ENABLED,
+    LLM_RETRY_ON_EMPTY_RESULTS,
 )
 from woo_client import woo_client
 from formatters import (
@@ -42,6 +44,8 @@ from conversation_flow import (
     get_disambiguation_message,
 )
 from chat_logger import get_logger, sanitize_log_string
+from llm_fallback import llm_fallback, llm_retry_search
+from store_registry import get_store_loader
 
 logger = get_logger("miraq_chat")
 
@@ -288,11 +292,173 @@ def chat():
     }
     logger.info(f"Step 1: Classified intent={intent.value} | confidence={confidence:.2f} | entities={entity_summary}")
 
-    # ─── Step 1.5: Disambiguation check ───
-    if should_disambiguate(intent.value, confidence):
+    # ─── Step 1.5: LLM Fallback / Disambiguation check ───
+    # Trigger LLM fallback when:
+    # 1. Intent is UNKNOWN
+    # 2. Confidence is below threshold
+    # 3. Search intent but missing both product_name AND category_id
+    # 4. Order create intent but missing both order_item_name AND product_name
+    
+    should_try_llm = False
+    llm_trigger_reason = None
+    
+    if intent.value == "unknown":
+        should_try_llm = True
+        llm_trigger_reason = "unknown_intent"
+    elif should_disambiguate(intent.value, confidence):
+        should_try_llm = True
+        llm_trigger_reason = "low_confidence"
+    elif intent == Intent.PRODUCT_SEARCH and entities.product_name is None and entities.category_id is None:
+        should_try_llm = True
+        llm_trigger_reason = "missing_entities"
+    elif intent in ORDER_CREATE_INTENTS and entities.order_item_name is None and entities.product_name is None:
+        should_try_llm = True
+        llm_trigger_reason = "missing_entities"
+    
+    if should_try_llm and LLM_FALLBACK_ENABLED:
+        # Try LLM fallback
+        store_loader = get_store_loader()
+        session_history = None
+        if session_id and session_id in sessions:
+            session_history = sessions[session_id].get("history", [])
+        
+        llm_result = llm_fallback(
+            user_message=message,
+            original_intent=intent.value,
+            original_confidence=confidence,
+            trigger_reason=llm_trigger_reason,
+            session_id=session_id,
+            store_loader=store_loader,
+            session_history=session_history,
+        )
+        
+        if llm_result.get("success"):
+            fallback_type = llm_result.get("fallback_type")
+            
+            if fallback_type == "conversational":
+                # LLM handled it as general Q&A - return response directly
+                elapsed = time.time() - start_time
+                llm_metadata = llm_result.get("metadata", {})
+                llm_metadata["response_time_ms"] = round(elapsed * 1000)
+                
+                if session_id and session_id in sessions:
+                    sessions[session_id]["history"].append({
+                        "role": "bot",
+                        "message": llm_result["bot_message"],
+                        "intent": "conversational",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                
+                return jsonify({
+                    "success": True,
+                    "bot_message": llm_result["bot_message"],
+                    "intent": "conversational",
+                    "products": [],
+                    "filters_applied": {},
+                    "suggestions": [],
+                    "session_id": session_id,
+                    "metadata": llm_metadata,
+                }), 200
+            
+            elif fallback_type in ["intent_resolved", "entity_extracted"]:
+                # LLM resolved the intent or extracted entities
+                # Re-inject into pipeline at Step 2 by rebuilding the ClassifiedResult
+                from models import ClassifiedResult, ExtractedEntities
+                
+                # Convert LLM entities to ExtractedEntities object
+                llm_entities_dict = llm_result.get("entities", {})
+                new_entities = ExtractedEntities()
+                
+                # Map LLM entity fields to ExtractedEntities fields
+                entity_field_map = {
+                    "product_name": "product_name",
+                    "category_name": "category_name",
+                    "finish": "finish",
+                    "color_tone": "color_tone",
+                    "tile_size": "tile_size",
+                    "application": "application",
+                    "visual": "visual",
+                }
+                
+                for llm_field, entity_field in entity_field_map.items():
+                    if llm_field in llm_entities_dict:
+                        setattr(new_entities, entity_field, llm_entities_dict[llm_field])
+                
+                # Merge with original entities if entity_extracted
+                if fallback_type == "entity_extracted":
+                    # Keep original entities and merge with new ones
+                    for entity_field in entity_field_map.values():
+                        new_val = getattr(new_entities, entity_field)
+                        orig_val = getattr(entities, entity_field)
+                        if new_val is None and orig_val is not None:
+                            setattr(new_entities, entity_field, orig_val)
+                
+                # Map intent string to Intent enum
+                llm_intent_str = llm_result.get("intent", "unknown")
+                try:
+                    new_intent = Intent(llm_intent_str)
+                except ValueError:
+                    # If LLM returned invalid intent, try to map common variations
+                    intent_mapping = {
+                        "search": Intent.PRODUCT_SEARCH,
+                        "browse": Intent.CATEGORY_BROWSE,
+                        "filter": Intent.PRODUCT_LIST,
+                        "order": Intent.QUICK_ORDER,
+                    }
+                    new_intent = intent_mapping.get(llm_intent_str, Intent.PRODUCT_LIST)
+                
+                # Update intent, entities, and confidence
+                intent = new_intent
+                entities = new_entities
+                confidence = llm_result.get("confidence", 0.70)
+                
+                # Create new ClassifiedResult for API builder
+                result = ClassifiedResult(
+                    intent=intent,
+                    entities=entities,
+                    confidence=confidence,
+                )
+                
+                logger.info(
+                    f"Step 1.5: LLM fallback applied | new_intent={intent.value} | "
+                    f"new_confidence={confidence:.2f} | fallback_type={fallback_type}"
+                )
+                
+                # Continue to Step 2 with updated intent/entities
+                # (fall through to rest of pipeline)
+            else:
+                # Unknown fallback type - treat as failure
+                llm_result["success"] = False
+        
+        # If LLM failed or returned error, fall back to disambiguation menu
+        if not llm_result.get("success"):
+            disambig = get_disambiguation_message()
+            elapsed = time.time() - start_time
+            logger.info(f"Step 1.5: LLM failed, returning disambiguation | confidence={confidence:.2f}")
+            return jsonify({
+                "success": True,
+                "bot_message": disambig["bot_message"],
+                "intent": "disambiguation",
+                "products": [],
+                "filters_applied": {},
+                "suggestions": disambig["suggestions"],
+                "session_id": session_id,
+                "metadata": {
+                    "flow_state": disambig["flow_state"],
+                    "confidence": round(confidence, 2),
+                    "original_intent": intent.value,
+                    "response_time_ms": round((time.time() - start_time) * 1000),
+                    "provider": "conversation_flow",
+                    "llm_error": llm_result.get("error", "LLM fallback failed"),
+                },
+                "flow_state": disambig["flow_state"],
+            }), 200
+    
+    elif should_try_llm and not LLM_FALLBACK_ENABLED:
+        # LLM is disabled, use old disambiguation menu
         disambig = get_disambiguation_message()
         elapsed = time.time() - start_time
-        logger.info(f"Step 1.5: Low confidence, returning disambiguation | confidence={confidence:.2f}")
+        logger.info(f"Step 1.5: Low confidence, returning disambiguation (LLM disabled) | confidence={confidence:.2f}")
         return jsonify({
             "success": True,
             "bot_message": disambig["bot_message"],
@@ -567,6 +733,111 @@ def chat():
                 "session_id": session_id,
                 "metadata": metadata,
             }), 200
+
+    # ─── Step 3.8: LLM Retry on Empty Search Results ───
+    # When API returns 0 products for search/filter intents, try LLM for suggestions
+    SEARCH_FILTER_INTENTS = {
+        Intent.PRODUCT_SEARCH,
+        Intent.PRODUCT_LIST,
+        Intent.CATEGORY_BROWSE,
+        Intent.FILTER_BY_FINISH,
+        Intent.FILTER_BY_SIZE,
+        Intent.FILTER_BY_COLOR,
+        Intent.FILTER_BY_APPLICATION,
+        Intent.PRODUCT_BY_VISUAL,
+        Intent.PRODUCT_BY_ORIGIN,
+    }
+    
+    if (
+        intent in SEARCH_FILTER_INTENTS
+        and len(all_products_raw) == 0
+        and LLM_RETRY_ON_EMPTY_RESULTS
+        and LLM_FALLBACK_ENABLED
+    ):
+        logger.info(f"Step 3.8: Empty search results, trying LLM retry | intent={intent.value}")
+        
+        store_loader = get_store_loader()
+        entities_dict = {
+            "product_name": entities.product_name,
+            "category_name": entities.category_name,
+            "finish": entities.finish,
+            "color_tone": entities.color_tone,
+            "tile_size": entities.tile_size,
+            "application": entities.application,
+            "visual": entities.visual,
+        }
+        
+        llm_retry_result = llm_retry_search(
+            user_message=message,
+            original_intent=intent.value,
+            entities=entities_dict,
+            session_id=session_id,
+            store_loader=store_loader,
+        )
+        
+        if llm_retry_result.get("success"):
+            retry_type = llm_retry_result.get("retry_type")
+            
+            if retry_type == "corrected_search" and llm_retry_result.get("corrected_term"):
+                # LLM suggested a corrected search term - retry the search
+                corrected_term = llm_retry_result["corrected_term"]
+                logger.info(f"Step 3.8: LLM suggested correction | corrected_term={corrected_term}")
+                
+                # Re-classify with corrected term
+                from classifier import classify
+                corrected_result = classify(corrected_term)
+                
+                # Rebuild API calls with corrected entities
+                corrected_api_calls = build_api_calls(corrected_result)
+                corrected_responses = woo_client.execute_all(corrected_api_calls)
+                
+                # Extract products from corrected search
+                corrected_products_raw = []
+                for resp in corrected_responses:
+                    if resp.get("success"):
+                        data = resp.get("data")
+                        if isinstance(data, dict) and "products" in data:
+                            corrected_products_raw.extend(data["products"])
+                        elif isinstance(data, list):
+                            corrected_products_raw.extend(data)
+                        elif isinstance(data, dict):
+                            corrected_products_raw.append(data)
+                
+                if corrected_products_raw:
+                    # Success! Use corrected results
+                    all_products_raw = corrected_products_raw
+                    logger.info(f"Step 3.8: LLM retry successful | found {len(all_products_raw)} products")
+                else:
+                    # Still no results - use suggestion message
+                    logger.info("Step 3.8: LLM retry still returned 0 products")
+            
+            # If we still have no products, use LLM suggestion message
+            if len(all_products_raw) == 0 and llm_retry_result.get("suggestion_message"):
+                suggestion_msg = llm_retry_result["suggestion_message"]
+                elapsed = time.time() - start_time
+                llm_metadata = llm_retry_result.get("metadata", {})
+                llm_metadata["response_time_ms"] = round(elapsed * 1000)
+                llm_metadata["original_intent"] = intent.value
+                llm_metadata["confidence"] = round(confidence, 2)
+                
+                if session_id and session_id in sessions:
+                    sessions[session_id]["history"].append({
+                        "role": "bot",
+                        "message": suggestion_msg,
+                        "intent": intent.value,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                
+                return jsonify({
+                    "success": True,
+                    "bot_message": suggestion_msg,
+                    "intent": INTENT_LABELS.get(intent, "unknown"),
+                    "products": [],
+                    "filters_applied": {},
+                    "suggestions": [],
+                    "session_id": session_id,
+                    "metadata": llm_metadata,
+                }), 200
 
     # ─── Step 4: Format products ───
     products = []
