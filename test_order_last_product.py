@@ -4,7 +4,7 @@ Test order placement using last_product_ctx to ensure product info is correctly 
 import pytest
 from unittest.mock import Mock, patch
 from models import Intent, ExtractedEntities
-from server import generate_bot_message
+from response_generator import generate_bot_message
 
 
 class TestOrderLastProduct:
