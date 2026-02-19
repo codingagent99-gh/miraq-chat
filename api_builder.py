@@ -128,6 +128,10 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             params["on_sale"] = "true"
         if e.tag_ids:
             params["tag"] = str(e.tag_ids[0])
+        # Apply attribute filters if present (size, finish, color, etc.)
+        if e.attribute_slug and e.attribute_term_ids:
+            params["attribute"] = e.attribute_slug
+            params["attribute_term"] = ",".join(str(tid) for tid in e.attribute_term_ids)
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
