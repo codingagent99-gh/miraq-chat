@@ -124,6 +124,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             # Map attribute_slug to entity value
             _ATTR_TO_ENTITY = {
                 "pa_tile-size": lambda ent: (ent.tile_size or "").replace('"', ''),
+                "pa_sample-size": lambda ent: (ent.sample_size or "").replace('"', ''),
                 "pa_finish": lambda ent: ent.finish or "",
                 "pa_colors": lambda ent: ent.color_tone or "",
                 "pa_thickness": lambda ent: ent.thickness or "",
@@ -141,6 +142,102 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
                     endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
                     params={"filters": json.dumps(filters), "page": 1},
                     description=f"Filter category '{e.category_name}' by {e.attribute_slug}: {term_value}",
+                    is_custom_api=True,
+                ))
+
+    elif intent == Intent.CATEGORY_BROWSE_FILTERED:
+        # Call 1: Plain category browse
+        params = {"per_page": 20, "status": "publish", "category": str(e.category_id)}
+        if e.on_sale:
+            params["on_sale"] = "true"
+        if e.tag_ids:
+            params["tag"] = str(e.tag_ids[0])
+        calls.append(WooAPICall(
+            method="GET",
+            endpoint=f"{BASE}/products",
+            params=params,
+            description=f"Browse category '{e.category_name}' (id={e.category_id})",
+        ))
+        
+        # Call 2: Custom API attribute filter within category
+        if e.attribute_slug:
+            _ATTR_TO_ENTITY = {
+                "pa_tile-size": lambda ent: (ent.tile_size or "").replace('"', ''),
+                "pa_sample-size": lambda ent: (ent.sample_size or "").replace('"', ''),
+                "pa_finish": lambda ent: ent.finish or "",
+                "pa_colors": lambda ent: ent.color_tone or "",
+                "pa_thickness": lambda ent: ent.thickness or "",
+                "pa_edge": lambda ent: ent.edge or "",
+                "pa_application": lambda ent: ent.application or "",
+                "pa_visual": lambda ent: ent.visual or "",
+                "pa_origin": lambda ent: ent.origin or "",
+            }
+            resolver = _ATTR_TO_ENTITY.get(e.attribute_slug)
+            term_value = resolver(e) if resolver else ""
+            
+            if e.attribute_term_ids:
+                # Use custom API with both category and attribute filters
+                filters = [
+                    {"attribute": e.attribute_slug, "terms": term_value},
+                    {"attribute": "category", "terms": str(e.category_id)},
+                ]
+                calls.append(WooAPICall(
+                    method="GET",
+                    endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
+                    params={"filters": json.dumps(filters), "page": 1},
+                    description=f"Filter category '{e.category_name}' by {e.attribute_slug}: {term_value}",
+                    is_custom_api=True,
+                ))
+            elif term_value:
+                # Fallback: add search param to category browse if term IDs not found
+                calls[0].params["search"] = term_value
+                calls[0].description += f" (with search: {term_value})"
+
+    elif intent == Intent.PRODUCT_SEARCH_IN_CATEGORY:
+        # Call 1: WooCommerce search with both search and category params
+        params = {
+            "search": e.product_name or "",
+            "category": str(e.category_id),
+            "per_page": 20,
+            "status": "publish"
+        }
+        calls.append(WooAPICall(
+            method="GET",
+            endpoint=f"{BASE}/products",
+            params=params,
+            description=f"Search '{e.product_name}' in category '{e.category_name}'",
+        ))
+        
+        # Call 2 (optional): If attribute filters are also present, add custom API call
+        has_attributes = any([
+            e.finish, e.tile_size, e.sample_size,
+            e.color_tone, e.thickness, e.visual,
+            e.origin, e.application,
+        ])
+        if has_attributes and e.attribute_slug:
+            _ATTR_TO_ENTITY = {
+                "pa_tile-size": lambda ent: (ent.tile_size or "").replace('"', ''),
+                "pa_sample-size": lambda ent: (ent.sample_size or "").replace('"', ''),
+                "pa_finish": lambda ent: ent.finish or "",
+                "pa_colors": lambda ent: ent.color_tone or "",
+                "pa_thickness": lambda ent: ent.thickness or "",
+                "pa_edge": lambda ent: ent.edge or "",
+                "pa_application": lambda ent: ent.application or "",
+                "pa_visual": lambda ent: ent.visual or "",
+                "pa_origin": lambda ent: ent.origin or "",
+            }
+            resolver = _ATTR_TO_ENTITY.get(e.attribute_slug)
+            term_value = resolver(e) if resolver else ""
+            if term_value:
+                filters = [
+                    {"attribute": e.attribute_slug, "terms": term_value},
+                    {"attribute": "category", "terms": str(e.category_id)},
+                ]
+                calls.append(WooAPICall(
+                    method="GET",
+                    endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
+                    params={"filters": json.dumps(filters), "page": 1},
+                    description=f"Filter '{e.product_name}' in category '{e.category_name}' by {e.attribute_slug}: {term_value}",
                     is_custom_api=True,
                 ))
 

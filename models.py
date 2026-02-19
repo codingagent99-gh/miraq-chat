@@ -23,6 +23,8 @@ class Intent(Enum):
 
     # ──── Category-Based Browsing ────
     CATEGORY_BROWSE        = "category_browse"
+    CATEGORY_BROWSE_FILTERED = "category_browse_filtered"
+    PRODUCT_SEARCH_IN_CATEGORY = "product_search_in_category"
     CATEGORY_LIST          = "category_list"
 
     # Attribute Filtering

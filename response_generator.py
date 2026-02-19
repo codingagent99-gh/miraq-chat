@@ -241,6 +241,15 @@ def generate_bot_message(
 
     if intent == Intent.CATEGORY_BROWSE:
         msg += f"Here are **{count}** products in the **{entities.category_name}** category! 📂\n\n"
+    elif intent == Intent.CATEGORY_BROWSE_FILTERED:
+        # Build attribute description
+        attr_desc = " / ".join(filter(None, [
+            entities.finish, entities.tile_size, entities.sample_size,
+            entities.color_tone, entities.thickness, entities.visual,
+        ]))
+        msg += f"Here are **{count}** products in **{entities.category_name}** filtered by **{attr_desc}**! 🔍\n\n"
+    elif intent == Intent.PRODUCT_SEARCH_IN_CATEGORY:
+        msg += f"Found **{count}** products matching **{entities.product_name}** in **{entities.category_name}**! 🔍\n\n"
     elif intent == Intent.PRODUCT_BY_VISUAL:
         msg += f"Found **{count}** products with **{entities.visual}** look! 🎨\n\n"
     elif intent == Intent.FILTER_BY_FINISH:
@@ -316,8 +325,10 @@ def generate_suggestions(
 
     elif products and len(products) > 1:
         # Suggest browsing related
-        if intent == Intent.CATEGORY_BROWSE and entities.category_name:
+        if intent in (Intent.CATEGORY_BROWSE, Intent.CATEGORY_BROWSE_FILTERED) and entities.category_name:
             suggestions.append(f"Show me more {entities.category_name} products")
+        if intent == Intent.PRODUCT_SEARCH_IN_CATEGORY and entities.category_name:
+            suggestions.append(f"Browse all {entities.category_name}")
         suggestions.append("Show me what's on sale")
         suggestions.append("Show me quick ship products")
 
@@ -480,6 +491,8 @@ INTENT_LABELS = {
     Intent.PRODUCT_QUICK_SHIP:    "filter",
     Intent.RELATED_PRODUCTS:      "related",
     Intent.CATEGORY_BROWSE:       "category",
+    Intent.CATEGORY_BROWSE_FILTERED: "category",
+    Intent.PRODUCT_SEARCH_IN_CATEGORY: "search",
     Intent.CATEGORY_LIST:         "categories",
     Intent.FILTER_BY_FINISH:      "filter",
     Intent.FILTER_BY_SIZE:        "filter",
