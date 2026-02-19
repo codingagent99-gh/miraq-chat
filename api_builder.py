@@ -12,6 +12,19 @@ from store_registry import get_store_loader
 BASE = "https://wgc.net.in/hn/wp-json/wc/v3"
 CUSTOM_API_BASE = "https://wgc.net.in/hn/wp-json/custom-api/v1"
 
+# Mapping of attribute slugs to entity extractors
+_ATTR_TO_ENTITY = {
+    "pa_tile-size": lambda ent: (ent.tile_size or "").replace('"', ''),
+    "pa_sample-size": lambda ent: (ent.sample_size or "").replace('"', ''),
+    "pa_finish": lambda ent: ent.finish or "",
+    "pa_colors": lambda ent: ent.color_tone or "",
+    "pa_thickness": lambda ent: ent.thickness or "",
+    "pa_edge": lambda ent: ent.edge or "",
+    "pa_application": lambda ent: ent.application or "",
+    "pa_visual": lambda ent: ent.visual or "",
+    "pa_origin": lambda ent: ent.origin or "",
+}
+
 
 def _loader():
     """Convenience accessor for StoreLoader."""
@@ -121,18 +134,6 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         # Apply attribute filters if present (size, finish, color, etc.)
         # Use custom API for attribute filtering
         if e.attribute_slug:
-            # Map attribute_slug to entity value
-            _ATTR_TO_ENTITY = {
-                "pa_tile-size": lambda ent: (ent.tile_size or "").replace('"', ''),
-                "pa_sample-size": lambda ent: (ent.sample_size or "").replace('"', ''),
-                "pa_finish": lambda ent: ent.finish or "",
-                "pa_colors": lambda ent: ent.color_tone or "",
-                "pa_thickness": lambda ent: ent.thickness or "",
-                "pa_edge": lambda ent: ent.edge or "",
-                "pa_application": lambda ent: ent.application or "",
-                "pa_visual": lambda ent: ent.visual or "",
-                "pa_origin": lambda ent: ent.origin or "",
-            }
             resolver = _ATTR_TO_ENTITY.get(e.attribute_slug)
             term_value = resolver(e) if resolver else ""
             if term_value:
@@ -161,17 +162,6 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         
         # Call 2: Custom API attribute filter within category
         if e.attribute_slug:
-            _ATTR_TO_ENTITY = {
-                "pa_tile-size": lambda ent: (ent.tile_size or "").replace('"', ''),
-                "pa_sample-size": lambda ent: (ent.sample_size or "").replace('"', ''),
-                "pa_finish": lambda ent: ent.finish or "",
-                "pa_colors": lambda ent: ent.color_tone or "",
-                "pa_thickness": lambda ent: ent.thickness or "",
-                "pa_edge": lambda ent: ent.edge or "",
-                "pa_application": lambda ent: ent.application or "",
-                "pa_visual": lambda ent: ent.visual or "",
-                "pa_origin": lambda ent: ent.origin or "",
-            }
             resolver = _ATTR_TO_ENTITY.get(e.attribute_slug)
             term_value = resolver(e) if resolver else ""
             
@@ -215,17 +205,6 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             e.origin, e.application,
         ])
         if has_attributes and e.attribute_slug:
-            _ATTR_TO_ENTITY = {
-                "pa_tile-size": lambda ent: (ent.tile_size or "").replace('"', ''),
-                "pa_sample-size": lambda ent: (ent.sample_size or "").replace('"', ''),
-                "pa_finish": lambda ent: ent.finish or "",
-                "pa_colors": lambda ent: ent.color_tone or "",
-                "pa_thickness": lambda ent: ent.thickness or "",
-                "pa_edge": lambda ent: ent.edge or "",
-                "pa_application": lambda ent: ent.application or "",
-                "pa_visual": lambda ent: ent.visual or "",
-                "pa_origin": lambda ent: ent.origin or "",
-            }
             resolver = _ATTR_TO_ENTITY.get(e.attribute_slug)
             term_value = resolver(e) if resolver else ""
             if term_value:

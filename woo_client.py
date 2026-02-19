@@ -23,6 +23,10 @@ class WooClient:
         """Execute a single API call and return raw response."""
         import time
         
+        def calculate_response_time_ms(start_time):
+            """Helper to calculate response time in milliseconds."""
+            return int((time.time() - start_time) * 1000)
+        
         params = dict(api_call.params)
         
         # Only add auth params for standard WooCommerce API, not for custom API
@@ -67,7 +71,7 @@ class WooClient:
                 )
             
             # Calculate response time
-            response_time_ms = int((time.time() - start_time) * 1000)
+            response_time_ms = calculate_response_time_ms(start_time)
             
             resp.raise_for_status()
             
@@ -107,7 +111,7 @@ class WooClient:
             }
         except Exception as e:
             # Calculate response time even on error
-            response_time_ms = int((time.time() - start_time) * 1000)
+            response_time_ms = calculate_response_time_ms(start_time)
             
             logger.error(
                 f"WooCommerce API error: {api_call.method} {sanitized_endpoint} | "
