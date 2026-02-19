@@ -784,7 +784,6 @@ def chat():
                 logger.info(f"Step 3.8: LLM suggested correction | corrected_term={corrected_term}")
                 
                 # Re-classify with corrected term
-                from classifier import classify
                 corrected_result = classify(corrected_term)
                 
                 # Rebuild API calls with corrected entities
