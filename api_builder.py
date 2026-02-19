@@ -3,6 +3,7 @@ Builds WooCommerce API calls using live StoreLoader data.
 No hardcoded tag/attribute IDs — everything resolved through StoreLoader.
 """
 
+import json
 from typing import List, Optional
 from models import Intent, ClassifiedResult, WooAPICall, ExtractedEntities
 from store_registry import get_store_loader
@@ -32,23 +33,6 @@ def _attr_id(slug: str) -> Optional[int]:
 def _first_tag_id(tag_ids: list) -> Optional[int]:
     """Return first tag ID from a list, or None."""
     return tag_ids[0] if tag_ids else None
-
-
-def _attr_filter_params(attr_slug: str, term_ids: List[int], tag_ids: List[int]) -> dict:
-    """
-    Build the right WooCommerce filter params for an attribute.
-    Uses attribute+attribute_term when term IDs are resolved (accurate).
-    Falls back to tag= when only tag IDs are available.
-    """
-    params = {}
-    if term_ids:
-        attr_id = _attr_id(attr_slug)
-        if attr_id:
-            params["attribute"] = attr_slug
-            params["attribute_term"] = ",".join(str(i) for i in term_ids)
-    elif tag_ids:
-        params["tag"] = str(_first_tag_id(tag_ids))
-    return params
 
 
 def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
@@ -128,16 +112,37 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             params["on_sale"] = "true"
         if e.tag_ids:
             params["tag"] = str(e.tag_ids[0])
-        # Apply attribute filters if present (size, finish, color, etc.)
-        if e.attribute_slug and e.attribute_term_ids:
-            params["attribute"] = e.attribute_slug
-            params["attribute_term"] = ",".join(str(tid) for tid in e.attribute_term_ids)
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
             params=params,
             description=f"Browse category '{e.category_name}' (id={e.category_id})",
         ))
+        # Apply attribute filters if present (size, finish, color, etc.)
+        # Use custom API for attribute filtering
+        if e.attribute_slug:
+            # Map attribute_slug to entity value
+            _ATTR_TO_ENTITY = {
+                "pa_tile-size": lambda ent: (ent.tile_size or "").replace('"', ''),
+                "pa_finish": lambda ent: ent.finish or "",
+                "pa_colors": lambda ent: ent.color_tone or "",
+                "pa_thickness": lambda ent: ent.thickness or "",
+                "pa_edge": lambda ent: ent.edge or "",
+                "pa_application": lambda ent: ent.application or "",
+                "pa_visual": lambda ent: ent.visual or "",
+                "pa_origin": lambda ent: ent.origin or "",
+            }
+            resolver = _ATTR_TO_ENTITY.get(e.attribute_slug)
+            term_value = resolver(e) if resolver else ""
+            if term_value:
+                filters = [{"attribute": e.attribute_slug, "terms": term_value}]
+                calls.append(WooAPICall(
+                    method="GET",
+                    endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
+                    params={"filters": json.dumps(filters), "page": 1},
+                    description=f"Filter category '{e.category_name}' by {e.attribute_slug}: {term_value}",
+                    is_custom_api=True,
+                ))
 
     elif intent == Intent.CATEGORY_LIST:
         calls.append(WooAPICall(
@@ -207,22 +212,35 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             ))
 
     elif intent == Intent.PRODUCT_BY_COLLECTION:
-        params = {"per_page": 20, "status": "publish", "stock_status": "instock"}
-        if e.tag_ids:
-            params["tag"] = str(e.tag_ids[0])
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/products",
-            params=params,
-            description=f"Products from {e.collection_year} collection",
-        ))
+        # Use custom API if tag slugs are available
+        if e.tag_slugs:
+            tags_str = ",".join(e.tag_slugs)
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{CUSTOM_API_BASE}/products-by-tags",
+                params={"tags": tags_str, "page": 1},
+                description=f"Products from {e.collection_year} collection (tags: {tags_str})",
+                is_custom_api=True,
+            ))
+        else:
+            # Fallback to standard API with tag IDs
+            params = {"per_page": 20, "status": "publish", "stock_status": "instock"}
+            if e.tag_ids:
+                params["tag"] = str(e.tag_ids[0])
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products",
+                params=params,
+                description=f"Products from {e.collection_year} collection",
+            ))
 
     elif intent == Intent.PRODUCT_BY_ORIGIN:
         origin_term = e.origin or ""
+        filters = [{"attribute": "pa_origin", "terms": origin_term}]
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"attribute": "pa_origin", "term": origin_term},
+            params={"filters": json.dumps(filters), "page": 1},
             description=f"Products from {e.origin}",
             is_custom_api=True,
         ))
@@ -241,10 +259,11 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
 
     elif intent == Intent.PRODUCT_BY_VISUAL:
         visual_term = e.visual or ""
+        filters = [{"attribute": "pa_visual", "terms": visual_term}]
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"attribute": "pa_visual", "term": visual_term},
+            params={"filters": json.dumps(filters), "page": 1},
             description=f"Products with '{e.visual}' visual/look",
             is_custom_api=True,
         ))
@@ -288,90 +307,90 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
 
     elif intent == Intent.FILTER_BY_FINISH:
         finish_term = e.finish or ""
+        filters = [{"attribute": "pa_finish", "terms": finish_term}]
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"attribute": "pa_finish", "term": finish_term},
+            params={"filters": json.dumps(filters), "page": 1},
             description=f"Filter by finish: {e.finish}",
             is_custom_api=True,
         ))
 
     elif intent == Intent.FILTER_BY_SIZE:
         size_term = e.tile_size.replace('"', '') if e.tile_size else ""
+        filters = [{"attribute": "pa_tile-size", "terms": size_term}]
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"attribute": "pa_tile-size", "term": size_term},
+            params={"filters": json.dumps(filters), "page": 1},
             description=f"Filter by tile size: {e.tile_size}",
             is_custom_api=True,
         ))
 
     elif intent == Intent.FILTER_BY_COLOR:
         color_term = e.color_tone or ""
+        filters = [{"attribute": "pa_colors", "terms": color_term}]
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"attribute": "pa_colors", "term": color_term},
+            params={"filters": json.dumps(filters), "page": 1},
             description=f"Filter by color: {e.color_tone}",
             is_custom_api=True,
         ))
 
     elif intent == Intent.FILTER_BY_THICKNESS:
         thickness_term = e.thickness or ""
+        filters = [{"attribute": "pa_thickness", "terms": thickness_term}]
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"attribute": "pa_thickness", "term": thickness_term},
+            params={"filters": json.dumps(filters), "page": 1},
             description=f"Filter by thickness: {e.thickness}",
             is_custom_api=True,
         ))
 
     elif intent == Intent.FILTER_BY_EDGE:
         edge_term = e.edge or ""
+        filters = [{"attribute": "pa_edge", "terms": edge_term}]
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"attribute": "pa_edge", "term": edge_term},
+            params={"filters": json.dumps(filters), "page": 1},
             description=f"Filter by edge: {e.edge}",
+            is_custom_api=True,
         ))
 
     elif intent == Intent.FILTER_BY_APPLICATION:
         application_term = e.application or ""
+        filters = [{"attribute": "pa_application", "terms": application_term}]
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"attribute": "pa_application", "term": application_term},
+            params={"filters": json.dumps(filters), "page": 1},
             description=f"Filter by application: {e.application}",
-            is_custom_api=True,
-        ))
-
-    elif intent == Intent.FILTER_BY_EDGE:
-        # Use custom API for attribute filtering
-        term_value = e.edge.lower() if e.edge else ""
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"attribute": "pa_edge", "term": term_value},
-            description=f"Filter by edge: {e.edge}",
             is_custom_api=True,
         ))
 
     elif intent == Intent.FILTER_BY_MATERIAL:
         material_term = e.visual or ""
+        filters = [{"attribute": "pa_visual", "terms": material_term}]
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"attribute": "pa_visual", "term": material_term},
+            params={"filters": json.dumps(filters), "page": 1},
             description=f"Filter by material: {e.visual}",
+            is_custom_api=True,
         ))
 
     elif intent == Intent.FILTER_BY_ORIGIN:
         origin_term = e.origin or ""
+        filters = [{"attribute": "pa_origin", "terms": origin_term}]
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"attribute": "pa_origin", "term": origin_term},
+            params={"filters": json.dumps(filters), "page": 1},
             description=f"Filter by origin: {e.origin}",
+            is_custom_api=True,
         ))
 
     elif intent == Intent.SIZE_LIST:

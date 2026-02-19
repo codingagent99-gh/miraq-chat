@@ -23,8 +23,12 @@ class TestCustomAPIIntegration:
         assert len(api_calls) == 1
         assert CUSTOM_API_BASE in api_calls[0].endpoint
         assert "products-by-attribute" in api_calls[0].endpoint
-        assert api_calls[0].params["attribute"] == "pa_finish"
-        assert api_calls[0].params["term"] == "matte"
+        
+        import json
+        filters = json.loads(api_calls[0].params["filters"])
+        assert filters[0]["attribute"] == "pa_finish"
+        assert filters[0]["terms"] == "matte"
+        assert api_calls[0].params["page"] == 1
 
     def test_filter_by_size_uses_custom_api_and_strips_quotes(self):
         """Test FILTER_BY_SIZE intent uses custom API and strips quote characters."""
@@ -40,8 +44,12 @@ class TestCustomAPIIntegration:
         assert len(api_calls) == 1
         assert CUSTOM_API_BASE in api_calls[0].endpoint
         assert "products-by-attribute" in api_calls[0].endpoint
-        assert api_calls[0].params["attribute"] == "pa_tile-size"
-        assert api_calls[0].params["term"] == "24x48"  # Quotes stripped
+        
+        import json
+        filters = json.loads(api_calls[0].params["filters"])
+        assert filters[0]["attribute"] == "pa_tile-size"
+        assert filters[0]["terms"] == "24x48"  # Quotes stripped
+        assert api_calls[0].params["page"] == 1
 
     def test_filter_by_color_uses_custom_api(self):
         """Test FILTER_BY_COLOR intent uses custom API."""
@@ -57,8 +65,12 @@ class TestCustomAPIIntegration:
         assert len(api_calls) == 1
         assert CUSTOM_API_BASE in api_calls[0].endpoint
         assert "products-by-attribute" in api_calls[0].endpoint
-        assert api_calls[0].params["attribute"] == "pa_colors"
-        assert api_calls[0].params["term"] == "grey"
+        
+        import json
+        filters = json.loads(api_calls[0].params["filters"])
+        assert filters[0]["attribute"] == "pa_colors"
+        assert filters[0]["terms"] == "grey"
+        assert api_calls[0].params["page"] == 1
 
     def test_filter_by_thickness_uses_custom_api(self):
         """Test FILTER_BY_THICKNESS intent uses custom API."""
@@ -74,8 +86,12 @@ class TestCustomAPIIntegration:
         assert len(api_calls) == 1
         assert CUSTOM_API_BASE in api_calls[0].endpoint
         assert "products-by-attribute" in api_calls[0].endpoint
-        assert api_calls[0].params["attribute"] == "pa_thickness"
-        assert api_calls[0].params["term"] == "3/8"
+        
+        import json
+        filters = json.loads(api_calls[0].params["filters"])
+        assert filters[0]["attribute"] == "pa_thickness"
+        assert filters[0]["terms"] == "3/8"
+        assert api_calls[0].params["page"] == 1
 
     def test_filter_by_edge_uses_custom_api(self):
         """Test FILTER_BY_EDGE intent uses custom API."""
@@ -91,8 +107,12 @@ class TestCustomAPIIntegration:
         assert len(api_calls) == 1
         assert CUSTOM_API_BASE in api_calls[0].endpoint
         assert "products-by-attribute" in api_calls[0].endpoint
-        assert api_calls[0].params["attribute"] == "pa_edge"
-        assert api_calls[0].params["term"] == "rectified"
+        
+        import json
+        filters = json.loads(api_calls[0].params["filters"])
+        assert filters[0]["attribute"] == "pa_edge"
+        assert filters[0]["terms"] == "rectified"
+        assert api_calls[0].params["page"] == 1
 
     def test_filter_by_application_uses_custom_api(self):
         """Test FILTER_BY_APPLICATION intent uses custom API."""
@@ -108,8 +128,12 @@ class TestCustomAPIIntegration:
         assert len(api_calls) == 1
         assert CUSTOM_API_BASE in api_calls[0].endpoint
         assert "products-by-attribute" in api_calls[0].endpoint
-        assert api_calls[0].params["attribute"] == "pa_application"
-        assert api_calls[0].params["term"] == "floor"
+        
+        import json
+        filters = json.loads(api_calls[0].params["filters"])
+        assert filters[0]["attribute"] == "pa_application"
+        assert filters[0]["terms"] == "floor"
+        assert api_calls[0].params["page"] == 1
 
     def test_filter_by_material_uses_custom_api(self):
         """Test FILTER_BY_MATERIAL intent uses custom API with pa_visual."""
@@ -125,8 +149,12 @@ class TestCustomAPIIntegration:
         assert len(api_calls) == 1
         assert CUSTOM_API_BASE in api_calls[0].endpoint
         assert "products-by-attribute" in api_calls[0].endpoint
-        assert api_calls[0].params["attribute"] == "pa_visual"
-        assert api_calls[0].params["term"] == "marble"
+        
+        import json
+        filters = json.loads(api_calls[0].params["filters"])
+        assert filters[0]["attribute"] == "pa_visual"
+        assert filters[0]["terms"] == "marble"
+        assert api_calls[0].params["page"] == 1
 
     def test_product_by_visual_uses_custom_api(self):
         """Test PRODUCT_BY_VISUAL intent uses custom API."""
@@ -142,8 +170,12 @@ class TestCustomAPIIntegration:
         assert len(api_calls) == 1
         assert CUSTOM_API_BASE in api_calls[0].endpoint
         assert "products-by-attribute" in api_calls[0].endpoint
-        assert api_calls[0].params["attribute"] == "pa_visual"
-        assert api_calls[0].params["term"] == "wood"
+        
+        import json
+        filters = json.loads(api_calls[0].params["filters"])
+        assert filters[0]["attribute"] == "pa_visual"
+        assert filters[0]["terms"] == "wood"
+        assert api_calls[0].params["page"] == 1
 
     def test_product_by_origin_uses_custom_api(self):
         """Test PRODUCT_BY_ORIGIN intent uses custom API."""
@@ -159,5 +191,9 @@ class TestCustomAPIIntegration:
         assert len(api_calls) == 1
         assert CUSTOM_API_BASE in api_calls[0].endpoint
         assert "products-by-attribute" in api_calls[0].endpoint
-        assert api_calls[0].params["attribute"] == "pa_origin"
-        assert api_calls[0].params["term"] == "italy"
+        
+        import json
+        filters = json.loads(api_calls[0].params["filters"])
+        assert filters[0]["attribute"] == "pa_origin"
+        assert filters[0]["terms"] == "italy"
+        assert api_calls[0].params["page"] == 1
