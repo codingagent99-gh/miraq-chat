@@ -66,6 +66,9 @@ class Intent(Enum):
     ORDER_ITEM             = "order_item"
     QUICK_ORDER            = "quick_order"
 
+    # ──── Chit-Chat ────
+    GREETING               = "greeting"
+
     UNKNOWN                = "unknown"
 
 

@@ -23,6 +23,13 @@ def generate_bot_message(
     
     count = len(products)
 
+    # ── Greeting intent ──
+    if intent == Intent.GREETING:
+        return (
+            "👋 Hello! Welcome to our store! How can I help you today?\n\n"
+            "You can ask me about our tiles, browse categories, check your orders, or search for specific products."
+        )
+
     # ── Order-specific handling ──
     # For order intents (LAST_ORDER, ORDER_HISTORY, REORDER), handle order data first
     if intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.REORDER):
@@ -270,6 +277,15 @@ def generate_suggestions(
     """Generate follow-up suggestions based on context."""
     suggestions = []
 
+    # Greeting suggestions
+    if intent == Intent.GREETING:
+        return [
+            "Show me all products",
+            "What categories do you have?",
+            "Show me marble look tiles",
+            "Quick ship tiles",
+        ]
+
     # Order-specific suggestions
     if intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.REORDER):
         suggestions.append("Show my order history")
@@ -494,5 +510,6 @@ INTENT_LABELS = {
     Intent.QUICK_ORDER:           "order",
     Intent.PRODUCT_VARIATIONS:    "variations",
     Intent.SAMPLE_REQUEST:        "sample",
+    Intent.GREETING:              "greeting",
     Intent.UNKNOWN:               "unknown",
 }
