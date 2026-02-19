@@ -268,7 +268,7 @@ class StoreLoader:
             self.product_by_name_lower[name.lower()] = entry
             # Also index each meaningful word/token from the product name
             # e.g. "Lager Matte 24x48" → tokens: ["lager", "matte", "24x48"]
-            stop = {"tile", "tiles", "the", "a", "an", "and", "or", "of", "series"}
+            stop = {"tile", "tiles", "the", "a", "an", "and", "or", "of", "series", "product", "products"}
             for token in re.split(r'[\s\-_/]+', name.lower()):
                 token = token.strip()
                 if token and token not in stop and len(token) > 2:

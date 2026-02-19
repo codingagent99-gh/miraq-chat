@@ -205,6 +205,10 @@ def classify(utterance: str) -> ClassifiedResult:
     elif entities.collection_year:
         intent, confidence = Intent.PRODUCT_BY_COLLECTION, 0.89
 
+    # 12. EXPLICIT "show me more/all products" RULE (higher priority than entity-based classification)
+    elif re.search(r"\b(show|list|get|see)\b.*\b(more|all)\b.*\bproducts?\b", text):
+        intent, confidence = Intent.PRODUCT_LIST, 0.87
+
     # 13. PRODUCT SEARCH BY NAME
     elif entities.product_name:
         if re.search(r"\b(tell|about|detail|info|specs?|specification)\b", text):
@@ -259,6 +263,10 @@ def _extract_product_name(text: str, entities: ExtractedEntities):
     if loader:
         match = loader.get_product_for_text(text)
         if match:
+            # Skip generic words that shouldn't match as product names
+            generic_words = {"product", "products", "tile", "tiles", "item", "items"}
+            if match["name"].lower().strip() in generic_words:
+                return
             entities.product_name = match["name"]
             entities.product_slug = match.get("slug", "")
             entities.product_id = match.get("id")
