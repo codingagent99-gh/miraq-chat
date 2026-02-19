@@ -11,13 +11,34 @@ from models import ExtractedEntities
 def format_product(raw: dict) -> dict:
     """Convert raw WooCommerce product to clean response format."""
     images = raw.get("images", [])
-    image_urls = [img.get("src", "") for img in images if img.get("src")]
+    image_urls = []
+    for img in images:
+        if isinstance(img, dict):
+            src = img.get("src", "")
+            if src:
+                image_urls.append(src)
+        elif isinstance(img, str) and img:
+            image_urls.append(img)
 
     categories = raw.get("categories", [])
-    cat_names = [c.get("name", "") for c in categories]
+    cat_names = []
+    for c in categories:
+        if isinstance(c, dict):
+            name = c.get("name", "")
+            if name:
+                cat_names.append(name)
+        elif isinstance(c, str) and c:
+            cat_names.append(c)
 
     tags = raw.get("tags", [])
-    tag_names = [t.get("name", "") for t in tags]
+    tag_names = []
+    for t in tags:
+        if isinstance(t, dict):
+            name = t.get("name", "")
+            if name:
+                tag_names.append(name)
+        elif isinstance(t, str) and t:
+            tag_names.append(t)
 
     # Parse prices safely
     price = _safe_float(raw.get("price", ""))
@@ -57,7 +78,7 @@ def _format_attributes(attrs: list) -> list:
     """Format product attributes for response."""
     result = []
     for attr in attrs:
-        if attr.get("visible", False):
+        if isinstance(attr, dict) and attr.get("visible", False):
             result.append({
                 "name": attr.get("name", ""),
                 "options": attr.get("options", []),
