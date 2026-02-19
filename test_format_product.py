@@ -305,16 +305,17 @@ class TestFormatProduct:
             "tags": [],
             "attributes": [
                 {"name": "Finish", "options": ["Matte"], "visible": True},
-                "invalid_string_attribute",
+                "invalid_string_attribute",  # Should be skipped
                 {"name": "Size", "options": ["12x12"], "visible": True},
-                None,
-                {"name": "Hidden", "options": ["Value"], "visible": False},
+                None,  # Should be skipped (won't crash)
+                {"name": "Hidden", "options": ["Value"], "visible": False},  # Should be skipped (not visible)
             ],
         }
 
         formatted = format_product(raw_product)
 
-        # Should only include visible dict attributes
+        # Should only include visible dict attributes (skipping string, None, and non-visible)
+        # Expected: only "Finish" and "Size" (2 attributes)
         assert len(formatted["attributes"]) == 2
         assert formatted["attributes"][0]["name"] == "Finish"
         assert formatted["attributes"][1]["name"] == "Size"
