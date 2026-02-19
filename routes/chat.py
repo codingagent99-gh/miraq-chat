@@ -485,8 +485,8 @@ def chat():
 
     # ─── Step 2: Build API calls ───
     api_calls = build_api_calls(result)
-    logger.info(f"Step 2: Built {len(api_calls)} API call(s) | endpoints={[f'{c.method} {c.endpoint.split('/')[-1]}' for c in api_calls]}")
-
+    endpoint_summary = [f"{c.method} {c.endpoint.split('/')[-1]}" for c in api_calls]
+    logger.info(f"Step 2: Built {len(api_calls)} API call(s) | endpoints={endpoint_summary}")
     # ─── Step 2.5: Resolve user context placeholders ───
     customer_id = user_context.get("customer_id")
     if customer_id:
