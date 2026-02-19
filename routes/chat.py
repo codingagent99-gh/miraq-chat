@@ -53,7 +53,24 @@ logger = get_logger("miraq_chat")
 chat_bp = Blueprint("chat", __name__)
 
 
-# Helper functions imported from other modules (see imports above)
+def parse_address(text: str) -> dict:
+    """Parse a free-text address string into WooCommerce shipping fields."""
+    parts = [p.strip() for p in text.split(",")]
+    address: dict = {"country": "US"}
+    if len(parts) >= 1:
+        address["address_1"] = parts[0]
+    if len(parts) >= 2:
+        address["city"] = parts[1]
+    if len(parts) >= 3:
+        state_zip = parts[2].strip().split()
+        if len(state_zip) >= 2:
+            address["state"] = state_zip[0]
+            address["postcode"] = state_zip[1]
+        elif len(state_zip) == 1:
+            address["state"] = state_zip[0]
+    if len(parts) >= 4:
+        address["postcode"] = parts[3].strip()
+    return address
 
 
 @chat_bp.route("/chat", methods=["POST"])
@@ -172,6 +189,17 @@ def chat():
             # Flow handler consumed the message — return immediately
             logger.info(f"Step 0: Flow handler consumed message | new_state={flow_result.get('flow_state', 'idle')}")
             elapsed = time.time() - start_time
+            flow_metadata: dict = {
+                "flow_state": flow_result.get("flow_state", "idle"),
+                "response_time_ms": round((time.time() - start_time) * 1000),
+                "provider": "conversation_flow",
+            }
+            # Propagate pending context so the frontend can send it back on the next turn
+            for ctx_key in ("pending_product_name", "pending_product_id", "pending_quantity", "pending_shipping_address"):
+                if flow_result.get(ctx_key) is not None:
+                    flow_metadata[ctx_key] = flow_result[ctx_key]
+                elif user_context.get(ctx_key) is not None:
+                    flow_metadata[ctx_key] = user_context[ctx_key]
             return jsonify({
                 "success": True,
                 "bot_message": flow_result["bot_message"],
@@ -180,11 +208,7 @@ def chat():
                 "filters_applied": {},
                 "suggestions": flow_result.get("suggestions", []),
                 "session_id": session_id,
-                "metadata": {
-                    "flow_state": flow_result.get("flow_state", "idle"),
-                    "response_time_ms": round((time.time() - start_time) * 1000),
-                    "provider": "conversation_flow",
-                },
+                "metadata": flow_metadata,
                 "flow_state": flow_result.get("flow_state", "idle"),
             }), 200
 
@@ -201,19 +225,26 @@ def chat():
             if pending_product_id and customer_id:
                 logger.info(f"Step 0: Order confirmed via flow | product_id={pending_product_id} | quantity={pending_quantity}")
                 
-                # Build the order directly
+                # Build order body; include shipping override if user provided a new address
+                order_body: dict = {
+                    "status": "processing",
+                    "customer_id": customer_id,
+                    "payment_method": DEFAULT_PAYMENT_METHOD,
+                    "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
+                    "set_paid": False,
+                    "line_items": [{"product_id": pending_product_id, "quantity": pending_quantity}],
+                }
+                if flow_result.get("use_new_address"):
+                    raw_address = user_context.get("pending_shipping_address", "")
+                    if raw_address:
+                        order_body["shipping"] = parse_address(raw_address)
+                        logger.info(f"Step 0: Including shipping override | address={order_body['shipping']}")
+
                 order_call = WooAPICall(
                     method="POST",
                     endpoint=f"{WOO_BASE_URL}/orders",
                     params={},
-                    body={
-                        "status": "processing",
-                        "customer_id": customer_id,
-                        "payment_method": DEFAULT_PAYMENT_METHOD,
-                        "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
-                        "set_paid": False,
-                        "line_items": [{"product_id": pending_product_id, "quantity": pending_quantity}],
-                    },
+                    body=order_body,
                     description=f"Create order for '{pending_product_name}' (confirmed via flow)",
                 )
                 order_resp = woo_client.execute(order_call)
@@ -274,6 +305,82 @@ def chat():
                         "metadata": {"flow_state": FlowState.IDLE.value},
                         "flow_state": FlowState.IDLE.value,
                     }), 200
+
+        elif flow_result and flow_result.get("fetch_customer_address"):
+            # User confirmed order — fetch their shipping address before creating the order
+            pending_product_id = user_context.get("pending_product_id")
+            pending_product_name = user_context.get("pending_product_name", "")
+            pending_quantity = user_context.get("pending_quantity", 1)
+
+            shipping_address = None
+            if customer_id:
+                try:
+                    cust_call = WooAPICall(
+                        method="GET",
+                        endpoint=f"{WOO_BASE_URL}/customers/{customer_id}",
+                        params={},
+                        body={},
+                        description=f"Fetch customer {customer_id} shipping address",
+                    )
+                    cust_resp = woo_client.execute(cust_call)
+                    if cust_resp.get("success") and isinstance(cust_resp.get("data"), dict):
+                        shipping_address = cust_resp["data"].get("shipping", {})
+                except Exception as exc:
+                    logger.warning(f"Step 0: Could not fetch customer address | error={exc}")
+
+            has_address = bool(
+                shipping_address
+                and (shipping_address.get("address_1") or shipping_address.get("city"))
+            )
+
+            base_meta = {
+                "pending_product_name": pending_product_name,
+                "pending_product_id": pending_product_id,
+                "pending_quantity": pending_quantity,
+                "response_time_ms": round((time.time() - start_time) * 1000),
+            }
+
+            if has_address:
+                addr_parts = [
+                    p for p in [
+                        shipping_address.get("address_1", ""),
+                        shipping_address.get("address_2", ""),
+                        shipping_address.get("city", ""),
+                        shipping_address.get("state", ""),
+                        shipping_address.get("postcode", ""),
+                        shipping_address.get("country", ""),
+                    ] if p
+                ]
+                addr_display = ", ".join(addr_parts)
+                logger.info(f"Step 0: Showing shipping address to user | address={addr_display}")
+                return jsonify({
+                    "success": True,
+                    "bot_message": (
+                        f"Your shipping address on file:\n\n"
+                        f"📦 **{addr_display}**\n\n"
+                        "Would you like to ship to this address, or use a different one?"
+                    ),
+                    "intent": "guided_flow",
+                    "products": [],
+                    "filters_applied": {},
+                    "suggestions": ["Yes, use this address", "Change address", "Cancel"],
+                    "session_id": session_id,
+                    "metadata": {**base_meta, "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value},
+                    "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value,
+                }), 200
+            else:
+                logger.info("Step 0: No shipping address on file — prompting user to enter one")
+                return jsonify({
+                    "success": True,
+                    "bot_message": "No shipping address is on file. Please type your shipping address (street, city, state, zip code):",
+                    "intent": "guided_flow",
+                    "products": [],
+                    "filters_applied": {},
+                    "suggestions": [],
+                    "session_id": session_id,
+                    "metadata": {**base_meta, "flow_state": FlowState.AWAITING_NEW_ADDRESS.value},
+                    "flow_state": FlowState.AWAITING_NEW_ADDRESS.value,
+                }), 200
 
     # ─── Step 1: Classify intent ───
     result = classify(message)

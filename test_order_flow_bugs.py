@@ -124,8 +124,8 @@ class TestBug2QuantityExtraction:
 class TestBug3OrderConfirmationFlow:
     """Test order confirmation flow with create_order flag."""
     
-    def test_awaiting_order_confirm_returns_create_order_flag(self):
-        """Test that AWAITING_ORDER_CONFIRM state returns create_order=True on confirmation."""
+    def test_awaiting_order_confirm_returns_fetch_address_flag(self):
+        """Test that AWAITING_ORDER_CONFIRM state triggers address fetch on confirmation."""
         flow_context = {
             "pending_product_name": "Marble Tile",
             "pending_product_id": 12345,
@@ -141,12 +141,12 @@ class TestBug3OrderConfirmationFlow:
         )
         
         assert result is not None
-        assert result.get("create_order") is True
+        assert result.get("fetch_customer_address") is True
         assert result.get("pass_through") is True
-        assert result.get("flow_state") == FlowState.ORDER_COMPLETE.value
+        assert result.get("flow_state") == FlowState.AWAITING_SHIPPING_CONFIRM.value
     
     def test_awaiting_order_confirm_handles_confirmation_variations(self):
-        """Test various confirmation phrases trigger order creation."""
+        """Test various confirmation phrases trigger address fetch step."""
         flow_context = {
             "pending_product_name": "Ceramic Tile",
             "pending_product_id": 67890,
@@ -172,7 +172,7 @@ class TestBug3OrderConfirmationFlow:
             )
             
             assert result is not None, f"Failed for phrase: {phrase}"
-            assert result.get("create_order") is True, f"Failed for phrase: {phrase}"
+            assert result.get("fetch_customer_address") is True, f"Failed for phrase: {phrase}"
             assert result.get("pass_through") is True, f"Failed for phrase: {phrase}"
     
     def test_awaiting_order_confirm_handles_cancellation(self):
