@@ -333,7 +333,22 @@ def chat():
     # ─── Step 3: Execute API calls ───
     all_products_raw = []
     order_data = []
-    api_responses = woo_client.execute_all(api_calls)
+    
+    # BUG FIX: For order-create intents, skip POST /orders calls from api_builder
+    # since Step 3.6 will handle order creation. This prevents duplicate orders.
+    filtered_api_calls = []
+    if intent in ORDER_CREATE_INTENTS:
+        for call in api_calls:
+            # Skip POST /orders calls - Step 3.6 will create the order
+            if call.method == "POST" and "/orders" in call.endpoint:
+                logger.info(f"Step 3: Skipping POST /orders call from api_builder (intent={intent.value}) - Step 3.6 will handle order creation")
+                continue
+            filtered_api_calls.append(call)
+        api_calls_to_execute = filtered_api_calls
+    else:
+        api_calls_to_execute = api_calls
+    
+    api_responses = woo_client.execute_all(api_calls_to_execute)
 
     for resp in api_responses:
         if resp.get("success"):
