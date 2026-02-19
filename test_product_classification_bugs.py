@@ -248,11 +248,11 @@ class TestBug2CascadingFix:
         """Verify that 'Show me more products' does not extract 'Product' entity."""
         result = classify("Show me more products")
         # Should not have product_name='Product' or product_id=7846
-        assert result.entities.product_name != "Product" if result.entities.product_name else True
-        assert result.entities.product_id != 7846 if result.entities.product_id else True
+        assert result.entities.product_name is None or result.entities.product_name != "Product"
+        assert result.entities.product_id is None or result.entities.product_id != 7846
 
     def test_all_products_does_not_extract_product_entity(self):
         """Verify that 'all products' does not extract 'Product' entity."""
         result = classify("all products")
-        assert result.entities.product_name != "Product" if result.entities.product_name else True
-        assert result.entities.product_id != 7846 if result.entities.product_id else True
+        assert result.entities.product_name is None or result.entities.product_name != "Product"
+        assert result.entities.product_id is None or result.entities.product_id != 7846

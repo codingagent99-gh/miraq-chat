@@ -205,7 +205,9 @@ def classify(utterance: str) -> ClassifiedResult:
     elif entities.collection_year:
         intent, confidence = Intent.PRODUCT_BY_COLLECTION, 0.89
 
-    # 12. EXPLICIT "show me more/all products" RULE (higher priority than entity-based classification)
+    # 12. EXPLICIT "show me more/all products" RULE
+    # Must be BEFORE product_name check to override generic product matches
+    # Catches patterns like "show me more products" even if product_name was extracted
     elif re.search(r"\b(show|list|get|see)\b.*\b(more|all)\b.*\bproducts?\b", text):
         intent, confidence = Intent.PRODUCT_LIST, 0.87
 
