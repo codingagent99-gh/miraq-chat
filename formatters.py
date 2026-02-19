@@ -220,29 +220,29 @@ def _filter_variations_by_entities(
 
 def _entities_to_dict(entities: ExtractedEntities) -> dict:
     """Convert entities to a dict for logging/metadata."""
-    return {
-        "product_name": entities.product_name,
-        "product_id": entities.product_id,
-        "category_name": entities.category_name,
-        "category_id": entities.category_id,
-        "visual": entities.visual,
-        "finish": entities.finish,
-        "color_tone": entities.color_tone,
-        "tile_size": entities.tile_size,
-        "thickness": entities.thickness,
-        "origin": entities.origin,
-        "application": entities.application,
-        "edge": entities.edge,
-        "search_term": entities.search_term,
-        "order_id": entities.order_id,
-        "order_item_name": entities.order_item_name,
-        "order_count": entities.order_count,
-        "quantity": entities.quantity,
-        "variation_id": entities.variation_id,
-        "tag_ids": entities.tag_ids,
-        "collection_year": entities.collection_year,
-        "on_sale": entities.on_sale,
-    }
+    d = {}
+    if entities.product_name:    d["product_name"] = entities.product_name
+    if entities.product_id:      d["product_id"] = entities.product_id
+    if entities.category_name:   d["category_name"] = entities.category_name
+    if entities.category_id:     d["category_id"] = entities.category_id
+    if entities.visual:          d["visual"] = entities.visual
+    if entities.finish:          d["finish"] = entities.finish
+    if entities.color_tone:      d["color_tone"] = entities.color_tone
+    if entities.tile_size:       d["tile_size"] = entities.tile_size
+    if entities.thickness:       d["thickness"] = entities.thickness
+    if entities.origin:          d["origin"] = entities.origin
+    if entities.application:     d["application"] = entities.application
+    if entities.edge:            d["edge"] = entities.edge
+    if entities.search_term:     d["search_term"] = entities.search_term
+    if entities.order_id:        d["order_id"] = entities.order_id
+    if entities.order_item_name: d["order_item_name"] = entities.order_item_name
+    if entities.order_count:     d["order_count"] = entities.order_count
+    if entities.quantity:        d["quantity"] = entities.quantity
+    if entities.variation_id:    d["variation_id"] = entities.variation_id
+    if entities.tag_ids:         d["tag_ids"] = entities.tag_ids
+    if entities.collection_year: d["collection_year"] = entities.collection_year
+    if entities.on_sale:         d["on_sale"] = entities.on_sale
+    return d
 
 
 def _safe_float(val) -> float:

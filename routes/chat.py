@@ -38,6 +38,8 @@ from api_builder import build_api_calls
 from conversation_flow import (
     FlowState,
     handle_flow_state,
+    should_disambiguate,
+    get_disambiguation_message,
 )
 from chat_logger import get_logger, sanitize_log_string
 
@@ -287,7 +289,6 @@ def chat():
     logger.info(f"Step 1: Classified intent={intent.value} | confidence={confidence:.2f} | entities={entity_summary}")
 
     # ─── Step 1.5: Disambiguation check ───
-    from conversation_flow import should_disambiguate, get_disambiguation_message
     if should_disambiguate(intent.value, confidence):
         disambig = get_disambiguation_message()
         elapsed = time.time() - start_time
