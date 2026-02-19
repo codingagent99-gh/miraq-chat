@@ -4,6 +4,18 @@ Can be used for rule-based testing or ML model training.
 """
 
 TRAINING_DATA = [
+    # ── Greetings / Chit-Chat ──
+    {"utterance": "Hi",                         "intent": "greeting"},
+    {"utterance": "Hello",                      "intent": "greeting"},
+    {"utterance": "Hey",                        "intent": "greeting"},
+    {"utterance": "Good morning",               "intent": "greeting"},
+    {"utterance": "Good evening",               "intent": "greeting"},
+    {"utterance": "How are you?",               "intent": "greeting"},
+    {"utterance": "What's up?",                 "intent": "greeting"},
+    {"utterance": "Howdy",                      "intent": "greeting"},
+    {"utterance": "Hi there",                   "intent": "greeting"},
+    {"utterance": "Hey there!",                 "intent": "greeting"},
+
     # ── Product Discovery ──
     {"utterance": "Show me all floor tiles",          "intent": "product_list"},
     {"utterance": "What wall tiles do you have?",     "intent": "product_list"},

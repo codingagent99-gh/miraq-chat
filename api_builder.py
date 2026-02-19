@@ -58,6 +58,15 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
     calls = []
 
     # ═══════════════════════════════════════════
+    # GREETING - No API calls needed
+    # ═══════════════════════════════════════════
+    
+    if intent == Intent.GREETING:
+        # Greetings don't require any WooCommerce API calls
+        result.api_calls = []
+        return []
+
+    # ═══════════════════════════════════════════
     # ORDER HISTORY / REORDER / ORDER ITEM
     # ═══════════════════════════════════════════
 

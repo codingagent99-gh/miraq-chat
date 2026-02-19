@@ -33,8 +33,20 @@ def classify(utterance: str) -> ClassifiedResult:
 
     # ─── Intent Classification (priority order) ───
 
-    # 0. ORDER HISTORY / REORDER
-    if re.search(r"\b(repeat|reorder|re-order|order\s*again)\b", text):
+    # PRIORITY 1: GREETINGS (short unambiguous phrases)
+    if re.search(r"^\s*(hi|hello|hey|hiya|howdy|yo|sup)\s*[!.]?\s*$", text):
+        intent, confidence = Intent.GREETING, 0.99
+    elif re.search(r"^\s*good\s+(morning|afternoon|evening|day)\s*[!.]?\s*$", text):
+        intent, confidence = Intent.GREETING, 0.99
+    elif re.search(r"^\s*(how\s+are\s+you|how'?s\s+it\s+going|what'?s\s+up)\s*[?!.]?\s*$", text):
+        intent, confidence = Intent.GREETING, 0.99
+    elif re.search(r"^\s*hi\s+there\s*[!.]?\s*$", text):
+        intent, confidence = Intent.GREETING, 0.99
+    elif re.search(r"^\s*hey\s+there\s*[!.]?\s*$", text):
+        intent, confidence = Intent.GREETING, 0.99
+
+    # PRIORITY 2: ORDER HISTORY / REORDER
+    elif re.search(r"\b(repeat|reorder|re-order|order\s*again)\b", text):
         intent, confidence = Intent.REORDER, 0.95
         entities.reorder = True
         entities.order_count = 1
