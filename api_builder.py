@@ -534,26 +534,25 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             ))
 
     elif intent == Intent.PLACE_ORDER:
-        line_items = []
+        # For PLACE_ORDER, we search for the product but don't create the order here
+        # The chat endpoint Step 3.6 handles order creation with proper product resolution
+        # This prevents duplicate order creation
         if e.product_id:
-            item = {"product_id": e.product_id, "quantity": e.quantity or 1}
-            if e.variation_id:
-                item["variation_id"] = e.variation_id
-            line_items.append(item)
-        calls.append(WooAPICall(
-            method="POST",
-            endpoint=f"{BASE}/orders",
-            params={},
-            body={
-                "status": "processing",
-                "customer_id": "CURRENT_USER_ID",
-                "payment_method": "cod",
-                "payment_method_title": "Cash on Delivery",
-                "set_paid": False,
-                "line_items": line_items,
-            },
-            description="Create new order (COD)",
-        ))
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/{e.product_id}",
+                params={},
+                description=f"Fetch product id={e.product_id} for order placement",
+            ))
+        elif e.product_name or e.order_item_name:
+            search_term = e.product_name or e.order_item_name
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products",
+                params={"search": search_term, "status": "publish", "per_page": 5},
+                description=f"Find product '{search_term}' for order placement",
+            ))
+        # Note: Order creation happens in Step 3.6 of the chat endpoint
 
     # ═══════════════════════════════════════════
     # FALLBACK

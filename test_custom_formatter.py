@@ -2,7 +2,7 @@
 Test custom API response formatting.
 """
 import pytest
-from server import format_custom_product
+from formatters import format_custom_product
 
 
 class TestCustomProductFormatter:
