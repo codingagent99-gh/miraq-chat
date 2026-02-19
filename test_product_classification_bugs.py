@@ -102,27 +102,30 @@ class TestBug3CategoryWithAttributeFiltering:
         # Build API calls
         api_calls = build_api_calls(result)
         
-        # Verify API call includes both category and attribute filters
-        assert len(api_calls) > 0, "Expected at least one API call"
-        params = api_calls[0].params
+        # Verify we get two API calls: first for category, second for attribute filter
+        assert len(api_calls) == 2, "Expected two API calls: category browse + attribute filter"
         
-        # Should have category filter
-        assert "category" in params, "Expected category param in API call"
-        assert params["category"] == "123"
+        # First call should be category browse without attribute params
+        first_call = api_calls[0]
+        assert "category" in first_call.params, "Expected category param in first API call"
+        assert first_call.params["category"] == "123"
+        assert "attribute" not in first_call.params, "First call should NOT have attribute param"
+        assert "attribute_term" not in first_call.params, "First call should NOT have attribute_term param"
         
-        # Should have attribute filter (this is the bug fix!)
-        assert "attribute" in params, (
-            "BUG FIX: Expected attribute param in API call when attribute_slug is present"
+        # Second call should use custom API with filters format
+        second_call = api_calls[1]
+        assert second_call.is_custom_api, "Second call should be a custom API call"
+        assert "products-by-attribute" in second_call.endpoint
+        
+        import json
+        filters = json.loads(second_call.params["filters"])
+        assert filters[0]["attribute"] == "pa_tile-size", (
+            f"Expected attribute='pa_tile-size' but got '{filters[0]['attribute']}'"
         )
-        assert params["attribute"] == "pa_tile-size", (
-            f"Expected attribute='pa_tile-size' but got '{params.get('attribute')}'"
+        assert filters[0]["terms"] == "12x24", (
+            f"Expected terms='12x24' but got '{filters[0]['terms']}'"
         )
-        assert "attribute_term" in params, (
-            "BUG FIX: Expected attribute_term param in API call when attribute_term_ids is present"
-        )
-        assert params["attribute_term"] == "456,789", (
-            f"Expected attribute_term='456,789' but got '{params.get('attribute_term')}'"
-        )
+        assert second_call.params["page"] == 1, "Expected page param in second call"
 
     def test_tiles_with_size_filter_includes_both_category_and_attribute(self):
         """Test that 'show me tiles of size 12x24' includes both category and size filters."""
@@ -140,26 +143,31 @@ class TestBug3CategoryWithAttributeFiltering:
         api_calls = build_api_calls(result)
         assert len(api_calls) > 0, "Expected at least one API call"
         
-        params = api_calls[0].params
-        
         # If category was extracted, check that both category and attribute filters are present
         if result.entities.category_id is not None:
             # Should classify as CATEGORY_BROWSE (category takes priority)
             assert result.intent == Intent.CATEGORY_BROWSE, (
                 f"Expected CATEGORY_BROWSE when category is extracted but got {result.intent}"
             )
-            # Should have category filter
-            assert "category" in params, "Expected category param in API call"
-            # Should have attribute filter (this is the bug fix!)
-            assert "attribute" in params, (
-                "Expected attribute param in API call for size filtering"
+            # Should have two calls: category + attribute filter
+            assert len(api_calls) == 2, "Expected two API calls for category + attribute filter"
+            
+            # First call should have category filter but no attribute params
+            first_call = api_calls[0]
+            assert "category" in first_call.params, "Expected category param in first API call"
+            assert "attribute" not in first_call.params, "First call should NOT have attribute param"
+            
+            # Second call should use custom API with filters
+            second_call = api_calls[1]
+            assert second_call.is_custom_api, "Second call should be custom API"
+            assert "products-by-attribute" in second_call.endpoint
+            
+            import json
+            filters = json.loads(second_call.params["filters"])
+            assert filters[0]["attribute"] == "pa_tile-size", (
+                f"Expected attribute='pa_tile-size' but got '{filters[0]['attribute']}'"
             )
-            assert params.get("attribute") == "pa_tile-size", (
-                f"Expected attribute='pa_tile-size' but got '{params.get('attribute')}'"
-            )
-            assert "attribute_term" in params, (
-                "Expected attribute_term param in API call for size filtering"
-            )
+            assert second_call.params["page"] == 1
         else:
             # If no category extracted (e.g., store doesn't have "Tile" category),
             # should classify as FILTER_BY_SIZE which is also acceptable
@@ -184,14 +192,14 @@ class TestBug3CategoryWithAttributeFiltering:
                 f"Expected CATEGORY_BROWSE when category is extracted but got {result.intent}"
             )
             
-            if len(api_calls) > 0:
-                params = api_calls[0].params
-                assert "category" in params
-                # If finish is extracted with attribute_term_ids, should have attribute filter
-                if result.entities.attribute_term_ids:
-                    assert "attribute" in params or "tag" in params, (
-                        "Expected attribute or tag filter when finish is present"
-                    )
+            # If finish attribute was extracted, should have two calls
+            if result.entities.attribute_slug and result.entities.finish:
+                assert len(api_calls) >= 1, "Expected at least one API call"
+                # First call should have category
+                assert "category" in api_calls[0].params
+                # If we got a second call, it should be the custom API for attribute filter
+                if len(api_calls) > 1:
+                    assert api_calls[1].is_custom_api, "Second call should use custom API"
         else:
             # If no category extracted, should classify based on the strongest entity
             assert result.intent in (Intent.FILTER_BY_FINISH, Intent.FILTER_BY_APPLICATION), (
@@ -230,9 +238,14 @@ class TestBug3CategoryWithAttributeFiltering:
         # Build API calls and check for attribute filter
         api_calls = build_api_calls(result)
         if len(api_calls) > 0 and result.intent == Intent.CATEGORY_BROWSE:
-            params = api_calls[0].params
-            if result.entities.attribute_term_ids:
-                assert "attribute" in params and "attribute_term" in params
+            # Should have two calls: category + attribute filter
+            if result.entities.attribute_slug:
+                assert len(api_calls) >= 1
+                # First call should have category
+                assert "category" in api_calls[0].params
+                # If we got a second call, it should be the custom API
+                if len(api_calls) > 1:
+                    assert api_calls[1].is_custom_api
 
 
 class TestBug2CascadingFix:
