@@ -11,6 +11,19 @@ from store_registry import get_store_loader
 BASE = "https://wgc.net.in/hn/wp-json/wc/v3"
 CUSTOM_API_BASE = "https://wgc.net.in/hn/wp-json/custom-api/v1"
 
+# Mapping of attribute slugs to entity value resolvers
+# Used to extract term values from entities for custom API calls
+ATTRIBUTE_TO_ENTITY_RESOLVER = {
+    "pa_tile-size": lambda ent: (ent.tile_size or "").replace('"', ''),
+    "pa_finish": lambda ent: ent.finish or "",
+    "pa_colors": lambda ent: ent.color_tone or "",
+    "pa_thickness": lambda ent: ent.thickness or "",
+    "pa_edge": lambda ent: ent.edge or "",
+    "pa_application": lambda ent: ent.application or "",
+    "pa_visual": lambda ent: ent.visual or "",
+    "pa_origin": lambda ent: ent.origin or "",
+}
+
 
 def _loader():
     """Convenience accessor for StoreLoader."""
@@ -128,16 +141,25 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             params["on_sale"] = "true"
         if e.tag_ids:
             params["tag"] = str(e.tag_ids[0])
-        # Apply attribute filters if present (size, finish, color, etc.)
-        if e.attribute_slug and e.attribute_term_ids:
-            params["attribute"] = e.attribute_slug
-            params["attribute_term"] = ",".join(str(tid) for tid in e.attribute_term_ids)
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
             params=params,
             description=f"Browse category '{e.category_name}' (id={e.category_id})",
         ))
+        
+        # If attribute filters present, add custom API call for attribute filtering
+        if e.attribute_slug:
+            resolver = ATTRIBUTE_TO_ENTITY_RESOLVER.get(e.attribute_slug)
+            term_value = resolver(e) if resolver else ""
+            if term_value:
+                calls.append(WooAPICall(
+                    method="GET",
+                    endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
+                    params={"attribute": e.attribute_slug, "term": term_value},
+                    description=f"Filter category '{e.category_name}' by {e.attribute_slug}: {term_value}",
+                    is_custom_api=True,
+                ))
 
     elif intent == Intent.CATEGORY_LIST:
         calls.append(WooAPICall(

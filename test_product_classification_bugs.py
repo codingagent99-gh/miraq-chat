@@ -82,8 +82,9 @@ class TestBug3CategoryWithAttributeFiltering:
     """Test Bug 3: Category browse should include attribute filters when present."""
 
     def test_api_builder_category_browse_includes_attribute_filters(self):
-        """Test that api_builder includes attribute filters for CATEGORY_BROWSE intent."""
+        """Test that api_builder uses custom API for attribute filters in CATEGORY_BROWSE."""
         from models import ClassifiedResult, ExtractedEntities, Intent
+        from api_builder import CUSTOM_API_BASE
         
         # Create a mock classification result with both category and attribute
         entities = ExtractedEntities()
@@ -102,27 +103,35 @@ class TestBug3CategoryWithAttributeFiltering:
         # Build API calls
         api_calls = build_api_calls(result)
         
-        # Verify API call includes both category and attribute filters
-        assert len(api_calls) > 0, "Expected at least one API call"
-        params = api_calls[0].params
+        # Should have TWO API calls: category browse + attribute filter
+        assert len(api_calls) == 2, f"Expected 2 API calls but got {len(api_calls)}"
         
-        # Should have category filter
-        assert "category" in params, "Expected category param in API call"
-        assert params["category"] == "123"
+        # First call: standard category browse (WITHOUT attribute params)
+        category_call = api_calls[0]
+        assert "category" in category_call.params, "Expected category param in first API call"
+        assert category_call.params["category"] == "123"
+        assert "attribute" not in category_call.params, (
+            "First call should NOT have attribute param (should use custom API instead)"
+        )
+        assert "attribute_term" not in category_call.params, (
+            "First call should NOT have attribute_term param (should use custom API instead)"
+        )
         
-        # Should have attribute filter (this is the bug fix!)
-        assert "attribute" in params, (
-            "BUG FIX: Expected attribute param in API call when attribute_slug is present"
+        # Second call: custom API for attribute filtering
+        attr_call = api_calls[1]
+        assert CUSTOM_API_BASE in attr_call.endpoint, (
+            f"Expected custom API endpoint but got {attr_call.endpoint}"
         )
-        assert params["attribute"] == "pa_tile-size", (
-            f"Expected attribute='pa_tile-size' but got '{params.get('attribute')}'"
+        assert "products-by-attribute" in attr_call.endpoint, (
+            f"Expected products-by-attribute endpoint but got {attr_call.endpoint}"
         )
-        assert "attribute_term" in params, (
-            "BUG FIX: Expected attribute_term param in API call when attribute_term_ids is present"
+        assert attr_call.params["attribute"] == "pa_tile-size", (
+            f"Expected attribute='pa_tile-size' but got '{attr_call.params.get('attribute')}'"
         )
-        assert params["attribute_term"] == "456,789", (
-            f"Expected attribute_term='456,789' but got '{params.get('attribute_term')}'"
+        assert attr_call.params["term"] == "12x24", (
+            f"Expected term='12x24' (from tile_size) but got '{attr_call.params.get('term')}'"
         )
+        assert attr_call.is_custom_api is True, "Expected is_custom_api=True for custom endpoint"
 
     def test_tiles_with_size_filter_includes_both_category_and_attribute(self):
         """Test that 'show me tiles of size 12x24' includes both category and size filters."""
