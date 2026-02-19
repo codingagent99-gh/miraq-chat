@@ -370,27 +370,26 @@ def chat():
                 new_entities = ExtractedEntities()
                 
                 # Map LLM entity fields to ExtractedEntities fields
-                if "product_name" in llm_entities_dict:
-                    new_entities.product_name = llm_entities_dict["product_name"]
-                if "category_name" in llm_entities_dict:
-                    new_entities.category_name = llm_entities_dict["category_name"]
-                if "finish" in llm_entities_dict:
-                    new_entities.finish = llm_entities_dict["finish"]
-                if "color_tone" in llm_entities_dict:
-                    new_entities.color_tone = llm_entities_dict["color_tone"]
-                if "tile_size" in llm_entities_dict:
-                    new_entities.tile_size = llm_entities_dict["tile_size"]
-                if "application" in llm_entities_dict:
-                    new_entities.application = llm_entities_dict["application"]
-                if "visual" in llm_entities_dict:
-                    new_entities.visual = llm_entities_dict["visual"]
+                entity_field_map = {
+                    "product_name": "product_name",
+                    "category_name": "category_name",
+                    "finish": "finish",
+                    "color_tone": "color_tone",
+                    "tile_size": "tile_size",
+                    "application": "application",
+                    "visual": "visual",
+                }
+                
+                for llm_field, entity_field in entity_field_map.items():
+                    if llm_field in llm_entities_dict:
+                        setattr(new_entities, entity_field, llm_entities_dict[llm_field])
                 
                 # Merge with original entities if entity_extracted
                 if fallback_type == "entity_extracted":
                     # Keep original entities and merge with new ones
-                    for field in ["product_name", "category_name", "finish", "color_tone", "tile_size", "application", "visual"]:
-                        if not getattr(new_entities, field) and getattr(entities, field):
-                            setattr(new_entities, field, getattr(entities, field))
+                    for entity_field in entity_field_map.values():
+                        if not getattr(new_entities, entity_field) and getattr(entities, entity_field):
+                            setattr(new_entities, entity_field, getattr(entities, entity_field))
                 
                 # Map intent string to Intent enum
                 llm_intent_str = llm_result.get("intent", "unknown")

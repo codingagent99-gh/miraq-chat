@@ -60,8 +60,9 @@ def _sanitize_for_llm(text: str) -> str:
     text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', '[EMAIL]', text)
     
     # Remove phone numbers (various formats)
-    text = re.sub(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', '[PHONE]', text)
+    # Do this before SSN check since patterns can overlap
     text = re.sub(r'\b\+?\d{1,3}[-.\s]?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,9}\b', '[PHONE]', text)
+    text = re.sub(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', '[PHONE]', text)
     
     # Remove credit card numbers (basic pattern)
     text = re.sub(r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b', '[CARD]', text)
@@ -116,10 +117,10 @@ def _build_store_context(store_loader) -> Dict[str, Any]:
                     t.get("name", "") for t in terms if t.get("name")
                 ]
     
-    # Tag names (colors, origins, visual styles)
+    # Tag names (first 50 for prompt size limit)
     context["tags"] = [
         {"id": t.get("id"), "name": t.get("name", ""), "slug": t.get("slug", "")}
-        for t in store_loader.tags[:50]  # Limit to 50 most relevant tags
+        for t in store_loader.tags[:50]  # Limit to first 50 tags
         if t.get("name")
     ]
     

@@ -146,6 +146,16 @@ class TestSystemPromptBuilding:
 class TestLLMClient:
     """Test LLM client initialization and configuration."""
     
+    @pytest.fixture(autouse=True)
+    def clean_env(self):
+        """Clean up environment variables after each test."""
+        import os
+        original_env = os.environ.copy()
+        yield
+        # Restore original environment
+        os.environ.clear()
+        os.environ.update(original_env)
+    
     def test_llm_client_init_copilot(self):
         """LLMClient should initialize with Copilot provider."""
         # Set environment before importing
