@@ -308,10 +308,10 @@ def chat():
     elif should_disambiguate(intent.value, confidence):
         should_try_llm = True
         llm_trigger_reason = "low_confidence"
-    elif intent == Intent.PRODUCT_SEARCH and not entities.product_name and entities.category_id is None:
+    elif intent == Intent.PRODUCT_SEARCH and entities.product_name is None and entities.category_id is None:
         should_try_llm = True
         llm_trigger_reason = "missing_entities"
-    elif intent in ORDER_CREATE_INTENTS and not entities.order_item_name and not entities.product_name:
+    elif intent in ORDER_CREATE_INTENTS and entities.order_item_name is None and entities.product_name is None:
         should_try_llm = True
         llm_trigger_reason = "missing_entities"
     
@@ -388,8 +388,10 @@ def chat():
                 if fallback_type == "entity_extracted":
                     # Keep original entities and merge with new ones
                     for entity_field in entity_field_map.values():
-                        if not getattr(new_entities, entity_field) and getattr(entities, entity_field):
-                            setattr(new_entities, entity_field, getattr(entities, entity_field))
+                        new_val = getattr(new_entities, entity_field)
+                        orig_val = getattr(entities, entity_field)
+                        if new_val is None and orig_val is not None:
+                            setattr(new_entities, entity_field, orig_val)
                 
                 # Map intent string to Intent enum
                 llm_intent_str = llm_result.get("intent", "unknown")

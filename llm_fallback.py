@@ -59,9 +59,10 @@ def _sanitize_for_llm(text: str) -> str:
     # Remove email addresses
     text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', '[EMAIL]', text)
     
-    # Remove phone numbers (various formats)
-    # Do this before SSN check since patterns can overlap
+    # Remove phone numbers - use most specific pattern first to avoid overlaps
+    # International format with country code
     text = re.sub(r'\b\+?\d{1,3}[-.\s]?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,9}\b', '[PHONE]', text)
+    # Standard US format
     text = re.sub(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', '[PHONE]', text)
     
     # Remove credit card numbers (basic pattern)
@@ -512,8 +513,7 @@ def llm_fallback(
                 "llm_output_tokens": llm_response["output_tokens"],
                 "llm_latency_ms": llm_response["latency_ms"],
                 "llm_cost_estimate": round(total_cost, 4),
-                "llm_fallback_reason": trigger_reason,
-                "llm_trigger_reason": trigger_reason,
+                "llm_trigger_reason": trigger_reason,  # Why LLM was called
                 "original_intent": original_intent,
                 "original_confidence": original_confidence,
                 "provider": "llm_fallback",
