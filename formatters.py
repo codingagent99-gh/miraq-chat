@@ -8,6 +8,45 @@ from typing import List
 from models import ExtractedEntities
 
 
+def format_category(raw: dict) -> dict:
+    """Convert raw WooCommerce category to clean response format."""
+    image = raw.get("image")
+    image_url = ""
+    if isinstance(image, dict):
+        image_url = image.get("src", "")
+
+    return {
+        "id": raw.get("id"),
+        "name": raw.get("name", ""),
+        "slug": raw.get("slug", ""),
+        "parent": raw.get("parent", 0),
+        "count": raw.get("count", 0),
+        "description": _clean_html(raw.get("description", "")),
+        "image": image_url,
+        # Keep product-compatible fields so the response schema stays consistent
+        "price": 0.0,
+        "regular_price": 0.0,
+        "sale_price": None,
+        "on_sale": False,
+        "in_stock": True,
+        "stock_status": "",
+        "sku": "",
+        "permalink": "",
+        "total_sales": 0,
+        "short_description": _clean_html(raw.get("description", "")),
+        "categories": [],
+        "tags": [],
+        "images": [image_url] if image_url else [],
+        "average_rating": "0.00",
+        "rating_count": 0,
+        "weight": "",
+        "dimensions": {"length": "", "width": "", "height": ""},
+        "attributes": [],
+        "variations": [],
+        "type": "category",
+    }
+
+
 def format_product(raw: dict) -> dict:
     """Convert raw WooCommerce product to clean response format."""
     images = raw.get("images", [])
