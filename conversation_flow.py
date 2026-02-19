@@ -20,6 +20,9 @@ class FlowState(Enum):
     SHOWING_RESULTS = "showing_results"    # Results displayed, user may order or refine
     AWAITING_QUANTITY = "awaiting_quantity" # MQ asked: how many?
     AWAITING_ORDER_CONFIRM = "awaiting_order_confirm"  # MQ asked: Place order for N items. OK?
+    AWAITING_SHIPPING_CONFIRM = "awaiting_shipping_confirm"  # Show address, ask use/change
+    AWAITING_NEW_ADDRESS = "awaiting_new_address"            # User typing new address
+    AWAITING_ADDRESS_CONFIRM = "awaiting_address_confirm"    # Confirm the newly typed address
     ORDER_COMPLETE = "order_complete"       # Order placed
     AWAITING_ANYTHING_ELSE = "awaiting_anything_else"  # MQ asked: anything else?
     CLOSING = "closing"                     # User said no, chat closing
@@ -165,9 +168,9 @@ def handle_flow_state(
     if state == FlowState.AWAITING_ORDER_CONFIRM:
         if any(kw in text for kw in ["yes", "ok", "confirm", "sure", "go ahead", "place"]):
             return {
-                "flow_state": FlowState.ORDER_COMPLETE.value,
-                "pass_through": True,  # Let the order creation pipeline execute
-                "create_order": True,
+                "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value,
+                "fetch_customer_address": True,
+                "pass_through": True,
             }
         elif any(kw in text for kw in ["no", "cancel", "stop", "don't"]):
             return {
@@ -177,6 +180,70 @@ def handle_flow_state(
                     "Browse categories",
                     "No, thank you",
                 ],
+                "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
+                "pass_through": False,
+            }
+
+    # ── State: Awaiting shipping address confirmation ──
+    if state == FlowState.AWAITING_SHIPPING_CONFIRM:
+        if any(kw in text for kw in ["yes", "use this", "ship here", "ok", "confirm", "correct", "sure"]):
+            return {
+                "flow_state": FlowState.ORDER_COMPLETE.value,
+                "create_order": True,
+                "pass_through": True,
+                "use_existing_address": True,
+            }
+        elif any(kw in text for kw in ["change", "new address", "different", "update"]):
+            return {
+                "bot_message": "Please type your new shipping address (street, city, state, zip code):",
+                "flow_state": FlowState.AWAITING_NEW_ADDRESS.value,
+                "pass_through": False,
+            }
+        elif any(kw in text for kw in ["cancel", "no", "stop"]):
+            return {
+                "bot_message": "No problem! Order cancelled. Is there anything else I can help with?",
+                "suggestions": ["Show me products", "Browse categories", "No, thank you"],
+                "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
+                "pass_through": False,
+            }
+
+    # ── State: Awaiting new shipping address input ──
+    if state == FlowState.AWAITING_NEW_ADDRESS:
+        if any(kw in text for kw in ["cancel", "stop"]):
+            return {
+                "bot_message": "No problem! Order cancelled. Is there anything else I can help with?",
+                "suggestions": ["Show me products", "Browse categories", "No, thank you"],
+                "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
+                "pass_through": False,
+            }
+        # Accept any other text as the new address
+        return {
+            "flow_state": FlowState.AWAITING_ADDRESS_CONFIRM.value,
+            "pending_shipping_address": message.strip(),
+            "bot_message": f"Ship to: **{message.strip()}**\n\nIs that correct?",
+            "suggestions": ["Yes, correct", "Re-enter address", "Cancel"],
+            "pass_through": False,
+        }
+
+    # ── State: Awaiting confirmation of new address ──
+    if state == FlowState.AWAITING_ADDRESS_CONFIRM:
+        if any(kw in text for kw in ["yes", "confirm", "correct", "ok", "sure"]):
+            return {
+                "flow_state": FlowState.ORDER_COMPLETE.value,
+                "create_order": True,
+                "pass_through": True,
+                "use_new_address": True,
+            }
+        elif any(kw in text for kw in ["re-enter", "change", "wrong", "different", "no"]):
+            return {
+                "bot_message": "Please type your new shipping address (street, city, state, zip code):",
+                "flow_state": FlowState.AWAITING_NEW_ADDRESS.value,
+                "pass_through": False,
+            }
+        elif any(kw in text for kw in ["cancel", "stop"]):
+            return {
+                "bot_message": "No problem! Order cancelled. Is there anything else I can help with?",
+                "suggestions": ["Show me products", "Browse categories", "No, thank you"],
                 "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
                 "pass_through": False,
             }
