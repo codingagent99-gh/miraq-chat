@@ -22,6 +22,7 @@ def classify(utterance: str) -> ClassifiedResult:
     _extract_finish(text, entities)
     _extract_visual(text, entities)
     _extract_origin(text, entities)
+    _extract_sample_size(text, entities)  # BEFORE _extract_size()
     _extract_size(text, entities)
     _extract_thickness(text, entities)
     _extract_application(text, entities)
@@ -122,7 +123,8 @@ def classify(utterance: str) -> ClassifiedResult:
         entities.on_sale = True
 
     # 3. SAMPLE REQUESTS
-    elif re.search(r"\bsample\b", text):
+    # Only match generic "sample" if it's NOT "sample size" (which should be an attribute filter)
+    elif re.search(r"\bsample\b", text) and not re.search(r"\bsample\s+size\b", text) and not entities.sample_size:
         intent, confidence = Intent.SAMPLE_REQUEST, 0.90
 
     elif re.search(r"\bchip\s*cards?\b", text):
@@ -169,7 +171,19 @@ def classify(utterance: str) -> ClassifiedResult:
 
     # 7. CATEGORY MATCH
     elif entities.category_id is not None:
-        intent, confidence = Intent.CATEGORY_BROWSE, 0.94
+        has_attributes = any([
+            entities.finish, entities.tile_size, entities.sample_size,
+            entities.color_tone, entities.thickness, entities.visual,
+            entities.origin, entities.application,
+        ])
+        if entities.product_name and has_attributes:
+            intent, confidence = Intent.PRODUCT_SEARCH_IN_CATEGORY, 0.96
+        elif entities.product_name:
+            intent, confidence = Intent.PRODUCT_SEARCH_IN_CATEGORY, 0.95
+        elif has_attributes:
+            intent, confidence = Intent.CATEGORY_BROWSE_FILTERED, 0.95
+        else:
+            intent, confidence = Intent.CATEGORY_BROWSE, 0.94
 
     elif re.search(r"\b(what|list|show|all)\b.*\bcategor(y|ies)\b", text):
         intent, confidence = Intent.CATEGORY_LIST, 0.91
@@ -179,6 +193,9 @@ def classify(utterance: str) -> ClassifiedResult:
         intent, confidence = Intent.FILTER_BY_FINISH, 0.89
 
     elif entities.tile_size:
+        intent, confidence = Intent.FILTER_BY_SIZE, 0.90
+
+    elif entities.sample_size:
         intent, confidence = Intent.FILTER_BY_SIZE, 0.90
 
     elif entities.color_tone and not entities.product_name:
@@ -393,11 +410,65 @@ def _extract_origin(text: str, entities: ExtractedEntities):
             break
 
 
+def _extract_sample_size(text: str, entities: ExtractedEntities):
+    """
+    Extract sample size from user text when 'sample' keyword is present.
+    Resolves to pa_sample-size attribute.
+    Handles: "sample size 12x24", "12x24 sample", "small sample", "large sample"
+    """
+    # Only trigger if 'sample' is in the text
+    if not re.search(r'\bsample\b', text):
+        return
+    
+    loader = get_store_loader()
+
+    # 1. Numeric size pattern: "12x24", "12 x 24", "12 by 24"
+    size_match = re.search(r'(\d+)\s*(?:x|by|×|X)\s*(\d+)', text)
+    if size_match:
+        w, h = size_match.group(1), size_match.group(2)
+        size_str = f"{w}x{h}"
+        entities.sample_size = f'{w}"x{h}"' if len(w) > 1 else size_str
+        entities.attribute_slug = "pa_sample-size"
+        if loader:
+            term_ids = loader.get_attribute_term_ids("pa_sample-size", size_str)
+            if not term_ids:
+                # Try with quotes e.g. "12\"x24\""
+                term_ids = loader.get_attribute_term_ids("pa_sample-size", f'{w}"x{h}"')
+            entities.attribute_term_ids = term_ids
+        return
+
+    # 2. Descriptive sample size keywords
+    SAMPLE_SIZE_KEYWORDS = {
+        "small sample": ["small", "6x", "3x"],
+        "large sample": ["large", "12x", "18x"],
+        "medium sample": ["medium", "9x"],
+    }
+    if loader:
+        all_terms = loader.get_all_attribute_terms("pa_sample-size")
+        for phrase, hints in SAMPLE_SIZE_KEYWORDS.items():
+            if re.search(rf"\b{re.escape(phrase)}\b", text):
+                matched_ids = []
+                for term in all_terms:
+                    term_name = term.get("name", "").lower()
+                    if any(h in term_name for h in hints):
+                        matched_ids.append(term["id"])
+                if matched_ids:
+                    entities.sample_size = phrase.title()
+                    entities.attribute_slug = "pa_sample-size"
+                    entities.attribute_term_ids = matched_ids
+                    return
+
+
 def _extract_size(text: str, entities: ExtractedEntities):
     """
     Extract tile size from user text and resolve to live pa_tile-size term IDs.
     Handles: "24x48", "24 by 48", "24x48 tiles", "large format", "large", "small"
+    Skips extraction if sample_size is already populated.
     """
+    # Skip if sample_size is already set
+    if entities.sample_size:
+        return
+    
     loader = get_store_loader()
 
     # 1. Numeric size pattern: "24x48", "24 x 48", "24 by 48", "24×48"

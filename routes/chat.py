@@ -288,6 +288,15 @@ def chat():
             "product_id": entities.product_id,
             "order_item_name": entities.order_item_name,
             "quantity": entities.quantity,
+            "tile_size": entities.tile_size,
+            "sample_size": entities.sample_size,
+            "finish": entities.finish,
+            "color_tone": entities.color_tone,
+            "visual": entities.visual,
+            "origin": entities.origin,
+            "application": entities.application,
+            "thickness": entities.thickness,
+            "attribute_slug": entities.attribute_slug,
         }.items() if v is not None
     }
     logger.info(f"Step 1: Classified intent={intent.value} | confidence={confidence:.2f} | entities={entity_summary}")
