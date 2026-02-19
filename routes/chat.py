@@ -22,6 +22,7 @@ from woo_client import woo_client
 from formatters import (
     format_product,
     format_custom_product,
+    format_category,
     format_variation,
     _filter_variations_by_entities,
     _entities_to_dict,
@@ -846,12 +847,21 @@ def chat():
 
     # ─── Step 4: Format products ───
     products = []
-    for p in all_products_raw:
-        # Detect custom API format by checking for "featured_image" key
-        if "featured_image" in p:
-            products.append(format_custom_product(p))
-        else:
-            products.append(format_product(p))
+    if intent == Intent.CATEGORY_LIST:
+        # Deduplicate categories by name and format them properly
+        seen_names = set()
+        for cat in all_products_raw:
+            name = cat.get("name", "")
+            if name and name not in seen_names:
+                seen_names.add(name)
+                products.append(format_category(cat))
+    else:
+        for p in all_products_raw:
+            # Detect custom API format by checking for "featured_image" key
+            if "featured_image" in p:
+                products.append(format_custom_product(p))
+            else:
+                products.append(format_product(p))
 
     # Filter out private/draft products
     products = [p for p in products if p.get("name")]

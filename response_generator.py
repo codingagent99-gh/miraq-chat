@@ -255,6 +255,12 @@ def generate_bot_message(
         msg += f"Found **{count}** mosaic products! 🧩\n\n"
     elif intent == Intent.CATEGORY_LIST:
         msg += f"Here are our product categories! 📂\n\n"
+        for p in products[:MAX_DISPLAYED_ITEMS]:
+            count_str = f"({p.get('count', 0)} products)" if p.get('count', 0) > 0 else ""
+            msg += f"• **{p['name']}** {count_str}\n"
+        if len(products) > MAX_DISPLAYED_ITEMS:
+            msg += f"\n...and {len(products) - MAX_DISPLAYED_ITEMS} more categories."
+        return msg
     else:
         msg += f"Here are **{count}** products I found! 🛍️\n\n"
 
