@@ -265,8 +265,9 @@ class TestGreetingWhitespace:
         assert result.intent == Intent.GREETING
 
     def test_greeting_with_multiple_spaces(self):
-        """Test 'good  morning' with multiple spaces."""
+        """Test 'good  morning' with multiple spaces - regex still matches."""
         result = classify("good  morning")
-        # This might not match due to regex, which is expected behavior
-        # We only want to match normal greetings, not malformed ones
-        pass
+        # The \s+ in regex matches one or more spaces, so this still matches
+        # This is acceptable behavior - we want to be flexible with whitespace
+        assert result.intent == Intent.GREETING
+        assert result.confidence == 0.99
