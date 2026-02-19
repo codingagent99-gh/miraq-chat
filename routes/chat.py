@@ -311,9 +311,15 @@ def chat():
     elif intent == Intent.PRODUCT_SEARCH and entities.product_name is None and entities.category_id is None:
         should_try_llm = True
         llm_trigger_reason = "missing_entities"
+        
+    # For order-create intents, check last_product context BEFORE triggering LLM
     elif intent in ORDER_CREATE_INTENTS and entities.order_item_name is None and entities.product_name is None:
-        should_try_llm = True
-        llm_trigger_reason = "missing_entities"
+        # Check if frontend sent last_product context — if so, skip LLM,
+        # let the pipeline reach Step 3.6 where last_product_ctx is used
+        last_product_ctx_check = user_context.get("last_product")
+        if not (last_product_ctx_check and last_product_ctx_check.get("id")):
+            should_try_llm = True
+            llm_trigger_reason = "missing_entities"
     
     if should_try_llm and LLM_FALLBACK_ENABLED:
         # Try LLM fallback
