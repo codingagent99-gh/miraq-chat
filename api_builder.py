@@ -414,13 +414,22 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         ))
 
     elif intent == Intent.FILTER_BY_SIZE:
-        size_term = e.tile_size.replace('"', '') if e.tile_size else ""
-        filters = [{"attribute": "pa_tile-size", "terms": size_term}]
+        # Handle both tile_size and sample_size
+        if e.sample_size:
+            size_term = e.sample_size.replace('"', '')
+            attribute_slug = "pa_sample-size"
+            description = f"Filter by sample size: {e.sample_size}"
+        else:
+            size_term = e.tile_size.replace('"', '') if e.tile_size else ""
+            attribute_slug = "pa_tile-size"
+            description = f"Filter by tile size: {e.tile_size}"
+        
+        filters = [{"attribute": attribute_slug, "terms": size_term}]
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
             params={"filters": json.dumps(filters), "page": 1},
-            description=f"Filter by tile size: {e.tile_size}",
+            description=description,
             is_custom_api=True,
         ))
 

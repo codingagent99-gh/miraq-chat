@@ -123,7 +123,8 @@ def classify(utterance: str) -> ClassifiedResult:
         entities.on_sale = True
 
     # 3. SAMPLE REQUESTS
-    elif re.search(r"\bsample\b", text):
+    # Only match generic "sample" if it's NOT "sample size" (which should be an attribute filter)
+    elif re.search(r"\bsample\b", text) and not re.search(r"\bsample\s+size\b", text) and not entities.sample_size:
         intent, confidence = Intent.SAMPLE_REQUEST, 0.90
 
     elif re.search(r"\bchip\s*cards?\b", text):
