@@ -26,6 +26,7 @@ class FlowState(Enum):
     ORDER_COMPLETE = "order_complete"       # Order placed
     AWAITING_ANYTHING_ELSE = "awaiting_anything_else"  # MQ asked: anything else?
     CLOSING = "closing"                     # User said no, chat closing
+    AWAITING_VARIANT_SELECTION = "awaiting_variant_selection"  # MQ asked: which variant?
 
 
 @dataclass
@@ -43,6 +44,7 @@ class ConversationContext:
     pending_product_id: Optional[int] = None
     pending_product_name: Optional[str] = None
     pending_quantity: Optional[int] = None
+    pending_variation_id: Optional[int] = None
     
     # Disambiguation context
     user_choice: Optional[str] = None  # "product", "category", "order"
@@ -276,5 +278,20 @@ def handle_flow_state(
                 "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
                 "pass_through": False,
             }
+
+    # ── State: Awaiting variant selection for a variable product ──
+    if state == FlowState.AWAITING_VARIANT_SELECTION:
+        if any(kw in text for kw in ["cancel", "stop", "nevermind", "never mind"]):
+            return {
+                "bot_message": "No problem! Order cancelled. Is there anything else I can help with?",
+                "suggestions": ["Show me products", "Browse categories", "No, thank you"],
+                "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
+                "pass_through": False,
+            }
+        # Pass through so Step 3.6 can resolve the variant from the user's response
+        return {
+            "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
+            "pass_through": True,
+        }
 
     return None  # Fall through to normal pipeline

@@ -126,23 +126,51 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
 
     elif intent == Intent.ORDER_ITEM:
         product_name = e.order_item_name or e.product_name or ""
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/products",
-            params={"search": product_name, "status": "publish", "per_page": 5},
-            description=f"Find product '{product_name}' for ordering",
-            requires_resolution=["order_item_step2"],
-        ))
+        if e.product_id:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/{e.product_id}",
+                params={},
+                description=f"Fetch product id={e.product_id} ('{product_name}') for ordering",
+            ))
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/{e.product_id}/variations",
+                params={"per_page": 100, "status": "publish"},
+                description=f"Fetch variations for order resolution of '{product_name}'",
+            ))
+        else:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products",
+                params={"search": product_name, "status": "publish", "per_page": 5},
+                description=f"Find product '{product_name}' for ordering",
+                requires_resolution=["order_item_step2"],
+            ))
 
     elif intent == Intent.QUICK_ORDER:
         search_term = e.order_item_name or e.product_name or ""
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/products",
-            params={"search": search_term, "status": "publish", "per_page": 5},
-            description=f"Find product '{search_term}' for quick order",
-            requires_resolution=["create_order_from_product"],
-        ))
+        if e.product_id:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/{e.product_id}",
+                params={},
+                description=f"Fetch product id={e.product_id} ('{search_term}') for quick order",
+            ))
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/{e.product_id}/variations",
+                params={"per_page": 100, "status": "publish"},
+                description=f"Fetch variations for quick order resolution of '{search_term}'",
+            ))
+        else:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products",
+                params={"search": search_term, "status": "publish", "per_page": 5},
+                description=f"Find product '{search_term}' for quick order",
+                requires_resolution=["create_order_from_product"],
+            ))
 
     # ═══════════════════════════════════════════
     # CATEGORY-BASED BROWSING
@@ -589,6 +617,12 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
                 endpoint=f"{BASE}/products/{e.product_id}",
                 params={},
                 description=f"Fetch product id={e.product_id} for order placement",
+            ))
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/{e.product_id}/variations",
+                params={"per_page": 100, "status": "publish"},
+                description=f"Fetch variations for order placement resolution of product id={e.product_id}",
             ))
         elif e.product_name or e.order_item_name:
             search_term = e.product_name or e.order_item_name
