@@ -513,14 +513,51 @@ def chat():
                     new_intent = Intent(llm_intent_str)
                 except ValueError:
                     # If LLM returned invalid intent, try to map common variations
+                    # If LLM returned invalid intent, try to map common variations.
+                    # This handles cases where the LLM (e.g. Mistral) returns a
+                    # short-hand or non-enum intent string like "order_inquiry".
                     intent_mapping = {
+                        # Product discovery
                         "search": Intent.PRODUCT_SEARCH,
+                        "product_search": Intent.PRODUCT_SEARCH,
                         "browse": Intent.CATEGORY_BROWSE,
+                        "category_browse": Intent.CATEGORY_BROWSE,
                         "filter": Intent.PRODUCT_LIST,
+                        "filter_by_finish": Intent.FILTER_BY_FINISH,
+                        "filter_by_color": Intent.FILTER_BY_COLOR,
+                        "filter_by_size": Intent.FILTER_BY_SIZE,
+                        "filter_by_application": Intent.FILTER_BY_APPLICATION,
+                        "filter_by_material": Intent.FILTER_BY_MATERIAL,
+                        "general_question": Intent.PRODUCT_LIST,
+                        # Order inquiry / history (read-only)
+                        "order_inquiry": Intent.ORDER_HISTORY,
+                        "order_history": Intent.ORDER_HISTORY,
+                        "check_orders": Intent.ORDER_HISTORY,
+                        "my_orders": Intent.ORDER_HISTORY,
+                        "order_status": Intent.ORDER_STATUS,
+                        "order_tracking": Intent.ORDER_TRACKING,
+                        "last_order": Intent.LAST_ORDER,
+                        "reorder": Intent.REORDER,
+                        # Order creation
                         "order": Intent.QUICK_ORDER,
+                        "place_order": Intent.PLACE_ORDER,
+                        "quick_order": Intent.QUICK_ORDER,
+                        "order_item": Intent.ORDER_ITEM,
+                        # Discounts & promotions
+                        "discount_inquiry": Intent.DISCOUNT_INQUIRY,
+                        "promotions": Intent.PROMOTIONS,
+                        "clearance": Intent.CLEARANCE_PRODUCTS,
+                        # Greeting / chit-chat
+                        "greeting": Intent.GREETING,
                     }
                     new_intent = intent_mapping.get(llm_intent_str, Intent.PRODUCT_LIST)
-                
+
+                    if llm_intent_str not in intent_mapping:
+                        logger.warning(
+                            f"Step 1.5: Unmapped LLM intent '{llm_intent_str}' — "
+                            f"falling back to PRODUCT_LIST. Consider adding it to intent_mapping."
+                        )
+                                        
                 # Update intent, entities, and confidence
                 intent = new_intent
                 entities = new_entities

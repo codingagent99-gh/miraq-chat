@@ -74,6 +74,20 @@ def classify(utterance: str) -> ClassifiedResult:
     elif re.search(r"\bwhat\b.*\bordered\b.*\bbefore\b", text):
         intent, confidence = Intent.ORDER_HISTORY, 0.91
         entities.order_count = 10
+        
+    # NEW: Catch "check my orders", "show my orders", "view my orders",
+    #      "see my orders", "show orders", "view orders"
+    elif re.search(
+        r"\b(check|show|view|see|get|list|display)\b.*\b(my\s+)?orders?\b", text
+    ) and not re.search(
+        r"\b(track|tracking|status|where|last|latest|most\s+recent|previous)\b", text
+    ):
+        intent, confidence = Intent.ORDER_HISTORY, 0.92
+        entities.order_count = 10
+        
+    elif re.search(r"^\s*(my\s+)?orders?\s*[?!.]?\s*$", text):
+        intent, confidence = Intent.ORDER_HISTORY, 0.90
+        entities.order_count = 10
 
     elif re.search(r"\b(last|latest|most\s*recent|previous)\b.*\border\b", text):
         intent, confidence = Intent.LAST_ORDER, 0.94
