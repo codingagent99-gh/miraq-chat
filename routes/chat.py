@@ -249,6 +249,7 @@ def chat():
     }
 
     # If we're in a multi-turn flow, let the flow handler try first
+    flow_result = None
     if current_flow_state != FlowState.IDLE:
         flow_result = handle_flow_state(
             state=current_flow_state,
@@ -463,6 +464,9 @@ def chat():
                     "pagination": _default_pagination(page),
                 }), 200
 
+    # Capture resolve_variant flag from flow handler (set when in AWAITING_VARIANT_SELECTION)
+    _resolve_variant = bool(flow_result and flow_result.get("resolve_variant"))
+
     # ─── Step 1: Classify intent ───
     result = classify(message)
     intent = result.intent
@@ -510,7 +514,7 @@ def chat():
             should_try_llm = True
             llm_trigger_reason = "missing_entities"
     
-    if should_try_llm and LLM_FALLBACK_ENABLED:
+    if should_try_llm and LLM_FALLBACK_ENABLED and not _resolve_variant:
         # Try LLM fallback
         store_loader = get_store_loader()
         session_history = None
@@ -688,7 +692,7 @@ def chat():
                 "pagination": _default_pagination(page),
             }), 200
     
-    elif should_try_llm and not LLM_FALLBACK_ENABLED:
+    elif should_try_llm and not LLM_FALLBACK_ENABLED and not _resolve_variant:
         # LLM is disabled, use old disambiguation menu
         disambig = get_disambiguation_message()
         elapsed = time.time() - start_time
@@ -834,27 +838,47 @@ def chat():
             var_resp = woo_client.execute(var_call)
             if var_resp.get("success") and isinstance(var_resp.get("data"), list):
                 all_variations = var_resp["data"]
-                matched = _filter_variations_by_entities(all_variations, entities)
 
-                # Raw-text fallback: match user message directly against variation option values
-                if len(matched) != 1:
+                if _resolve_variant:
+                    # Self-contained scoring: bypass classifier entities entirely.
+                    # Score each variation by counting how many of its attribute options
+                    # appear (case-insensitive) in the user's raw message.
                     user_text_lower = message.lower()
-                    candidates = matched if len(matched) > 1 else all_variations
-                    text_matched = []
-                    for var in candidates:
-                        var_attrs = var.get("attributes", [])
-                        if not var_attrs:
-                            continue
-                        # Check if ALL attribute options for this variation appear in the user's message
-                        all_options_found = all(
-                            a.get("option", "").lower() in user_text_lower
-                            for a in var_attrs
-                            if a.get("option")
-                        )
-                        if all_options_found:
-                            text_matched.append(var)
-                    if text_matched and len(text_matched) < len(candidates):
-                        matched = text_matched
+                    scores = [
+                        (var, sum(
+                            1 for attr in var.get("attributes", [])
+                            for opt_lower in [attr.get("option", "").lower()]
+                            if opt_lower and opt_lower in user_text_lower
+                        ))
+                        for var in all_variations
+                    ]
+                    max_score = max((s for _, s in scores), default=0)
+                    if max_score > 0:
+                        matched = [var for var, s in scores if s == max_score]
+                    else:
+                        matched = all_variations
+                else:
+                    matched = _filter_variations_by_entities(all_variations, entities)
+
+                    # Raw-text fallback: match user message directly against variation option values
+                    if len(matched) != 1:
+                        user_text_lower = message.lower()
+                        candidates = matched if len(matched) > 1 else all_variations
+                        text_matched = []
+                        for var in candidates:
+                            var_attrs = var.get("attributes", [])
+                            if not var_attrs:
+                                continue
+                            # Check if ALL attribute options for this variation appear in the user's message
+                            all_options_found = all(
+                                a.get("option", "").lower() in user_text_lower
+                                for a in var_attrs
+                                if a.get("option")
+                            )
+                            if all_options_found:
+                                text_matched.append(var)
+                        if text_matched and len(text_matched) < len(candidates):
+                            matched = text_matched
 
                 if len(matched) == 1:
                     # Exactly one match — create the order
