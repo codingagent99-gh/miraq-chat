@@ -836,6 +836,26 @@ def chat():
                 all_variations = var_resp["data"]
                 matched = _filter_variations_by_entities(all_variations, entities)
 
+                # Raw-text fallback: match user message directly against variation option values
+                if len(matched) != 1:
+                    user_text_lower = message.lower()
+                    candidates = matched if len(matched) > 1 else all_variations
+                    text_matched = []
+                    for var in candidates:
+                        var_attrs = var.get("attributes", [])
+                        if not var_attrs:
+                            continue
+                        # Check if ALL attribute options for this variation appear in the user's message
+                        all_options_found = all(
+                            a.get("option", "").lower() in user_text_lower
+                            for a in var_attrs
+                            if a.get("option")
+                        )
+                        if all_options_found:
+                            text_matched.append(var)
+                    if text_matched and len(text_matched) < len(candidates):
+                        matched = text_matched
+
                 if len(matched) == 1:
                     # Exactly one match — create the order
                     _resolved_variation_id = matched[0]["id"]

@@ -443,5 +443,140 @@ class TestStep355VariantResolvedNoQuantity:
                     f"pending_variation_id should be preserved, got: {meta.get('pending_variation_id')}"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. _filter_variations_by_entities — sample_size filter
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestFilterVariationsBySampleSize:
+    """Verify that sample_size in entities correctly filters variations."""
+
+    def _make_variations(self):
+        """Return a small set of Allspice-like variations with 3 attributes."""
+        base_attrs = [
+            ("ALLSPICE Beleza", "Honed",    '1 7/8"x7 3/8" Chip Size'),
+            ("ALLSPICE Beleza", "Honed",    '12"x24"'),
+            ("ALLSPICE Beleza", "Polished", '1 7/8"x7 3/8" Chip Size'),
+            ("ALLSPICE Brilho", "Honed",    '1 7/8"x7 3/8" Chip Size'),
+        ]
+        variations = []
+        for i, (color, finish, sample) in enumerate(base_attrs):
+            variations.append({
+                "id": 1000 + i,
+                "attributes": [
+                    {"name": "Colors",      "option": color},
+                    {"name": "Finish",      "option": finish},
+                    {"name": "Sample Size", "option": sample},
+                ],
+            })
+        return variations
+
+    def test_sample_size_filters_correctly(self):
+        from formatters import _filter_variations_by_entities
+
+        entities = ExtractedEntities(sample_size='1 7/8"x7 3/8" Chip Size')
+        matched = _filter_variations_by_entities(self._make_variations(), entities)
+        assert len(matched) == 3, f"Expected 3 chip-size variants, got {len(matched)}"
+        for v in matched:
+            opts = {a["name"]: a["option"] for a in v["attributes"]}
+            assert opts["Sample Size"] == '1 7/8"x7 3/8" Chip Size'
+
+    def test_sample_size_combined_with_finish(self):
+        from formatters import _filter_variations_by_entities
+
+        entities = ExtractedEntities(finish="Honed", sample_size='1 7/8"x7 3/8" Chip Size')
+        matched = _filter_variations_by_entities(self._make_variations(), entities)
+        assert len(matched) == 2, f"Expected 2 Honed+chip-size variants, got {len(matched)}"
+
+    def test_sample_size_combined_with_color_and_finish(self):
+        from formatters import _filter_variations_by_entities
+
+        entities = ExtractedEntities(
+            color_tone="allspice beleza",
+            finish="honed",
+            sample_size='1 7/8"x7 3/8" chip size',
+        )
+        matched = _filter_variations_by_entities(self._make_variations(), entities)
+        assert len(matched) == 1, f"Expected exactly 1 variation, got {len(matched)}"
+        assert matched[0]["id"] == 1000
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. Step 3.55 — raw-text fallback resolves Allspice scenario
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestStep355RawTextFallback:
+    """
+    The raw-text fallback in Step 3.55 should resolve to a single variation
+    when the entity extractor doesn't recognise product-specific colour names
+    like "Allspice Beleza" but they appear verbatim in the user's message.
+    """
+
+    def _allspice_variations(self):
+        """51-variation-like set simplified to 4 Honed variants (the failure scenario)."""
+        combos = [
+            ("ALLSPICE Beleza",      "Honed",    '1 7/8"x7 3/8" Chip Size'),
+            ("ALLSPICE Beleza",      "Honed",    '12"x24"'),
+            ("ALLSPICE Brilho Azul", "Honed",    '1 7/8"x7 3/8" Chip Size'),
+            ("ALLSPICE Calacatta",   "Honed",    '1 7/8"x7 3/8" Chip Size'),
+        ]
+        variations = []
+        for i, (color, finish, sample) in enumerate(combos):
+            variations.append({
+                "id": 2000 + i,
+                "parent_id": 7272,
+                "attributes": [
+                    {"name": "Colors",      "option": color},
+                    {"name": "Finish",      "option": finish},
+                    {"name": "Sample Size", "option": sample},
+                ],
+                "price": "15.00", "regular_price": "15.00", "sale_price": "",
+                "sku": "", "stock_status": "instock", "on_sale": False,
+                "slug": "", "image": {},
+            })
+        return variations
+
+    def test_raw_text_fallback_resolves_to_single_variant(self):
+        """
+        When entity extraction yields 'finish=Honed' only (4 matches), the raw-text
+        fallback should use the message text to narrow down to exactly 1 variation.
+        """
+        from server import app
+
+        mock_classify = Mock()
+        mock_classify.intent = Intent.QUICK_ORDER
+        mock_classify.confidence = 0.90
+        # Classifier only extracts finish; colour and sample_size are product-specific
+        mock_classify.entities = ExtractedEntities(
+            product_name="Allspice", finish="Honed", quantity=None,
+        )
+
+        with app.test_client() as client:
+            with patch("routes.chat.woo_client") as mock_woo, \
+                 patch("routes.chat.classify", return_value=mock_classify):
+                mock_woo.execute.return_value = {
+                    "success": True,
+                    "data": self._allspice_variations(),
+                }
+
+                resp = client.post("/chat", json={
+                    "message": 'i will like color Allspice Beleza, finish Honed and sample size 1 7/8"x7 3/8" Chip Size',
+                    "session_id": "test-rawtext-fallback",
+                    "user_context": {
+                        "customer_id": 130,
+                        "flow_state": "awaiting_variant_selection",
+                        "pending_product_id": 7272,
+                        "pending_product_name": "Allspice",
+                        "pending_quantity": 1,
+                    },
+                })
+                data = resp.get_json()
+
+                # The raw-text fallback should match variation 2000 and create the order
+                # or at minimum narrow down to 1 and NOT stay in awaiting_variant_selection
+                flow = data.get("flow_state") or data.get("metadata", {}).get("flow_state", "")
+                assert flow != "awaiting_variant_selection", \
+                    f"Raw-text fallback should resolve the variation; still in selection loop. Response: {data}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
