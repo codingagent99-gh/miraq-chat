@@ -258,6 +258,9 @@ def _filter_variations_by_entities(
     if entities.visual:
         filters.append(("visual", entities.visual.lower()))
 
+    if entities.sample_size:
+        filters.append(("sample size", entities.sample_size.lower()))
+
     if not filters:
         return variations
 
