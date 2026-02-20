@@ -821,7 +821,7 @@ def chat():
     if current_flow_state == FlowState.AWAITING_VARIANT_SELECTION and customer_id:
         _var_product_id = user_context.get("pending_product_id")
         _var_product_name = user_context.get("pending_product_name", "the product")
-        _var_quantity = user_context.get("pending_quantity", 1)
+        _var_quantity = user_context.get("pending_quantity")
         logger.info(f"Step 3.55: Variant selection response | pending_product_id={_var_product_id} | pending_quantity={_var_quantity}")
 
         if _var_product_id:
@@ -840,6 +840,28 @@ def chat():
                     # Exactly one match — create the order
                     _resolved_variation_id = matched[0]["id"]
                     logger.info(f"Step 3.55: Resolved to variation_id={_resolved_variation_id}")
+                    if not _var_quantity:
+                        # Variant resolved but quantity missing — ask for quantity
+                        logger.info(f"Step 3.55: Variant resolved but quantity missing — asking for quantity")
+                        elapsed = time.time() - start_time
+                        return jsonify({
+                            "success": True,
+                            "bot_message": f"Great choice! How many **{_var_product_name}** would you like to order? 🛒",
+                            "intent": "guided_flow",
+                            "products": [],
+                            "filters_applied": {},
+                            "suggestions": ["1", "5", "10", "25"],
+                            "session_id": session_id,
+                            "metadata": {
+                                "flow_state": FlowState.AWAITING_QUANTITY.value,
+                                "pending_product_id": _var_product_id,
+                                "pending_product_name": _var_product_name,
+                                "pending_variation_id": _resolved_variation_id,
+                                "response_time_ms": round(elapsed * 1000),
+                            },
+                            "flow_state": FlowState.AWAITING_QUANTITY.value,
+                            "pagination": _default_pagination(page),
+                        }), 200
                     order_call = WooAPICall(
                         method="POST",
                         endpoint=f"{WOO_BASE_URL}/orders",
@@ -1419,8 +1441,30 @@ def chat():
 
     # ─── Step 5.5: Detect when quantity is needed for ordering ───
     if intent in ORDER_CREATE_INTENTS and not entities.quantity and products:
-        # We found the product but no quantity — ask
+        # We found the product but no quantity — check if variable first
         product = products[0]
+        if product.get("type") == "variable":
+            # Variable product — ask for variant first, quantity will be asked after
+            _raw_for_prompt = next((p for p in all_products_raw if not p.get("parent_id")), {})
+            prompt_msg = _build_variant_prompt(_raw_for_prompt, product["name"])
+            elapsed = time.time() - start_time
+            return jsonify({
+                "success": True,
+                "bot_message": prompt_msg,
+                "intent": INTENT_LABELS.get(intent, "order"),
+                "products": products[:1],
+                "filters_applied": {},
+                "suggestions": [],
+                "session_id": session_id,
+                "metadata": {
+                    "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
+                    "pending_product_id": product.get("id"),
+                    "pending_product_name": product["name"],
+                    "response_time_ms": round(elapsed * 1000),
+                },
+                "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
+                "pagination": _default_pagination(page),
+            }), 200
         elapsed = time.time() - start_time
         return jsonify({
             "success": True,
@@ -1434,7 +1478,7 @@ def chat():
                 "flow_state": FlowState.AWAITING_QUANTITY.value,
                 "pending_product_name": product["name"],
                 "pending_product_id": product.get("id"),
-                "response_time_ms": round((time.time() - start_time) * 1000),
+                "response_time_ms": round(elapsed * 1000),
             },
             "flow_state": FlowState.AWAITING_QUANTITY.value,
             "pagination": _default_pagination(page),

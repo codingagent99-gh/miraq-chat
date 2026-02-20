@@ -294,5 +294,154 @@ class TestVariationSeparation:
                 assert 8002 not in product_ids, "Variation 8002 should not appear as a standalone product"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Step 5.5 — variable product without quantity → AWAITING_VARIANT_SELECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestStep55VariableProductNoQuantity:
+    """
+    When a user orders a variable product without specifying quantity,
+    Step 5.5 should redirect to AWAITING_VARIANT_SELECTION (not AWAITING_QUANTITY).
+    """
+
+    def _variable_product(self):
+        return {
+            "id": 7272, "name": "Allspice", "type": "variable",
+            "price": "15.00", "regular_price": "15.00", "sale_price": "",
+            "slug": "allspice", "sku": "", "permalink": "",
+            "on_sale": False, "stock_status": "instock", "total_sales": 0,
+            "description": "", "short_description": "", "images": [],
+            "categories": [], "tags": [],
+            "attributes": [
+                {"name": "Size", "variation": True, "visible": True, "options": ["100g", "500g", "1kg"]},
+            ],
+            "variations": [9001, 9002, 9003],
+            "average_rating": "0.00", "rating_count": 0, "weight": "",
+            "dimensions": {"length": "", "width": "", "height": ""},
+        }
+
+    def test_variable_product_no_quantity_asks_for_variant(self):
+        """Step 5.5: variable product without quantity → AWAITING_VARIANT_SELECTION."""
+        from server import app
+
+        with app.test_client() as client:
+            with patch("routes.chat.woo_client") as mock_woo:
+                mock_woo.execute_all.return_value = [
+                    {"success": True, "data": [self._variable_product()], "total": "1", "total_pages": "1"}
+                ]
+
+                resp = client.post("/chat", json={
+                    "message": "can you place an order allspice",
+                    "session_id": "test-step55-variable",
+                    "user_context": {"customer_id": 130},
+                })
+                data = resp.get_json()
+
+                flow = data.get("flow_state") or data.get("metadata", {}).get("flow_state", "")
+                assert flow == FlowState.AWAITING_VARIANT_SELECTION.value, \
+                    f"Variable product without quantity should go to AWAITING_VARIANT_SELECTION, got: {flow}"
+
+                meta = data.get("metadata", {})
+                assert meta.get("pending_product_id") == 7272
+                assert meta.get("pending_product_name") == "Allspice"
+                # No pending_quantity since we don't have it yet
+                assert "pending_quantity" not in meta or meta.get("pending_quantity") is None
+
+    def test_simple_product_no_quantity_asks_for_quantity(self):
+        """Step 5.5: simple product without quantity → AWAITING_QUANTITY (unchanged behavior)."""
+        from server import app
+
+        simple_product = {
+            "id": 7266, "name": "Lager", "type": "simple",
+            "price": "10.00", "regular_price": "10.00", "sale_price": "",
+            "slug": "lager", "sku": "", "permalink": "",
+            "on_sale": False, "stock_status": "instock", "total_sales": 0,
+            "description": "", "short_description": "", "images": [],
+            "categories": [], "tags": [], "attributes": [], "variations": [],
+            "average_rating": "0.00", "rating_count": 0, "weight": "",
+            "dimensions": {"length": "", "width": "", "height": ""},
+        }
+
+        with app.test_client() as client:
+            with patch("routes.chat.woo_client") as mock_woo:
+                mock_woo.execute_all.return_value = [
+                    {"success": True, "data": [simple_product], "total": "1", "total_pages": "1"}
+                ]
+
+                resp = client.post("/chat", json={
+                    "message": "order lager",
+                    "session_id": "test-step55-simple",
+                    "user_context": {"customer_id": 130},
+                })
+                data = resp.get_json()
+
+                flow = data.get("flow_state") or data.get("metadata", {}).get("flow_state", "")
+                assert flow == FlowState.AWAITING_QUANTITY.value, \
+                    f"Simple product without quantity should go to AWAITING_QUANTITY, got: {flow}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Step 3.55 — variant resolved but quantity missing → AWAITING_QUANTITY
+#    with pending_variation_id preserved
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestStep355VariantResolvedNoQuantity:
+    """
+    When variant is resolved in Step 3.55 but pending_quantity is None
+    (because the user was asked for variant before quantity), the response
+    should ask for quantity and preserve pending_variation_id in metadata.
+    """
+
+    def test_variant_resolved_no_quantity_asks_for_quantity(self):
+        """Step 3.55: variant resolved but no quantity → AWAITING_QUANTITY with pending_variation_id."""
+        from server import app
+        from models import Intent, ExtractedEntities
+
+        variation = {
+            "id": 9001, "parent_id": 7272, "name": "Allspice — 100g",
+            "attributes": [{"name": "Size", "option": "100g"}],
+            "price": "5.00", "regular_price": "5.00", "sale_price": "",
+            "sku": "", "stock_status": "instock", "on_sale": False, "slug": "", "image": {},
+        }
+
+        # Build a mock classify result that bypasses the LLM disambiguation check
+        mock_classify_result = Mock()
+        mock_classify_result.intent = Intent.QUICK_ORDER
+        mock_classify_result.confidence = 0.95
+        mock_classify_result.entities = ExtractedEntities(
+            product_name="Allspice", order_item_name="100g", quantity=None,
+        )
+
+        with app.test_client() as client:
+            with patch("routes.chat.woo_client") as mock_woo, \
+                 patch("routes.chat.classify", return_value=mock_classify_result):
+                mock_woo.execute.return_value = {
+                    "success": True, "data": [variation],
+                }
+
+                resp = client.post("/chat", json={
+                    "message": "100g",
+                    "session_id": "test-step355-no-qty",
+                    "user_context": {
+                        "customer_id": 130,
+                        "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
+                        "pending_product_id": 7272,
+                        "pending_product_name": "Allspice",
+                        # No pending_quantity — this is the scenario from the bug
+                    },
+                })
+                data = resp.get_json()
+
+                flow = data.get("flow_state") or data.get("metadata", {}).get("flow_state", "")
+                assert flow == FlowState.AWAITING_QUANTITY.value, \
+                    f"Resolved variant without quantity should go to AWAITING_QUANTITY, got: {flow}"
+
+                meta = data.get("metadata", {})
+                assert meta.get("pending_product_id") == 7272
+                assert meta.get("pending_product_name") == "Allspice"
+                assert meta.get("pending_variation_id") == 9001, \
+                    f"pending_variation_id should be preserved, got: {meta.get('pending_variation_id')}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
