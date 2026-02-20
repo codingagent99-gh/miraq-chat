@@ -30,6 +30,7 @@ def classify(utterance: str) -> ClassifiedResult:
     _extract_quantity(text, entities)
     _extract_category(text, entities)
     _extract_order_item(text, entities)
+    _extract_tag(text, entities)
 
     # ─── Intent Classification (priority order) ───
 
@@ -224,6 +225,13 @@ def classify(utterance: str) -> ClassifiedResult:
     # 11. COLLECTION YEAR
     elif entities.collection_year:
         intent, confidence = Intent.PRODUCT_BY_COLLECTION, 0.89
+
+    # 11.5. PRODUCT BY TAG — generic tag match
+    # Fires when _extract_tag() populated tag_ids but no domain-specific
+    # attribute (finish/color/visual/origin/collection/thickness/size/application)
+    # was found (those intents already fired above via the elif chain).
+    elif entities.tag_ids:
+        intent, confidence = Intent.PRODUCT_BY_TAG, 0.88
 
     # 12. EXPLICIT "show me more/all products" RULE
     # Must be BEFORE product_name check to override generic product matches
@@ -549,6 +557,49 @@ def _extract_quantity(text: str, entities: ExtractedEntities):
     match = re.search(r'\b(\d+)\s+of\s+(?:this|these|them|it|the)\b', text)
     if match:
         entities.quantity = int(match.group(1))
+
+
+def _extract_tag(text: str, entities: ExtractedEntities):
+    """
+    Generic tag extractor: matches user text against all live tags.
+    Populates tag_ids/tag_slugs for tags not already found by domain-specific
+    extractors (color, finish, visual, origin, collection_year).
+    Uses word-boundary matching to reduce false positives.
+    """
+    loader = get_store_loader()
+    if not loader:
+        return
+
+    existing_ids = set(entities.tag_ids)
+
+    for name_lower, tag in loader.tag_by_name_lower.items():
+        if tag["id"] in existing_ids:
+            continue
+        # Skip tags with no products
+        if tag.get("count", 0) == 0:
+            continue
+        # Skip very short names — too prone to false positives
+        if len(name_lower) < 4:
+            continue
+        # Word-boundary match on tag name
+        try:
+            if re.search(rf'\b{re.escape(name_lower)}\b', text):
+                entities.tag_ids.append(tag["id"])
+                entities.tag_slugs.append(tag["slug"])
+                existing_ids.add(tag["id"])
+                continue
+        except re.error:
+            pass
+        # Also try slug-as-words (e.g. "quick-ship" → "quick ship")
+        slug_words = tag["slug"].replace("-", " ")
+        if slug_words != name_lower and len(slug_words) >= 4:
+            try:
+                if re.search(rf'\b{re.escape(slug_words)}\b', text):
+                    entities.tag_ids.append(tag["id"])
+                    entities.tag_slugs.append(tag["slug"])
+                    existing_ids.add(tag["id"])
+            except re.error:
+                pass
 
 
 def _extract_order_item(text: str, entities: ExtractedEntities):
