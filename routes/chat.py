@@ -273,7 +273,6 @@ def chat():
                         f"**Quantity:** {pending_quantity}\n"
                         f"**Total:** {currency_symbol}{float(total):.2f}\n"
                         f"**Payment Mode:** Cash on Delivery\n"
-                        f"**Status:** Processing"
                     )
                     
                     elapsed = time.time() - start_time

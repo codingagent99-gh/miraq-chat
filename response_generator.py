@@ -119,13 +119,20 @@ def generate_bot_message(
                 line_total = sum(float(item.get("total", "0") or "0") for item in placed["line_items"])
                 if line_total > 0:
                     total = str(line_total)
+            # Extract quantity from line_items or entities
+            quantity = 1
+            if placed.get("line_items"):
+                quantity = sum(item.get("quantity", 1) for item in placed["line_items"])
+            elif hasattr(entities, 'quantity') and entities.quantity:
+                quantity = entities.quantity
             return (
                 f"✅ **Order #{order_number} placed successfully!**\n\n"
                 f"**Product:** {p_name}\n"
+                f"**Quantity:** {quantity}\n"
                 f"**Total:** ${float(total):.2f}\n"
-                f"**Payment Mode:** Cash on Delivery\n"
-                f"**Status:** Processing"
+                f"**Payment Mode:** Cash on Delivery"
             )
+            
         if count > 0:
             p = products[0]
             msg = f"Found **{p['name']}** 🎯\n\n"
