@@ -219,6 +219,27 @@ class TestLLMClient:
         assert client.model == "claude-3-sonnet"
         assert client.api_key == "test-key"
     
+    def test_llm_client_init_mistral(self):
+        """LLMClient should initialize with Mistral provider."""
+        import os
+        os.environ["LLM_PROVIDER"] = "mistral"
+        os.environ["LLM_MODEL"] = "mistral-large-latest"
+        os.environ["LLM_API_KEY"] = "test-mistral-key"
+        
+        import importlib
+        import app_config
+        importlib.reload(app_config)
+        
+        import llm_fallback
+        importlib.reload(llm_fallback)
+        
+        from llm_fallback import LLMClient
+        client = LLMClient()
+        assert client.provider == "mistral"
+        assert client.model == "mistral-large-latest"
+        assert client.api_key == "test-mistral-key"
+        assert client.api_url == "https://api.mistral.ai/v1/chat/completions"
+    
     def test_llm_client_invalid_provider(self):
         """LLMClient should raise error for invalid provider."""
         import os
