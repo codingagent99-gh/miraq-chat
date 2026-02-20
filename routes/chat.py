@@ -73,6 +73,54 @@ def parse_address(text: str) -> dict:
     return address
 
 
+def _default_pagination(page: int = 1) -> dict:
+    """Return a default pagination object for responses without product lists."""
+    return {
+        "page": page,
+        "per_page": 0,
+        "total_items": 0,
+        "total_pages": 1,
+        "has_more": False,
+    }
+
+
+def _build_pagination(page: int, api_responses: list, api_calls: list) -> dict:
+    """Build pagination object from API responses and call params."""
+    total_items = None
+    total_pages = None
+    per_page = 20
+
+    # Extract per_page from the first API call's params
+    if api_calls:
+        per_page = int(api_calls[0].params.get("per_page", 20))
+
+    # Extract total/total_pages from the first successful response
+    for resp in api_responses:
+        if resp.get("success"):
+            raw_total = resp.get("total")
+            raw_total_pages = resp.get("total_pages")
+            if raw_total is not None:
+                try:
+                    total_items = int(raw_total)
+                except (ValueError, TypeError):
+                    pass
+            if raw_total_pages is not None:
+                try:
+                    total_pages = int(raw_total_pages)
+                except (ValueError, TypeError):
+                    pass
+            break
+
+    has_more = (page < total_pages) if total_pages is not None else False
+    return {
+        "page": page,
+        "per_page": per_page,
+        "total_items": total_items,
+        "total_pages": total_pages,
+        "has_more": has_more,
+    }
+
+
 @chat_bp.route("/chat", methods=["POST"])
 def chat():
     """
@@ -116,11 +164,13 @@ def chat():
             "suggestions": ["Show me all products", "What categories do you have?"],
             "session_id": "",
             "metadata": {"error": "Invalid JSON body"},
+            "pagination": _default_pagination(),
         }), 400
 
     message = body.get("message", "").strip()
     session_id = body.get("session_id", "")
     user_context = body.get("user_context", {})
+    page = int(body.get("page", 1))
     
     # Log incoming request (sanitize user input to prevent log injection)
     truncated_msg = message[:100] + "..." if len(message) > 100 else message
@@ -145,6 +195,7 @@ def chat():
             ],
             "session_id": session_id,
             "metadata": {"error": "Empty message"},
+            "pagination": _default_pagination(page),
         }), 400
 
     # ─── Update session ───
@@ -210,6 +261,7 @@ def chat():
                 "session_id": session_id,
                 "metadata": flow_metadata,
                 "flow_state": flow_result.get("flow_state", "idle"),
+                "pagination": _default_pagination(page),
             }), 200
 
         elif flow_result and flow_result.get("override_message"):
@@ -289,6 +341,7 @@ def chat():
                             "response_time_ms": round(elapsed * 1000),
                         },
                         "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
+                        "pagination": _default_pagination(page),
                     }), 200
                 else:
                     error_msg = str(order_resp.get('error', 'Unknown'))
@@ -303,6 +356,7 @@ def chat():
                         "session_id": session_id,
                         "metadata": {"flow_state": FlowState.IDLE.value},
                         "flow_state": FlowState.IDLE.value,
+                        "pagination": _default_pagination(page),
                     }), 200
 
         elif flow_result and flow_result.get("fetch_customer_address"):
@@ -366,6 +420,7 @@ def chat():
                     "session_id": session_id,
                     "metadata": {**base_meta, "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value},
                     "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value,
+                    "pagination": _default_pagination(page),
                 }), 200
             else:
                 logger.info("Step 0: No shipping address on file — prompting user to enter one")
@@ -379,6 +434,7 @@ def chat():
                     "session_id": session_id,
                     "metadata": {**base_meta, "flow_state": FlowState.AWAITING_NEW_ADDRESS.value},
                     "flow_state": FlowState.AWAITING_NEW_ADDRESS.value,
+                    "pagination": _default_pagination(page),
                 }), 200
 
     # ─── Step 1: Classify intent ───
@@ -471,6 +527,7 @@ def chat():
                     "suggestions": [],
                     "session_id": session_id,
                     "metadata": llm_metadata,
+                    "pagination": _default_pagination(page),
                 }), 200
             
             elif fallback_type in ["intent_resolved", "entity_extracted"]:
@@ -602,6 +659,7 @@ def chat():
                     "llm_error": llm_result.get("error", "LLM fallback failed"),
                 },
                 "flow_state": disambig["flow_state"],
+                "pagination": _default_pagination(page),
             }), 200
     
     elif should_try_llm and not LLM_FALLBACK_ENABLED:
@@ -625,10 +683,11 @@ def chat():
                 "provider": "conversation_flow",
             },
             "flow_state": disambig["flow_state"],
+            "pagination": _default_pagination(page),
         }), 200
 
     # ─── Step 2: Build API calls ───
-    api_calls = build_api_calls(result)
+    api_calls = build_api_calls(result, page)
     endpoint_summary = [f"{c.method} {c.endpoint.split('/')[-1]}" for c in api_calls]
     logger.info(f"Step 2: Built {len(api_calls)} API call(s) | endpoints={endpoint_summary}")
     # ─── Step 2.5: Resolve user context placeholders ───
@@ -915,6 +974,7 @@ def chat():
                 "suggestions": suggestions,
                 "session_id": session_id,
                 "metadata": metadata,
+                "pagination": _build_pagination(page, api_responses, api_calls_to_execute),
             }), 200
 
     # ─── Step 3.8: LLM Retry on Empty Search Results ───
@@ -1019,6 +1079,7 @@ def chat():
                     "suggestions": [],
                     "session_id": session_id,
                     "metadata": llm_metadata,
+                    "pagination": _default_pagination(page),
                 }), 200
 
     # ─── Step 4: Format products ───
@@ -1125,6 +1186,7 @@ def chat():
         "suggestions": suggestions,
         "session_id": session_id,
         "metadata": metadata,
+        "pagination": _build_pagination(page, api_responses, api_calls_to_execute),
     }
 
     # ─── Step 5.5: Detect when quantity is needed for ordering ───
@@ -1147,6 +1209,7 @@ def chat():
                 "response_time_ms": round((time.time() - start_time) * 1000),
             },
             "flow_state": FlowState.AWAITING_QUANTITY.value,
+            "pagination": _default_pagination(page),
         }), 200
 
     # ─── Step 10.5: After successful response, add "anything else?" flow ───

@@ -35,7 +35,7 @@ def _first_tag_id(tag_ids: list) -> Optional[int]:
     return tag_ids[0] if tag_ids else None
 
 
-def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
+def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]:
     """Build one or more WooCommerce API calls from classified result."""
     intent = result.intent
     e = result.entities
@@ -68,7 +68,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/orders",
-            params={"customer": "CURRENT_USER_ID", "per_page": count, "orderby": "date", "order": "desc"},
+            params={"customer": "CURRENT_USER_ID", "per_page": count, "page": page, "orderby": "date", "order": "desc"},
             description=f"Get customer's last {count} orders",
             requires_resolution=["customer_id"],
         ))
@@ -107,7 +107,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
     # ═══════════════════════════════════════════
 
     elif intent == Intent.CATEGORY_BROWSE:
-        params = {"per_page": 20, "status": "publish", "category": str(e.category_id)}
+        params = {"per_page": 20, "page": page, "status": "publish", "category": str(e.category_id)}
         if e.on_sale:
             params["on_sale"] = "true"
         if e.tag_ids:
@@ -139,7 +139,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
                 calls.append(WooAPICall(
                     method="GET",
                     endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-                    params={"filters": json.dumps(filters), "page": 1},
+                    params={"filters": json.dumps(filters), "page": page},
                     description=f"Filter category '{e.category_name}' by {e.attribute_slug}: {term_value}",
                     is_custom_api=True,
                 ))
@@ -148,7 +148,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products/categories",
-            params={"per_page": 100, "hide_empty": True, "orderby": "name", "order": "asc"},
+            params={"per_page": 100, "page": page, "hide_empty": True, "orderby": "name", "order": "asc"},
             description="List all product categories",
         ))
 
@@ -160,7 +160,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={"per_page": 20, "status": "publish", "stock_status": "instock",
+            params={"per_page": 20, "page": page, "status": "publish", "stock_status": "instock",
                     "orderby": "menu_order", "order": "asc"},
             description="List all published, in-stock products",
         ))
@@ -178,14 +178,14 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
                 calls.append(WooAPICall(
                     method="GET",
                     endpoint=f"{BASE}/products/{e.product_id}/variations",
-                    params={"per_page": 100, "status": "publish"},
+                    params={"per_page": 100, "page": page, "status": "publish"},
                     description=f"Fetch variations for id={e.product_id}",
                 ))
         else:
             calls.append(WooAPICall(
                 method="GET",
                 endpoint=f"{BASE}/products",
-                params={"per_page": 20, "status": "publish", "search": e.product_name or e.search_term or ""},
+                params={"per_page": 20, "page": page, "status": "publish", "search": e.product_name or e.search_term or ""},
                 description=f"Search products matching '{e.product_name}'",
             ))
 
@@ -218,13 +218,13 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             calls.append(WooAPICall(
                 method="GET",
                 endpoint=f"{CUSTOM_API_BASE}/products-by-tags",
-                params={"tags": tags_str, "page": 1},
+                params={"tags": tags_str, "page": page},
                 description=f"Products from {e.collection_year} collection (tags: {tags_str})",
                 is_custom_api=True,
             ))
         else:
             # Fallback to standard API with tag IDs
-            params = {"per_page": 20, "status": "publish", "stock_status": "instock"}
+            params = {"per_page": 20, "page": page, "status": "publish", "stock_status": "instock"}
             if e.tag_ids:
                 params["tag"] = str(e.tag_ids[0])
             calls.append(WooAPICall(
@@ -240,13 +240,13 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"filters": json.dumps(filters), "page": 1},
+            params={"filters": json.dumps(filters), "page": page},
             description=f"Products from {e.origin}",
             is_custom_api=True,
         ))
 
     elif intent == Intent.PRODUCT_QUICK_SHIP:
-        params = {"per_page": 20, "status": "publish", "stock_status": "instock"}
+        params = {"per_page": 20, "page": page, "status": "publish", "stock_status": "instock"}
         qs_tag_id = _tag_id("quick-ship")
         if qs_tag_id:
             params["tag"] = str(qs_tag_id)
@@ -263,7 +263,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"filters": json.dumps(filters), "page": 1},
+            params={"filters": json.dumps(filters), "page": page},
             description=f"Products with '{e.visual}' visual/look",
             is_custom_api=True,
         ))
@@ -281,13 +281,13 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products/categories",
-            params={"per_page": 100, "hide_empty": True},
+            params={"per_page": 100, "page": page, "hide_empty": True},
             description="Get all product categories",
         ))
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products/tags",
-            params={"per_page": 100, "hide_empty": True},
+            params={"per_page": 100, "page": page, "hide_empty": True},
             description="Get all product tags",
         ))
 
@@ -311,7 +311,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"filters": json.dumps(filters), "page": 1},
+            params={"filters": json.dumps(filters), "page": page},
             description=f"Filter by finish: {e.finish}",
             is_custom_api=True,
         ))
@@ -322,7 +322,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"filters": json.dumps(filters), "page": 1},
+            params={"filters": json.dumps(filters), "page": page},
             description=f"Filter by tile size: {e.tile_size}",
             is_custom_api=True,
         ))
@@ -333,7 +333,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"filters": json.dumps(filters), "page": 1},
+            params={"filters": json.dumps(filters), "page": page},
             description=f"Filter by color: {e.color_tone}",
             is_custom_api=True,
         ))
@@ -344,7 +344,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"filters": json.dumps(filters), "page": 1},
+            params={"filters": json.dumps(filters), "page": page},
             description=f"Filter by thickness: {e.thickness}",
             is_custom_api=True,
         ))
@@ -355,7 +355,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"filters": json.dumps(filters), "page": 1},
+            params={"filters": json.dumps(filters), "page": page},
             description=f"Filter by edge: {e.edge}",
             is_custom_api=True,
         ))
@@ -366,7 +366,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"filters": json.dumps(filters), "page": 1},
+            params={"filters": json.dumps(filters), "page": page},
             description=f"Filter by application: {e.application}",
             is_custom_api=True,
         ))
@@ -377,7 +377,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"filters": json.dumps(filters), "page": 1},
+            params={"filters": json.dumps(filters), "page": page},
             description=f"Filter by material: {e.visual}",
             is_custom_api=True,
         ))
@@ -388,7 +388,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{CUSTOM_API_BASE}/products-by-attribute",
-            params={"filters": json.dumps(filters), "page": 1},
+            params={"filters": json.dumps(filters), "page": page},
             description=f"Filter by origin: {e.origin}",
             is_custom_api=True,
         ))
@@ -412,7 +412,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={"per_page": 20, "status": "publish", "search": search_term},
+            params={"per_page": 20, "page": page, "status": "publish", "search": search_term},
             description=f"Search mosaic products: '{search_term}'",
         ))
 
@@ -421,7 +421,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={"per_page": 20, "status": "publish", "search": search_term},
+            params={"per_page": 20, "page": page, "status": "publish", "search": search_term},
             description=f"List trim products",
         ))
 
@@ -430,13 +430,13 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             calls.append(WooAPICall(
                 method="GET",
                 endpoint=f"{BASE}/products",
-                params={"per_page": 10, "status": "publish",
+                params={"per_page": 10, "page": page, "status": "publish",
                         "search": f"{e.product_name} chip card"},
                 description=f"Find chip card for '{e.product_name}'",
             ))
         else:
             cc_tag_id = _tag_id("chip-card")
-            params = {"per_page": 50, "status": "publish"}
+            params = {"per_page": 50, "page": page, "status": "publish"}
             if cc_tag_id:
                 params["tag"] = str(cc_tag_id)
             calls.append(WooAPICall(
@@ -461,7 +461,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             calls.append(WooAPICall(
                 method="GET",
                 endpoint=f"{BASE}/products/{e.product_id}/variations",
-                params={"per_page": 100, "status": "publish"},
+                params={"per_page": 100, "page": page, "status": "publish"},
                 description=f"Get all variations for '{e.product_name}'",
             ))
         elif e.product_name:
@@ -491,7 +491,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={"on_sale": "true", "per_page": 20, "status": "publish"},
+            params={"on_sale": "true", "per_page": 20, "page": page, "status": "publish"},
             description="List products on sale",
         ))
 
@@ -499,7 +499,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={"on_sale": "true", "per_page": 20, "status": "publish"},
+            params={"on_sale": "true", "per_page": 20, "page": page, "status": "publish"},
             description="List clearance products",
         ))
 
@@ -507,7 +507,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={"per_page": 20, "status": "publish", "search": "bulk"},
+            params={"per_page": 20, "page": page, "status": "publish", "search": "bulk"},
             description="Check for bulk discount products",
         ))
 
@@ -515,7 +515,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={"on_sale": "true", "per_page": 20, "status": "publish"},
+            params={"on_sale": "true", "per_page": 20, "page": page, "status": "publish"},
             description="List current promotions",
         ))
 
@@ -523,7 +523,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/coupons",
-            params={"per_page": 20},
+            params={"per_page": 20, "page": page},
             description="List available coupon codes",
         ))
 
@@ -560,7 +560,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
             calls.append(WooAPICall(
                 method="GET",
                 endpoint=f"{BASE}/orders",
-                params={"customer": "CURRENT_USER_ID", "per_page": 5,
+                params={"customer": "CURRENT_USER_ID", "per_page": 5, "page": page,
                         "orderby": "date", "order": "desc"},
                 description="List recent orders (no order ID provided)",
             ))
@@ -599,7 +599,7 @@ def build_api_calls(result: ClassifiedResult) -> List[WooAPICall]:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={"search": search, "per_page": 20, "status": "publish"},
+            params={"search": search, "per_page": 20, "page": page, "status": "publish"},
             description=f"Fallback search: '{search}'",
         ))
 
