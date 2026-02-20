@@ -54,6 +54,7 @@ class StoreLoader:
         self.attributes: List[Dict] = []
         self.attribute_terms: Dict[int, List[Dict]] = {}
         self.products: List[Dict] = []
+        self.all_attributes_raw: List[Dict] = []
 
         # Lookup maps
         self.category_by_slug: Dict[str, Dict] = {}
@@ -110,6 +111,17 @@ class StoreLoader:
             extra_params={"status": "publish"},
         )
         print(f"   ✅ Loaded {len(self.products)} products")
+
+        # Also fetch from custom all-attributes API for fresh data
+        custom_api_base = self.base.replace("/wp-json/wc/v3", "/wp-json/custom-api/v1")
+        try:
+            resp = self.session.get(f"{custom_api_base}/all-attributes", timeout=self.timeout)
+            resp.raise_for_status()
+            self.all_attributes_raw = resp.json()
+            print(f"   ✅ Loaded {len(self.all_attributes_raw)} attributes from custom API")
+        except Exception as e:
+            print(f"   ⚠️  Custom all-attributes API failed: {e}")
+            self.all_attributes_raw = []
 
         self._build_lookups()
         self._last_loaded = time.time()
@@ -426,6 +438,11 @@ class StoreLoader:
     # ─────────────────────────────────────────────
     # ATTRIBUTE & TAG LOOKUPS  (replaces store_registry hardcoded maps)
     # ─────────────────────────────────────────────
+
+    def get_category_slug(self, category_id: int) -> Optional[str]:
+        """Return category slug for an ID."""
+        entry = self.category_by_id.get(category_id)
+        return entry["slug"] if entry else None
 
     def get_attribute_id(self, slug: str) -> Optional[int]:
         """Return WooCommerce attribute ID for a slug, e.g. 'pa_tile-size' → 5."""
