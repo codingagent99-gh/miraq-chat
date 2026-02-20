@@ -168,8 +168,14 @@ def classify(utterance: str) -> ClassifiedResult:
         entities.quick_ship = True
 
     # 7. CATEGORY MATCH
+    # If user also mentioned a specific product name, treat as product search
+    # scoped to category — the category context is preserved in entities for
+    # the response. e.g. "show me allspice in countertop" → PRODUCT_SEARCH
     elif entities.category_id is not None:
-        intent, confidence = Intent.CATEGORY_BROWSE, 0.94
+        if entities.product_name:
+            intent, confidence = Intent.PRODUCT_SEARCH, 0.95
+        else:
+            intent, confidence = Intent.CATEGORY_BROWSE, 0.94
 
     elif re.search(r"\b(what|list|show|all)\b.*\bcategor(y|ies)\b", text):
         intent, confidence = Intent.CATEGORY_LIST, 0.91

@@ -136,8 +136,8 @@ def handle_flow_state(
         elif any(kw in text for kw in ["yes", "yeah", "ok", "sure", "start again"]):
             return get_disambiguation_message()
         else:
-            # Still confused — re-prompt
-            return get_disambiguation_message()
+            # No keyword matched — let the classifier pipeline handle it
+            return None
 
     # ── State: Awaiting quantity for an order ──
     if state == FlowState.AWAITING_QUANTITY:

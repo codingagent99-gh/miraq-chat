@@ -230,7 +230,19 @@ def generate_bot_message(
     msg = ""
 
     if intent == Intent.CATEGORY_BROWSE:
-        msg += f"Here are **{count}** products in the **{entities.category_name}** category! 📂\n\n"
+        # ── FIX: Detect unresolved qualifiers the API couldn't filter on ──
+        # e.g. user said "bathroom tiles" but we only filtered by category "Tile"
+        # because there's no "bathroom" sub-category or attribute match.
+        qualifier = _get_unresolved_category_qualifier(entities)
+        if qualifier:
+            msg += (
+                f"We don't have a specific **{qualifier} {entities.category_name}** "
+                f"sub-category, but here are all **{count}** products in "
+                f"**{entities.category_name}** — many of these work great for "
+                f"**{qualifier.lower()}** use! 📂\n\n"
+            )
+        else:
+            msg += f"Here are **{count}** products in the **{entities.category_name}** category! 📂\n\n"
     elif intent == Intent.PRODUCT_BY_VISUAL:
         msg += f"Found **{count}** products with **{entities.visual}** look! 🎨\n\n"
     elif intent == Intent.FILTER_BY_FINISH:
@@ -265,6 +277,26 @@ def generate_bot_message(
         msg += f"\n...and {count - 5} more products."
 
     return msg
+
+
+def _get_unresolved_category_qualifier(entities: ExtractedEntities) -> str:
+    """
+    Detect if the user mentioned a qualifier (application, visual, finish, etc.)
+    that was extracted as an entity but could NOT be used to filter the API results
+    (i.e., the attribute_term_ids were empty, meaning the store has no matching
+    attribute value for that qualifier).
+
+    Returns the qualifier string (e.g. "Bathroom") if unresolved, or empty string.
+    """
+    # Application qualifier (bathroom, kitchen, outdoor, etc.)
+    # If application was extracted but attribute_term_ids is empty,
+    # the store doesn't have that application value — it's unresolved.
+    if entities.application and not getattr(entities, 'attribute_term_ids', None):
+        return entities.application
+
+    return ""
+
+
 def generate_suggestions(
     intent: Intent,
     entities: ExtractedEntities,
