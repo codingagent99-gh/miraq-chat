@@ -288,10 +288,18 @@ def handle_flow_state(
                 "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
                 "pass_through": False,
             }
-        # Pass through so Step 3.6 can resolve the variant from the user's response
+        # Topic-change detection: user clearly wants to do something else — reset to IDLE
+        _topic_change_phrases = [
+            "show me products", "show products", "browse categories",
+            "what categories", "check my orders", "check orders",
+        ]
+        if any(ph in text for ph in _topic_change_phrases) or text.strip() in ("hello", "hi"):
+            return None
+        # Everything else is a variant selection response — handle self-contained in Step 3.55
         return {
             "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
             "pass_through": True,
+            "resolve_variant": True,
         }
 
     return None  # Fall through to normal pipeline

@@ -79,12 +79,22 @@ class TestHandleFlowStateVariantSelection:
         assert result.get("flow_state") == FlowState.AWAITING_ANYTHING_ELSE.value
 
     def test_variant_description_passes_through(self):
-        """Any non-cancel message should pass through to the classifier pipeline."""
+        """Non-cancel, non-topic-change messages should pass through with resolve_variant=True."""
         for phrase in ["True White Matte", "Polished 6x6", "Charcoal Honed 12x24"]:
             result = self._call(phrase)
             assert result is not None, f"Expected result for phrase: {phrase}"
             assert result.get("pass_through") is True, f"Expected pass_through for: {phrase}"
+            assert result.get("resolve_variant") is True, f"Expected resolve_variant for: {phrase}"
             assert result.get("flow_state") == FlowState.AWAITING_VARIANT_SELECTION.value
+
+    def test_topic_change_resets_to_idle(self):
+        """Messages that clearly start a new topic should return None (reset to IDLE)."""
+        for phrase in [
+            "show me products", "show products", "browse categories",
+            "what categories do you have", "check my orders", "hello", "hi",
+        ]:
+            result = self._call(phrase)
+            assert result is None, f"Expected None (topic-change reset) for: '{phrase}', got: {result}"
 
     def test_cancellation_phrases(self):
         for phrase in ["cancel", "stop", "nevermind", "never mind"]:
