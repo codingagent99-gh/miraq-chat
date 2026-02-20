@@ -84,6 +84,25 @@ def _default_pagination(page: int = 1) -> dict:
     }
 
 
+def _build_variant_prompt(product_raw: dict, product_name: str) -> str:
+    """Build a variant selection prompt message from the product's variation attributes."""
+    attrs = product_raw.get("attributes", [])
+    variation_attrs = [a for a in attrs if isinstance(a, dict) and a.get("variation")]
+    if not variation_attrs:
+        return (
+            f"I'd love to order **{product_name}** for you! "
+            "Which variant would you like? Please specify the options you'd like."
+        )
+    lines = [f"I'd love to order **{product_name}** for you! But first, I need to know which variant you'd like. 🎨\n\n**Available options:**"]
+    for attr in variation_attrs:
+        name = attr.get("name", "")
+        options = attr.get("options", [])
+        if options:
+            lines.append(f"• **{name}:** {', '.join(options)}")
+    lines.append("\nWhich combination would you like?")
+    return "\n".join(lines)
+
+
 def _build_pagination(page: int, api_responses: list, api_calls: list) -> dict:
     """Build pagination object from API responses and call params."""
     total_items = None
@@ -226,6 +245,7 @@ def chat():
         "pending_product_name": user_context.get("pending_product_name"),
         "pending_product_id": user_context.get("pending_product_id"),
         "pending_quantity": user_context.get("pending_quantity"),
+        "pending_variation_id": user_context.get("pending_variation_id"),
     }
 
     # If we're in a multi-turn flow, let the flow handler try first
@@ -246,7 +266,7 @@ def chat():
                 "provider": "conversation_flow",
             }
             # Propagate pending context so the frontend can send it back on the next turn
-            for ctx_key in ("pending_product_name", "pending_product_id", "pending_quantity", "pending_shipping_address"):
+            for ctx_key in ("pending_product_name", "pending_product_id", "pending_quantity", "pending_variation_id", "pending_shipping_address"):
                 if flow_result.get(ctx_key) is not None:
                     flow_metadata[ctx_key] = flow_result[ctx_key]
                 elif user_context.get(ctx_key) is not None:
@@ -273,10 +293,16 @@ def chat():
             pending_product_id = user_context.get("pending_product_id")
             pending_product_name = user_context.get("pending_product_name", "")
             pending_quantity = user_context.get("pending_quantity", 1)
+            pending_variation_id = user_context.get("pending_variation_id")
             
             if pending_product_id and customer_id:
-                logger.info(f"Step 0: Order confirmed via flow | product_id={pending_product_id} | quantity={pending_quantity}")
+                logger.info(f"Step 0: Order confirmed via flow | product_id={pending_product_id} | quantity={pending_quantity} | variation_id={pending_variation_id}")
                 
+                # Build line item; include variation_id for variable products
+                _confirmed_line_item: dict = {"product_id": pending_product_id, "quantity": pending_quantity}
+                if pending_variation_id:
+                    _confirmed_line_item["variation_id"] = pending_variation_id
+
                 # Build order body; include shipping override if user provided a new address
                 order_body: dict = {
                     "status": "processing",
@@ -284,7 +310,7 @@ def chat():
                     "payment_method": DEFAULT_PAYMENT_METHOD,
                     "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
                     "set_paid": False,
-                    "line_items": [{"product_id": pending_product_id, "quantity": pending_quantity}],
+                    "line_items": [_confirmed_line_item],
                 }
                 if flow_result.get("use_new_address"):
                     raw_address = user_context.get("pending_shipping_address", "")
@@ -791,6 +817,108 @@ def chat():
                     error_msg = sanitize_log_string(str(reorder_resp.get('error', 'Unknown')))
                     logger.warning(f"Step 3.5: Reorder failed | error={error_msg}")
 
+    # ─── Step 3.55: AWAITING_VARIANT_SELECTION — resolve variant from user response ───
+    if current_flow_state == FlowState.AWAITING_VARIANT_SELECTION and customer_id:
+        _var_product_id = user_context.get("pending_product_id")
+        _var_product_name = user_context.get("pending_product_name", "the product")
+        _var_quantity = user_context.get("pending_quantity", 1)
+        logger.info(f"Step 3.55: Variant selection response | pending_product_id={_var_product_id} | pending_quantity={_var_quantity}")
+
+        if _var_product_id:
+            var_call = WooAPICall(
+                method="GET",
+                endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}/variations",
+                params={"per_page": 100, "status": "publish"},
+                description=f"Fetch variations for variant selection of '{_var_product_name}'",
+            )
+            var_resp = woo_client.execute(var_call)
+            if var_resp.get("success") and isinstance(var_resp.get("data"), list):
+                all_variations = var_resp["data"]
+                matched = _filter_variations_by_entities(all_variations, entities)
+
+                if len(matched) == 1:
+                    # Exactly one match — create the order
+                    _resolved_variation_id = matched[0]["id"]
+                    logger.info(f"Step 3.55: Resolved to variation_id={_resolved_variation_id}")
+                    order_call = WooAPICall(
+                        method="POST",
+                        endpoint=f"{WOO_BASE_URL}/orders",
+                        params={},
+                        body={
+                            "status": "processing",
+                            "customer_id": customer_id,
+                            "payment_method": DEFAULT_PAYMENT_METHOD,
+                            "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
+                            "set_paid": False,
+                            "line_items": [{"product_id": _var_product_id, "quantity": _var_quantity, "variation_id": _resolved_variation_id}],
+                        },
+                        description=f"Create order for '{_var_product_name}' variation {_resolved_variation_id}",
+                    )
+                    order_resp = woo_client.execute(order_call)
+                    if order_resp.get("success") and isinstance(order_resp.get("data"), dict):
+                        order_data.append(order_resp["data"])
+                        created_order = order_resp["data"]
+                        logger.info(f"Step 3.55: Order created | order_id={created_order.get('id')}")
+                        # Inject a minimal product dict so the rest of the pipeline can generate a proper response
+                        if not all_products_raw:
+                            all_products_raw.append({
+                                "id": _var_product_id, "name": _var_product_name, "type": "variable",
+                                "price": "", "regular_price": "", "sale_price": "", "slug": "", "sku": "",
+                                "permalink": "", "on_sale": False, "stock_status": "instock", "total_sales": 0,
+                                "description": "", "short_description": "", "images": [], "categories": [],
+                                "tags": [], "attributes": [], "variations": [], "average_rating": "0.00",
+                                "rating_count": 0, "weight": "", "dimensions": {"length": "", "width": "", "height": ""},
+                            })
+                    else:
+                        error_msg = sanitize_log_string(str(order_resp.get("error", "Unknown")))
+                        logger.error(f"Step 3.55: Order creation failed | error={error_msg}")
+                else:
+                    # Multiple or no exact match — ask user to narrow down or re-select
+                    logger.info(f"Step 3.55: Could not resolve to single variation | matched={len(matched)} of {len(all_variations)}")
+                    # Fetch parent product to rebuild the prompt
+                    parent_call = WooAPICall(
+                        method="GET",
+                        endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}",
+                        params={},
+                        description=f"Fetch parent product '{_var_product_name}' for variant re-prompt",
+                    )
+                    parent_resp = woo_client.execute(parent_call)
+                    parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
+                    if len(matched) > 1 and len(matched) < len(all_variations):
+                        # Some variants matched but need more specifics
+                        variation_labels = [
+                            " / ".join(a.get("option", "") for a in v.get("attributes", []) if a.get("option"))
+                            for v in matched
+                        ]
+                        prompt_msg = (
+                            f"I found **{len(matched)}** variants of **{_var_product_name}** matching your description:\n\n"
+                            + "\n".join(f"• {lbl}" for lbl in variation_labels if lbl)
+                            + "\n\nWhich one would you like?"
+                        )
+                    else:
+                        prompt_msg = _build_variant_prompt(parent_raw, _var_product_name)
+                        if len(all_variations) > 0:
+                            prompt_msg = f"Sorry, I couldn't find that exact variant. " + prompt_msg
+                    elapsed = time.time() - start_time
+                    return jsonify({
+                        "success": True,
+                        "bot_message": prompt_msg,
+                        "intent": "guided_flow",
+                        "products": [],
+                        "filters_applied": {},
+                        "suggestions": [],
+                        "session_id": session_id,
+                        "metadata": {
+                            "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
+                            "pending_product_id": _var_product_id,
+                            "pending_product_name": _var_product_name,
+                            "pending_quantity": _var_quantity,
+                            "response_time_ms": round(elapsed * 1000),
+                        },
+                        "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
+                        "pagination": _default_pagination(page),
+                    }), 200
+
     # ─── Step 3.6: QUICK_ORDER / ORDER_ITEM / PLACE_ORDER — create order from matched product ───
     if intent in (Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER) and customer_id and entities.quantity:
         # Resolve which product to order:
@@ -798,18 +926,24 @@ def chat():
         # Priority 2 — last_product sent by the frontend (handles "order this" / "buy it")
         _order_product_id = None
         _order_product_name = None
+        _order_product_raw = None
 
-        if all_products_raw:
-            _p = all_products_raw[0]
+        # Separate parent products from pre-fetched variations (variations have parent_id)
+        _parent_products_raw = [p for p in all_products_raw if not p.get("parent_id")]
+        _prefetched_variations = [p for p in all_products_raw if p.get("parent_id")]
+
+        if _parent_products_raw:
+            _p = _parent_products_raw[0]
             _order_product_id = _p.get("id")
             _order_product_name = _p.get("name", str(_order_product_id))
+            _order_product_raw = _p
             logger.info(f"Step 3.6: Using all_products_raw → product_id={_order_product_id}, product_name=\"{sanitize_log_string(_order_product_name)}\"")
         elif last_product_ctx and last_product_ctx.get("id"):
             _order_product_id = last_product_ctx["id"]
             _order_product_name = last_product_ctx.get("name", str(last_product_ctx["id"]))
             logger.info(f"Step 3.6: Using last_product_ctx → product_id={_order_product_id}, product_name=\"{sanitize_log_string(_order_product_name)}\"")
             # Inject a minimal product dict so bot message and response include the product info
-            all_products_raw.append({
+            _injected = {
                 "id": _order_product_id,
                 "name": _order_product_name,
                 "price": "",
@@ -833,13 +967,104 @@ def chat():
                 "rating_count": 0,
                 "weight": "",
                 "dimensions": {"length": "", "width": "", "height": ""},
-            })
+            }
+            all_products_raw.append(_injected)
+            _order_product_raw = _injected
             logger.info(f"Step 3.6: Injected minimal product dict into all_products_raw (count={len(all_products_raw)})")
         else:
             logger.warning("Step 3.6: No product found to order (all_products_raw empty, no last_product_ctx)")
 
         if _order_product_id:
-            logger.info(f"Step 3.6: Creating WooCommerce order | product_id={_order_product_id} | quantity={entities.quantity or 1} | customer_id={customer_id}")
+            _order_variation_id = entities.variation_id
+            _product_type = (_order_product_raw or {}).get("type", "simple")
+
+            if _product_type == "variable":
+                # Variable product — need to resolve a variation_id before ordering
+                has_attrs = any([entities.color_tone, entities.finish, entities.tile_size, entities.sample_size])
+
+                if not _order_variation_id and not has_attrs:
+                    # Case C: No variant info provided — ask user to choose
+                    logger.info(f"Step 3.6: Variable product with no variant info | product_id={_order_product_id}")
+                    prompt_msg = _build_variant_prompt(_order_product_raw or {}, _order_product_name)
+                    elapsed = time.time() - start_time
+                    return jsonify({
+                        "success": True,
+                        "bot_message": prompt_msg,
+                        "intent": INTENT_LABELS.get(intent, "order"),
+                        "products": [format_product(_order_product_raw)] if _order_product_raw else [],
+                        "filters_applied": {},
+                        "suggestions": [],
+                        "session_id": session_id,
+                        "metadata": {
+                            "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
+                            "pending_product_id": _order_product_id,
+                            "pending_product_name": _order_product_name,
+                            "pending_quantity": entities.quantity,
+                            "response_time_ms": round(elapsed * 1000),
+                        },
+                        "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
+                        "pagination": _default_pagination(page),
+                    }), 200
+
+                elif not _order_variation_id and has_attrs:
+                    # Case B: Attributes specified — use pre-fetched or freshly fetched variations
+                    logger.info(f"Step 3.6: Variable product with attributes, resolving variation | product_id={_order_product_id}")
+                    if _prefetched_variations:
+                        all_variations = _prefetched_variations
+                        logger.info(f"Step 3.6: Using {len(all_variations)} pre-fetched variations")
+                    else:
+                        var_call = WooAPICall(
+                            method="GET",
+                            endpoint=f"{WOO_BASE_URL}/products/{_order_product_id}/variations",
+                            params={"per_page": 100, "status": "publish"},
+                            description=f"Fetch variations for order resolution of '{_order_product_name}'",
+                        )
+                        var_resp = woo_client.execute(var_call)
+                        all_variations = var_resp.get("data", []) if var_resp.get("success") else []
+                    if all_variations:
+                        matched = _filter_variations_by_entities(all_variations, entities)
+                        if len(matched) == 1:
+                            _order_variation_id = matched[0]["id"]
+                            logger.info(f"Step 3.6: Resolved variation_id={_order_variation_id} from attributes")
+                        else:
+                            # Cannot resolve to single variation — ask user
+                            logger.info(f"Step 3.6: Attributes matched {len(matched)} variations, asking user")
+                            if len(matched) > 1 and len(matched) < len(all_variations):
+                                variation_labels = [
+                                    " / ".join(a.get("option", "") for a in v.get("attributes", []) if a.get("option"))
+                                    for v in matched
+                                ]
+                                prompt_msg = (
+                                    f"I found **{len(matched)}** variants of **{_order_product_name}** matching your description:\n\n"
+                                    + "\n".join(f"• {lbl}" for lbl in variation_labels if lbl)
+                                    + "\n\nWhich one would you like?"
+                                )
+                            else:
+                                prompt_msg = _build_variant_prompt(_order_product_raw or {}, _order_product_name)
+                            elapsed = time.time() - start_time
+                            return jsonify({
+                                "success": True,
+                                "bot_message": prompt_msg,
+                                "intent": INTENT_LABELS.get(intent, "order"),
+                                "products": [format_product(_order_product_raw)] if _order_product_raw else [],
+                                "filters_applied": {},
+                                "suggestions": [],
+                                "session_id": session_id,
+                                "metadata": {
+                                    "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
+                                    "pending_product_id": _order_product_id,
+                                    "pending_product_name": _order_product_name,
+                                    "pending_quantity": entities.quantity,
+                                    "response_time_ms": round(elapsed * 1000),
+                                },
+                                "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
+                                "pagination": _default_pagination(page),
+                            }), 200
+
+            logger.info(f"Step 3.6: Creating WooCommerce order | product_id={_order_product_id} | variation_id={_order_variation_id} | quantity={entities.quantity or 1} | customer_id={customer_id}")
+            _line_item: dict = {"product_id": _order_product_id, "quantity": entities.quantity or 1}
+            if _order_variation_id:
+                _line_item["variation_id"] = _order_variation_id
             order_call = WooAPICall(
                 method="POST",
                 endpoint=f"{WOO_BASE_URL}/orders",
@@ -850,7 +1075,7 @@ def chat():
                     "payment_method": DEFAULT_PAYMENT_METHOD,
                     "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
                     "set_paid": False,
-                    "line_items": [{"product_id": _order_product_id, "quantity": entities.quantity or 1}],
+                    "line_items": [_line_item],
                 },
                 description=f"Create order for product '{_order_product_name}' (COD, processing)",
             )
@@ -1094,6 +1319,9 @@ def chat():
                 products.append(format_category(cat))
     else:
         for p in all_products_raw:
+            # Skip pre-fetched variations (they have parent_id and should not appear as standalone products)
+            if p.get("parent_id"):
+                continue
             # Detect custom API format by checking for "featured_image" key
             if "featured_image" in p:
                 products.append(format_custom_product(p))
@@ -1211,6 +1439,34 @@ def chat():
             "flow_state": FlowState.AWAITING_QUANTITY.value,
             "pagination": _default_pagination(page),
         }), 200
+
+    # After quantity check, also check for variant requirement
+    if intent in ORDER_CREATE_INTENTS and entities.quantity and products and not order_data:
+        product = products[0]
+        if product.get("type") == "variable":
+            # Variable product with quantity but no order placed (e.g. no customer_id, or variant not resolved)
+            # Use only parent (non-variation) raw products for the prompt to avoid passing a variation dict
+            _raw_for_prompt = next((p for p in all_products_raw if not p.get("parent_id")), {})
+            prompt_msg = _build_variant_prompt(_raw_for_prompt, product["name"])
+            elapsed = time.time() - start_time
+            return jsonify({
+                "success": True,
+                "bot_message": prompt_msg,
+                "intent": INTENT_LABELS.get(intent, "order"),
+                "products": products[:1],
+                "filters_applied": {},
+                "suggestions": [],
+                "session_id": session_id,
+                "metadata": {
+                    "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
+                    "pending_product_id": product.get("id"),
+                    "pending_product_name": product["name"],
+                    "pending_quantity": entities.quantity,
+                    "response_time_ms": round(elapsed * 1000),
+                },
+                "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
+                "pagination": _default_pagination(page),
+            }), 200
 
     # ─── Step 10.5: After successful response, add "anything else?" flow ───
     # Append to the response dict before returning:
