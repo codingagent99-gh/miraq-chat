@@ -72,8 +72,8 @@ DEFAULT_PAYMENT_METHOD_TITLE = "Cash on Delivery"
 # ═══════════════════════════════════════════
 
 # LLM Provider settings
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "copilot")  # copilot, openai, anthropic, azure_openai
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.2")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "mistral")  # mistral, copilot, openai, anthropic, azure_openai
+LLM_MODEL = os.getenv("LLM_MODEL", "mistral-large-latest")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_API_BASE_URL = os.getenv("LLM_API_BASE_URL", "")
 COPILOT_API_TOKEN = os.getenv("COPILOT_API_TOKEN", "")

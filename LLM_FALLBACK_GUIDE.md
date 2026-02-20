@@ -29,16 +29,16 @@ All settings are configured via environment variables:
 ### Required Settings
 
 ```bash
-# LLM Provider (copilot, openai, anthropic, azure_openai)
-LLM_PROVIDER=copilot
+# LLM Provider (mistral, copilot, openai, anthropic, azure_openai)
+LLM_PROVIDER=mistral
 
 # Model to use
-LLM_MODEL=gpt-5.2
+LLM_MODEL=mistral-large-latest
 
 # API credentials (depends on provider)
-COPILOT_API_TOKEN=your-token-here  # For Copilot
+LLM_API_KEY=your-mistral-key-here  # For Mistral/OpenAI/Anthropic/Azure
 # OR
-LLM_API_KEY=your-key-here          # For OpenAI/Anthropic/Azure
+COPILOT_API_TOKEN=your-token-here  # For Copilot
 LLM_API_BASE_URL=https://...       # Optional, for custom endpoints
 ```
 
@@ -61,7 +61,15 @@ LLM_COST_PER_1K_OUTPUT=0.008       # USD per 1000 output tokens
 
 ## Supported Providers
 
-### 1. GitHub Copilot (Default)
+### 1. Mistral AI Cloud (Default)
+
+```bash
+LLM_PROVIDER=mistral
+LLM_MODEL=mistral-large-latest
+LLM_API_KEY=your-mistral-api-key
+```
+
+### 2. GitHub Copilot
 
 ```bash
 LLM_PROVIDER=copilot
@@ -69,7 +77,7 @@ LLM_MODEL=gpt-5.2
 COPILOT_API_TOKEN=your-copilot-token
 ```
 
-### 2. OpenAI
+### 3. OpenAI
 
 ```bash
 LLM_PROVIDER=openai
@@ -77,7 +85,7 @@ LLM_MODEL=gpt-4
 LLM_API_KEY=sk-your-openai-key
 ```
 
-### 3. Anthropic Claude
+### 4. Anthropic Claude
 
 ```bash
 LLM_PROVIDER=anthropic
@@ -85,7 +93,7 @@ LLM_MODEL=claude-3-sonnet-20240229
 LLM_API_KEY=your-anthropic-key
 ```
 
-### 4. Azure OpenAI
+### 5. Azure OpenAI
 
 ```bash
 LLM_PROVIDER=azure_openai
@@ -228,7 +236,7 @@ python -m pytest test_llm_fallback.py -v
 - **PII Sanitization**: Email, phone, credit card, SSN removal
 - **Store Context Building**: Product/category/attribute extraction
 - **System Prompt Construction**: Proper formatting and privacy rules
-- **LLM Client Initialization**: All 4 providers (Copilot, OpenAI, Anthropic, Azure)
+- **LLM Client Initialization**: All 5 providers (Mistral, Copilot, OpenAI, Anthropic, Azure)
 - **Privacy Protections**: No customer data in prompts
 
 ### Manual Testing
@@ -361,7 +369,7 @@ Output: "Card: [CARD]"
 
 ## Best Practices
 
-1. **Start with Copilot**: Default provider, good balance of quality and cost
+1. **Start with Mistral**: Default provider, good balance of quality and cost
 2. **Monitor costs**: Check logs for `cost_estimate` field
 3. **Tune confidence threshold**: Adjust `LOW_CONFIDENCE_THRESHOLD` based on your data
 4. **Keep store data fresh**: StoreLoader auto-refreshes every 6 hours

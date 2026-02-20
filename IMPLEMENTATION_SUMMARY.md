@@ -9,7 +9,7 @@ This PR successfully implements a comprehensive LLM (Large Language Model) fallb
 ### 1. Core Module: `llm_fallback.py` (675 lines)
 
 **Key Components:**
-- `LLMClient` class: Abstracts LLM providers (Copilot, OpenAI, Anthropic, Azure OpenAI)
+- `LLMClient` class: Abstracts LLM providers (Mistral, Copilot, OpenAI, Anthropic, Azure OpenAI)
 - `llm_fallback()`: Pre-API fallback (Step 1.5) - handles UNKNOWN intents and low confidence
 - `llm_retry_search()`: Post-API fallback (Step 3.8) - handles empty search results
 - `_sanitize_for_llm()`: Removes PII (emails, phone numbers, credit cards, SSNs)
@@ -26,8 +26,8 @@ This PR successfully implements a comprehensive LLM (Large Language Model) fallb
 Added complete LLM configuration section:
 ```python
 # LLM Provider settings
-LLM_PROVIDER = "copilot"  # Default
-LLM_MODEL = "gpt-5.2"
+LLM_PROVIDER = "mistral"  # Default
+LLM_MODEL = "mistral-large-latest"
 COPILOT_API_TOKEN = env var
 LLM_API_KEY = env var
 LLM_API_BASE_URL = env var
@@ -105,7 +105,8 @@ Automated validation script that checks:
 ## Key Features
 
 ### Multi-Provider Support
-- ✅ GitHub Copilot (default, GPT-5.2)
+- ✅ Mistral AI Cloud (default, mistral-large-latest)
+- ✅ GitHub Copilot (GPT-5.2)
 - ✅ OpenAI (GPT-4, GPT-3.5-turbo)
 - ✅ Anthropic (Claude 3)
 - ✅ Azure OpenAI
@@ -151,13 +152,13 @@ All requirements from the problem statement are met:
 | Requirement | Status |
 |-------------|--------|
 | New module `llm_fallback.py` | ✅ Complete |
-| LLM provider: Copilot with GPT-5.2 | ✅ Default, configurable |
+| LLM provider: Mistral with mistral-large-latest | ✅ Default, configurable |
 | Fully configurable via env vars | ✅ All settings |
 | Comprehensive LLM logging | ✅ All required fields |
 | Data privacy (no PII to LLM) | ✅ Validated |
 | Step 1.5 integration | ✅ Pre-API fallback |
 | Step 3.8 integration | ✅ Post-API retry |
-| LLMClient class (multi-provider) | ✅ 4 providers |
+| LLMClient class (multi-provider) | ✅ 5 providers |
 | System prompt with store context | ✅ Implemented |
 | Feature flags | ✅ Both flags |
 | No token budget needed | ✅ Skipped as specified |

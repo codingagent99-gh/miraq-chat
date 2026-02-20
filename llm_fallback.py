@@ -211,6 +211,7 @@ class LLMClient:
     Abstraction over LLM providers — configurable via environment variables.
     
     Supported providers:
+    - mistral: Mistral AI Cloud API
     - copilot: GitHub Copilot API
     - openai: OpenAI API
     - anthropic: Anthropic Claude API
@@ -237,6 +238,9 @@ class LLMClient:
         elif self.provider == "azure_openai":
             self.api_key = LLM_API_KEY
             self.api_url = LLM_API_BASE_URL  # Must be provided for Azure
+        elif self.provider == "mistral":
+            self.api_key = LLM_API_KEY
+            self.api_url = LLM_API_BASE_URL or "https://api.mistral.ai/v1/chat/completions"
         else:
             raise ValueError(f"Unsupported LLM provider: {self.provider}")
     
@@ -266,7 +270,7 @@ class LLMClient:
         start_time = time.time()
         
         try:
-            if self.provider in ["copilot", "openai", "azure_openai"]:
+            if self.provider in ["copilot", "openai", "azure_openai", "mistral"]:
                 result = self._openai_style_completion(system_prompt, user_message)
             elif self.provider == "anthropic":
                 result = self._anthropic_completion(system_prompt, user_message)
