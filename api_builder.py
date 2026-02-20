@@ -269,6 +269,24 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
                 description=f"Products from {e.collection_year} collection",
             ))
 
+    elif intent == Intent.PRODUCT_BY_TAG:
+        if e.tag_slugs:
+            calls.append(_build_advanced_filter_call(
+                tags=list(e.tag_slugs),
+                page=page,
+                description=f"Products by tag (slugs: {','.join(e.tag_slugs)})",
+            ))
+        else:
+            params = {"per_page": 20, "page": page, "status": "publish", "stock_status": "instock"}
+            if e.tag_ids:
+                params["tag"] = str(e.tag_ids[0])
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products",
+                params=params,
+                description=f"Products by tag (id: {e.tag_ids[0] if e.tag_ids else 'unknown'})",
+            ))
+
     elif intent == Intent.PRODUCT_BY_ORIGIN:
         calls.append(_build_advanced_filter_call(
             attributes={"pa_origin": e.origin or ""},
