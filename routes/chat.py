@@ -798,6 +798,33 @@ def chat():
 
         if parent_product_raw:
             parent_formatted = format_product(parent_product_raw)
+
+            # ── FIX: Detect product ↔ category mismatch ──
+            # User said "show me allspice in tiles" but Allspice is in Countertop.
+            # Check BEFORE generating the message so we can either:
+            #   a) Prepend a mismatch note to the bot message, or
+            #   b) Correct entities so downstream message generation is accurate
+            category_mismatch_msg = ""
+            if entities.category_name:
+                product_cats = [c.lower() for c in parent_formatted.get("categories", [])]
+                requested_cat = entities.category_name.lower()
+                if product_cats and requested_cat not in product_cats:
+                    actual_cats = ", ".join(parent_formatted.get("categories", []))
+                    category_mismatch_msg = (
+                        f"**{parent_formatted['name']}** is not available in the "
+                        f"**{entities.category_name}** category — it's part of "
+                        f"**{actual_cats}**."
+                    )
+                    logger.info(
+                        f"Step 3.7: Category mismatch detected | "
+                        f"product={parent_formatted['name']} | "
+                        f"requested_category={entities.category_name} | "
+                        f"actual_categories={actual_cats}"
+                    )
+                    # Override entities.category_name so response_generator
+                    # doesn't generate a misleading "in Tile category" header
+                    entities.category_name = actual_cats
+
             has_attributes = any([
                 entities.finish, entities.color_tone, entities.tile_size,
                 entities.thickness, entities.visual, entities.origin,
@@ -817,6 +844,11 @@ def chat():
                 products = [parent_formatted]
 
             bot_message = generate_bot_message(intent, entities, products, confidence, order_data)
+
+            # Prepend category mismatch note if detected
+            if category_mismatch_msg:
+                bot_message = f"⚠️ {category_mismatch_msg}\n\n{bot_message}"
+
             suggestions = generate_suggestions(intent, entities, products)
             filters = build_filters(intent, entities, api_calls)
             elapsed = time.time() - start_time
@@ -830,6 +862,7 @@ def chat():
                 "entities": _entities_to_dict(entities),
                 "variations_found": len(variations_raw),
                 "variations_matched": len(products) - 1 if variations_raw else 0,
+                "category_mismatch": bool(category_mismatch_msg),
             }
             if session_id and session_id in sessions:
                 sessions[session_id]["history"].append({
