@@ -465,213 +465,258 @@ def chat():
                 }), 200
 
     # Capture resolve_variant flag from flow handler (set when in AWAITING_VARIANT_SELECTION)
+    # Capture resolve_variant flag from flow handler (set when in AWAITING_VARIANT_SELECTION)
     _resolve_variant = bool(flow_result and flow_result.get("resolve_variant"))
 
-    # ─── Step 1: Classify intent ───
-    result = classify(message)
-    intent = result.intent
-    entities = result.entities
-    confidence = result.confidence
-    
-    # Log classification result with key entities
-    entity_summary = {
-        k: v for k, v in {
-            "product_name": entities.product_name,
-            "category_name": entities.category_name,
-            "product_id": entities.product_id,
-            "order_item_name": entities.order_item_name,
-            "quantity": entities.quantity,
-        }.items() if v is not None
-    }
-    logger.info(f"Step 1: Classified intent={intent.value} | confidence={confidence:.2f} | entities={entity_summary}")
-
-    # ─── Step 1.5: LLM Fallback / Disambiguation check ───
-    # Trigger LLM fallback when:
-    # 1. Intent is UNKNOWN
-    # 2. Confidence is below threshold
-    # 3. Search intent but missing both product_name AND category_id
-    # 4. Order create intent but missing both order_item_name AND product_name
-    
-    should_try_llm = False
-    llm_trigger_reason = None
-    
-    if intent.value == "unknown":
-        should_try_llm = True
-        llm_trigger_reason = "unknown_intent"
-    elif should_disambiguate(intent.value, confidence):
-        should_try_llm = True
-        llm_trigger_reason = "low_confidence"
-    elif intent == Intent.PRODUCT_SEARCH and entities.product_name is None and entities.category_id is None:
-        should_try_llm = True
-        llm_trigger_reason = "missing_entities"
+    if _resolve_variant:
+        # Skip Steps 1–3 entirely: Step 3.55 is self-contained and only needs
+        # the raw user message to score variations. Running the classifier here
+        # re-interprets "allspice beleza" as product_search, building wrong API calls.
+        from models import ExtractedEntities
+        intent = Intent.QUICK_ORDER
+        entities = ExtractedEntities()
+        confidence = 1.0
+        result = None  # not used in variant resolution path
+        api_calls = []
+        api_calls_to_execute = []
+        api_responses = []
+        all_products_raw = []
+        order_data = []
+        # Preserve customer_id (needed by Step 3.55)
+        customer_id = user_context.get("customer_id")
+        last_product_ctx = None
+        logger.info("Steps 1-3: Skipped (variant resolution mode — Step 3.55 will handle)")
+    else:
+        # ─── Step 1: Classify intent ───
+        result = classify(message)
+        intent = result.intent
+        entities = result.entities
+        confidence = result.confidence
         
-    # For order-create intents, check last_product context BEFORE triggering LLM
-    elif intent in ORDER_CREATE_INTENTS and entities.order_item_name is None and entities.product_name is None:
-        # Check if frontend sent last_product context — if so, skip LLM,
-        # let the pipeline reach Step 3.6 where last_product_ctx is used
-        last_product_ctx_check = user_context.get("last_product")
-        if not (last_product_ctx_check and last_product_ctx_check.get("id")):
+        # Log classification result with key entities
+        entity_summary = {
+            k: v for k, v in {
+                "product_name": entities.product_name,
+                "category_name": entities.category_name,
+                "product_id": entities.product_id,
+                "order_item_name": entities.order_item_name,
+                "quantity": entities.quantity,
+            }.items() if v is not None
+        }
+        logger.info(f"Step 1: Classified intent={intent.value} | confidence={confidence:.2f} | entities={entity_summary}")
+
+        # ─── Step 1.5: LLM Fallback / Disambiguation check ───
+        # Trigger LLM fallback when:
+        # 1. Intent is UNKNOWN
+        # 2. Confidence is below threshold
+        # 3. Search intent but missing both product_name AND category_id
+        # 4. Order create intent but missing both order_item_name AND product_name
+        
+        should_try_llm = False
+        llm_trigger_reason = None
+        
+        if intent.value == "unknown":
+            should_try_llm = True
+            llm_trigger_reason = "unknown_intent"
+        elif should_disambiguate(intent.value, confidence):
+            should_try_llm = True
+            llm_trigger_reason = "low_confidence"
+        elif intent == Intent.PRODUCT_SEARCH and entities.product_name is None and entities.category_id is None:
             should_try_llm = True
             llm_trigger_reason = "missing_entities"
-    
-    if should_try_llm and LLM_FALLBACK_ENABLED and not _resolve_variant:
-        # Try LLM fallback
-        store_loader = get_store_loader()
-        session_history = None
-        if session_id and session_id in sessions:
-            session_history = sessions[session_id].get("history", [])
-        
-        llm_result = llm_fallback(
-            user_message=message,
-            original_intent=intent.value,
-            original_confidence=confidence,
-            trigger_reason=llm_trigger_reason,
-            session_id=session_id,
-            store_loader=store_loader,
-            session_history=session_history,
-        )
-        
-        if llm_result.get("success"):
-            fallback_type = llm_result.get("fallback_type")
             
-            if fallback_type == "conversational":
-                # LLM handled it as general Q&A - return response directly
-                elapsed = time.time() - start_time
-                llm_metadata = llm_result.get("metadata", {})
-                llm_metadata["response_time_ms"] = round(elapsed * 1000)
+        # For order-create intents, check last_product context BEFORE triggering LLM
+        elif intent in ORDER_CREATE_INTENTS and entities.order_item_name is None and entities.product_name is None:
+            # Check if frontend sent last_product context — if so, skip LLM,
+            # let the pipeline reach Step 3.6 where last_product_ctx is used
+            last_product_ctx_check = user_context.get("last_product")
+            if not (last_product_ctx_check and last_product_ctx_check.get("id")):
+                should_try_llm = True
+                llm_trigger_reason = "missing_entities"
+        
+        if should_try_llm and LLM_FALLBACK_ENABLED and not _resolve_variant:
+            # Try LLM fallback
+            store_loader = get_store_loader()
+            session_history = None
+            if session_id and session_id in sessions:
+                session_history = sessions[session_id].get("history", [])
+            
+            llm_result = llm_fallback(
+                user_message=message,
+                original_intent=intent.value,
+                original_confidence=confidence,
+                trigger_reason=llm_trigger_reason,
+                session_id=session_id,
+                store_loader=store_loader,
+                session_history=session_history,
+            )
+            
+            if llm_result.get("success"):
+                fallback_type = llm_result.get("fallback_type")
                 
-                if session_id and session_id in sessions:
-                    sessions[session_id]["history"].append({
-                        "role": "bot",
-                        "message": llm_result["bot_message"],
+                if fallback_type == "conversational":
+                    # LLM handled it as general Q&A - return response directly
+                    elapsed = time.time() - start_time
+                    llm_metadata = llm_result.get("metadata", {})
+                    llm_metadata["response_time_ms"] = round(elapsed * 1000)
+                    
+                    if session_id and session_id in sessions:
+                        sessions[session_id]["history"].append({
+                            "role": "bot",
+                            "message": llm_result["bot_message"],
+                            "intent": "conversational",
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        })
+                    
+                    return jsonify({
+                        "success": True,
+                        "bot_message": llm_result["bot_message"],
                         "intent": "conversational",
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    })
+                        "products": [],
+                        "filters_applied": {},
+                        "suggestions": [],
+                        "session_id": session_id,
+                        "metadata": llm_metadata,
+                        "pagination": _default_pagination(page),
+                    }), 200
                 
+                elif fallback_type in ["intent_resolved", "entity_extracted"]:
+                    # LLM resolved the intent or extracted entities
+                    # Re-inject into pipeline at Step 2 by rebuilding the ClassifiedResult
+                    from models import ClassifiedResult, ExtractedEntities
+                    
+                    # Convert LLM entities to ExtractedEntities object
+                    llm_entities_dict = llm_result.get("entities", {})
+                    new_entities = ExtractedEntities()
+                    
+                    # Map LLM entity fields to ExtractedEntities fields
+                    entity_field_map = {
+                        "product_name": "product_name",
+                        "category_name": "category_name",
+                        "finish": "finish",
+                        "color_tone": "color_tone",
+                        "tile_size": "tile_size",
+                        "application": "application",
+                        "visual": "visual",
+                    }
+                    
+                    for llm_field, entity_field in entity_field_map.items():
+                        if llm_field in llm_entities_dict:
+                            setattr(new_entities, entity_field, llm_entities_dict[llm_field])
+                    
+                    # Merge with original entities if entity_extracted
+                    if fallback_type == "entity_extracted":
+                        # Keep original entities and merge with new ones
+                        for entity_field in entity_field_map.values():
+                            new_val = getattr(new_entities, entity_field)
+                            orig_val = getattr(entities, entity_field)
+                            if new_val is None and orig_val is not None:
+                                setattr(new_entities, entity_field, orig_val)
+                    
+                    # Map intent string to Intent enum
+                    llm_intent_str = llm_result.get("intent", "unknown")
+                    try:
+                        new_intent = Intent(llm_intent_str)
+                    except ValueError:
+                        # If LLM returned invalid intent, try to map common variations
+                        # If LLM returned invalid intent, try to map common variations.
+                        # This handles cases where the LLM (e.g. Mistral) returns a
+                        # short-hand or non-enum intent string like "order_inquiry".
+                        intent_mapping = {
+                            # Product discovery
+                            "search": Intent.PRODUCT_SEARCH,
+                            "product_search": Intent.PRODUCT_SEARCH,
+                            "browse": Intent.CATEGORY_BROWSE,
+                            "category_browse": Intent.CATEGORY_BROWSE,
+                            "filter": Intent.PRODUCT_LIST,
+                            "filter_by_finish": Intent.FILTER_BY_FINISH,
+                            "filter_by_color": Intent.FILTER_BY_COLOR,
+                            "filter_by_size": Intent.FILTER_BY_SIZE,
+                            "filter_by_application": Intent.FILTER_BY_APPLICATION,
+                            "filter_by_material": Intent.FILTER_BY_MATERIAL,
+                            "general_question": Intent.PRODUCT_LIST,
+                            # Order inquiry / history (read-only)
+                            "order_inquiry": Intent.ORDER_HISTORY,
+                            "order_history": Intent.ORDER_HISTORY,
+                            "check_orders": Intent.ORDER_HISTORY,
+                            "my_orders": Intent.ORDER_HISTORY,
+                            "order_status": Intent.ORDER_STATUS,
+                            "order_tracking": Intent.ORDER_TRACKING,
+                            "last_order": Intent.LAST_ORDER,
+                            "reorder": Intent.REORDER,
+                            # Order creation
+                            "order": Intent.QUICK_ORDER,
+                            "place_order": Intent.PLACE_ORDER,
+                            "quick_order": Intent.QUICK_ORDER,
+                            "order_item": Intent.ORDER_ITEM,
+                            # Discounts & promotions
+                            "discount_inquiry": Intent.DISCOUNT_INQUIRY,
+                            "promotions": Intent.PROMOTIONS,
+                            "clearance": Intent.CLEARANCE_PRODUCTS,
+                            # Greeting / chit-chat
+                            "greeting": Intent.GREETING,
+                        }
+                        new_intent = intent_mapping.get(llm_intent_str, Intent.PRODUCT_LIST)
+
+                        if llm_intent_str not in intent_mapping:
+                            logger.warning(
+                                f"Step 1.5: Unmapped LLM intent '{llm_intent_str}' — "
+                                f"falling back to PRODUCT_LIST. Consider adding it to intent_mapping."
+                            )
+                                            
+                    # Update intent, entities, and confidence
+                    intent = new_intent
+                    entities = new_entities
+                    confidence = llm_result.get("confidence", 0.70)
+                    
+                    # Create new ClassifiedResult for API builder
+                    result = ClassifiedResult(
+                        intent=intent,
+                        entities=entities,
+                        confidence=confidence,
+                    )
+                    
+                    logger.info(
+                        f"Step 1.5: LLM fallback applied | new_intent={intent.value} | "
+                        f"new_confidence={confidence:.2f} | fallback_type={fallback_type}"
+                    )
+                    
+                    # Continue to Step 2 with updated intent/entities
+                    # (fall through to rest of pipeline)
+                else:
+                    # Unknown fallback type - treat as failure
+                    llm_result["success"] = False
+            
+            # If LLM failed or returned error, fall back to disambiguation menu
+            if not llm_result.get("success"):
+                disambig = get_disambiguation_message()
+                elapsed = time.time() - start_time
+                logger.info(f"Step 1.5: LLM failed, returning disambiguation | confidence={confidence:.2f}")
                 return jsonify({
                     "success": True,
-                    "bot_message": llm_result["bot_message"],
-                    "intent": "conversational",
+                    "bot_message": disambig["bot_message"],
+                    "intent": "disambiguation",
                     "products": [],
                     "filters_applied": {},
-                    "suggestions": [],
+                    "suggestions": disambig["suggestions"],
                     "session_id": session_id,
-                    "metadata": llm_metadata,
+                    "metadata": {
+                        "flow_state": disambig["flow_state"],
+                        "confidence": round(confidence, 2),
+                        "original_intent": intent.value,
+                        "response_time_ms": round((time.time() - start_time) * 1000),
+                        "provider": "conversation_flow",
+                        "llm_error": llm_result.get("error", "LLM fallback failed"),
+                    },
+                    "flow_state": disambig["flow_state"],
                     "pagination": _default_pagination(page),
                 }), 200
-            
-            elif fallback_type in ["intent_resolved", "entity_extracted"]:
-                # LLM resolved the intent or extracted entities
-                # Re-inject into pipeline at Step 2 by rebuilding the ClassifiedResult
-                from models import ClassifiedResult, ExtractedEntities
-                
-                # Convert LLM entities to ExtractedEntities object
-                llm_entities_dict = llm_result.get("entities", {})
-                new_entities = ExtractedEntities()
-                
-                # Map LLM entity fields to ExtractedEntities fields
-                entity_field_map = {
-                    "product_name": "product_name",
-                    "category_name": "category_name",
-                    "finish": "finish",
-                    "color_tone": "color_tone",
-                    "tile_size": "tile_size",
-                    "application": "application",
-                    "visual": "visual",
-                }
-                
-                for llm_field, entity_field in entity_field_map.items():
-                    if llm_field in llm_entities_dict:
-                        setattr(new_entities, entity_field, llm_entities_dict[llm_field])
-                
-                # Merge with original entities if entity_extracted
-                if fallback_type == "entity_extracted":
-                    # Keep original entities and merge with new ones
-                    for entity_field in entity_field_map.values():
-                        new_val = getattr(new_entities, entity_field)
-                        orig_val = getattr(entities, entity_field)
-                        if new_val is None and orig_val is not None:
-                            setattr(new_entities, entity_field, orig_val)
-                
-                # Map intent string to Intent enum
-                llm_intent_str = llm_result.get("intent", "unknown")
-                try:
-                    new_intent = Intent(llm_intent_str)
-                except ValueError:
-                    # If LLM returned invalid intent, try to map common variations
-                    # If LLM returned invalid intent, try to map common variations.
-                    # This handles cases where the LLM (e.g. Mistral) returns a
-                    # short-hand or non-enum intent string like "order_inquiry".
-                    intent_mapping = {
-                        # Product discovery
-                        "search": Intent.PRODUCT_SEARCH,
-                        "product_search": Intent.PRODUCT_SEARCH,
-                        "browse": Intent.CATEGORY_BROWSE,
-                        "category_browse": Intent.CATEGORY_BROWSE,
-                        "filter": Intent.PRODUCT_LIST,
-                        "filter_by_finish": Intent.FILTER_BY_FINISH,
-                        "filter_by_color": Intent.FILTER_BY_COLOR,
-                        "filter_by_size": Intent.FILTER_BY_SIZE,
-                        "filter_by_application": Intent.FILTER_BY_APPLICATION,
-                        "filter_by_material": Intent.FILTER_BY_MATERIAL,
-                        "general_question": Intent.PRODUCT_LIST,
-                        # Order inquiry / history (read-only)
-                        "order_inquiry": Intent.ORDER_HISTORY,
-                        "order_history": Intent.ORDER_HISTORY,
-                        "check_orders": Intent.ORDER_HISTORY,
-                        "my_orders": Intent.ORDER_HISTORY,
-                        "order_status": Intent.ORDER_STATUS,
-                        "order_tracking": Intent.ORDER_TRACKING,
-                        "last_order": Intent.LAST_ORDER,
-                        "reorder": Intent.REORDER,
-                        # Order creation
-                        "order": Intent.QUICK_ORDER,
-                        "place_order": Intent.PLACE_ORDER,
-                        "quick_order": Intent.QUICK_ORDER,
-                        "order_item": Intent.ORDER_ITEM,
-                        # Discounts & promotions
-                        "discount_inquiry": Intent.DISCOUNT_INQUIRY,
-                        "promotions": Intent.PROMOTIONS,
-                        "clearance": Intent.CLEARANCE_PRODUCTS,
-                        # Greeting / chit-chat
-                        "greeting": Intent.GREETING,
-                    }
-                    new_intent = intent_mapping.get(llm_intent_str, Intent.PRODUCT_LIST)
-
-                    if llm_intent_str not in intent_mapping:
-                        logger.warning(
-                            f"Step 1.5: Unmapped LLM intent '{llm_intent_str}' — "
-                            f"falling back to PRODUCT_LIST. Consider adding it to intent_mapping."
-                        )
-                                        
-                # Update intent, entities, and confidence
-                intent = new_intent
-                entities = new_entities
-                confidence = llm_result.get("confidence", 0.70)
-                
-                # Create new ClassifiedResult for API builder
-                result = ClassifiedResult(
-                    intent=intent,
-                    entities=entities,
-                    confidence=confidence,
-                )
-                
-                logger.info(
-                    f"Step 1.5: LLM fallback applied | new_intent={intent.value} | "
-                    f"new_confidence={confidence:.2f} | fallback_type={fallback_type}"
-                )
-                
-                # Continue to Step 2 with updated intent/entities
-                # (fall through to rest of pipeline)
-            else:
-                # Unknown fallback type - treat as failure
-                llm_result["success"] = False
         
-        # If LLM failed or returned error, fall back to disambiguation menu
-        if not llm_result.get("success"):
+        elif should_try_llm and not LLM_FALLBACK_ENABLED and not _resolve_variant:
+            # LLM is disabled, use old disambiguation menu
             disambig = get_disambiguation_message()
             elapsed = time.time() - start_time
-            logger.info(f"Step 1.5: LLM failed, returning disambiguation | confidence={confidence:.2f}")
+            logger.info(f"Step 1.5: Low confidence, returning disambiguation (LLM disabled) | confidence={confidence:.2f}")
             return jsonify({
                 "success": True,
                 "bot_message": disambig["bot_message"],
@@ -686,101 +731,76 @@ def chat():
                     "original_intent": intent.value,
                     "response_time_ms": round((time.time() - start_time) * 1000),
                     "provider": "conversation_flow",
-                    "llm_error": llm_result.get("error", "LLM fallback failed"),
                 },
                 "flow_state": disambig["flow_state"],
                 "pagination": _default_pagination(page),
             }), 200
-    
-    elif should_try_llm and not LLM_FALLBACK_ENABLED and not _resolve_variant:
-        # LLM is disabled, use old disambiguation menu
-        disambig = get_disambiguation_message()
-        elapsed = time.time() - start_time
-        logger.info(f"Step 1.5: Low confidence, returning disambiguation (LLM disabled) | confidence={confidence:.2f}")
-        return jsonify({
-            "success": True,
-            "bot_message": disambig["bot_message"],
-            "intent": "disambiguation",
-            "products": [],
-            "filters_applied": {},
-            "suggestions": disambig["suggestions"],
-            "session_id": session_id,
-            "metadata": {
-                "flow_state": disambig["flow_state"],
-                "confidence": round(confidence, 2),
-                "original_intent": intent.value,
-                "response_time_ms": round((time.time() - start_time) * 1000),
-                "provider": "conversation_flow",
-            },
-            "flow_state": disambig["flow_state"],
-            "pagination": _default_pagination(page),
-        }), 200
 
-    # ─── Step 2: Build API calls ───
-    api_calls = build_api_calls(result, page)
-    endpoint_summary = [f"{c.method} {c.endpoint.split('/')[-1]}" for c in api_calls]
-    logger.info(f"Step 2: Built {len(api_calls)} API call(s) | endpoints={endpoint_summary}")
-    # ─── Step 2.5: Resolve user context placeholders ───
-    customer_id = user_context.get("customer_id")
-    if customer_id:
-        logger.info(f"Step 2.5: Resolved customer_id={customer_id}")
-        _resolve_user_placeholders(api_calls, customer_id)
+        # ─── Step 2: Build API calls ───
+        api_calls = build_api_calls(result, page)
+        endpoint_summary = [f"{c.method} {c.endpoint.split('/')[-1]}" for c in api_calls]
+        logger.info(f"Step 2: Built {len(api_calls)} API call(s) | endpoints={endpoint_summary}")
+        # ─── Step 2.5: Resolve user context placeholders ───
+        customer_id = user_context.get("customer_id")
+        if customer_id:
+            logger.info(f"Step 2.5: Resolved customer_id={customer_id}")
+            _resolve_user_placeholders(api_calls, customer_id)
 
-    # ─── Step 2.6: Extract last_product context (for "order this" resolution) ───
-    # The frontend sends the last displayed product so vague order phrases
-    # like "order this" / "buy it" resolve correctly without a product search.
-    last_product_ctx = user_context.get("last_product")  # {id, name} or None
-    
-    if last_product_ctx and last_product_ctx.get("id"):
-        logger.info(f"Step 2.6: last_product_ctx found: id={last_product_ctx.get('id')}, name=\"{sanitize_log_string(last_product_ctx.get('name', ''))}\"")
-    else:
-        logger.info("Step 2.6: No last_product_ctx")
-
-    # ─── Step 3: Execute API calls ───
-    all_products_raw = []
-    order_data = []
-    
-    # BUG FIX: For order-create intents, skip POST /orders calls from api_builder
-    # since Step 3.6 will handle order creation. This prevents duplicate orders.
-    filtered_api_calls = []
-    if intent in ORDER_CREATE_INTENTS:
-        for call in api_calls:
-            # Skip POST /orders calls - Step 3.6 will create the order
-            if call.method == "POST" and "/orders" in call.endpoint:
-                logger.info(f"Step 3: Skipping POST /orders call from api_builder (intent={intent.value}) - Step 3.6 will handle order creation")
-                continue
-            filtered_api_calls.append(call)
-        api_calls_to_execute = filtered_api_calls
-    else:
-        api_calls_to_execute = api_calls
-    
-    api_responses = woo_client.execute_all(api_calls_to_execute)
-
-    for resp in api_responses:
-        if resp.get("success"):
-            data = resp.get("data")
-            # Handle custom API response format (has "products" key)
-            if isinstance(data, dict) and "products" in data:
-                if intent in ORDER_INTENTS:
-                    order_data.extend(data["products"])
-                else:
-                    all_products_raw.extend(data["products"])
-            elif isinstance(data, list):
-                if intent in ORDER_INTENTS:
-                    order_data.extend(data)
-                else:
-                    all_products_raw.extend(data)
-            elif isinstance(data, dict):
-                if intent in ORDER_INTENTS:
-                    order_data.append(data)
-                else:
-                    all_products_raw.append(data)
+        # ─── Step 2.6: Extract last_product context (for "order this" resolution) ───
+        # The frontend sends the last displayed product so vague order phrases
+        # like "order this" / "buy it" resolve correctly without a product search.
+        last_product_ctx = user_context.get("last_product")  # {id, name} or None
+        
+        if last_product_ctx and last_product_ctx.get("id"):
+            logger.info(f"Step 2.6: last_product_ctx found: id={last_product_ctx.get('id')}, name=\"{sanitize_log_string(last_product_ctx.get('name', ''))}\"")
         else:
-            # Log API call failure (sanitize error message to prevent log injection)
-            error_msg = sanitize_log_string(str(resp.get('error', 'Unknown')))
-            logger.warning(f"Step 3: API call failed | error={error_msg}")
-    
-    logger.info(f"Step 3: API execution complete | all_products_raw count={len(all_products_raw)} | order_data count={len(order_data)}")
+            logger.info("Step 2.6: No last_product_ctx")
+
+        # ─── Step 3: Execute API calls ───
+        all_products_raw = []
+        order_data = []
+        
+        # BUG FIX: For order-create intents, skip POST /orders calls from api_builder
+        # since Step 3.6 will handle order creation. This prevents duplicate orders.
+        filtered_api_calls = []
+        if intent in ORDER_CREATE_INTENTS:
+            for call in api_calls:
+                # Skip POST /orders calls - Step 3.6 will create the order
+                if call.method == "POST" and "/orders" in call.endpoint:
+                    logger.info(f"Step 3: Skipping POST /orders call from api_builder (intent={intent.value}) - Step 3.6 will handle order creation")
+                    continue
+                filtered_api_calls.append(call)
+            api_calls_to_execute = filtered_api_calls
+        else:
+            api_calls_to_execute = api_calls
+        
+        api_responses = woo_client.execute_all(api_calls_to_execute)
+
+        for resp in api_responses:
+            if resp.get("success"):
+                data = resp.get("data")
+                # Handle custom API response format (has "products" key)
+                if isinstance(data, dict) and "products" in data:
+                    if intent in ORDER_INTENTS:
+                        order_data.extend(data["products"])
+                    else:
+                        all_products_raw.extend(data["products"])
+                elif isinstance(data, list):
+                    if intent in ORDER_INTENTS:
+                        order_data.extend(data)
+                    else:
+                        all_products_raw.extend(data)
+                elif isinstance(data, dict):
+                    if intent in ORDER_INTENTS:
+                        order_data.append(data)
+                    else:
+                        all_products_raw.append(data)
+            else:
+                # Log API call failure (sanitize error message to prevent log injection)
+                error_msg = sanitize_log_string(str(resp.get('error', 'Unknown')))
+                logger.warning(f"Step 3: API call failed | error={error_msg}")
+        
+        logger.info(f"Step 3: API execution complete | all_products_raw count={len(all_products_raw)} | order_data count={len(order_data)}")
 
     # ─── Step 3.5: REORDER step 2 — create new order from last order's line_items ───
     if intent == Intent.REORDER and order_data:
@@ -851,6 +871,7 @@ def chat():
                             if opt_lower and opt_lower in user_text_lower
                         ))
                         for var in all_variations
+                        if var.get("attributes")  # skip variations with empty attributes
                     ]
                     max_score = max((s for _, s in scores), default=0)
                     if max_score > 0:
@@ -951,16 +972,37 @@ def chat():
                     parent_resp = woo_client.execute(parent_call)
                     parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
                     if len(matched) > 1 and len(matched) < len(all_variations):
-                        # Some variants matched but need more specifics
-                        variation_labels = [
-                            " / ".join(a.get("option", "") for a in v.get("attributes", []) if a.get("option"))
-                            for v in matched
-                        ]
-                        prompt_msg = (
-                            f"I found **{len(matched)}** variants of **{_var_product_name}** matching your description:\n\n"
-                            + "\n".join(f"• {lbl}" for lbl in variation_labels if lbl)
-                            + "\n\nWhich one would you like?"
-                        )
+                        # Determine which attributes are still ambiguous
+                        # Collect unique values per attribute across matched variations
+                        attr_values = {}  # {attr_name: set_of_options}
+                        for v in matched:
+                            for a in v.get("attributes", []):
+                                name = a.get("name", "")
+                                opt = a.get("option", "")
+                                if name and opt:
+                                    attr_values.setdefault(name, set()).add(opt)
+                        
+                        # Ambiguous attrs = those with more than 1 unique value
+                        ambiguous = {k: sorted(v) for k, v in attr_values.items() if len(v) > 1}
+                        
+                        if ambiguous:
+                            # Ask specifically about the remaining attributes
+                            lines = [f"Great, I found **{_var_product_name}** in your selected options! I just need a bit more info:\n"]
+                            for attr_name, options in ambiguous.items():
+                                lines.append(f"• **{attr_name}:** {', '.join(options)}")
+                            lines.append("\nWhich combination would you like?")
+                            prompt_msg = "\n".join(lines)
+                        else:
+                            # All attributes have same values across matches (shouldn't happen, but fallback)
+                            variation_labels = [
+                                " / ".join(a.get("option", "") for a in v.get("attributes", []) if a.get("option"))
+                                for v in matched
+                            ]
+                            prompt_msg = (
+                                f"I found **{len(matched)}** variants of **{_var_product_name}** matching your description:\n\n"
+                                + "\n".join(f"• {lbl}" for lbl in variation_labels if lbl)
+                                + "\n\nWhich one would you like?"
+                            )
                     else:
                         prompt_msg = _build_variant_prompt(parent_raw, _var_product_name)
                         if len(all_variations) > 0:
