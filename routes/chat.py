@@ -3,6 +3,7 @@ Chat endpoint as a Flask Blueprint.
 """
 
 import os
+import re as _re
 import time
 from datetime import datetime, timezone
 from typing import List, Dict
@@ -52,6 +53,36 @@ logger = get_logger("miraq_chat")
 
 chat_bp = Blueprint("chat", __name__)
 
+_TOKEN_OVERLAP_THRESHOLD = 0.5
+_STRIP_QUOTES_RE = _re.compile(r'["\'\u201c\u201d\u2018\u2019]')
+_TOKENIZE_RE = _re.compile(r'[\w/]+')
+
+
+def _score_variation_against_text(var: dict, user_text_clean: str, user_tokens: set) -> int:
+    """Score how well a variation's attribute options match the user's cleaned message.
+
+    Returns a non-negative integer score:
+    * +2 for each attribute option whose cleaned string is found verbatim in *user_text_clean*.
+    * +1 for each attribute option that has >=50% token overlap with *user_tokens*, or whose
+      cleaned string contains at least one significant (len>=2) user token as a substring.
+    """
+    score = 0
+    for attr in var.get("attributes", []):
+        opt = attr.get("option", "").lower()
+        if not opt:
+            continue
+        opt_clean = _STRIP_QUOTES_RE.sub('', opt)
+        if opt_clean in user_text_clean:
+            score += 2
+        else:
+            opt_tokens = set(_TOKENIZE_RE.findall(opt_clean))
+            if opt_tokens:
+                overlap = opt_tokens & user_tokens
+                if len(overlap) >= max(1, len(opt_tokens) * _TOKEN_OVERLAP_THRESHOLD):
+                    score += 1
+                elif any(len(t) >= 2 and t in opt_clean for t in user_tokens):
+                    score += 1
+    return score
 
 def parse_address(text: str) -> dict:
     """Parse a free-text address string into WooCommerce shipping fields."""
@@ -246,6 +277,7 @@ def chat():
         "pending_product_id": user_context.get("pending_product_id"),
         "pending_quantity": user_context.get("pending_quantity"),
         "pending_variation_id": user_context.get("pending_variation_id"),
+        "resolved_attributes": user_context.get("resolved_attributes"),
     }
 
     # If we're in a multi-turn flow, let the flow handler try first
@@ -859,17 +891,37 @@ def chat():
             if var_resp.get("success") and isinstance(var_resp.get("data"), list):
                 all_variations = var_resp["data"]
 
+                # ── CHANGE 3a: Pre-filter using resolved attributes from prior turns ──
+                prev_resolved = user_context.get("resolved_attributes", {})
+                if prev_resolved:
+                    pre_filtered = []
+                    for var in all_variations:
+                        var_attrs = {
+                            a.get("name", "").lower(): a.get("option", "").lower()
+                            for a in var.get("attributes", [])
+                        }
+                        matches_all = True
+                        for attr_name, attr_val in prev_resolved.items():
+                            var_opt = var_attrs.get(attr_name.lower(), "")
+                            if attr_val.lower() not in var_opt:
+                                matches_all = False
+                                break
+                        if matches_all:
+                            pre_filtered.append(var)
+                    if pre_filtered:
+                        logger.info(f"Step 3.55: Pre-filtered {len(all_variations)} → {len(pre_filtered)} using resolved_attributes={prev_resolved}")
+                        all_variations = pre_filtered
+                # ── END CHANGE 3a ──
+
                 if _resolve_variant:
                     # Self-contained scoring: bypass classifier entities entirely.
                     # Score each variation by counting how many of its attribute options
                     # appear (case-insensitive) in the user's raw message.
                     user_text_lower = message.lower()
+                    user_text_clean = _STRIP_QUOTES_RE.sub('', user_text_lower)
+                    user_tokens = set(_TOKENIZE_RE.findall(user_text_clean))
                     scores = [
-                        (var, sum(
-                            1 for attr in var.get("attributes", [])
-                            for opt_lower in [attr.get("option", "").lower()]
-                            if opt_lower and opt_lower in user_text_lower
-                        ))
+                        (var, _score_variation_against_text(var, user_text_clean, user_tokens))
                         for var in all_variations
                         if var.get("attributes")  # skip variations with empty attributes
                     ]
@@ -962,6 +1014,29 @@ def chat():
                 else:
                     # Multiple or no exact match — ask user to narrow down or re-select
                     logger.info(f"Step 3.55: Could not resolve to single variation | matched={len(matched)} of {len(all_variations)}")
+                    # Collect which attributes have been pinned down
+                    resolved_attributes = {}
+                    if len(matched) > 1 and len(matched) < len(all_variations):
+                        attr_values = {}
+                        for v in matched:
+                            for a in v.get("attributes", []):
+                                name = a.get("name", "")
+                                opt = a.get("option", "")
+                                if name and opt:
+                                    attr_values.setdefault(name, set()).add(opt)
+                        # Attributes with exactly 1 unique value are "resolved"
+                        for attr_name, options in attr_values.items():
+                            if len(options) == 1:
+                                resolved_attributes[attr_name] = list(options)[0]
+                        logger.info(f"Step 3.55: Resolved attributes so far: {resolved_attributes}")
+
+                    # Merge in any previously resolved attributes from prior turns
+                    if prev_resolved:
+                        for k, v in prev_resolved.items():
+                            if k not in resolved_attributes:
+                                resolved_attributes[k] = v
+                        logger.info(f"Step 3.55: Merged with previous resolved_attributes: {resolved_attributes}")
+
                     # Fetch parent product to rebuild the prompt
                     parent_call = WooAPICall(
                         method="GET",
@@ -974,17 +1049,16 @@ def chat():
                     if len(matched) > 1 and len(matched) < len(all_variations):
                         # Determine which attributes are still ambiguous
                         # Collect unique values per attribute across matched variations
-                        attr_values = {}  # {attr_name: set_of_options}
+                        attr_values_all = {}  # {attr_name: set_of_options}
                         for v in matched:
                             for a in v.get("attributes", []):
                                 name = a.get("name", "")
                                 opt = a.get("option", "")
                                 if name and opt:
-                                    attr_values.setdefault(name, set()).add(opt)
+                                    attr_values_all.setdefault(name, set()).add(opt)
                         
                         # Ambiguous attrs = those with more than 1 unique value
-                        ambiguous = {k: sorted(v) for k, v in attr_values.items() if len(v) > 1}
-                        
+                        ambiguous = {k: sorted(v) for k, v in attr_values_all.items() if len(v) > 1}
                         if ambiguous:
                             # Ask specifically about the remaining attributes
                             lines = [f"Great, I found **{_var_product_name}** in your selected options! I just need a bit more info:\n"]
@@ -1021,6 +1095,7 @@ def chat():
                             "pending_product_id": _var_product_id,
                             "pending_product_name": _var_product_name,
                             "pending_quantity": _var_quantity,
+                            "resolved_attributes": resolved_attributes,  # ← CHANGE 3b: persist resolved attrs
                             "response_time_ms": round(elapsed * 1000),
                         },
                         "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
