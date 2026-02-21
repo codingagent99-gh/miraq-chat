@@ -266,6 +266,8 @@ def _filter_variations_by_entities(
 
     matched = []
     for var in variations:
+        if not var.get("attributes"):
+            continue
         var_attrs = {
             a.get("name", "").lower(): a.get("option", "").lower()
             for a in var.get("attributes", [])
