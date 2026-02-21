@@ -522,7 +522,7 @@ class TestStep355RawTextFallback:
     """
 
     def _allspice_variations(self):
-        """51-variation-like set simplified to 4 Honed variants (the failure scenario)."""
+        """51-variation-like set simplified to 4 Honed variants plus a ghost variation."""
         combos = [
             ("ALLSPICE Beleza",      "Honed",    '1 7/8"x7 3/8" Chip Size'),
             ("ALLSPICE Beleza",      "Honed",    '12"x24"'),
@@ -541,14 +541,22 @@ class TestStep355RawTextFallback:
                 ],
                 "price": "15.00", "regular_price": "15.00", "sale_price": "",
                 "sku": "", "stock_status": "instock", "on_sale": False,
-                "slug": "", "image": {},
+                "slug": "", "image": {}, "purchasable": True,
             })
+        # Ghost variation — empty attributes, not purchasable; should be filtered out
+        variations.append({
+            "id": 8611, "parent_id": 7272, "name": "", "attributes": [],
+            "price": "", "purchasable": False, "sku": "", "stock_status": "instock",
+            "on_sale": False, "slug": "", "image": {},
+        })
         return variations
 
     def test_raw_text_fallback_resolves_to_single_variant(self):
         """
-        When entity extraction yields 'finish=Honed' only (4 matches), the raw-text
-        fallback should use the message text to narrow down to exactly 1 variation.
+        When entity extraction yields 'finish=Honed' only (4 matches), the smart
+        text-scoring fallback should use the message text to narrow down to exactly
+        1 variation.  Uses natural/partial input ("7/8") rather than the full
+        WooCommerce option string to confirm token-overlap scoring works.
         """
         from server import app
 
@@ -569,7 +577,7 @@ class TestStep355RawTextFallback:
                 }
 
                 resp = client.post("/chat", json={
-                    "message": 'i will like color Allspice Beleza, finish Honed and sample size 1 7/8"x7 3/8" Chip Size',
+                    "message": 'i will like color Allspice Beleza, finish Honed and sample size 7/8"',
                     "session_id": "test-rawtext-fallback",
                     "user_context": {
                         "customer_id": 130,
@@ -581,11 +589,26 @@ class TestStep355RawTextFallback:
                 })
                 data = resp.get_json()
 
-                # The raw-text fallback should match variation 2000 and create the order
-                # or at minimum narrow down to 1 and NOT stay in awaiting_variant_selection
+                # The smart text-scoring fallback should match variation 2000 and create
+                # the order, or at minimum narrow down to 1 and NOT stay in
+                # awaiting_variant_selection
                 flow = data.get("flow_state") or data.get("metadata", {}).get("flow_state", "")
                 assert flow != "awaiting_variant_selection", \
                     f"Raw-text fallback should resolve the variation; still in selection loop. Response: {data}"
+
+    def test_ghost_variation_filtered_out(self):
+        """Ghost variation (empty attributes, purchasable=False) must not pollute candidate list."""
+        from formatters import _filter_variations_by_entities
+
+        all_vars = self._allspice_variations()
+        # Without filtering, all_vars has 5 items (4 real + 1 ghost)
+        assert len(all_vars) == 5
+
+        entities = ExtractedEntities(finish="Honed")
+        matched = _filter_variations_by_entities(all_vars, entities)
+        # Ghost variation should never appear in the results
+        ids = [v["id"] for v in matched]
+        assert 8611 not in ids, "Ghost variation (id=8611) should be excluded from matches"
 
 
 if __name__ == "__main__":

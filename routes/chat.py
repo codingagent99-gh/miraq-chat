@@ -3,6 +3,7 @@ Chat endpoint as a Flask Blueprint.
 """
 
 import os
+import re as _re
 import time
 from datetime import datetime, timezone
 from typing import List, Dict
@@ -51,6 +52,37 @@ from store_registry import get_store_loader
 logger = get_logger("miraq_chat")
 
 chat_bp = Blueprint("chat", __name__)
+
+_TOKEN_OVERLAP_THRESHOLD = 0.5
+_STRIP_QUOTES_RE = _re.compile(r'["\'\u201c\u201d\u2018\u2019]')
+_TOKENIZE_RE = _re.compile(r'[\w/]+')
+
+
+def _score_variation_against_text(var: dict, user_text_clean: str, user_tokens: set) -> int:
+    """Score how well a variation's attribute options match the user's cleaned message.
+
+    Returns a non-negative integer score:
+    * +2 for each attribute option whose cleaned string is found verbatim in *user_text_clean*.
+    * +1 for each attribute option that has ≥50% token overlap with *user_tokens*, or whose
+      cleaned string contains at least one significant (len≥2) user token as a substring.
+    """
+    score = 0
+    for attr in var.get("attributes", []):
+        opt = attr.get("option", "").lower()
+        if not opt:
+            continue
+        opt_clean = _STRIP_QUOTES_RE.sub('', opt)
+        if opt_clean in user_text_clean:
+            score += 2
+        else:
+            opt_tokens = set(_TOKENIZE_RE.findall(opt_clean))
+            if opt_tokens:
+                overlap = opt_tokens & user_tokens
+                if len(overlap) >= max(1, len(opt_tokens) * _TOKEN_OVERLAP_THRESHOLD):
+                    score += 1
+                elif any(len(t) >= 2 and t in opt_clean for t in user_tokens):
+                    score += 1
+    return score
 
 
 def parse_address(text: str) -> dict:
@@ -837,48 +869,46 @@ def chat():
             )
             var_resp = woo_client.execute(var_call)
             if var_resp.get("success") and isinstance(var_resp.get("data"), list):
-                all_variations = var_resp["data"]
+                all_variations = [
+                    v for v in var_resp["data"]
+                    if v.get("attributes") and v.get("purchasable", True)
+                ]
 
                 if _resolve_variant:
                     # Self-contained scoring: bypass classifier entities entirely.
-                    # Score each variation by counting how many of its attribute options
-                    # appear (case-insensitive) in the user's raw message.
-                    user_text_lower = message.lower()
-                    scores = [
-                        (var, sum(
-                            1 for attr in var.get("attributes", [])
-                            for opt_lower in [attr.get("option", "").lower()]
-                            if opt_lower and opt_lower in user_text_lower
-                        ))
-                        for var in all_variations
+                    # Score each variation by how well its attribute options match
+                    # the user's raw message (handles partial input like "7/8"
+                    # matching '1 7/8"x7 3/8" Chip Size').
+                    user_text_clean = _STRIP_QUOTES_RE.sub('', message.lower())
+                    user_tokens = set(_TOKENIZE_RE.findall(user_text_clean))
+                    scored: list = [
+                        (var, s) for var in all_variations
+                        if (s := _score_variation_against_text(var, user_text_clean, user_tokens)) > 0
                     ]
-                    max_score = max((s for _, s in scores), default=0)
-                    if max_score > 0:
-                        matched = [var for var, s in scores if s == max_score]
+                    if scored:
+                        max_score = max(s for _, s in scored)
+                        matched = [v for v, s in scored if s == max_score]
                     else:
                         matched = all_variations
                 else:
                     matched = _filter_variations_by_entities(all_variations, entities)
 
-                    # Raw-text fallback: match user message directly against variation option values
+                    # Smarter text fallback: score each variation by how well its
+                    # attribute options match the user's raw message (handles partial
+                    # input like "7/8" matching '1 7/8"x7 3/8" Chip Size').
                     if len(matched) != 1:
-                        user_text_lower = message.lower()
+                        user_text_clean = _STRIP_QUOTES_RE.sub('', message.lower())
+                        user_tokens = set(_TOKENIZE_RE.findall(user_text_clean))
                         candidates = matched if len(matched) > 1 else all_variations
-                        text_matched = []
-                        for var in candidates:
-                            var_attrs = var.get("attributes", [])
-                            if not var_attrs:
-                                continue
-                            # Check if ALL attribute options for this variation appear in the user's message
-                            all_options_found = all(
-                                a.get("option", "").lower() in user_text_lower
-                                for a in var_attrs
-                                if a.get("option")
-                            )
-                            if all_options_found:
-                                text_matched.append(var)
-                        if text_matched and len(text_matched) < len(candidates):
-                            matched = text_matched
+                        scored = [
+                            (var, s) for var in candidates
+                            if (s := _score_variation_against_text(var, user_text_clean, user_tokens)) > 0
+                        ]
+                        if scored:
+                            max_score = max(s for _, s in scored)
+                            text_matched = [v for v, s in scored if s == max_score]
+                            if text_matched and len(text_matched) < len(candidates):
+                                matched = text_matched
 
                 if len(matched) == 1:
                     # Exactly one match — create the order
@@ -1076,7 +1106,10 @@ def chat():
                     # Case B: Attributes specified — use pre-fetched or freshly fetched variations
                     logger.info(f"Step 3.6: Variable product with attributes, resolving variation | product_id={_order_product_id}")
                     if _prefetched_variations:
-                        all_variations = _prefetched_variations
+                        all_variations = [
+                            v for v in _prefetched_variations
+                            if v.get("attributes") and v.get("purchasable", True)
+                        ]
                         logger.info(f"Step 3.6: Using {len(all_variations)} pre-fetched variations")
                     else:
                         var_call = WooAPICall(
@@ -1086,7 +1119,10 @@ def chat():
                             description=f"Fetch variations for order resolution of '{_order_product_name}'",
                         )
                         var_resp = woo_client.execute(var_call)
-                        all_variations = var_resp.get("data", []) if var_resp.get("success") else []
+                        all_variations = [
+                            v for v in var_resp.get("data", [])
+                            if v.get("attributes") and v.get("purchasable", True)
+                        ] if var_resp.get("success") else []
                     if all_variations:
                         matched = _filter_variations_by_entities(all_variations, entities)
                         if len(matched) == 1:
