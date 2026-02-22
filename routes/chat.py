@@ -7,6 +7,7 @@ import re as _re
 import time
 from datetime import datetime, timezone
 from typing import List, Dict
+from config.settings import DEFAULT_PER_PAGE  # add this import at top of file alongside existing imports
 
 from flask import Blueprint, request, jsonify
 
@@ -138,11 +139,11 @@ def _build_pagination(page: int, api_responses: list, api_calls: list) -> dict:
     """Build pagination object from API responses and call params."""
     total_items = None
     total_pages = None
-    per_page = 20
+    per_page = DEFAULT_PER_PAGE
 
     # Extract per_page from the first API call's params
     if api_calls:
-        per_page = int(api_calls[0].params.get("per_page", 20))
+        per_page = int(api_calls[0].params.get("per_page", DEFAULT_PER_PAGE))
 
     # Extract total/total_pages from the first successful response
     for resp in api_responses:
@@ -169,7 +170,6 @@ def _build_pagination(page: int, api_responses: list, api_calls: list) -> dict:
         "total_pages": total_pages,
         "has_more": has_more,
     }
-
 
 def _fetch_unit_price(product_id, variation_id=None) -> str:
     """Fetch the unit price for a product or variation. Returns price string or 'N/A'."""
@@ -1646,8 +1646,13 @@ def chat():
     logger.info(f"Step 4: Formatted {len(products)} products")
 
     # ─── Step 5: Generate bot message ───
-    bot_message = generate_bot_message(intent, entities, products, confidence, order_data)
-    
+    # Extract total_items from pagination so the bot message shows the real
+    # total (e.g. "26 products") instead of just the page size (e.g. "4 products")
+    _pagination_data = _build_pagination(page, api_responses, api_calls_to_execute)
+    _total_items_for_msg = _pagination_data.get("total_items")
+
+    bot_message = generate_bot_message(intent, entities, products, confidence, order_data, total_items=_total_items_for_msg)
+        
     if intent in ORDER_CREATE_INTENTS and order_data:
         placed_order = order_data[-1]
         if products:
@@ -1710,8 +1715,8 @@ def chat():
             "products_count": len(products),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
-
-    # ─── Step 10: Build response ─���─
+    
+    # ─── Step 10: Build response ───
     response = {
         "success": True,
         "bot_message": bot_message,
@@ -1721,7 +1726,7 @@ def chat():
         "suggestions": suggestions,
         "session_id": session_id,
         "metadata": metadata,
-        "pagination": _build_pagination(page, api_responses, api_calls_to_execute),
+        "pagination": _pagination_data,
     }
 
     # ─── Step 5.5: Detect when quantity is needed for ordering ───

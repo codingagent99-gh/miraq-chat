@@ -7,6 +7,7 @@ import json
 from typing import List, Optional
 from models import Intent, ClassifiedResult, WooAPICall, ExtractedEntities
 from store_registry import get_store_loader
+from config.settings import DEFAULT_PER_PAGE
 
 
 BASE = "https://wgc.net.in/hn/wp-json/wc/v3"
@@ -46,7 +47,7 @@ def _build_advanced_filter_call(
     categories: List[str] = None,
     attributes: dict = None,
     page: int = 1,
-    per_page: int = 20,
+    per_page: int = DEFAULT_PER_PAGE,
     description: str = "",
 ) -> WooAPICall:
     """
@@ -227,7 +228,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={"per_page": 20, "page": page, "status": "publish", "stock_status": "instock",
+            params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish", "stock_status": "instock",
                     "orderby": "menu_order", "order": "asc"},
             description="List all published, in-stock products",
         ))
@@ -252,7 +253,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
             calls.append(WooAPICall(
                 method="GET",
                 endpoint=f"{BASE}/products",
-                params={"per_page": 20, "page": page, "status": "publish", "search": e.product_name or e.search_term or ""},
+                params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish", "search": e.product_name or e.search_term or ""},
                 description=f"Search products matching '{e.product_name}'",
             ))
 
@@ -287,7 +288,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
             ))
         else:
             # Fallback to standard API with tag IDs (keep existing behavior for when no slugs)
-            params = {"per_page": 20, "page": page, "status": "publish", "stock_status": "instock"}
+            params = {"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish", "stock_status": "instock"}
             if e.tag_ids:
                 params["tag"] = str(e.tag_ids[0])
             calls.append(WooAPICall(
@@ -305,7 +306,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
                 description=f"Products by tag (slugs: {','.join(e.tag_slugs)})",
             ))
         else:
-            params = {"per_page": 20, "page": page, "status": "publish", "stock_status": "instock"}
+            params = {"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish", "stock_status": "instock"}
             if e.tag_ids:
                 params["tag"] = str(e.tag_ids[0])
             calls.append(WooAPICall(
@@ -323,7 +324,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         ))
 
     elif intent == Intent.PRODUCT_QUICK_SHIP:
-        params = {"per_page": 20, "page": page, "status": "publish", "stock_status": "instock"}
+        params = {"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish", "stock_status": "instock"}
         qs_tag_id = _tag_id("quick-ship")
         if qs_tag_id:
             params["tag"] = str(qs_tag_id)
@@ -390,7 +391,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         calls.append(_build_advanced_filter_call(
             attributes={"pa_tile-size": size_term},
             page=page,
-            description=f"Filter by tile size: {e.tile_size}",
+            description=f"Filter by size: {size_term}",
         ))
 
     elif intent == Intent.FILTER_BY_COLOR:
@@ -398,20 +399,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
             attributes={"pa_colors": e.color_tone or ""},
             page=page,
             description=f"Filter by color: {e.color_tone}",
-        ))
-
-    elif intent == Intent.FILTER_BY_THICKNESS:
-        calls.append(_build_advanced_filter_call(
-            attributes={"pa_thickness": e.thickness or ""},
-            page=page,
-            description=f"Filter by thickness: {e.thickness}",
-        ))
-
-    elif intent == Intent.FILTER_BY_EDGE:
-        calls.append(_build_advanced_filter_call(
-            attributes={"pa_edge": e.edge or ""},
-            page=page,
-            description=f"Filter by edge: {e.edge}",
         ))
 
     elif intent == Intent.FILTER_BY_APPLICATION:
@@ -447,14 +434,14 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
 
     # ═══════════════════════════════════════════
     # PRODUCT SUBTYPES
-    # ═══════════════════════════════════════════
+    # ════════════���══════════════════════════════
 
     elif intent == Intent.MOSAIC_PRODUCTS:
         search_term = f"{e.product_name} mosaic" if e.product_name else "mosaic"
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={"per_page": 20, "page": page, "status": "publish", "search": search_term},
+            params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish", "search": search_term},
             description=f"Search mosaic products: '{search_term}'",
         ))
 
@@ -463,7 +450,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={"per_page": 20, "page": page, "status": "publish", "search": search_term},
+            params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish", "search": search_term},
             description=f"List trim products",
         ))
 
@@ -472,7 +459,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
             calls.append(WooAPICall(
                 method="GET",
                 endpoint=f"{BASE}/products",
-                params={"per_page": 10, "page": page, "status": "publish",
+                params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish",
                         "search": f"{e.product_name} chip card"},
                 description=f"Find chip card for '{e.product_name}'",
             ))
@@ -533,7 +520,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={"on_sale": "true", "per_page": 20, "page": page, "status": "publish"},
+            params={"on_sale": "true", "per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish"},
             description="List products on sale",
         ))
 
@@ -541,7 +528,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={"on_sale": "true", "per_page": 20, "page": page, "status": "publish"},
+            params={"on_sale": "true", "per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish"},
             description="List clearance products",
         ))
 
@@ -549,7 +536,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={"per_page": 20, "page": page, "status": "publish", "search": "bulk"},
+            params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish", "search": "bulk"},
             description="Check for bulk discount products",
         ))
 
@@ -557,7 +544,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={"on_sale": "true", "per_page": 20, "page": page, "status": "publish"},
+            params={"on_sale": "true", "per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish"},
             description="List current promotions",
         ))
 
@@ -565,7 +552,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/coupons",
-            params={"per_page": 20, "page": page},
+            params={"per_page": DEFAULT_PER_PAGE, "page": page},
             description="List available coupon codes",
         ))
 
@@ -576,15 +563,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
     elif intent == Intent.SAVE_FOR_LATER:
         calls.append(WooAPICall(
             method="POST",
-            endpoint=f"{BASE}/wishlist/add",
-            params={},
-            body={"product_id": e.product_id},
-            description="Save item for later",
-        ))
-
-    elif intent == Intent.WISHLIST:
-        calls.append(WooAPICall(
-            method="GET",
             endpoint=f"{BASE}/wishlist",
             params={"customer_id": "CURRENT_USER"},
             description="Get customer wishlist",
@@ -647,7 +625,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
-            params={"search": search, "per_page": 20, "page": page, "status": "publish"},
+            params={"search": search, "per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish"},
             description=f"Fallback search: '{search}'",
         ))
 

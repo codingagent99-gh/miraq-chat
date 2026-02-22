@@ -2,7 +2,7 @@
 Response generation module for bot messages, suggestions, and formatting.
 """
 
-from typing import List
+from typing import List, Optional
 from datetime import datetime
 
 from models import Intent, ExtractedEntities, WooAPICall
@@ -15,13 +15,24 @@ def generate_bot_message(
     products: List[dict],
     confidence: float,
     order_data: List[dict] = None,
+    total_items: Optional[int] = None,
 ) -> str:
-    """Generate a natural language bot response."""
+    """Generate a natural language bot response.
+
+    Args:
+        total_items: The real total number of matching products across all pages
+                     (from X-WP-Total header). When provided, this is shown in
+                     the message instead of len(products) which is just the
+                     current page size.
+    """
 
     if order_data is None:
         order_data = []
-    
-    count = len(products)
+
+    page_count = len(products)
+    # Display count: use total_items (real total across all pages) when available,
+    # otherwise fall back to the number of products on this page.
+    count = total_items if total_items is not None else page_count
 
     # ── Greeting intent ──
     if intent == Intent.GREETING:
@@ -41,12 +52,12 @@ def generate_bot_message(
             status = order.get("status", "unknown").title()
             total = order.get("total", "0")
             date_created = order.get("date_created", "")
-            
+
             msg = f"📦 **Your Last Order** (#{order_number})\n\n"
             msg += f"**Status:** {status}\n"
             msg += f"**Date:** {_format_order_date(date_created)}\n"
             msg += f"**Total:** ${total}\n\n"
-            
+
             line_items = order.get("line_items", [])
             if line_items:
                 msg += "**Items:**\n"
@@ -55,7 +66,7 @@ def generate_bot_message(
                     name = item.get("name") or "Unknown Item"
                     item_total = item.get("total", "0")
                     msg += f"  • {name} × {qty} — ${item_total}\n"
-            
+
             return msg
 
         elif intent == Intent.REORDER and order_data:
@@ -79,8 +90,8 @@ def generate_bot_message(
                 msg += "\n⚠️ Items identified — but the new order could not be created automatically. Please place the order manually or contact support."
 
             return msg
-        
-        if count == 0:
+
+        if page_count == 0 and not order_data:
             if intent == Intent.LAST_ORDER:
                 return (
                     "I can show you your most recent order! 📦\n\n"
@@ -88,22 +99,16 @@ def generate_bot_message(
                 )
             elif intent == Intent.ORDER_HISTORY:
                 return (
-                    f"I can show you your order history! 📋\n\n"
-                    "Please make sure you're logged in so I can retrieve your past orders."
+                    "I'd love to show your order history! 📦\n\n"
+                    "Please make sure you're logged in so I can retrieve your orders."
                 )
             elif intent == Intent.REORDER:
                 return (
-                    "I can help you reorder your last purchase! 🔄\n\n"
-                    "Please make sure you're logged in so I can access your order history."
-                )
-            elif intent == Intent.QUICK_ORDER:
-                search_term = entities.order_item_name or entities.product_name or "that item"
-                return (
-                    f"I couldn't find a product matching **{search_term}**. 😕\n\n"
-                    "Try searching by a different name or browse our categories."
+                    "I can reorder from your last purchase! 🔄\n\n"
+                    "Please make sure you're logged in first."
                 )
 
-    # ── QUICK_ORDER / ORDER_ITEM / PLACE_ORDER ──
+    # ── Quick order / Order item / Place order ──
     if intent in (Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER):
         if order_data:
             placed = order_data[-1]
@@ -119,6 +124,7 @@ def generate_bot_message(
                 line_total = sum(float(item.get("total", "0") or "0") for item in placed["line_items"])
                 if line_total > 0:
                     total = str(line_total)
+
             # Extract quantity from line_items or entities
             quantity = 1
             if placed.get("line_items"):
@@ -132,8 +138,8 @@ def generate_bot_message(
                 f"**Total:** ${float(total):.2f}\n"
                 f"**Payment Mode:** Cash on Delivery"
             )
-            
-        if count > 0:
+
+        if page_count > 0:
             p = products[0]
             msg = f"Found **{p['name']}** 🎯\n\n"
             if p.get("price", 0) > 0:
@@ -142,7 +148,7 @@ def generate_bot_message(
             return msg
 
     # ── No products found ──
-    if count == 0:
+    if page_count == 0:
         search = (
             entities.product_name or entities.category_name
             or entities.visual or entities.finish
@@ -159,7 +165,7 @@ def generate_bot_message(
 
     # ── Variation results ──
     if intent in (Intent.PRODUCT_SEARCH, Intent.PRODUCT_DETAIL, Intent.PRODUCT_VARIATIONS) \
-            and entities.product_id and count > 0:
+            and entities.product_id and page_count > 0:
         parent = products[0]
         variations = [p for p in products[1:] if p.get("type") == "variation"]
         has_attributes = any([
@@ -218,7 +224,7 @@ def generate_bot_message(
             return msg
 
     # ── Single product ──
-    if count == 1:
+    if page_count == 1:
         p = products[0]
         msg = f"I found the perfect match! 🎯\n\n**{p['name']}**\n"
         if p.get("price", 0) > 0:
@@ -238,8 +244,6 @@ def generate_bot_message(
 
     if intent == Intent.CATEGORY_BROWSE:
         # ── FIX: Detect unresolved qualifiers the API couldn't filter on ──
-        # e.g. user said "bathroom tiles" but we only filtered by category "Tile"
-        # because there's no "bathroom" sub-category or attribute match.
         qualifier = _get_unresolved_category_qualifier(entities)
         if qualifier:
             msg += (
@@ -265,8 +269,8 @@ def generate_bot_message(
     elif intent == Intent.CATEGORY_LIST:
         msg += f"Here are our product categories! 📂\n\n"
         for p in products[:MAX_DISPLAYED_ITEMS]:
-            count = p.get('count', 0)
-            count_str = f"({count} products)" if count > 0 else ""
+            count_val = p.get('count', 0)
+            count_str = f"({count_val} products)" if count_val > 0 else ""
             msg += f"• **{p['name']}** {count_str}\n"
         if len(products) > MAX_DISPLAYED_ITEMS:
             msg += f"\n...and {len(products) - MAX_DISPLAYED_ITEMS} more categories."
@@ -288,19 +292,11 @@ def generate_bot_message(
 
 def _get_unresolved_category_qualifier(entities: ExtractedEntities) -> str:
     """
-    Detect if the user mentioned a qualifier (application, visual, finish, etc.)
-    that was extracted as an entity but could NOT be used to filter the API results
-    (i.e., the attribute_term_ids were empty, meaning the store has no matching
-    attribute value for that qualifier).
-
-    Returns the qualifier string (e.g. "Bathroom") if unresolved, or empty string.
+    Check if entities contain filter attributes (like application) that
+    the API couldn't resolve, so we can mention them in the response.
     """
-    # Application qualifier (bathroom, kitchen, outdoor, etc.)
-    # If application was extracted but attribute_term_ids is empty,
-    # the store doesn't have that application value — it's unresolved.
-    if entities.application and not getattr(entities, 'attribute_term_ids', None):
-        return entities.application
-
+    if entities.application:
+        return entities.application.title()
     return ""
 
 
@@ -312,66 +308,33 @@ def generate_suggestions(
     """Generate follow-up suggestions based on context."""
     suggestions = []
 
-    # Greeting suggestions
     if intent == Intent.GREETING:
-        return [
-            "Show me all products",
-            "What categories do you have?",
-            "Show me marble look tiles",
-            "Quick ship tiles",
-        ]
-
-    # Order-specific suggestions
-    if intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.REORDER):
-        suggestions.append("Show my order history")
-        suggestions.append("Reorder my last purchase")
-        suggestions.append("Track my order")
-        suggestions.append("Show me what's on sale")
-        return suggestions[:4]
-
-    if intent == Intent.QUICK_ORDER:
-        suggestions.append("Show me all products")
-        suggestions.append("What categories do you have?")
-        suggestions.append("Show me quick ship products")
-        suggestions.append("What's on sale?")
-        return suggestions[:4]
-
-    # Product-specific suggestions
-    if products and len(products) == 1:
-        p = products[0]
-        name = p.get("name", "")
-        base_name = name.split(" ")[0] if name else ""
-
-        if "Chip Card" not in name:
-            suggestions.append(f"Show me {base_name} Chip Card")
-        if "Mosaic" not in name:
-            suggestions.append(f"Show me {base_name} Mosaic")
-        suggestions.append(f"What colors does {base_name} come in?")
-        suggestions.append(f"What goes with {base_name}?")
-
-    elif products and len(products) > 1:
-        # Suggest browsing related
-        if intent == Intent.CATEGORY_BROWSE and entities.category_name:
-            suggestions.append(f"Show me more {entities.category_name} products")
-        suggestions.append("Show me what's on sale")
-        suggestions.append("Show me quick ship products")
-
-    # General suggestions
-    if intent == Intent.PRODUCT_SEARCH:
-        suggestions.append("Show me all chip cards")
-    if intent not in (Intent.CATEGORY_LIST, Intent.PRODUCT_CATALOG):
-        suggestions.append("What categories do you have?")
-
-    # Always include a fallback
-    if not suggestions:
         suggestions = [
             "Show me all products",
             "What categories do you have?",
             "Show me what's on sale",
-            "Quick ship tiles",
         ]
+    elif intent in (Intent.PRODUCT_SEARCH, Intent.PRODUCT_LIST, Intent.CATEGORY_BROWSE):
+        if products:
+            suggestions.append("Show me what's on sale")
+            suggestions.append("Show me quick ship products")
+            suggestions.append("What categories do you have?")
+    elif intent == Intent.PRODUCT_DETAIL:
+        if products:
+            suggestions.append(f"Order {products[0]['name']}")
+            suggestions.append("Show me similar products")
+    elif intent in (Intent.FILTER_BY_FINISH, Intent.FILTER_BY_COLOR, Intent.FILTER_BY_SIZE):
+        suggestions.append("Show me all products")
+        suggestions.append("What finishes are available?")
+    elif intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY):
+        suggestions.append("Reorder my last order")
+        suggestions.append("Show me products")
+    elif intent == Intent.CATEGORY_LIST:
+        if products:
+            for cat in products[:3]:
+                suggestions.append(f"Show me {cat['name']}")
 
-    return suggestions[:4]  # Max 4 suggestions
+    return suggestions
 
 
 def build_filters(
@@ -384,167 +347,111 @@ def build_filters(
         "search": None,
         "category": None,
         "tag": None,
+        "on_sale": None,
         "min_price": None,
         "max_price": None,
-        "on_sale": None,
-        "orderby": "date",
-        "order": "desc",
+        "orderby": None,
+        "order": None,
     }
 
-    # Extract from API call params
-    if api_calls:
-        params = api_calls[0].params
-        filters["search"] = params.get("search")
-        filters["category"] = params.get("category")
-        filters["tag"] = params.get("tag")
-        filters["on_sale"] = params.get("on_sale")
-        if params.get("orderby"):
-            filters["orderby"] = params["orderby"]
-        if params.get("order"):
-            filters["order"] = params["order"]
-
-    # Override with entity data if more specific
-    if entities.category_name and not filters["category"]:
-        filters["category"] = entities.category_name
-    if entities.on_sale:
-        filters["on_sale"] = True
+    for call in api_calls:
+        p = call.params
+        if "search" in p:
+            filters["search"] = p["search"]
+        if "category" in p:
+            filters["category"] = p["category"]
+        if "tag" in p:
+            filters["tag"] = p["tag"]
+        if "on_sale" in p:
+            filters["on_sale"] = p["on_sale"]
+        if "min_price" in p:
+            filters["min_price"] = p["min_price"]
+        if "max_price" in p:
+            filters["max_price"] = p["max_price"]
+        if "orderby" in p:
+            filters["orderby"] = p["orderby"]
+        if "order" in p:
+            filters["order"] = p["order"]
 
     return filters
 
 
-def _format_order_date(date_created: str) -> str:
-    """
-    Format a WooCommerce date string to readable date + time format.
-
-    Args:
-        date_created: ISO format date string from WooCommerce API
-
-    Returns:
-        Formatted string e.g. "Feb 10, 2026 at 3:45 PM" or fallback if parsing fails
-    """
-    date_str = date_created[:10] if len(date_created) >= 10 else date_created
-    try:
-        dt = datetime.fromisoformat(date_created.replace("Z", "+00:00"))
-        date_str = dt.strftime("%b %d, %Y at %I:%M %p").replace(" 0", " ")
-    except (ValueError, AttributeError):
-        pass
-    return date_str
+# ── Label mapping for API response ──
+INTENT_LABELS = {
+    Intent.PRODUCT_SEARCH: "search",
+    Intent.PRODUCT_LIST: "browse",
+    Intent.PRODUCT_DETAIL: "detail",
+    Intent.CATEGORY_BROWSE: "category",
+    Intent.CATEGORY_LIST: "categories",
+    Intent.PRODUCT_BY_COLLECTION: "collection",
+    Intent.PRODUCT_BY_TAG: "tag",
+    Intent.PRODUCT_QUICK_SHIP: "quick_ship",
+    Intent.PRODUCT_BY_VISUAL: "visual",
+    Intent.FILTER_BY_FINISH: "filter",
+    Intent.FILTER_BY_SIZE: "filter",
+    Intent.FILTER_BY_COLOR: "filter",
+    Intent.FILTER_BY_APPLICATION: "filter",
+    Intent.FILTER_BY_MATERIAL: "filter",
+    Intent.FILTER_BY_ORIGIN: "filter",
+    Intent.SIZE_LIST: "sizes",
+    Intent.PRODUCT_TYPES: "types",
+    Intent.PRODUCT_CATALOG: "catalog",
+    Intent.RELATED_PRODUCTS: "related",
+    Intent.MOSAIC_PRODUCTS: "mosaic",
+    Intent.TRIM_PRODUCTS: "trim",
+    Intent.CHIP_CARD: "chip_card",
+    Intent.SAMPLE_REQUEST: "sample",
+    Intent.PRODUCT_VARIATIONS: "variations",
+    Intent.PRODUCT_BY_ORIGIN: "origin",
+    Intent.LAST_ORDER: "order",
+    Intent.ORDER_HISTORY: "order_history",
+    Intent.REORDER: "reorder",
+    Intent.ORDER_ITEM: "order",
+    Intent.QUICK_ORDER: "order",
+    Intent.PLACE_ORDER: "order",
+    Intent.ORDER_TRACKING: "order",
+    Intent.ORDER_STATUS: "order",
+    Intent.DISCOUNT_INQUIRY: "discount",
+    Intent.CLEARANCE_PRODUCTS: "clearance",
+    Intent.BULK_DISCOUNT: "bulk",
+    Intent.PROMOTIONS: "promotions",
+    Intent.COUPON_INQUIRY: "coupon",
+    Intent.SAVE_FOR_LATER: "wishlist",
+    Intent.GREETING: "greeting",
+}
 
 
 def _resolve_user_placeholders(api_calls: List[WooAPICall], customer_id: int):
-    """
-    Replace CURRENT_USER_ID placeholders with actual customer ID.
-    
-    Modifies api_calls in-place, replacing any placeholder strings in params or body
-    with the provided customer_id (converted to string for API compatibility).
-    
-    Args:
-        api_calls: List of WooAPICall objects to process
-        customer_id: The actual customer ID (integer) to substitute for placeholders.
-                     Will be converted to string internally for WooCommerce API compatibility.
-    """
-    customer_id_str = str(customer_id)
+    """Replace CURRENT_USER_ID / CURRENT_USER placeholders."""
     for call in api_calls:
-        if isinstance(call.params, dict):
-            for key in call.params:
-                if isinstance(call.params[key], str) and call.params[key] in USER_PLACEHOLDERS:
-                    call.params[key] = customer_id_str
-        if isinstance(call.body, dict):
-            for key in call.body:
-                if isinstance(call.body[key], str) and call.body[key] in USER_PLACEHOLDERS:
-                    call.body[key] = customer_id_str
+        for key, val in list(call.params.items()):
+            if isinstance(val, str) and val in USER_PLACEHOLDERS:
+                call.params[key] = str(customer_id)
+
+
+def _format_order_date(date_created: str) -> str:
+    """Format an ISO date string to a readable format."""
+    if not date_created:
+        return "Unknown date"
+    try:
+        dt = datetime.fromisoformat(date_created.replace("Z", "+00:00"))
+        return dt.strftime("%B %d, %Y at %I:%M %p")
+    except (ValueError, TypeError):
+        return date_created
 
 
 def _format_order_history_message(orders: List[dict]) -> str:
-    """
-    Generate a bot message for order history from raw WooCommerce order data.
-    
-    Args:
-        orders: List of WooCommerce order dictionaries. Each order should contain:
-            - id (int): Order ID
-            - number (str): Order number
-            - status (str): Order status (e.g., 'completed', 'processing')
-            - total (str): Order total amount
-            - date_created (str): ISO format date string
-            - line_items (list): List of items with 'name', 'quantity', 'total'
-    
-    Returns:
-        str: Formatted message showing order history or empty message if no orders
-    """
+    """Format multiple orders into a readable message."""
     if not orders:
-        return (
-            "You don't have any orders yet. 📦\n\n"
-            "Browse our collection and place your first order!"
-        )
-    
-    msg = f"📋 **Your Order History** ({len(orders)} orders)\n\n"
-    
-    for order in orders:
-        order_id = order.get("id", "")
-        order_number = order.get("number", str(order_id))
+        return "No orders found."
+
+    msg = f"📦 **Your Recent Orders** ({len(orders)} orders)\n\n"
+    for order in orders[:10]:
+        order_number = order.get("number", str(order.get("id", "")))
         status = order.get("status", "unknown").title()
         total = order.get("total", "0")
         date_created = order.get("date_created", "")
-        
-        # Get item names with accurate count
-        line_items = order.get("line_items", [])
-        valid_item_names = [item.get("name") for item in line_items if item.get("name")]
-        item_names = ", ".join(valid_item_names[:MAX_DISPLAYED_ITEMS])
-        if len(valid_item_names) > MAX_DISPLAYED_ITEMS:
-            item_names += f" +{len(valid_item_names) - MAX_DISPLAYED_ITEMS} more"
-        
-        msg += (
-            f"**#{order_number}** — {status} — ${total}\n"
-            f"  🕐 {_format_order_date(date_created)}\n"
-            f"  Items: {item_names}\n\n"
-        )
-    
+        msg += f"• **#{order_number}** — {status} — ${total} — {_format_order_date(date_created)}\n"
+    if len(orders) > 10:
+        msg += f"\n...and {len(orders) - 10} more orders."
     return msg
-
-
-# Intent label mapping for API responses
-INTENT_LABELS = {
-    Intent.PRODUCT_LIST:          "browse",
-    Intent.PRODUCT_SEARCH:        "search",
-    Intent.PRODUCT_DETAIL:        "detail",
-    Intent.PRODUCT_CATALOG:       "catalog",
-    Intent.PRODUCT_TYPES:         "catalog",
-    Intent.PRODUCT_BY_COLLECTION: "browse",
-    Intent.PRODUCT_BY_ORIGIN:     "filter",
-    Intent.PRODUCT_BY_VISUAL:     "filter",
-    Intent.PRODUCT_QUICK_SHIP:    "filter",
-    Intent.RELATED_PRODUCTS:      "related",
-    Intent.CATEGORY_BROWSE:       "category",
-    Intent.CATEGORY_LIST:         "categories",
-    Intent.FILTER_BY_FINISH:      "filter",
-    Intent.FILTER_BY_SIZE:        "filter",
-    Intent.FILTER_BY_COLOR:       "filter",
-    Intent.FILTER_BY_THICKNESS:   "filter",
-    Intent.FILTER_BY_EDGE:        "filter",
-    Intent.FILTER_BY_APPLICATION: "filter",
-    Intent.FILTER_BY_MATERIAL:    "filter",
-    Intent.FILTER_BY_ORIGIN:      "filter",
-    Intent.SIZE_LIST:             "info",
-    Intent.MOSAIC_PRODUCTS:       "search",
-    Intent.TRIM_PRODUCTS:         "search",
-    Intent.CHIP_CARD:             "search",
-    Intent.DISCOUNT_INQUIRY:      "deals",
-    Intent.BULK_DISCOUNT:         "deals",
-    Intent.CLEARANCE_PRODUCTS:    "deals",
-    Intent.PROMOTIONS:            "deals",
-    Intent.COUPON_INQUIRY:        "deals",
-    Intent.SAVE_FOR_LATER:        "account",
-    Intent.WISHLIST:              "account",
-    Intent.ORDER_TRACKING:        "order",
-    Intent.ORDER_STATUS:          "order",
-    Intent.PLACE_ORDER:           "order",
-    Intent.ORDER_HISTORY:         "order",
-    Intent.LAST_ORDER:            "order",
-    Intent.REORDER:               "order",
-    Intent.ORDER_ITEM:            "order",
-    Intent.QUICK_ORDER:           "order",
-    Intent.PRODUCT_VARIATIONS:    "variations",
-    Intent.SAMPLE_REQUEST:        "sample",
-    Intent.GREETING:              "greeting",
-    Intent.UNKNOWN:               "unknown",
-}

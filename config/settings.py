@@ -15,10 +15,14 @@ WOO_BASE_URL = os.getenv("WOO_BASE_URL", "https://wgc.net.in/hn/wp-json/wc/v3")
 WOO_CONSUMER_KEY = os.getenv("WOO_CONSUMER_KEY", "")
 WOO_CONSUMER_SECRET = os.getenv("WOO_CONSUMER_SECRET", "")
 
-# ────────────────────────��────────────────────
+# ─────────────────────────────────────────────
 # API Defaults
 # ─────────────────────────────────────────────
-DEFAULT_PER_PAGE = 20
+# Number of products per page in chat responses.
+# This controls how many product cards are returned per server request.
+# The frontend shows all of them directly (no local pagination).
+# Users click "Load More" to fetch the next page from the server.
+DEFAULT_PER_PAGE = int(os.getenv("CHAT_PER_PAGE", "4"))
 DEFAULT_STATUS = "publish"
 DEFAULT_STOCK_STATUS = "instock"
 REQUEST_TIMEOUT = 30  # seconds
