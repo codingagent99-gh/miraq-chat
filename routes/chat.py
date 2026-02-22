@@ -129,7 +129,7 @@ def _build_variant_prompt(product_raw: dict, product_name: str) -> str:
         name = attr.get("name", "")
         options = attr.get("options", [])
         if options:
-            lines.append(f"• **{name}:** {', '.join(options)}")
+            lines.append(f"�� **{name}:** {', '.join(options)}")
     lines.append("\nWhich combination would you like?")
     return "\n".join(lines)
 
@@ -169,6 +169,36 @@ def _build_pagination(page: int, api_responses: list, api_calls: list) -> dict:
         "total_pages": total_pages,
         "has_more": has_more,
     }
+
+
+def _fetch_unit_price(product_id, variation_id=None) -> str:
+    """Fetch the unit price for a product or variation. Returns price string or 'N/A'."""
+    try:
+        if variation_id and product_id:
+            call = WooAPICall(
+                method="GET",
+                endpoint=f"{WOO_BASE_URL}/products/{product_id}/variations/{variation_id}",
+                params={},
+                description=f"Fetch variation {variation_id} price",
+            )
+            resp = woo_client.execute(call)
+            if resp.get("success") and isinstance(resp.get("data"), dict):
+                d = resp["data"]
+                return d.get("sale_price") or d.get("price") or d.get("regular_price") or "N/A"
+        elif product_id:
+            call = WooAPICall(
+                method="GET",
+                endpoint=f"{WOO_BASE_URL}/products/{product_id}",
+                params={},
+                description=f"Fetch product {product_id} price",
+            )
+            resp = woo_client.execute(call)
+            if resp.get("success") and isinstance(resp.get("data"), dict):
+                d = resp["data"]
+                return d.get("sale_price") or d.get("price") or d.get("regular_price") or "N/A"
+    except Exception as exc:
+        logger.warning(f"_fetch_unit_price failed | error={exc}")
+    return "N/A"
 
 
 @chat_bp.route("/chat", methods=["POST"])
@@ -345,7 +375,9 @@ def chat():
                     "set_paid": False,
                     "line_items": [_confirmed_line_item],
                 }
-                if flow_result.get("use_new_address"):
+                # Check both flow_result flags and user_context flags for address handling
+                _use_new_address = flow_result.get("use_new_address") or user_context.get("use_new_address")
+                if _use_new_address:
                     raw_address = user_context.get("pending_shipping_address", "")
                     if raw_address:
                         order_body["shipping"] = parse_address(raw_address)
@@ -419,10 +451,12 @@ def chat():
                     }), 200
 
         elif flow_result and flow_result.get("fetch_customer_address"):
-            # User confirmed order — fetch their shipping address before creating the order
+            # User confirmed order or provided quantity — fetch their shipping address
             pending_product_id = user_context.get("pending_product_id")
             pending_product_name = user_context.get("pending_product_name", "")
-            pending_quantity = user_context.get("pending_quantity", 1)
+            # Quantity may come from the flow_result (AWAITING_QUANTITY) or user_context
+            pending_quantity = flow_result.get("pending_quantity") or user_context.get("pending_quantity", 1)
+            pending_variation_id = user_context.get("pending_variation_id")
 
             shipping_address = None
             if customer_id:
@@ -449,6 +483,7 @@ def chat():
                 "pending_product_name": pending_product_name,
                 "pending_product_id": pending_product_id,
                 "pending_quantity": pending_quantity,
+                "pending_variation_id": pending_variation_id,
                 "response_time_ms": round((time.time() - start_time) * 1000),
             }
 
@@ -496,7 +531,89 @@ def chat():
                     "pagination": _default_pagination(page),
                 }), 200
 
-    # Capture resolve_variant flag from flow handler (set when in AWAITING_VARIANT_SELECTION)
+        elif flow_result and flow_result.get("fetch_price_summary"):
+            # Shipping address confirmed — fetch price and show final order summary
+            pending_product_id = user_context.get("pending_product_id")
+            pending_product_name = user_context.get("pending_product_name", "the product")
+            pending_quantity = user_context.get("pending_quantity", 1)
+            pending_variation_id = user_context.get("pending_variation_id")
+
+            _price_display = _fetch_unit_price(pending_product_id, pending_variation_id)
+
+            # Build variant label if we have a variation_id
+            _variant_label = ""
+            if pending_variation_id and pending_product_id:
+                try:
+                    var_call = WooAPICall(
+                        method="GET",
+                        endpoint=f"{WOO_BASE_URL}/products/{pending_product_id}/variations/{pending_variation_id}",
+                        params={},
+                        description=f"Fetch variation {pending_variation_id} for summary label",
+                    )
+                    var_resp = woo_client.execute(var_call)
+                    if var_resp.get("success") and isinstance(var_resp.get("data"), dict):
+                        var_data = var_resp["data"]
+                        _variant_label = " / ".join(
+                            a.get("option", "") for a in var_data.get("attributes", []) if a.get("option")
+                        )
+                except Exception:
+                    pass
+
+            # Calculate total
+            try:
+                _total = float(_price_display) * int(pending_quantity)
+                _total_display = f"${_total:.2f}"
+            except (ValueError, TypeError):
+                _total_display = "N/A"
+
+            # Build the product description line
+            if _variant_label:
+                _product_line = f"{pending_product_name} ({_variant_label})"
+            else:
+                _product_line = pending_product_name
+
+            logger.info(
+                f"Step 0: Final confirmation summary | product={_product_line} | "
+                f"qty={pending_quantity} | unit_price={_price_display} | total={_total_display}"
+            )
+
+            base_meta = {
+                "pending_product_name": pending_product_name,
+                "pending_product_id": pending_product_id,
+                "pending_quantity": pending_quantity,
+                "pending_variation_id": pending_variation_id,
+                "flow_state": FlowState.AWAITING_FINAL_CONFIRM.value,
+                "response_time_ms": round((time.time() - start_time) * 1000),
+            }
+            # Carry forward address info so create_order handler knows which to use
+            if flow_result.get("use_existing_address"):
+                base_meta["use_existing_address"] = True
+            if flow_result.get("use_new_address"):
+                base_meta["use_new_address"] = True
+            if user_context.get("pending_shipping_address"):
+                base_meta["pending_shipping_address"] = user_context["pending_shipping_address"]
+
+            return jsonify({
+                "success": True,
+                "bot_message": (
+                    f"📋 **Order Summary**\n\n"
+                    f"**Product:** {_product_line}\n"
+                    f"**Quantity:** {pending_quantity}\n"
+                    f"**Unit Price:** ${_price_display}\n"
+                    f"**Estimated Total:** {_total_display}\n"
+                    f"**Payment:** Cash on Delivery\n\n"
+                    f"Shall I place this order? ✅"
+                ),
+                "intent": "guided_flow",
+                "products": [],
+                "filters_applied": {},
+                "suggestions": ["Yes, confirm order", "No, cancel"],
+                "session_id": session_id,
+                "metadata": base_meta,
+                "flow_state": FlowState.AWAITING_FINAL_CONFIRM.value,
+                "pagination": _default_pagination(page),
+            }), 200
+
     # Capture resolve_variant flag from flow handler (set when in AWAITING_VARIANT_SELECTION)
     _resolve_variant = bool(flow_result and flow_result.get("resolve_variant"))
 
@@ -538,12 +655,6 @@ def chat():
         logger.info(f"Step 1: Classified intent={intent.value} | confidence={confidence:.2f} | entities={entity_summary}")
 
         # ─── Step 1.5: LLM Fallback / Disambiguation check ───
-        # Trigger LLM fallback when:
-        # 1. Intent is UNKNOWN
-        # 2. Confidence is below threshold
-        # 3. Search intent but missing both product_name AND category_id
-        # 4. Order create intent but missing both order_item_name AND product_name
-        
         should_try_llm = False
         llm_trigger_reason = None
         
@@ -556,18 +667,13 @@ def chat():
         elif intent == Intent.PRODUCT_SEARCH and entities.product_name is None and entities.category_id is None:
             should_try_llm = True
             llm_trigger_reason = "missing_entities"
-            
-        # For order-create intents, check last_product context BEFORE triggering LLM
         elif intent in ORDER_CREATE_INTENTS and entities.order_item_name is None and entities.product_name is None:
-            # Check if frontend sent last_product context — if so, skip LLM,
-            # let the pipeline reach Step 3.6 where last_product_ctx is used
             last_product_ctx_check = user_context.get("last_product")
             if not (last_product_ctx_check and last_product_ctx_check.get("id")):
                 should_try_llm = True
                 llm_trigger_reason = "missing_entities"
         
         if should_try_llm and LLM_FALLBACK_ENABLED and not _resolve_variant:
-            # Try LLM fallback
             store_loader = get_store_loader()
             session_history = None
             if session_id and session_id in sessions:
@@ -587,7 +693,6 @@ def chat():
                 fallback_type = llm_result.get("fallback_type")
                 
                 if fallback_type == "conversational":
-                    # LLM handled it as general Q&A - return response directly
                     elapsed = time.time() - start_time
                     llm_metadata = llm_result.get("metadata", {})
                     llm_metadata["response_time_ms"] = round(elapsed * 1000)
@@ -613,15 +718,11 @@ def chat():
                     }), 200
                 
                 elif fallback_type in ["intent_resolved", "entity_extracted"]:
-                    # LLM resolved the intent or extracted entities
-                    # Re-inject into pipeline at Step 2 by rebuilding the ClassifiedResult
                     from models import ClassifiedResult, ExtractedEntities
                     
-                    # Convert LLM entities to ExtractedEntities object
                     llm_entities_dict = llm_result.get("entities", {})
                     new_entities = ExtractedEntities()
                     
-                    # Map LLM entity fields to ExtractedEntities fields
                     entity_field_map = {
                         "product_name": "product_name",
                         "category_name": "category_name",
@@ -636,26 +737,18 @@ def chat():
                         if llm_field in llm_entities_dict:
                             setattr(new_entities, entity_field, llm_entities_dict[llm_field])
                     
-                    # Merge with original entities if entity_extracted
                     if fallback_type == "entity_extracted":
-                        # Keep original entities and merge with new ones
                         for entity_field in entity_field_map.values():
                             new_val = getattr(new_entities, entity_field)
                             orig_val = getattr(entities, entity_field)
                             if new_val is None and orig_val is not None:
                                 setattr(new_entities, entity_field, orig_val)
                     
-                    # Map intent string to Intent enum
                     llm_intent_str = llm_result.get("intent", "unknown")
                     try:
                         new_intent = Intent(llm_intent_str)
                     except ValueError:
-                        # If LLM returned invalid intent, try to map common variations
-                        # If LLM returned invalid intent, try to map common variations.
-                        # This handles cases where the LLM (e.g. Mistral) returns a
-                        # short-hand or non-enum intent string like "order_inquiry".
                         intent_mapping = {
-                            # Product discovery
                             "search": Intent.PRODUCT_SEARCH,
                             "product_search": Intent.PRODUCT_SEARCH,
                             "browse": Intent.CATEGORY_BROWSE,
@@ -667,7 +760,6 @@ def chat():
                             "filter_by_application": Intent.FILTER_BY_APPLICATION,
                             "filter_by_material": Intent.FILTER_BY_MATERIAL,
                             "general_question": Intent.PRODUCT_LIST,
-                            # Order inquiry / history (read-only)
                             "order_inquiry": Intent.ORDER_HISTORY,
                             "order_history": Intent.ORDER_HISTORY,
                             "check_orders": Intent.ORDER_HISTORY,
@@ -676,16 +768,13 @@ def chat():
                             "order_tracking": Intent.ORDER_TRACKING,
                             "last_order": Intent.LAST_ORDER,
                             "reorder": Intent.REORDER,
-                            # Order creation
                             "order": Intent.QUICK_ORDER,
                             "place_order": Intent.PLACE_ORDER,
                             "quick_order": Intent.QUICK_ORDER,
                             "order_item": Intent.ORDER_ITEM,
-                            # Discounts & promotions
                             "discount_inquiry": Intent.DISCOUNT_INQUIRY,
                             "promotions": Intent.PROMOTIONS,
                             "clearance": Intent.CLEARANCE_PRODUCTS,
-                            # Greeting / chit-chat
                             "greeting": Intent.GREETING,
                         }
                         new_intent = intent_mapping.get(llm_intent_str, Intent.PRODUCT_LIST)
@@ -696,12 +785,10 @@ def chat():
                                 f"falling back to PRODUCT_LIST. Consider adding it to intent_mapping."
                             )
                                             
-                    # Update intent, entities, and confidence
                     intent = new_intent
                     entities = new_entities
                     confidence = llm_result.get("confidence", 0.70)
                     
-                    # Create new ClassifiedResult for API builder
                     result = ClassifiedResult(
                         intent=intent,
                         entities=entities,
@@ -712,14 +799,9 @@ def chat():
                         f"Step 1.5: LLM fallback applied | new_intent={intent.value} | "
                         f"new_confidence={confidence:.2f} | fallback_type={fallback_type}"
                     )
-                    
-                    # Continue to Step 2 with updated intent/entities
-                    # (fall through to rest of pipeline)
                 else:
-                    # Unknown fallback type - treat as failure
                     llm_result["success"] = False
             
-            # If LLM failed or returned error, fall back to disambiguation menu
             if not llm_result.get("success"):
                 disambig = get_disambiguation_message()
                 elapsed = time.time() - start_time
@@ -745,7 +827,6 @@ def chat():
                 }), 200
         
         elif should_try_llm and not LLM_FALLBACK_ENABLED and not _resolve_variant:
-            # LLM is disabled, use old disambiguation menu
             disambig = get_disambiguation_message()
             elapsed = time.time() - start_time
             logger.info(f"Step 1.5: Low confidence, returning disambiguation (LLM disabled) | confidence={confidence:.2f}")
@@ -779,8 +860,6 @@ def chat():
             _resolve_user_placeholders(api_calls, customer_id)
 
         # ─── Step 2.6: Extract last_product context (for "order this" resolution) ───
-        # The frontend sends the last displayed product so vague order phrases
-        # like "order this" / "buy it" resolve correctly without a product search.
         last_product_ctx = user_context.get("last_product")  # {id, name} or None
         
         if last_product_ctx and last_product_ctx.get("id"):
@@ -797,7 +876,6 @@ def chat():
         filtered_api_calls = []
         if intent in ORDER_CREATE_INTENTS:
             for call in api_calls:
-                # Skip POST /orders calls - Step 3.6 will create the order
                 if call.method == "POST" and "/orders" in call.endpoint:
                     logger.info(f"Step 3: Skipping POST /orders call from api_builder (intent={intent.value}) - Step 3.6 will handle order creation")
                     continue
@@ -811,7 +889,6 @@ def chat():
         for resp in api_responses:
             if resp.get("success"):
                 data = resp.get("data")
-                # Handle custom API response format (has "products" key)
                 if isinstance(data, dict) and "products" in data:
                     if intent in ORDER_INTENTS:
                         order_data.extend(data["products"])
@@ -828,7 +905,6 @@ def chat():
                     else:
                         all_products_raw.append(data)
             else:
-                # Log API call failure (sanitize error message to prevent log injection)
                 error_msg = sanitize_log_string(str(resp.get('error', 'Unknown')))
                 logger.warning(f"Step 3: API call failed | error={error_msg}")
         
@@ -891,7 +967,7 @@ def chat():
             if var_resp.get("success") and isinstance(var_resp.get("data"), list):
                 all_variations = var_resp["data"]
 
-                # ── CHANGE 3a: Pre-filter using resolved attributes from prior turns ──
+                # ── Pre-filter using resolved attributes from prior turns ──
                 prev_resolved = user_context.get("resolved_attributes", {})
                 if prev_resolved:
                     pre_filtered = []
@@ -911,19 +987,15 @@ def chat():
                     if pre_filtered:
                         logger.info(f"Step 3.55: Pre-filtered {len(all_variations)} → {len(pre_filtered)} using resolved_attributes={prev_resolved}")
                         all_variations = pre_filtered
-                # ── END CHANGE 3a ──
 
                 if _resolve_variant:
-                    # Self-contained scoring: bypass classifier entities entirely.
-                    # Score each variation by counting how many of its attribute options
-                    # appear (case-insensitive) in the user's raw message.
                     user_text_lower = message.lower()
                     user_text_clean = _STRIP_QUOTES_RE.sub('', user_text_lower)
                     user_tokens = set(_TOKENIZE_RE.findall(user_text_clean))
                     scores = [
                         (var, _score_variation_against_text(var, user_text_clean, user_tokens))
                         for var in all_variations
-                        if var.get("attributes")  # skip variations with empty attributes
+                        if var.get("attributes")
                     ]
                     max_score = max((s for _, s in scores), default=0)
                     if max_score > 0:
@@ -933,7 +1005,6 @@ def chat():
                 else:
                     matched = _filter_variations_by_entities(all_variations, entities)
 
-                    # Raw-text fallback: match user message directly against variation option values
                     if len(matched) != 1:
                         user_text_lower = message.lower()
                         candidates = matched if len(matched) > 1 else all_variations
@@ -942,7 +1013,6 @@ def chat():
                             var_attrs = var.get("attributes", [])
                             if not var_attrs:
                                 continue
-                            # Check if ALL attribute options for this variation appear in the user's message
                             all_options_found = all(
                                 a.get("option", "").lower() in user_text_lower
                                 for a in var_attrs
@@ -954,16 +1024,31 @@ def chat():
                             matched = text_matched
 
                 if len(matched) == 1:
-                    # Exactly one match — create the order
-                    _resolved_variation_id = matched[0]["id"]
+                    # ── Variant resolved — DO NOT place order. Enter confirmation flow. ──
+                    _resolved_variation = matched[0]
+                    _resolved_variation_id = _resolved_variation["id"]
                     logger.info(f"Step 3.55: Resolved to variation_id={_resolved_variation_id}")
+
+                    # Build variant label and get price for display
+                    _variant_label = " / ".join(
+                        a.get("option", "") for a in _resolved_variation.get("attributes", []) if a.get("option")
+                    )
+                    _variant_price = _resolved_variation.get("sale_price") or _resolved_variation.get("price") or _resolved_variation.get("regular_price") or ""
+
                     if not _var_quantity:
-                        # Variant resolved but quantity missing — ask for quantity
-                        logger.info(f"Step 3.55: Variant resolved but quantity missing — asking for quantity")
+                        # Quantity missing — ask for quantity, show what was selected + price
+                        logger.info(f"Step 3.55: Variant resolved, asking for quantity | price={_variant_price}")
+                        _price_line = f"\n**Unit Price:** ${_variant_price}" if _variant_price else ""
                         elapsed = time.time() - start_time
                         return jsonify({
                             "success": True,
-                            "bot_message": f"Great choice! How many **{_var_product_name}** would you like to order? 🛒",
+                            "bot_message": (
+                                f"Great choice! Here's what you selected:\n\n"
+                                f"**Product:** {_var_product_name}\n"
+                                f"**Variant:** {_variant_label}"
+                                f"{_price_line}\n\n"
+                                f"How many would you like to order? 🛒"
+                            ),
                             "intent": "guided_flow",
                             "products": [],
                             "filters_applied": {},
@@ -979,38 +1064,82 @@ def chat():
                             "flow_state": FlowState.AWAITING_QUANTITY.value,
                             "pagination": _default_pagination(page),
                         }), 200
-                    order_call = WooAPICall(
-                        method="POST",
-                        endpoint=f"{WOO_BASE_URL}/orders",
-                        params={},
-                        body={
-                            "status": "processing",
-                            "customer_id": customer_id,
-                            "payment_method": DEFAULT_PAYMENT_METHOD,
-                            "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
-                            "set_paid": False,
-                            "line_items": [{"product_id": _var_product_id, "quantity": _var_quantity, "variation_id": _resolved_variation_id}],
-                        },
-                        description=f"Create order for '{_var_product_name}' variation {_resolved_variation_id}",
+
+                    # Quantity known — go straight to shipping address
+                    logger.info(f"Step 3.55: Variant resolved with quantity={_var_quantity}, proceeding to shipping")
+                    # Fetch customer address
+                    shipping_address = None
+                    try:
+                        cust_call = WooAPICall(
+                            method="GET",
+                            endpoint=f"{WOO_BASE_URL}/customers/{customer_id}",
+                            params={},
+                            body={},
+                            description=f"Fetch customer {customer_id} shipping address (from Step 3.55)",
+                        )
+                        cust_resp = woo_client.execute(cust_call)
+                        if cust_resp.get("success") and isinstance(cust_resp.get("data"), dict):
+                            shipping_address = cust_resp["data"].get("shipping", {})
+                    except Exception as exc:
+                        logger.warning(f"Step 3.55: Could not fetch customer address | error={exc}")
+
+                    has_address = bool(
+                        shipping_address
+                        and (shipping_address.get("address_1") or shipping_address.get("city"))
                     )
-                    order_resp = woo_client.execute(order_call)
-                    if order_resp.get("success") and isinstance(order_resp.get("data"), dict):
-                        order_data.append(order_resp["data"])
-                        created_order = order_resp["data"]
-                        logger.info(f"Step 3.55: Order created | order_id={created_order.get('id')}")
-                        # Inject a minimal product dict so the rest of the pipeline can generate a proper response
-                        if not all_products_raw:
-                            all_products_raw.append({
-                                "id": _var_product_id, "name": _var_product_name, "type": "variable",
-                                "price": "", "regular_price": "", "sale_price": "", "slug": "", "sku": "",
-                                "permalink": "", "on_sale": False, "stock_status": "instock", "total_sales": 0,
-                                "description": "", "short_description": "", "images": [], "categories": [],
-                                "tags": [], "attributes": [], "variations": [], "average_rating": "0.00",
-                                "rating_count": 0, "weight": "", "dimensions": {"length": "", "width": "", "height": ""},
-                            })
+
+                    base_meta = {
+                        "pending_product_id": _var_product_id,
+                        "pending_product_name": _var_product_name,
+                        "pending_quantity": _var_quantity,
+                        "pending_variation_id": _resolved_variation_id,
+                        "response_time_ms": round((time.time() - start_time) * 1000),
+                    }
+
+                    if has_address:
+                        addr_parts = [
+                            p for p in [
+                                shipping_address.get("address_1", ""),
+                                shipping_address.get("address_2", ""),
+                                shipping_address.get("city", ""),
+                                shipping_address.get("state", ""),
+                                shipping_address.get("postcode", ""),
+                                shipping_address.get("country", ""),
+                            ] if p
+                        ]
+                        addr_display = ", ".join(addr_parts)
+                        elapsed = time.time() - start_time
+                        return jsonify({
+                            "success": True,
+                            "bot_message": (
+                                f"Your shipping address on file:\n\n"
+                                f"📦 **{addr_display}**\n\n"
+                                "Would you like to ship to this address, or use a different one?"
+                            ),
+                            "intent": "guided_flow",
+                            "products": [],
+                            "filters_applied": {},
+                            "suggestions": ["Yes, use this address", "Change address", "Cancel"],
+                            "session_id": session_id,
+                            "metadata": {**base_meta, "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value},
+                            "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value,
+                            "pagination": _default_pagination(page),
+                        }), 200
                     else:
-                        error_msg = sanitize_log_string(str(order_resp.get("error", "Unknown")))
-                        logger.error(f"Step 3.55: Order creation failed | error={error_msg}")
+                        elapsed = time.time() - start_time
+                        return jsonify({
+                            "success": True,
+                            "bot_message": "No shipping address is on file. Please type your shipping address (street, city, state, zip code):",
+                            "intent": "guided_flow",
+                            "products": [],
+                            "filters_applied": {},
+                            "suggestions": [],
+                            "session_id": session_id,
+                            "metadata": {**base_meta, "flow_state": FlowState.AWAITING_NEW_ADDRESS.value},
+                            "flow_state": FlowState.AWAITING_NEW_ADDRESS.value,
+                            "pagination": _default_pagination(page),
+                        }), 200
+
                 else:
                     # Multiple or no exact match — ask user to narrow down or re-select
                     logger.info(f"Step 3.55: Could not resolve to single variation | matched={len(matched)} of {len(all_variations)}")
@@ -1024,7 +1153,6 @@ def chat():
                                 opt = a.get("option", "")
                                 if name and opt:
                                     attr_values.setdefault(name, set()).add(opt)
-                        # Attributes with exactly 1 unique value are "resolved"
                         for attr_name, options in attr_values.items():
                             if len(options) == 1:
                                 resolved_attributes[attr_name] = list(options)[0]
@@ -1047,9 +1175,7 @@ def chat():
                     parent_resp = woo_client.execute(parent_call)
                     parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
                     if len(matched) > 1 and len(matched) < len(all_variations):
-                        # Determine which attributes are still ambiguous
-                        # Collect unique values per attribute across matched variations
-                        attr_values_all = {}  # {attr_name: set_of_options}
+                        attr_values_all = {}
                         for v in matched:
                             for a in v.get("attributes", []):
                                 name = a.get("name", "")
@@ -1057,17 +1183,14 @@ def chat():
                                 if name and opt:
                                     attr_values_all.setdefault(name, set()).add(opt)
                         
-                        # Ambiguous attrs = those with more than 1 unique value
                         ambiguous = {k: sorted(v) for k, v in attr_values_all.items() if len(v) > 1}
                         if ambiguous:
-                            # Ask specifically about the remaining attributes
                             lines = [f"Great, I found **{_var_product_name}** in your selected options! I just need a bit more info:\n"]
                             for attr_name, options in ambiguous.items():
                                 lines.append(f"• **{attr_name}:** {', '.join(options)}")
                             lines.append("\nWhich combination would you like?")
                             prompt_msg = "\n".join(lines)
                         else:
-                            # All attributes have same values across matches (shouldn't happen, but fallback)
                             variation_labels = [
                                 " / ".join(a.get("option", "") for a in v.get("attributes", []) if a.get("option"))
                                 for v in matched
@@ -1095,7 +1218,7 @@ def chat():
                             "pending_product_id": _var_product_id,
                             "pending_product_name": _var_product_name,
                             "pending_quantity": _var_quantity,
-                            "resolved_attributes": resolved_attributes,  # ← CHANGE 3b: persist resolved attrs
+                            "resolved_attributes": resolved_attributes,
                             "response_time_ms": round(elapsed * 1000),
                         },
                         "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
@@ -1104,14 +1227,10 @@ def chat():
 
     # ─── Step 3.6: QUICK_ORDER / ORDER_ITEM / PLACE_ORDER — create order from matched product ───
     if intent in (Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER) and customer_id and entities.quantity:
-        # Resolve which product to order:
-        # Priority 1 — product returned by the search API call this turn
-        # Priority 2 — last_product sent by the frontend (handles "order this" / "buy it")
         _order_product_id = None
         _order_product_name = None
         _order_product_raw = None
 
-        # Separate parent products from pre-fetched variations (variations have parent_id)
         _parent_products_raw = [p for p in all_products_raw if not p.get("parent_id")]
         _prefetched_variations = [p for p in all_products_raw if p.get("parent_id")]
 
@@ -1125,7 +1244,6 @@ def chat():
             _order_product_id = last_product_ctx["id"]
             _order_product_name = last_product_ctx.get("name", str(last_product_ctx["id"]))
             logger.info(f"Step 3.6: Using last_product_ctx → product_id={_order_product_id}, product_name=\"{sanitize_log_string(_order_product_name)}\"")
-            # Inject a minimal product dict so bot message and response include the product info
             _injected = {
                 "id": _order_product_id,
                 "name": _order_product_name,
@@ -1162,11 +1280,9 @@ def chat():
             _product_type = (_order_product_raw or {}).get("type", "simple")
 
             if _product_type == "variable":
-                # Variable product — need to resolve a variation_id before ordering
                 has_attrs = any([entities.color_tone, entities.finish, entities.tile_size, entities.sample_size])
 
                 if not _order_variation_id and not has_attrs:
-                    # Case C: No variant info provided — ask user to choose
                     logger.info(f"Step 3.6: Variable product with no variant info | product_id={_order_product_id}")
                     prompt_msg = _build_variant_prompt(_order_product_raw or {}, _order_product_name)
                     elapsed = time.time() - start_time
@@ -1190,7 +1306,6 @@ def chat():
                     }), 200
 
                 elif not _order_variation_id and has_attrs:
-                    # Case B: Attributes specified — use pre-fetched or freshly fetched variations
                     logger.info(f"Step 3.6: Variable product with attributes, resolving variation | product_id={_order_product_id}")
                     if _prefetched_variations:
                         all_variations = _prefetched_variations
@@ -1210,7 +1325,6 @@ def chat():
                             _order_variation_id = matched[0]["id"]
                             logger.info(f"Step 3.6: Resolved variation_id={_order_variation_id} from attributes")
                         else:
-                            # Cannot resolve to single variation — ask user
                             logger.info(f"Step 3.6: Attributes matched {len(matched)} variations, asking user")
                             if len(matched) > 1 and len(matched) < len(all_variations):
                                 variation_labels = [
@@ -1244,46 +1358,86 @@ def chat():
                                 "pagination": _default_pagination(page),
                             }), 200
 
-            logger.info(f"Step 3.6: Creating WooCommerce order | product_id={_order_product_id} | variation_id={_order_variation_id} | quantity={entities.quantity or 1} | customer_id={customer_id}")
-            _line_item: dict = {"product_id": _order_product_id, "quantity": entities.quantity or 1}
-            if _order_variation_id:
-                _line_item["variation_id"] = _order_variation_id
-            order_call = WooAPICall(
-                method="POST",
-                endpoint=f"{WOO_BASE_URL}/orders",
-                params={},
-                body={
-                    "status": "processing",
-                    "customer_id": customer_id,
-                    "payment_method": DEFAULT_PAYMENT_METHOD,
-                    "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
-                    "set_paid": False,
-                    "line_items": [_line_item],
-                },
-                description=f"Create order for product '{_order_product_name}' (COD, processing)",
-            )
-            order_resp = woo_client.execute(order_call)
-            if order_resp.get("success") and isinstance(order_resp.get("data"), dict):
-                order_data.append(order_resp["data"])
-                created_order = order_resp["data"]
-                line_items_summary = [
-                    f"{item.get('name', 'Unknown')} x{item.get('quantity', 1)}"
-                    for item in created_order.get("line_items", [])
-                ]
-                logger.info(
-                    f"Step 3.6: WooCommerce order created | order_id={created_order.get('id')} | "
-                    f"order_number={created_order.get('number')} | total=${created_order.get('total', '0.00')} | "
-                    f"line_items={line_items_summary}"
+            # For simple products or resolved variations from Step 3.6 — go to shipping
+            # instead of placing order directly
+            logger.info(f"Step 3.6: Product resolved, proceeding to shipping | product_id={_order_product_id} | variation_id={_order_variation_id} | quantity={entities.quantity}")
+
+            # Fetch customer address
+            shipping_address = None
+            try:
+                cust_call = WooAPICall(
+                    method="GET",
+                    endpoint=f"{WOO_BASE_URL}/customers/{customer_id}",
+                    params={},
+                    body={},
+                    description=f"Fetch customer {customer_id} shipping address (from Step 3.6)",
                 )
+                cust_resp = woo_client.execute(cust_call)
+                if cust_resp.get("success") and isinstance(cust_resp.get("data"), dict):
+                    shipping_address = cust_resp["data"].get("shipping", {})
+            except Exception as exc:
+                logger.warning(f"Step 3.6: Could not fetch customer address | error={exc}")
+
+            has_address = bool(
+                shipping_address
+                and (shipping_address.get("address_1") or shipping_address.get("city"))
+            )
+
+            base_meta = {
+                "pending_product_id": _order_product_id,
+                "pending_product_name": _order_product_name,
+                "pending_quantity": entities.quantity,
+                "pending_variation_id": _order_variation_id,
+                "response_time_ms": round((time.time() - start_time) * 1000),
+            }
+
+            if has_address:
+                addr_parts = [
+                    p for p in [
+                        shipping_address.get("address_1", ""),
+                        shipping_address.get("address_2", ""),
+                        shipping_address.get("city", ""),
+                        shipping_address.get("state", ""),
+                        shipping_address.get("postcode", ""),
+                        shipping_address.get("country", ""),
+                    ] if p
+                ]
+                addr_display = ", ".join(addr_parts)
+                elapsed = time.time() - start_time
+                return jsonify({
+                    "success": True,
+                    "bot_message": (
+                        f"Your shipping address on file:\n\n"
+                        f"📦 **{addr_display}**\n\n"
+                        "Would you like to ship to this address, or use a different one?"
+                    ),
+                    "intent": "guided_flow",
+                    "products": [],
+                    "filters_applied": {},
+                    "suggestions": ["Yes, use this address", "Change address", "Cancel"],
+                    "session_id": session_id,
+                    "metadata": {**base_meta, "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value},
+                    "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value,
+                    "pagination": _default_pagination(page),
+                }), 200
             else:
-                error_msg = sanitize_log_string(str(order_resp.get('error', 'Unknown')))
-                logger.error(f"Step 3.6: WooCommerce order creation failed | error={error_msg}")
+                elapsed = time.time() - start_time
+                return jsonify({
+                    "success": True,
+                    "bot_message": "No shipping address is on file. Please type your shipping address (street, city, state, zip code):",
+                    "intent": "guided_flow",
+                    "products": [],
+                    "filters_applied": {},
+                    "suggestions": [],
+                    "session_id": session_id,
+                    "metadata": {**base_meta, "flow_state": FlowState.AWAITING_NEW_ADDRESS.value},
+                    "flow_state": FlowState.AWAITING_NEW_ADDRESS.value,
+                    "pagination": _default_pagination(page),
+                }), 200
         else:
             logger.warning("Step 3.6: Skipped order creation (no product_id resolved)")
 
     # ─── Step 3.7: Variation product handling ───
-    # When api_builder issued GET /products/{id} + GET /products/{id}/variations,
-    # we need to separate, filter, and format them properly.
     VARIATION_INTENTS = {Intent.PRODUCT_SEARCH, Intent.PRODUCT_DETAIL, Intent.PRODUCT_VARIATIONS}
 
     if intent in VARIATION_INTENTS and entities.product_id:
@@ -1302,11 +1456,6 @@ def chat():
         if parent_product_raw:
             parent_formatted = format_product(parent_product_raw)
 
-            # ── FIX: Detect product ↔ category mismatch ──
-            # User said "show me allspice in tiles" but Allspice is in Countertop.
-            # Check BEFORE generating the message so we can either:
-            #   a) Prepend a mismatch note to the bot message, or
-            #   b) Correct entities so downstream message generation is accurate
             category_mismatch_msg = ""
             if entities.category_name:
                 product_cats = [c.lower() for c in parent_formatted.get("categories", [])]
@@ -1324,8 +1473,6 @@ def chat():
                         f"requested_category={entities.category_name} | "
                         f"actual_categories={actual_cats}"
                     )
-                    # Override entities.category_name so response_generator
-                    # doesn't generate a misleading "in Tile category" header
                     entities.category_name = actual_cats
 
             has_attributes = any([
@@ -1334,21 +1481,17 @@ def chat():
             ])
 
             if variations_raw and has_attributes:
-                # Filter variations to only those matching user's attributes
                 filtered_vars = _filter_variations_by_entities(variations_raw, entities)
                 variation_products = [format_variation(v, parent_product_raw) for v in filtered_vars]
                 products = [parent_formatted] + variation_products
             elif variations_raw:
-                # No attribute filter — return parent + all variations
                 variation_products = [format_variation(v, parent_product_raw) for v in variations_raw]
                 products = [parent_formatted] + variation_products
             else:
-                # Simple product or variations call not made
                 products = [parent_formatted]
 
             bot_message = generate_bot_message(intent, entities, products, confidence, order_data)
 
-            # Prepend category mismatch note if detected
             if category_mismatch_msg:
                 bot_message = f"⚠️ {category_mismatch_msg}\n\n{bot_message}"
 
@@ -1386,7 +1529,6 @@ def chat():
             }), 200
 
     # ─── Step 3.8: LLM Retry on Empty Search Results ───
-    # When API returns 0 products for search/filter intents, try LLM for suggestions
     SEARCH_FILTER_INTENTS = {
         Intent.PRODUCT_SEARCH,
         Intent.PRODUCT_LIST,
@@ -1430,18 +1572,13 @@ def chat():
             retry_type = llm_retry_result.get("retry_type")
             
             if retry_type == "corrected_search" and llm_retry_result.get("corrected_term"):
-                # LLM suggested a corrected search term - retry the search
                 corrected_term = llm_retry_result["corrected_term"]
                 logger.info(f"Step 3.8: LLM suggested correction | corrected_term={corrected_term}")
                 
-                # Re-classify with corrected term
                 corrected_result = classify(corrected_term)
-                
-                # Rebuild API calls with corrected entities
                 corrected_api_calls = build_api_calls(corrected_result)
                 corrected_responses = woo_client.execute_all(corrected_api_calls)
                 
-                # Extract products from corrected search
                 corrected_products_raw = []
                 for resp in corrected_responses:
                     if resp.get("success"):
@@ -1454,14 +1591,11 @@ def chat():
                             corrected_products_raw.append(data)
                 
                 if corrected_products_raw:
-                    # Success! Use corrected results
                     all_products_raw = corrected_products_raw
                     logger.info(f"Step 3.8: LLM retry successful | found {len(all_products_raw)} products")
                 else:
-                    # Still no results - use suggestion message
                     logger.info("Step 3.8: LLM retry still returned 0 products")
             
-            # If we still have no products, use LLM suggestion message
             if len(all_products_raw) == 0 and llm_retry_result.get("suggestion_message"):
                 suggestion_msg = llm_retry_result["suggestion_message"]
                 elapsed = time.time() - start_time
@@ -1493,7 +1627,6 @@ def chat():
     # ─── Step 4: Format products ───
     products = []
     if intent == Intent.CATEGORY_LIST:
-        # Deduplicate categories by name and format them properly
         seen_names = set()
         for cat in all_products_raw:
             name = cat.get("name", "")
@@ -1502,26 +1635,21 @@ def chat():
                 products.append(format_category(cat))
     else:
         for p in all_products_raw:
-            # Skip pre-fetched variations (they have parent_id and should not appear as standalone products)
             if p.get("parent_id"):
                 continue
-            # Detect custom API format by checking for "featured_image" key
             if "featured_image" in p:
                 products.append(format_custom_product(p))
             else:
                 products.append(format_product(p))
 
-    # Filter out private/draft products
     products = [p for p in products if p.get("name")]
     logger.info(f"Step 4: Formatted {len(products)} products")
 
     # ─── Step 5: Generate bot message ───
     bot_message = generate_bot_message(intent, entities, products, confidence, order_data)
     
-    # Log product name and total for order intents (critical for debugging "your item" / $0.00 issues)
     if intent in ORDER_CREATE_INTENTS and order_data:
         placed_order = order_data[-1]
-        # Extract product name used in bot message
         if products:
             used_product_name = products[0]["name"]
         elif placed_order.get("line_items"):
@@ -1529,7 +1657,6 @@ def chat():
         else:
             used_product_name = "your item"
         
-        # Extract total with error handling
         total_str = placed_order.get("total", "0.00")
         try:
             total = float(total_str) if total_str else 0.0
@@ -1551,11 +1678,8 @@ def chat():
         
         logger.info(f"Step 5: Bot message generated | product_name=\"{sanitize_log_string(used_product_name)}\" | total=${total:.2f}")
         
-        # Warn if fallback to "your item" was used
         if used_product_name == "your item":
             logger.warning("Step 5: Used fallback 'your item' - no product name available from products[] or line_items[]")
-        
-        # Warn if $0.00 total detected
         if total == 0.0:
             logger.warning("Step 5: Order total is $0.00 - possible pricing issue")
 
@@ -1587,7 +1711,7 @@ def chat():
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
-    # ─── Step 10: Build response ───
+    # ─── Step 10: Build response ─���─
     response = {
         "success": True,
         "bot_message": bot_message,
@@ -1602,10 +1726,8 @@ def chat():
 
     # ─── Step 5.5: Detect when quantity is needed for ordering ───
     if intent in ORDER_CREATE_INTENTS and not entities.quantity and products:
-        # We found the product but no quantity — check if variable first
         product = products[0]
         if product.get("type") == "variable":
-            # Variable product — ask for variant first, quantity will be asked after
             _raw_for_prompt = next((p for p in all_products_raw if not p.get("parent_id")), {})
             prompt_msg = _build_variant_prompt(_raw_for_prompt, product["name"])
             elapsed = time.time() - start_time
@@ -1649,8 +1771,6 @@ def chat():
     if intent in ORDER_CREATE_INTENTS and entities.quantity and products and not order_data:
         product = products[0]
         if product.get("type") == "variable":
-            # Variable product with quantity but no order placed (e.g. no customer_id, or variant not resolved)
-            # Use only parent (non-variation) raw products for the prompt to avoid passing a variation dict
             _raw_for_prompt = next((p for p in all_products_raw if not p.get("parent_id")), {})
             prompt_msg = _build_variant_prompt(_raw_for_prompt, product["name"])
             elapsed = time.time() - start_time
@@ -1674,7 +1794,6 @@ def chat():
             }), 200
 
     # ─── Step 10.5: After successful response, add "anything else?" flow ───
-    # Append to the response dict before returning:
     if intent in ORDER_CREATE_INTENTS and order_data:
         response["flow_state"] = FlowState.AWAITING_ANYTHING_ELSE.value
     else:

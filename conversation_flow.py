@@ -20,6 +20,7 @@ class FlowState(Enum):
     SHOWING_RESULTS = "showing_results"    # Results displayed, user may order or refine
     AWAITING_QUANTITY = "awaiting_quantity" # MQ asked: how many?
     AWAITING_ORDER_CONFIRM = "awaiting_order_confirm"  # MQ asked: Place order for N items. OK?
+    AWAITING_FINAL_CONFIRM = "awaiting_final_confirm"  # MQ showed full summary with price. Confirm?
     AWAITING_SHIPPING_CONFIRM = "awaiting_shipping_confirm"  # Show address, ask use/change
     AWAITING_NEW_ADDRESS = "awaiting_new_address"            # User typing new address
     AWAITING_ADDRESS_CONFIRM = "awaiting_address_confirm"    # Confirm the newly typed address
@@ -142,21 +143,18 @@ def handle_flow_state(
             return None
 
     # ── State: Awaiting quantity for an order ──
+    # After user provides quantity → go straight to shipping (skip old order confirm)
     if state == FlowState.AWAITING_QUANTITY:
-        # Try to parse a number from the message
         import re
         qty_match = re.search(r"\b(\d+)\b", text)
         if qty_match:
             quantity = int(qty_match.group(1))
-            product_name = entities.get("pending_product_name", "the product")
+            # Go directly to shipping address — skip AWAITING_ORDER_CONFIRM
             return {
-                "bot_message": (
-                    f"Placing an order for **{quantity}** × **{product_name}**. Is that OK? ✅"
-                ),
-                "suggestions": ["Yes, place the order", "No, cancel"],
-                "flow_state": FlowState.AWAITING_ORDER_CONFIRM.value,
+                "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value,
+                "fetch_customer_address": True,
                 "pending_quantity": quantity,
-                "pass_through": False,
+                "pass_through": True,
             }
         else:
             return {
@@ -166,7 +164,7 @@ def handle_flow_state(
                 "pass_through": False,
             }
 
-    # ── State: Awaiting order confirmation ──
+    # ── State: Awaiting order confirmation (legacy — kept for backward compat) ──
     if state == FlowState.AWAITING_ORDER_CONFIRM:
         if any(kw in text for kw in ["yes", "ok", "confirm", "sure", "go ahead", "place"]):
             return {
@@ -187,11 +185,12 @@ def handle_flow_state(
             }
 
     # ── State: Awaiting shipping address confirmation ──
+    # After user confirms address → show final summary with price (AWAITING_FINAL_CONFIRM)
     if state == FlowState.AWAITING_SHIPPING_CONFIRM:
         if any(kw in text for kw in ["yes", "use this", "ship here", "ok", "confirm", "correct", "sure"]):
             return {
-                "flow_state": FlowState.ORDER_COMPLETE.value,
-                "create_order": True,
+                "flow_state": FlowState.AWAITING_FINAL_CONFIRM.value,
+                "fetch_price_summary": True,
                 "pass_through": True,
                 "use_existing_address": True,
             }
@@ -228,11 +227,12 @@ def handle_flow_state(
         }
 
     # ── State: Awaiting confirmation of new address ──
+    # After user confirms new address → show final summary with price
     if state == FlowState.AWAITING_ADDRESS_CONFIRM:
         if any(kw in text for kw in ["yes", "confirm", "correct", "ok", "sure"]):
             return {
-                "flow_state": FlowState.ORDER_COMPLETE.value,
-                "create_order": True,
+                "flow_state": FlowState.AWAITING_FINAL_CONFIRM.value,
+                "fetch_price_summary": True,
                 "pass_through": True,
                 "use_new_address": True,
             }
@@ -246,6 +246,26 @@ def handle_flow_state(
             return {
                 "bot_message": "No problem! Order cancelled. Is there anything else I can help with?",
                 "suggestions": ["Show me products", "Browse categories", "No, thank you"],
+                "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
+                "pass_through": False,
+            }
+
+    # ── State: Awaiting final confirmation (full summary with price shown) ──
+    if state == FlowState.AWAITING_FINAL_CONFIRM:
+        if any(kw in text for kw in ["yes", "ok", "confirm", "sure", "go ahead", "place"]):
+            return {
+                "flow_state": FlowState.ORDER_COMPLETE.value,
+                "create_order": True,
+                "pass_through": True,
+            }
+        elif any(kw in text for kw in ["no", "cancel", "stop", "don't"]):
+            return {
+                "bot_message": "No problem! Order cancelled. Is there anything else I can help with?",
+                "suggestions": [
+                    "Show me products",
+                    "Browse categories",
+                    "No, thank you",
+                ],
                 "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
                 "pass_through": False,
             }
@@ -281,7 +301,10 @@ def handle_flow_state(
 
     # ── State: Awaiting variant selection for a variable product ──
     if state == FlowState.AWAITING_VARIANT_SELECTION:
-        if any(kw in text for kw in ["cancel", "stop", "nevermind", "never mind"]):
+        if any(kw in text for kw in [
+            "cancel", "stop", "nevermind", "never mind",
+            "exit", "quit", "back", "done", "go back",
+        ]):
             return {
                 "bot_message": "No problem! Order cancelled. Is there anything else I can help with?",
                 "suggestions": ["Show me products", "Browse categories", "No, thank you"],
