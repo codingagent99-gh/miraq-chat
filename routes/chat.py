@@ -36,7 +36,7 @@ from response_generator import (
     _resolve_user_placeholders,
     INTENT_LABELS,
 )
-from session_store import sessions
+from session_store import sessions, touch_session
 from models import Intent, WooAPICall
 from classifier import classify
 from api_builder import build_api_calls
@@ -66,6 +66,10 @@ def _score_variation_against_text(var: dict, user_text_clean: str, user_tokens: 
     * +2 for each attribute option whose cleaned string is found verbatim in *user_text_clean*.
     * +1 for each attribute option that has >=50% token overlap with *user_tokens*, or whose
       cleaned string contains at least one significant (len>=2) user token as a substring.
+    * +1 bonus when the option tokens are a full subset of user_tokens AND the option token
+      count exactly matches the number of matching user tokens — rewards specificity so that
+      "WATERFALL Havana Linear" scores higher than "WATERFALL Havana" when user says
+      "waterfall havana linear".
     """
     score = 0
     for attr in var.get("attributes", []):
@@ -73,10 +77,14 @@ def _score_variation_against_text(var: dict, user_text_clean: str, user_tokens: 
         if not opt:
             continue
         opt_clean = _STRIP_QUOTES_RE.sub('', opt)
+        opt_tokens = set(_TOKENIZE_RE.findall(opt_clean))
         if opt_clean in user_text_clean:
             score += 2
+            # Bonus: reward more specific (longer) options that fully match
+            # e.g. "waterfall havana linear" beats "waterfall havana"
+            if opt_tokens and opt_tokens.issubset(user_tokens):
+                score += len(opt_tokens)
         else:
-            opt_tokens = set(_TOKENIZE_RE.findall(opt_clean))
             if opt_tokens:
                 overlap = opt_tokens & user_tokens
                 if len(overlap) >= max(1, len(opt_tokens) * _TOKEN_OVERLAP_THRESHOLD):
@@ -248,7 +256,12 @@ def chat():
         }), 400
 
     message = body.get("message", "").strip()
-    session_id = body.get("session_id", "")
+    session_id = body.get("session_id", "").strip()
+    # Generate a session_id if the frontend didn't send one
+    if not session_id:
+        import uuid
+        session_id = f"auto-{uuid.uuid4().hex}"
+        logger.info(f"POST /chat | No session_id received — generated: {session_id}")
     user_context = body.get("user_context", {})
     page = int(body.get("page", 1))
     
@@ -285,12 +298,14 @@ def chat():
                 "history": [],
                 "user_context": user_context,
                 "created_at": datetime.now(timezone.utc).isoformat(),
+                "last_active": datetime.now(timezone.utc).timestamp(),
             }
         sessions[session_id]["history"].append({
             "role": "user",
             "message": message,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
+        touch_session(session_id)
 
     # ─── Step 0: Check conversation flow state ───
     flow_state_str = user_context.get("flow_state", "idle")
@@ -435,18 +450,85 @@ def chat():
                         "pagination": _default_pagination(page),
                     }), 200
                 else:
-                    error_msg = str(order_resp.get('error', 'Unknown'))
-                    logger.error(f"Step 0: Order creation failed | error={error_msg}")
+                    error_msg = str(order_resp.get("error", "Unknown"))
+                    # WooCommerce returns structured errors in the data field on failure
+                    _err_data = order_resp.get("data") or {}
+                    _err_code = ""
+                    _err_detail = ""
+                    if isinstance(_err_data, dict):
+                        _err_code = str(_err_data.get("code", ""))
+                        _err_detail = str(_err_data.get("message", ""))
+                    # Also check error string itself for WooCommerce error codes
+                    _err_combined = f"{_err_code} {_err_detail} {error_msg}".lower()
+
+                    logger.error(
+                        f"Step 0: Order creation failed | error={sanitize_log_string(error_msg)} "
+                        f"| wc_code={_err_code} | wc_detail={sanitize_log_string(_err_detail)}"
+                    )
+
+                    # ── Detect discontinued/invalid variation ──
+                    _is_variant_error = any(kw in _err_combined for kw in [
+                        "invalid_variation", "invalid variation",
+                        "out of stock", "cannot be purchased",
+                        "product is not purchasable", "not purchasable",
+                        "variation", "no longer available",
+                        "stock", "sold out",
+                    ])
+
+                    if _is_variant_error and pending_product_id:
+                        # Clear the stale variation cache so next turn re-fetches from WooCommerce
+                        if session_id and session_id in sessions:
+                            sessions[session_id].get("variation_cache", {}).pop(str(pending_product_id), None)
+                            logger.info(
+                                f"Step 0: Cleared variation cache for product_id={pending_product_id} "
+                                f"due to order failure (variant likely discontinued)"
+                            )
+                        elapsed = time.time() - start_time
+                        return jsonify({
+                            "success": True,
+                            "bot_message": (
+                                f"Sorry, it looks like the variant you selected for "
+                                f"**{pending_product_name}** is no longer available. "
+                                f"Let me show you what's currently in stock — which variant would you like?"
+                            ),
+                            "intent": "guided_flow",
+                            "products": [],
+                            "filters_applied": {},
+                            "suggestions": [],
+                            "session_id": session_id,
+                            "metadata": {
+                                "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
+                                "pending_product_id": pending_product_id,
+                                "pending_product_name": pending_product_name,
+                                "pending_quantity": pending_quantity,
+                                "response_time_ms": round(elapsed * 1000),
+                            },
+                            "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
+                            "pagination": _default_pagination(page),
+                        }), 200
+
+                    # ── Generic order failure ──
+                    elapsed = time.time() - start_time
                     return jsonify({
                         "success": True,
-                        "bot_message": "Sorry, I couldn't place the order. Please try again.",
+                        "bot_message": (
+                            "Sorry, I couldn't place the order right now. "
+                            "This could be a temporary issue — please try again in a moment."
+                        ),
                         "intent": "order",
                         "products": [],
                         "filters_applied": {},
                         "suggestions": ["Try again", "Show me products"],
                         "session_id": session_id,
-                        "metadata": {"flow_state": FlowState.IDLE.value},
-                        "flow_state": FlowState.IDLE.value,
+                        "metadata": {
+                            "flow_state": FlowState.AWAITING_FINAL_CONFIRM.value,
+                            "pending_product_id": pending_product_id,
+                            "pending_product_name": pending_product_name,
+                            "pending_quantity": pending_quantity,
+                            "pending_variation_id": pending_variation_id,
+                            "response_time_ms": round(elapsed * 1000),
+                        },
+                        "flow_state": FlowState.AWAITING_FINAL_CONFIRM.value,
                         "pagination": _default_pagination(page),
                     }), 200
 
@@ -957,18 +1039,66 @@ def chat():
         logger.info(f"Step 3.55: Variant selection response | pending_product_id={_var_product_id} | pending_quantity={_var_quantity}")
 
         if _var_product_id:
-            var_call = WooAPICall(
-                method="GET",
-                endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}/variations",
-                params={"per_page": 100, "status": "publish"},
-                description=f"Fetch variations for variant selection of '{_var_product_name}'",
-            )
-            var_resp = woo_client.execute(var_call)
-            if var_resp.get("success") and isinstance(var_resp.get("data"), list):
-                all_variations = var_resp["data"]
+            # ── Use session-side variation cache — avoids re-fetching from WooCommerce each turn ──
+            _session_data = sessions.get(session_id, {})
+            _var_cache = _session_data.get("variation_cache", {}).get(str(_var_product_id))
+            if _var_cache:
+                all_variations = _var_cache["variations"]
+                logger.info(f"Step 3.55: Using session-cached variations ({len(all_variations)}) — skipping API call")
+                _variations_loaded = True
+            else:
+                var_call = WooAPICall(
+                    method="GET",
+                    endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}/variations",
+                    params={"per_page": 100, "status": "publish"},
+                    description=f"Fetch variations for variant selection of '{_var_product_name}'",
+                )
+                var_resp = woo_client.execute(var_call)
+                _variations_loaded = var_resp.get("success") and isinstance(var_resp.get("data"), list)
+                if _variations_loaded:
+                    all_variations = var_resp["data"]
+            if _variations_loaded:
 
                 # ── Pre-filter using resolved attributes from prior turns ──
                 prev_resolved = user_context.get("resolved_attributes", {})
+                # ── Pre-filter refinement: if the current message specifies a more specific
+                #    value for an already-resolved attribute (e.g. "WATERFALL Havana Linear"
+                #    refining a previously resolved "WATERFALL Havana"), update prev_resolved
+                #    to the more specific value before filtering. This prevents the broader
+                #    substring match from letting both the plain and Linear variants through. ──
+                if prev_resolved:
+                    user_msg_lower = message.lower()
+                    user_msg_clean = _STRIP_QUOTES_RE.sub('', user_msg_lower)
+                    refined_resolved = dict(prev_resolved)
+                    for attr_name, attr_val in prev_resolved.items():
+                        # Collect all distinct option values for this attribute across all variations
+                        candidate_options = set()
+                        for var in all_variations:
+                            for a in var.get("attributes", []):
+                                if a.get("name", "").lower() == attr_name.lower():
+                                    opt = a.get("option", "")
+                                    if opt:
+                                        candidate_options.add(opt)
+                        # Find options that are more specific than the current resolved value
+                        # i.e. they contain the current value as a substring AND are longer
+                        # AND appear in the current user message
+                        current_val_lower = attr_val.lower()
+                        for opt in candidate_options:
+                            opt_lower = opt.lower()
+                            opt_clean = _STRIP_QUOTES_RE.sub('', opt_lower)
+                            if (
+                                current_val_lower in opt_lower        # more specific
+                                and opt_lower != current_val_lower    # actually different
+                                and opt_clean in user_msg_clean       # user mentioned it
+                            ):
+                                refined_resolved[attr_name] = opt
+                                logger.info(
+                                    f"Step 3.55: Refined resolved attribute "
+                                    f"{attr_name}: '{attr_val}' → '{opt}' based on current message"
+                                )
+                                break
+                    prev_resolved = refined_resolved
+
                 if prev_resolved:
                     pre_filtered = []
                     for var in all_variations:
@@ -1165,15 +1295,20 @@ def chat():
                                 resolved_attributes[k] = v
                         logger.info(f"Step 3.55: Merged with previous resolved_attributes: {resolved_attributes}")
 
-                    # Fetch parent product to rebuild the prompt
-                    parent_call = WooAPICall(
-                        method="GET",
-                        endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}",
-                        params={},
-                        description=f"Fetch parent product '{_var_product_name}' for variant re-prompt",
-                    )
-                    parent_resp = woo_client.execute(parent_call)
-                    parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
+                    # Use session-cached parent_raw — avoids an extra WooCommerce API call
+                    _session_parent = sessions.get(session_id, {}).get("variation_cache", {}).get(str(_var_product_id), {}).get("parent_raw")
+                    if _session_parent:
+                        parent_raw = _session_parent
+                        logger.info(f"Step 3.55: Using session-cached parent_raw — skipping parent product API call")
+                    else:
+                        parent_call = WooAPICall(
+                            method="GET",
+                            endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}",
+                            params={},
+                            description=f"Fetch parent product '{_var_product_name}' for variant re-prompt",
+                        )
+                        parent_resp = woo_client.execute(parent_call)
+                        parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
                     if len(matched) > 1 and len(matched) < len(all_variations):
                         attr_values_all = {}
                         for v in matched:
@@ -1183,7 +1318,14 @@ def chat():
                                 if name and opt:
                                     attr_values_all.setdefault(name, set()).add(opt)
                         
-                        ambiguous = {k: sorted(v) for k, v in attr_values_all.items() if len(v) > 1}
+                        # Exclude already-resolved attributes so we never ask the user
+                        # for an attribute they already specified in a prior turn.
+                        _already_resolved = {k.lower() for k in resolved_attributes}
+                        ambiguous = {
+                            k: sorted(v)
+                            for k, v in attr_values_all.items()
+                            if len(v) > 1 and k.lower() not in _already_resolved
+                        }
                         if ambiguous:
                             lines = [f"Great, I found **{_var_product_name}** in your selected options! I just need a bit more info:\n"]
                             for attr_name, options in ambiguous.items():
@@ -1285,6 +1427,14 @@ def chat():
                 if not _order_variation_id and not has_attrs:
                     logger.info(f"Step 3.6: Variable product with no variant info | product_id={_order_product_id}")
                     prompt_msg = _build_variant_prompt(_order_product_raw or {}, _order_product_name)
+                    # ── Write to session-side variation cache ──
+                    if session_id and session_id in sessions:
+                        _pfv = _prefetched_variations or []
+                        sessions[session_id].setdefault("variation_cache", {})[str(_order_product_id)] = {
+                            "variations": _pfv,
+                            "parent_raw": _order_product_raw or {},
+                        }
+                        logger.info(f"Step 3.6: Cached {len(_pfv)} variations for product_id={_order_product_id} in session")
                     elapsed = time.time() - start_time
                     return jsonify({
                         "success": True,
@@ -1734,7 +1884,16 @@ def chat():
         product = products[0]
         if product.get("type") == "variable":
             _raw_for_prompt = next((p for p in all_products_raw if not p.get("parent_id")), {})
+            _variations_for_cache = [p for p in all_products_raw if p.get("parent_id") == product.get("id")]
             prompt_msg = _build_variant_prompt(_raw_for_prompt, product["name"])
+            # ── Write to session-side variation cache on first fetch ──
+            if session_id and session_id in sessions:
+                _pid = str(product.get("id"))
+                sessions[session_id].setdefault("variation_cache", {})[_pid] = {
+                    "variations": _variations_for_cache,
+                    "parent_raw": _raw_for_prompt,
+                }
+                logger.info(f"Step 5.5: Cached {len(_variations_for_cache)} variations for product_id={_pid} in session")
             elapsed = time.time() - start_time
             return jsonify({
                 "success": True,
@@ -1777,7 +1936,16 @@ def chat():
         product = products[0]
         if product.get("type") == "variable":
             _raw_for_prompt = next((p for p in all_products_raw if not p.get("parent_id")), {})
+            _variations_for_cache = [p for p in all_products_raw if p.get("parent_id") == product.get("id")]
             prompt_msg = _build_variant_prompt(_raw_for_prompt, product["name"])
+            # ── Write to session-side variation cache on first fetch ──
+            if session_id and session_id in sessions:
+                _pid = str(product.get("id"))
+                sessions[session_id].setdefault("variation_cache", {})[_pid] = {
+                    "variations": _variations_for_cache,
+                    "parent_raw": _raw_for_prompt,
+                }
+                logger.info(f"Step 5.5: Cached {len(_variations_for_cache)} variations for product_id={_pid} in session")
             elapsed = time.time() - start_time
             return jsonify({
                 "success": True,

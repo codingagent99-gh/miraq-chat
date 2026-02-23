@@ -255,19 +255,19 @@ def generate_bot_message(
         else:
             msg += f"Here are **{count}** products in the **{entities.category_name}** category! 📂\n\n"
     elif intent == Intent.PRODUCT_BY_VISUAL:
-        msg += f"Found **{count}** products with **{entities.visual}** look! 🎨\n\n"
+        msg += f"Found **{count}** products with **{entities.visual}** look! \n\n"
     elif intent == Intent.FILTER_BY_FINISH:
-        msg += f"Here are **{count}** products with **{entities.finish}** finish! ✨\n\n"
+        msg += f"Here are **{count}** products with **{entities.finish}** finish! \n\n"
     elif intent == Intent.FILTER_BY_COLOR:
-        msg += f"Found **{count}** products in **{entities.color_tone}** tones! 🎨\n\n"
+        msg += f"Found **{count}** products in **{entities.color_tone}** tones! \n\n"
     elif intent == Intent.PRODUCT_SEARCH:
-        msg += f"Found **{count}** products matching your search! 🔍\n\n"
+        msg += f"Found **{count}** products matching your search! \n\n"
     elif intent == Intent.CHIP_CARD:
-        msg += f"Here are **{count}** chip cards available! 🃏\n\n"
+        msg += f"Here are **{count}** chip cards available! \n\n"
     elif intent == Intent.MOSAIC_PRODUCTS:
-        msg += f"Found **{count}** mosaic products! 🧩\n\n"
+        msg += f"Found **{count}** mosaic products! \n\n"
     elif intent == Intent.CATEGORY_LIST:
-        msg += f"Here are our product categories! 📂\n\n"
+        msg += f"Here are our product categories! \n\n"
         for p in products[:MAX_DISPLAYED_ITEMS]:
             count_val = p.get('count', 0)
             count_str = f"({count_val} products)" if count_val > 0 else ""
