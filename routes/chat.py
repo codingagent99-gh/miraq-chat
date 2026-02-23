@@ -35,6 +35,7 @@ from response_generator import (
     build_filters,
     _resolve_user_placeholders,
     INTENT_LABELS,
+    format_order_detail,
 )
 from session_store import sessions, touch_session
 from models import Intent, WooAPICall
@@ -121,6 +122,42 @@ def _default_pagination(page: int = 1) -> dict:
         "total_items": 0,
         "total_pages": 1,
         "has_more": False,
+    }
+
+
+def _format_order_for_frontend(order: dict) -> dict:
+    """Map WooCommerce order dict to the frontend Order interface."""
+    line_items = order.get("line_items", [])
+    items = [
+        {
+            "name": item.get("name", "Unknown Item"),
+            "quantity": item.get("quantity", 1),
+            "price": float(item.get("price", 0) or 0),
+            "total": float(item.get("total", 0) or 0),
+            "sku": item.get("sku", ""),
+        }
+        for item in line_items
+    ]
+    try:
+        total = float(order.get("total", 0) or 0)
+    except (ValueError, TypeError):
+        total = 0.0
+
+    return {
+        "id": order.get("id"),
+        "order_number": str(order.get("number") or order.get("id", "")),
+        "status": order.get("status", "unknown"),
+        "currency": order.get("currency_symbol", "$"),
+        "total": total,
+        "subtotal": order.get("subtotal", "0"),
+        "shipping_total": order.get("shipping_total", "0"),
+        "date_created": order.get("date_created", ""),
+        "date_paid": order.get("date_paid"),
+        "payment_method": order.get("payment_method_title", ""),
+        "items": items,
+        "item_count": len(items),
+        "shipping": order.get("shipping", {}),
+        "billing": order.get("billing", {}),
     }
 
 
@@ -392,11 +429,37 @@ def chat():
                 }
                 # Check both flow_result flags and user_context flags for address handling
                 _use_new_address = flow_result.get("use_new_address") or user_context.get("use_new_address")
+                _use_existing_address = flow_result.get("use_existing_address") or user_context.get("use_existing_address")
+
                 if _use_new_address:
                     raw_address = user_context.get("pending_shipping_address", "")
                     if raw_address:
                         order_body["shipping"] = parse_address(raw_address)
-                        logger.info(f"Step 0: Including shipping override | address={order_body['shipping']}")
+                        logger.info(f"Step 0: Including new shipping address | address={order_body['shipping']}")
+
+                elif _use_existing_address:
+                    # User confirmed existing address — fetch it from customer profile and pass explicitly
+                    # WooCommerce REST API does NOT auto-populate from customer profile on order creation
+                    try:
+                        _cust_call = WooAPICall(
+                            method="GET",
+                            endpoint=f"{WOO_BASE_URL}/customers/{customer_id}",
+                            params={},
+                            body={},
+                            description=f"Fetch customer {customer_id} address for order",
+                        )
+                        _cust_resp = woo_client.execute(_cust_call)
+                        if _cust_resp.get("success") and isinstance(_cust_resp.get("data"), dict):
+                            _cust_data = _cust_resp["data"]
+                            _shipping = _cust_data.get("shipping", {})
+                            _billing = _cust_data.get("billing", {})
+                            if _shipping.get("address_1") or _shipping.get("city"):
+                                order_body["shipping"] = _shipping
+                                logger.info(f"Step 0: Including existing shipping address | city={_shipping.get('city')}")
+                            if _billing.get("email") or _billing.get("address_1"):
+                                order_body["billing"] = _billing
+                    except Exception as _exc:
+                        logger.warning(f"Step 0: Could not fetch customer address for order | error={_exc}")
 
                 order_call = WooAPICall(
                     method="POST",
@@ -1030,6 +1093,42 @@ def chat():
                 else:
                     error_msg = sanitize_log_string(str(reorder_resp.get('error', 'Unknown')))
                     logger.warning(f"Step 3.5: Reorder failed | error={error_msg}")
+
+    # ─── Step 3.5b: AWAITING_ORDER_DETAIL — user clicked an order or asked for detail ───
+    if current_flow_state == FlowState.AWAITING_ORDER_DETAIL and customer_id:
+        _detail_order_id = user_context.get("pending_order_id")
+        logger.info(f"Step 3.5b: Fetching order detail | order_id={_detail_order_id}")
+        if _detail_order_id:
+            detail_call = WooAPICall(
+                method="GET",
+                endpoint=f"{WOO_BASE_URL}/orders/{_detail_order_id}",
+                params={},
+                description=f"Fetch order #{_detail_order_id} detail",
+            )
+            detail_resp = woo_client.execute(detail_call)
+            elapsed = time.time() - start_time
+            if detail_resp.get("success") and isinstance(detail_resp.get("data"), dict):
+                order_detail = detail_resp["data"]
+                bot_message = format_order_detail(order_detail)
+                logger.info(f"Step 3.5b: Order detail fetched | order_id={_detail_order_id}")
+            else:
+                bot_message = f"Sorry, I couldn't find details for order #{_detail_order_id}. Please try again."
+                logger.warning(f"Step 3.5b: Failed to fetch order detail | order_id={_detail_order_id}")
+            return jsonify({
+                "success": True,
+                "bot_message": bot_message,
+                "intent": "order_detail",
+                "products": [],
+                "filters_applied": {},
+                "suggestions": ["Show my orders", "Place a new order", "No, that's all"],
+                "session_id": session_id,
+                "metadata": {
+                    "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
+                    "response_time_ms": round(elapsed * 1000),
+                },
+                "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
+                "pagination": _default_pagination(page),
+            }), 200
 
     # ─── Step 3.55: AWAITING_VARIANT_SELECTION — resolve variant from user response ───
     if current_flow_state == FlowState.AWAITING_VARIANT_SELECTION and customer_id:
@@ -1965,6 +2064,10 @@ def chat():
                 "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
                 "pagination": _default_pagination(page),
             }), 200
+
+    # ─── Step 10.3: Attach structured order data for frontend rendering ───
+    if intent in (Intent.ORDER_HISTORY, Intent.LAST_ORDER) and order_data:
+        response["orders"] = [_format_order_for_frontend(o) for o in order_data]
 
     # ─── Step 10.5: After successful response, add "anything else?" flow ───
     if intent in ORDER_CREATE_INTENTS and order_data:

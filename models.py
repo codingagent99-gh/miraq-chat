@@ -119,10 +119,14 @@ class ExtractedEntities:
     quantity: Optional[int] = None
     variation_id: Optional[int] = None
 
-    # ──── NEW: Order history & reorder fields ────
+    # ──── Order history & reorder fields ────
     reorder: Optional[bool] = None
     order_count: Optional[int] = None          # how many past orders to fetch
     order_item_name: Optional[str] = None      # product name for "order this item X"
+
+    # ──── Time range fields (used by ORDER_HISTORY) ────
+    date_after: Optional[str] = None           # ISO datetime string e.g. "2026-01-01T00:00:00"
+    date_before: Optional[str] = None          # ISO datetime string (reserved for future use)
 
 
 @dataclass

@@ -27,6 +27,7 @@ def classify(utterance: str) -> ClassifiedResult:
     _extract_application(text, entities)
     _extract_collection_year(text, entities)
     _extract_order_id(text, entities)
+    _extract_time_range(text, entities)
     _extract_quantity(text, entities)
     _extract_category(text, entities)
     _extract_order_item(text, entities)
@@ -60,7 +61,13 @@ def classify(utterance: str) -> ClassifiedResult:
     ):
         intent, confidence = Intent.QUICK_ORDER, 0.93
 
-    # 1. ORDER TRACKING & STATUS
+    # 1. ORDER DETAIL — specific order number mentioned (show me order #1234)
+    elif entities.order_id and re.search(
+        r"\b(show|view|see|detail|details|info|about|check|open|what\s+is|tell\s+me)\b", text
+    ):
+        intent, confidence = Intent.ORDER_STATUS, 0.96
+
+    # 1b. ORDER TRACKING & STATUS
     elif re.search(r"\b(track|tracking)\b.*\border\b|\border\b.*\btrack", text):
         intent, confidence = Intent.ORDER_TRACKING, 0.93
 
@@ -68,6 +75,11 @@ def classify(utterance: str) -> ClassifiedResult:
         intent, confidence = Intent.ORDER_STATUS, 0.93
 
     # 2. ORDER HISTORY & LAST ORDER
+    # "last 4 orders", "show me 5 orders", "get 3 recent orders"
+    elif m := re.search(r"\b(last|recent|past|show|get|fetch|list)\s+(\d+)\s+orders?\b", text):
+        intent, confidence = Intent.ORDER_HISTORY, 0.94
+        entities.order_count = int(m.group(2))
+
     elif re.search(r"\b(order\s*history|past\s*orders?|previous\s*orders?)\b", text):
         intent, confidence = Intent.ORDER_HISTORY, 0.92
         entities.order_count = 10
@@ -541,6 +553,46 @@ def _extract_order_id(text: str, entities: ExtractedEntities):
     if match:
         entities.order_id = int(match.group(1))
 
+
+def _extract_time_range(text: str, entities: ExtractedEntities):
+    """Extract date_after from time range phrases like 'past month', 'last 3 months', 'this year'."""
+    from datetime import datetime, timezone, timedelta
+    from dateutil.relativedelta import relativedelta
+    now = datetime.now(timezone.utc)
+
+    # "last N days/weeks/months/years"
+    m = re.search(r'(?:last|past)\s+(\d+)\s+(day|week|month|year)s?', text)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        if unit == 'day':
+            entities.date_after = (now - timedelta(days=n)).strftime('%Y-%m-%dT00:00:00')
+        elif unit == 'week':
+            entities.date_after = (now - timedelta(weeks=n)).strftime('%Y-%m-%dT00:00:00')
+        elif unit == 'month':
+            entities.date_after = (now - relativedelta(months=n)).strftime('%Y-%m-%dT00:00:00')
+        elif unit == 'year':
+            entities.date_after = (now - relativedelta(years=n)).strftime('%Y-%m-%dT00:00:00')
+        return
+
+    # "past month" / "last month" (no number)
+    if re.search(r'(?:last|past)\s+month', text):
+        entities.date_after = (now - relativedelta(months=1)).strftime('%Y-%m-%dT00:00:00')
+        return
+    if re.search(r'(?:last|past)\s+week', text):
+        entities.date_after = (now - timedelta(weeks=1)).strftime('%Y-%m-%dT00:00:00')
+        return
+    if re.search(r'(?:last|past)\s+year', text):
+        entities.date_after = (now - relativedelta(years=1)).strftime('%Y-%m-%dT00:00:00')
+        return
+
+    # "this month" / "this year"
+    if re.search(r'this\s+month', text):
+        entities.date_after = now.replace(day=1).strftime('%Y-%m-%dT00:00:00')
+        return
+    if re.search(r'this\s+year', text):
+        entities.date_after = now.replace(month=1, day=1).strftime('%Y-%m-%dT00:00:00')
+        return
 
 def _extract_quantity(text: str, entities: ExtractedEntities):
     # Primary: number + unit keyword

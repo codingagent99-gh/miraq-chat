@@ -42,8 +42,11 @@ def generate_bot_message(
         )
 
     # ── Order-specific handling ──
-    if intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.REORDER):
-        if intent == Intent.ORDER_HISTORY and order_data:
+    if intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.REORDER, Intent.ORDER_STATUS, Intent.ORDER_TRACKING):
+        # Single order detail — ORDER_STATUS/TRACKING with one order, or LAST_ORDER
+        if intent in (Intent.ORDER_STATUS, Intent.ORDER_TRACKING) and order_data:
+            return format_order_detail(order_data[0])
+        elif intent == Intent.ORDER_HISTORY and order_data:
             return _format_order_history_message(order_data)
         elif intent == Intent.LAST_ORDER and order_data:
             order = order_data[0]
@@ -255,19 +258,19 @@ def generate_bot_message(
         else:
             msg += f"Here are **{count}** products in the **{entities.category_name}** category! 📂\n\n"
     elif intent == Intent.PRODUCT_BY_VISUAL:
-        msg += f"Found **{count}** products with **{entities.visual}** look! \n\n"
+        msg += f"Found **{count}** products with **{entities.visual}** look! 🎨\n\n"
     elif intent == Intent.FILTER_BY_FINISH:
-        msg += f"Here are **{count}** products with **{entities.finish}** finish! \n\n"
+        msg += f"Here are **{count}** products with **{entities.finish}** finish! ✨\n\n"
     elif intent == Intent.FILTER_BY_COLOR:
-        msg += f"Found **{count}** products in **{entities.color_tone}** tones! \n\n"
+        msg += f"Found **{count}** products in **{entities.color_tone}** tones! 🎨\n\n"
     elif intent == Intent.PRODUCT_SEARCH:
-        msg += f"Found **{count}** products matching your search! \n\n"
+        msg += f"Found **{count}** products matching your search! 🔍\n\n"
     elif intent == Intent.CHIP_CARD:
-        msg += f"Here are **{count}** chip cards available! \n\n"
+        msg += f"Here are **{count}** chip cards available! 🃏\n\n"
     elif intent == Intent.MOSAIC_PRODUCTS:
-        msg += f"Found **{count}** mosaic products! \n\n"
+        msg += f"Found **{count}** mosaic products! 🧩\n\n"
     elif intent == Intent.CATEGORY_LIST:
-        msg += f"Here are our product categories! \n\n"
+        msg += f"Here are our product categories! 📂\n\n"
         for p in products[:MAX_DISPLAYED_ITEMS]:
             count_val = p.get('count', 0)
             count_str = f"({count_val} products)" if count_val > 0 else ""
@@ -441,17 +444,70 @@ def _format_order_date(date_created: str) -> str:
 
 
 def _format_order_history_message(orders: List[dict]) -> str:
-    """Format multiple orders into a readable message."""
+    """Return a short header — the frontend renders order cards from the structured orders array."""
     if not orders:
         return "No orders found."
+    count = len(orders)
+    return f"📦 Here are your {count} most recent order{'s' if count != 1 else ''}. Tap any to see full details."
 
-    msg = f"📦 **Your Recent Orders** ({len(orders)} orders)\n\n"
-    for order in orders[:10]:
-        order_number = order.get("number", str(order.get("id", "")))
-        status = order.get("status", "unknown").title()
-        total = order.get("total", "0")
-        date_created = order.get("date_created", "")
-        msg += f"• **#{order_number}** — {status} — ${total} — {_format_order_date(date_created)}\n"
-    if len(orders) > 10:
-        msg += f"\n...and {len(orders) - 10} more orders."
+
+def format_order_detail(order: dict) -> str:
+    """Format a single order into a rich detail message."""
+    if not order:
+        return "Order details not available."
+
+    order_number = order.get("number", str(order.get("id", "N/A")))
+    status = order.get("status", "unknown").title()
+    currency_symbol = order.get("currency_symbol", "$")
+    total = order.get("total", "0")
+    subtotal = order.get("subtotal", "")
+    date_created = order.get("date_created", "")
+    payment_method = order.get("payment_method_title", "N/A")
+
+    STATUS_EMOJI = {
+        "pending": "⏳", "processing": "🔄", "on-hold": "⏸️",
+        "completed": "✅", "cancelled": "❌", "refunded": "↩️",
+        "failed": "❗", "trash": "🗑️",
+    }
+    status_emoji = STATUS_EMOJI.get(order.get("status", "").lower(), "📦")
+
+    msg = f"{status_emoji} **Order #{order_number}**\n\n"
+    msg += f"**Status:** {status}\n"
+    msg += f"**Date:** {_format_order_date(date_created)}\n"
+    msg += f"**Payment:** {payment_method}\n"
+
+    # Shipping address
+    shipping = order.get("shipping", {})
+    if shipping and (shipping.get("address_1") or shipping.get("city")):
+        addr_parts = [p for p in [
+            shipping.get("first_name", "") + " " + shipping.get("last_name", ""),
+            shipping.get("address_1", ""),
+            shipping.get("address_2", ""),
+            shipping.get("city", ""),
+            shipping.get("state", ""),
+            shipping.get("postcode", ""),
+            shipping.get("country", ""),
+        ] if p and p.strip()]
+        msg += f"**Ships to:** {', '.join(addr_parts)}\n"
+
+    # Line items
+    line_items = order.get("line_items", [])
+    if line_items:
+        msg += f"\n**Items ({len(line_items)}):**\n"
+        for item in line_items:
+            name = item.get("name") or "Unknown Item"
+            qty = item.get("quantity", 1)
+            item_total = item.get("total", "0")
+            sku = item.get("sku", "")
+            msg += f"  • {name}"
+            if sku:
+                msg += f" _(SKU: {sku})_"
+            msg += f" × {qty} — {currency_symbol}{item_total}\n"
+
+    # Totals
+    msg += f"\n**Order Total:** {currency_symbol}{total}"
+    shipping_total = order.get("shipping_total", "0")
+    if float(shipping_total or 0) > 0:
+        msg += f"\n**Shipping:** {currency_symbol}{shipping_total}"
+
     return msg

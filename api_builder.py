@@ -108,11 +108,14 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
 
     elif intent == Intent.ORDER_HISTORY:
         count = e.order_count or 10
+        _order_params = {"customer": "CURRENT_USER_ID", "per_page": count, "page": page, "orderby": "date", "order": "desc"}
+        if getattr(e, "date_after", None):
+            _order_params["after"] = e.date_after
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/orders",
-            params={"customer": "CURRENT_USER_ID", "per_page": count, "page": page, "orderby": "date", "order": "desc"},
-            description=f"Get customer's last {count} orders",
+            params=_order_params,
+            description=f"Get customer orders{' after ' + e.date_after[:10] if getattr(e, 'date_after', None) else ' (last ' + str(count) + ')'}",
             requires_resolution=["customer_id"],
         ))
 

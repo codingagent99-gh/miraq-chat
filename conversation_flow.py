@@ -28,6 +28,7 @@ class FlowState(Enum):
     AWAITING_ANYTHING_ELSE = "awaiting_anything_else"  # MQ asked: anything else?
     CLOSING = "closing"                     # User said no, chat closing
     AWAITING_VARIANT_SELECTION = "awaiting_variant_selection"  # MQ asked: which variant?
+    AWAITING_ORDER_DETAIL = "awaiting_order_detail"            # User asked for order detail / clicked an order
 
 
 @dataclass
