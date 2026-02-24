@@ -181,8 +181,25 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
     # ═══════════════════════════════════════════
 
     elif intent == Intent.CATEGORY_BROWSE:
-        cat_slug = _category_slug(e.category_id) if e.category_id else None
-        categories_list = [cat_slug] if cat_slug else []
+        loader = get_store_loader()
+        cat_id = e.category_id
+
+        # Fallback: if category_id wasn't resolved by classifier, try to resolve
+        # category_name directly via store_loader so the API call isn't sent blind
+        if not cat_id and e.category_name and loader:
+            cat_id = loader.get_category_id(e.category_name)
+            if cat_id:
+                e.category_id = cat_id  # patch entity so response_generator sees it too
+
+        # Use ALL slugs for duplicate-named categories (e.g. "Tile Floor" has 6 WC entries)
+        # so the API returns products from any of them
+        if cat_id and loader:
+            categories_list = loader.get_all_slugs_for_category(cat_id)
+        elif cat_id:
+            cat_slug = _category_slug(cat_id)
+            categories_list = [cat_slug] if cat_slug else []
+        else:
+            categories_list = []
 
         # Collect tag slugs
         tag_slugs = []

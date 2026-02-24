@@ -31,7 +31,9 @@ class WooClient:
 
         # Log API call (sanitize sensitive data)
         sanitized_endpoint = sanitize_url(api_call.endpoint)
-        logger.info(f"WooCommerce API call: {api_call.method} {sanitized_endpoint}")
+        # Log params (excluding auth keys) for debugging
+        safe_params = {k: v for k, v in params.items() if k not in ("consumer_key", "consumer_secret")}
+        logger.info(f"WooCommerce API call: {api_call.method} {sanitized_endpoint} | params={safe_params}")
 
         try:
             if api_call.method == "GET":

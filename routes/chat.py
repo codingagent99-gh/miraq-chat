@@ -1116,6 +1116,28 @@ def chat():
             }), 200
 
     # ─── Step 3.55: AWAITING_VARIANT_SELECTION — resolve variant from user response ───
+    # Before entering variant resolution, check if the user has abandoned the flow
+    # by sending a clearly new search/browse intent. If so, reset flow and process normally.
+    if current_flow_state == FlowState.AWAITING_VARIANT_SELECTION:
+        _ABANDON_INTENTS = {
+            Intent.PRODUCT_SEARCH, Intent.PRODUCT_LIST, Intent.CATEGORY_BROWSE,
+            Intent.CATEGORY_LIST, Intent.FILTER_BY_FINISH, Intent.FILTER_BY_SIZE,
+            Intent.FILTER_BY_COLOR, Intent.FILTER_BY_APPLICATION, Intent.PRODUCT_BY_VISUAL,
+            Intent.PRODUCT_BY_ORIGIN, Intent.PRODUCT_QUICK_SHIP, Intent.GREETING,
+        }
+        if intent in _ABANDON_INTENTS:
+            logger.info(
+                f"Step 3.55: Abandoning variant flow — new intent={intent.value} detected | "
+                f"message=\"{sanitize_log_string(message)}\""
+            )
+            if session_id and session_id in sessions:
+                sessions[session_id]["flow_state"] = FlowState.IDLE.value
+                sessions[session_id]["user_context"].pop("pending_product_id", None)
+                sessions[session_id]["user_context"].pop("pending_product_name", None)
+                sessions[session_id]["user_context"].pop("pending_quantity", None)
+                sessions[session_id]["user_context"].pop("resolved_attributes", None)
+            current_flow_state = FlowState.IDLE
+
     if current_flow_state == FlowState.AWAITING_VARIANT_SELECTION and customer_id:
         _var_product_id = user_context.get("pending_product_id")
         _var_product_name = user_context.get("pending_product_name", "the product")
@@ -1765,94 +1787,6 @@ def chat():
         Intent.PRODUCT_BY_ORIGIN,
     }
     
-    # ─── Step 3.9: Pre-LLM "entity not in store" guard ───
-    # If the empty result is because the user asked for a category/application that
-    # simply doesn't exist in this store, we can answer locally — no LLM needed.
-    if intent in SEARCH_FILTER_INTENTS and len(all_products_raw) == 0:
-        _store = get_store_loader()
-        _unknown_entity: str | None = None
-
-        # 1. Check application entity against known pa_application terms
-        if entities.application and _store:
-            known_terms = _store.get_attribute_term_ids("pa_application", entities.application)
-            if not known_terms:
-                all_term_names = [
-                    t.get("name", "") for t in _store.get_all_attribute_terms("pa_application")
-                ]
-                _unknown_entity = f"application '{entities.application}'"
-                logger.info(
-                    f"Step 3.9: application='{entities.application}' not found in store "
-                    f"(known: {all_term_names[:10]}). Skipping LLM."
-                )
-
-        # 2. Check category_name against known categories
-        if not _unknown_entity and entities.category_name and not entities.category_id and _store:
-            resolved_cat_id = _store.get_category_id(entities.category_name)
-            if not resolved_cat_id:
-                _unknown_entity = f"category '{entities.category_name}'"
-                logger.info(
-                    f"Step 3.9: category_name='{entities.category_name}' not found in store. "
-                    f"Skipping LLM."
-                )
-
-        # 3. Check finish
-        if not _unknown_entity and entities.finish and _store:
-            if not _store.get_attribute_term_ids("pa_finish", entities.finish):
-                _unknown_entity = f"finish '{entities.finish}'"
-                logger.info(f"Step 3.9: finish='{entities.finish}' not found in store. Skipping LLM.")
-
-        # 4. Check visual/style
-        if not _unknown_entity and entities.visual and _store:
-            if not _store.get_attribute_term_ids("pa_visual", entities.visual):
-                _unknown_entity = f"style '{entities.visual}'"
-                logger.info(f"Step 3.9: visual='{entities.visual}' not found in store. Skipping LLM.")
-
-        # 5. Check tile size
-        if not _unknown_entity and entities.tile_size and _store:
-            if not _store.get_attribute_term_ids("pa_tile-size", entities.tile_size):
-                _unknown_entity = f"size '{entities.tile_size}'"
-                logger.info(f"Step 3.9: tile_size='{entities.tile_size}' not found in store. Skipping LLM.")
-
-        # 6. Check origin
-        if not _unknown_entity and entities.origin and _store:
-            if not _store.get_attribute_term_ids("pa_origin", entities.origin):
-                _unknown_entity = f"origin '{entities.origin}'"
-                logger.info(f"Step 3.9: origin='{entities.origin}' not found in store. Skipping LLM.")
-
-        if _unknown_entity:
-            _no_exist_msg = (
-                f"I'm sorry, we don't currently carry tiles for {_unknown_entity}. "
-                f"Would you like to browse our available collections instead?"
-            )
-            elapsed = time.time() - start_time
-            logger.info(
-                f"Step 3.9: Resolved locally (entity not in store) | "
-                f"entity={_unknown_entity} | skipped_llm=True"
-            )
-            if session_id and session_id in sessions:
-                sessions[session_id]["history"].append({
-                    "role": "bot",
-                    "message": _no_exist_msg,
-                    "intent": intent.value,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
-            return jsonify({
-                "success": True,
-                "bot_message": _no_exist_msg,
-                "intent": INTENT_LABELS.get(intent, "unknown"),
-                "products": [],
-                "suggestions": ["Show me all products", "What categories do you have?", "Browse by finish"],
-                "session_id": session_id,
-                "metadata": {
-                    "confidence": round(confidence, 2),
-                    "intent_raw": intent.value,
-                    "provider": "local_entity_not_in_store",
-                    "unknown_entity": _unknown_entity,
-                    "response_time_ms": round(elapsed * 1000),
-                },
-                "pagination": _default_pagination(page),
-            }), 200
-
     if (
         intent in SEARCH_FILTER_INTENTS
         and len(all_products_raw) == 0

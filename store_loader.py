@@ -58,6 +58,7 @@ class StoreLoader:
 
         # Lookup maps
         self.category_by_slug: Dict[str, Dict] = {}
+        self.category_slugs_by_name: Dict[str, List[str]] = {}  # name_lower → all slugs
         self.category_by_id: Dict[int, Dict] = {}
         self.category_by_name_lower: Dict[str, Dict] = {}
         self.tag_by_slug: Dict[str, Dict] = {}
@@ -67,6 +68,22 @@ class StoreLoader:
 
         # NLP keyword → category mappings
         self.category_keywords: Dict[str, int] = {}
+
+        # Store-generic terms derived from category names (e.g. {"tile", "tiles"} for a tile store)
+        # Used to generate "wall tile", "floor tiles" etc. combos — no hardcoding needed
+        self._store_generic_terms: set = set()
+
+        # Synonym map loaded from config — store-specific, empty by default
+        # Format: {"flooring": "floor", "walls": "wall", ...}
+        self._category_synonyms: Dict[str, str] = self._load_category_synonyms()
+
+        # Product variation schema — built at startup from products list
+        # product_id → {variation_axes, default_attributes, variation_ids, variation_count}
+        self.product_variation_schema: Dict[int, Dict] = {}
+
+        # Variation detail cache — populated lazily on first request, shared across sessions
+        # product_id → [variation_dict, ...]
+        self.variation_detail_cache: Dict[int, List[Dict]] = {}
 
         # ── Derived lookup maps (built after load) ──
         self.attribute_by_slug: Dict[str, Dict] = {}   # slug → {id, name, slug}
@@ -197,8 +214,66 @@ class StoreLoader:
     # LOOKUP BUILDERS
     # ─────────────────────────────────────────────
 
+    def _load_category_synonyms(self) -> Dict[str, str]:
+        """Load store-specific synonym map from env/config. Empty by default.
+
+        Set CATEGORY_SYNONYMS in your .env as a JSON string, e.g.:
+            CATEGORY_SYNONYMS={"flooring":"floor","walls":"wall","countertops":"countertop"}
+
+        This keeps tile-store-specific knowledge out of the source code.
+        """
+        import json
+        raw = os.getenv("CATEGORY_SYNONYMS", "{}")
+        try:
+            synonyms = json.loads(raw)
+            if isinstance(synonyms, dict):
+                return {k.lower(): v.lower() for k, v in synonyms.items()}
+        except Exception:
+            pass
+        return {}
+
+    def _build_store_generic_terms(self) -> set:
+        """Derive generic/filler terms from the store's own category names.
+
+        Words appearing in >30% of category names are too broad to be useful
+        as standalone keywords — treat them as suffixes for combo generation instead.
+        e.g. "tile" appears in Tile, Tile Floor, Tile Wall → auto-detected as generic.
+        Works for any store: a furniture store would detect "furniture", etc.
+        """
+        from collections import Counter
+        word_counts = Counter()
+        valid_cats = [c for c in self.categories if c.get("slug") != "uncategorized" and c.get("count", 0) > 0]
+        total = len(valid_cats) or 1
+        for cat in valid_cats:
+            for word in re.split(r"[\s\-_/&]+", cat.get("name", "").lower()):
+                word = word.strip()
+                if word and len(word) > 2:
+                    word_counts[word] += 1
+        # A word is "generic" if it appears in multiple category names AND
+        # is outnumbered — i.e. it alone doesn't identify a unique category.
+        # We use count >= 2 AND the word appears in more categories than any single
+        # category with that name has products (prevents real categories from being stripped).
+        generic = set()
+        for word, count in word_counts.items():
+            if count >= 2:
+                solo_count = sum(
+                    1 for c in valid_cats
+                    if c.get("name", "").lower().strip() == word
+                )
+                compound_count = count - solo_count
+                # Generic only if it appears MORE in compounds than as a solo category.
+                # "tile": solo=1 (Tile), compound=2 (Tile Floor, Tile Wall) → generic ✅
+                # "wall": solo=3 (Wall×3), compound=2 (Tile Wall, Wall/Floor) → NOT generic ✅
+                # "floor": solo=3 (Floor×3), compound=2 (Tile Floor, Wall/Floor) → NOT generic ✅
+                if compound_count > solo_count:
+                    generic.add(word)
+        return generic
+
     def _build_lookups(self):
         """Build lookup dicts and NLP keyword maps from loaded data."""
+
+        # Derive store-generic terms from category names before building keywords
+        self._store_generic_terms = self._build_store_generic_terms()
 
         # ── Attribute lookups ──
         self.attribute_by_slug = {}
@@ -249,7 +324,15 @@ class StoreLoader:
 
             self.category_by_slug[slug] = entry
             self.category_by_id[cat_id] = entry
-            self.category_by_name_lower[name_lower] = entry
+            # Prefer higher-count category when names collide (e.g. two "Floor" categories)
+            existing = self.category_by_name_lower.get(name_lower)
+            if not existing or count > existing.get("count", 0):
+                self.category_by_name_lower[name_lower] = entry
+            # Collect ALL slugs for duplicate-named categories
+            if name_lower not in self.category_slugs_by_name:
+                self.category_slugs_by_name[name_lower] = []
+            if slug not in self.category_slugs_by_name[name_lower]:
+                self.category_slugs_by_name[name_lower].append(slug)
 
             # Generate keywords for non-empty, non-uncategorized categories
             if slug != "uncategorized" and count > 0:
@@ -280,11 +363,36 @@ class StoreLoader:
             self.product_by_name_lower[name.lower()] = entry
             # Also index each meaningful word/token from the product name
             # e.g. "Lager Matte 24x48" → tokens: ["lager", "matte", "24x48"]
-            stop = {"tile", "tiles", "the", "a", "an", "and", "or", "of", "series", "product", "products"}
+            stop = {"the", "a", "an", "and", "or", "of", "series", "product", "products"} | self._store_generic_terms
             for token in re.split(r'[\s\-_/]+', name.lower()):
                 token = token.strip()
                 if token and token not in stop and len(token) > 2:
                     self.product_name_tokens.append((token, entry))
+
+        # Build variation schema from product attributes
+        # This avoids needing an API call just to know what axes a product has
+        self.product_variation_schema = {}
+        for product in self.products:
+            pid = product.get("id")
+            if not pid or product.get("type") != "variable":
+                continue
+            attrs = product.get("attributes", [])
+            variation_axes = {}
+            for attr in attrs:
+                if attr.get("variation"):
+                    variation_axes[attr["slug"]] = {
+                        "name": attr["name"],
+                        "options": attr.get("options", []),
+                    }
+            self.product_variation_schema[pid] = {
+                "variation_axes": variation_axes,
+                "default_attributes": {
+                    a["name"].lower(): a["option"]
+                    for a in product.get("default_attributes", [])
+                },
+                "variation_ids": product.get("variations", []),
+                "variation_count": len(product.get("variations", [])),
+            }
 
     def _generate_category_keywords(self, cat_entry: Dict):
         """
@@ -300,60 +408,55 @@ class StoreLoader:
         name = cat_entry["name"].lower().strip()
         slug = cat_entry["slug"]
 
+        cat_count = cat_entry.get("count", 0)
+
+        def _register(kw: str, cid: int):
+            """Register keyword, preferring the category with higher product count."""
+            if kw not in self.category_keywords:
+                self.category_keywords[kw] = cid
+            else:
+                existing_id = self.category_keywords[kw]
+                existing_count = (self.category_by_id.get(existing_id) or {}).get("count", 0)
+                if cat_count > existing_count:
+                    self.category_keywords[kw] = cid
+
         # Full name: "Wall/Floor" → "wall/floor"
-        self.category_keywords[name] = cat_id
+        _register(name, cat_id)
 
         # Split by spaces, hyphens, slashes, underscores
+        # Universal grammar stop words + store-generic terms (e.g. "tile" for a tile store)
+        # _store_generic_terms is derived from category name frequency — no hardcoding needed
         stop_words = {
             "the", "a", "an", "and", "or", "of", "for",
             "in", "on", "to", "is", "all", "our", "new",
-        }
+        } | self._store_generic_terms
         words = re.split(r'[\s\-_/&]+', name)
         for word in words:
             word = word.strip().lower()
             if word and word not in stop_words and len(word) > 2:
-                if word not in self.category_keywords:
-                    self.category_keywords[word] = cat_id
+                _register(word, cat_id)
 
         # Slug as words: "wall-floor" → "wall floor"
         slug_words = slug.replace("-", " ")
         if slug_words != name:
-            self.category_keywords[slug_words] = cat_id
+            _register(slug_words, cat_id)
 
-        # Common NL variations people might type
-        variations = {
-            "tiles": "tile", "tile": "tiles",
-            "flooring": "floor", "floor": "flooring",
-            "walls": "wall", "wall": "walls",
-            "countertops": "countertop", "countertop": "countertops",
-            "counter top": "countertop", "counter tops": "countertops",
-            "backsplash": "backsplashes", "backsplashes": "backsplash",
-            "outdoor": "exterior", "exterior": "outdoor",
-            "indoor": "interior", "interior": "indoor",
-        }
-
-        # Add variations of the full name
-        for original, variant in variations.items():
+        # Add synonym variations from config (store-specific, empty by default)
+        # e.g. {"flooring": "floor", "walls": "wall"} for a tile store
+        for original, variant in self._category_synonyms.items():
             if original in name:
                 alt_name = name.replace(original, variant)
-                if alt_name not in self.category_keywords:
-                    self.category_keywords[alt_name] = cat_id
+                _register(alt_name, cat_id)
 
-        # Also add "X tiles" if not already there
-        # e.g., category "Wall" → also match "wall tiles"
-        for suffix in ["tiles", "tile"]:
-            combo = f"{name} {suffix}"
-            if combo not in self.category_keywords:
-                self.category_keywords[combo] = cat_id
-
-        # And "[word] tiles" for each word
-        for word in words:
-            word = word.strip().lower()
-            if word and word not in stop_words and len(word) > 2:
-                for suffix in ["tiles", "tile"]:
-                    combo = f"{word} {suffix}"
-                    if combo not in self.category_keywords:
-                        self.category_keywords[combo] = cat_id
+        # Add "[category name] + [generic term]" combos
+        # e.g. store generic terms = {"tile", "tiles"} → "wall tile", "wall tiles"
+        # Derived from the store's own category names, not hardcoded
+        for suffix in self._store_generic_terms:
+            _register(f"{name} {suffix}", cat_id)
+            for word in words:
+                word = word.strip().lower()
+                if word and word not in stop_words and len(word) > 2:
+                    _register(f"{word} {suffix}", cat_id)
 
     # ─────────────────────────────────────────────
     # QUERY METHODS
@@ -370,11 +473,28 @@ class StoreLoader:
         if keyword in self.category_keywords:
             return self.category_keywords[keyword]
 
-        # Partial match
+        # Partial substring match
         for name_lower, entry in self.category_by_name_lower.items():
             if keyword in name_lower or name_lower in keyword:
                 if entry["count"] > 0:
                     return entry["id"]
+
+        # Word-set overlap match — catches word-order flips and partial matches like
+        # "floor tiles" vs "Tile Floor", "floor" vs "Tile Floor", "wall" vs "Tile Wall"
+        keyword_words = set(keyword.split())
+
+        best_id = None
+        best_count = 0
+        for name_lower, entry in self.category_by_name_lower.items():
+            name_words = set(name_lower.split())
+            overlap = keyword_words & name_words
+            # Any meaningful word overlap qualifies; prefer higher product count
+            if overlap and entry["count"] > best_count:
+                best_id = entry["id"]
+                best_count = entry["count"]
+        if best_id:
+            return best_id
+
         return None
 
     def get_category_for_text(self, text: str) -> Optional[Dict]:
@@ -444,6 +564,16 @@ class StoreLoader:
         entry = self.category_by_id.get(category_id)
         return entry["slug"] if entry else None
 
+    def get_all_slugs_for_category(self, category_id: int) -> List[str]:
+        """Return ALL slugs for categories sharing the same name as category_id.
+        Useful when WooCommerce has duplicate category entries with different slugs.
+        e.g. 'Tile Floor' → ['tile-floor', 'tile-floor-mosaics-4', ...]"""""
+        entry = self.category_by_id.get(category_id)
+        if not entry:
+            return []
+        name_lower = entry["name"].lower()
+        return self.category_slugs_by_name.get(name_lower, [entry["slug"]])
+
     def get_attribute_id(self, slug: str) -> Optional[int]:
         """Return WooCommerce attribute ID for a slug, e.g. 'pa_tile-size' → 5."""
         entry = self.attribute_by_slug.get(slug)
@@ -497,6 +627,20 @@ class StoreLoader:
         if not attr:
             return []
         return self.attribute_terms.get(attr["id"], [])
+
+    def get_variation_schema(self, product_id: int) -> Optional[Dict]:
+        """Return cached variation schema for a product (built at startup).
+        Contains variation_axes, default_attributes, variation_ids, variation_count.
+        Returns None if product is not variable or not found."""
+        return self.product_variation_schema.get(product_id)
+
+    def get_cached_variations(self, product_id: int) -> Optional[List[Dict]]:
+        """Return cached variation detail objects if already fetched, else None."""
+        return self.variation_detail_cache.get(product_id)
+
+    def cache_variations(self, product_id: int, variations: List[Dict]) -> None:
+        """Store fetched variation details in the global cache (shared across sessions)."""
+        self.variation_detail_cache[product_id] = variations
 
     def get_tag_id_by_slug(self, slug: str) -> Optional[int]:
         """Return tag ID by slug. Uses live data."""

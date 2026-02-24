@@ -54,10 +54,12 @@ def classify(utterance: str) -> ClassifiedResult:
         entities.order_count = 1
 
     elif re.search(
-        r"\b(order|buy|purchase|want)\b.*\b(this\s+item|this\s+product)?\s*\b",
+        r"\b(order|buy|purchase)\b"
+        r"|\bwant\s+to\s+(order|buy|purchase|get)\b"
+        r"|\bi'?d\s+like\s+to\s+(order|buy|purchase|get)\b",
         text,
     ) and entities.order_item_name and not re.search(
-        r"\b(track|tracking|status|where|last|history|previous|past)\b", text
+        r"\b(track|tracking|status|where|last|history|previous|past|look|show|search|browse|find|see|display)\b", text
     ):
         intent, confidence = Intent.QUICK_ORDER, 0.93
 
@@ -351,29 +353,49 @@ def _extract_color(text: str, entities: ExtractedEntities):
 def _extract_finish(text: str, entities: ExtractedEntities):
     """
     Match finish keywords against live pa_finish attribute terms.
-    Falls back to tag search if attribute terms not found.
+    Strategy:
+      1. Try each candidate word directly against pa_finish terms via store_loader
+         (fuzzy match — handles "matte", "ribbed", "polished", etc.)
+      2. If no pa_finish term found, fall back to tag search
+         (handles "glossy" which exists as a tag but not a pa_finish term)
+    No hardcoded synonym mapping — fully data-driven from live store terms.
     """
-    FINISH_KEYWORDS = {
-        "matte": "matte", "matt": "matte", "matte finish": "matte",
-        "polished": "polished", "glossy": "polished", "gloss": "polished",
-        "honed": "honed", "satin": "satin", "lappato": "lappato",
-        "structured": "structured", "textured": "textured",
-        "natural": "natural", "brushed": "brushed",
-    }
+    # Common finish-related words to scan for in user text.
+    # These are search candidates only — not synonym mappings.
+    # If a word isn't a real pa_finish term in the store, it falls back to tag search.
+    FINISH_CANDIDATES = [
+        "matte finish", "polished finish", "glossy finish", "honed finish",
+        "matte", "polished", "glossy", "gloss", "matt",
+        "honed", "satin", "lappato", "structured", "textured",
+        "natural", "brushed", "ribbed", "relief", "carved", "grip",
+    ]
     loader = get_store_loader()
-    for keyword, normalized in FINISH_KEYWORDS.items():
+    # Try longest match first to prefer "matte finish" over "matte"
+    for keyword in FINISH_CANDIDATES:
         if re.search(rf"\b{re.escape(keyword)}\b", text):
-            entities.finish = normalized.title()
-            entities.attribute_slug = "pa_finish"
             if loader:
-                term_ids = loader.get_attribute_term_ids("pa_finish", normalized)
+                # Check if this word (or close match) exists as a pa_finish term
+                term_ids = loader.get_attribute_term_ids("pa_finish", keyword)
                 if term_ids:
+                    entities.finish = keyword.title()
+                    entities.attribute_slug = "pa_finish"
                     entities.attribute_term_ids = term_ids
-                else:
-                    # Fallback: tag search
-                    tag_ids = loader.get_tag_ids_for_keyword(keyword)
+                    return
+                # Not a pa_finish term — try tag fallback instead
+                tag_ids = loader.get_tag_ids_for_keyword(keyword)
+                if tag_ids:
                     entities.tag_ids.extend(tag_ids)
-            break
+                    for tid in tag_ids:
+                        tag = loader.tag_by_id.get(tid)
+                        if tag:
+                            entities.tag_slugs.append(tag["slug"])
+                    # Don't set finish/attribute_slug — it's a tag, not a finish attribute
+                    return
+            else:
+                # No loader — best-effort, set finish directly
+                entities.finish = keyword.title()
+                entities.attribute_slug = "pa_finish"
+                return
 
 
 def _extract_visual(text: str, entities: ExtractedEntities):
@@ -523,6 +545,10 @@ def _extract_application(text: str, entities: ExtractedEntities):
     # Try longest match first
     for keyword in APPLICATION_KEYWORDS:
         if re.search(rf"\b{re.escape(keyword)}\b", text):
+            # Don't treat a word as an application filter if it's actually a category name.
+            # e.g. "floor" in "show me tile floor" is a category, not pa_application="Floor"
+            if loader and loader.get_category_id(keyword):
+                continue
             entities.application = keyword.title()
             entities.attribute_slug = "pa_application"
             if loader:
