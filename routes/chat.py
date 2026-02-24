@@ -32,7 +32,6 @@ from formatters import (
 from response_generator import (
     generate_bot_message,
     generate_suggestions,
-    build_filters,
     _resolve_user_placeholders,
     INTENT_LABELS,
     format_order_detail,
@@ -268,7 +267,6 @@ def chat():
             "bot_message": "...",
             "intent": "search",
             "products": [...],
-            "filters_applied": {...},
             "suggestions": [...],
             "session_id": "...",
             "metadata": {...}
@@ -285,7 +283,6 @@ def chat():
             "bot_message": "Invalid request. Send JSON with 'message' field.",
             "intent": "error",
             "products": [],
-            "filters_applied": {},
             "suggestions": ["Show me all products", "What categories do you have?"],
             "session_id": "",
             "metadata": {"error": "Invalid JSON body"},
@@ -316,7 +313,6 @@ def chat():
             "bot_message": "Please type a message! Try asking about our tiles, categories, or products.",
             "intent": "error",
             "products": [],
-            "filters_applied": {},
             "suggestions": [
                 "Show me all products",
                 "What categories do you have?",
@@ -391,7 +387,6 @@ def chat():
                 "bot_message": flow_result["bot_message"],
                 "intent": "guided_flow",
                 "products": [],
-                "filters_applied": {},
                 "suggestions": flow_result.get("suggestions", []),
                 "session_id": session_id,
                 "metadata": flow_metadata,
@@ -502,7 +497,6 @@ def chat():
                         "bot_message": bot_message,
                         "intent": "order",
                         "products": [],
-                        "filters_applied": {},
                         "suggestions": ["Show me more products", "Check my orders", "No, that's all"],
                         "session_id": session_id,
                         "metadata": {
@@ -556,7 +550,6 @@ def chat():
                             ),
                             "intent": "guided_flow",
                             "products": [],
-                            "filters_applied": {},
                             "suggestions": [],
                             "session_id": session_id,
                             "metadata": {
@@ -580,7 +573,6 @@ def chat():
                         ),
                         "intent": "order",
                         "products": [],
-                        "filters_applied": {},
                         "suggestions": ["Try again", "Show me products"],
                         "session_id": session_id,
                         "metadata": {
@@ -654,7 +646,6 @@ def chat():
                     ),
                     "intent": "guided_flow",
                     "products": [],
-                    "filters_applied": {},
                     "suggestions": ["Yes, use this address", "Change address", "Cancel"],
                     "session_id": session_id,
                     "metadata": {**base_meta, "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value},
@@ -668,7 +659,6 @@ def chat():
                     "bot_message": "No shipping address is on file. Please type your shipping address (street, city, state, zip code):",
                     "intent": "guided_flow",
                     "products": [],
-                    "filters_applied": {},
                     "suggestions": [],
                     "session_id": session_id,
                     "metadata": {**base_meta, "flow_state": FlowState.AWAITING_NEW_ADDRESS.value},
@@ -751,7 +741,6 @@ def chat():
                 ),
                 "intent": "guided_flow",
                 "products": [],
-                "filters_applied": {},
                 "suggestions": ["Yes, confirm order", "No, cancel"],
                 "session_id": session_id,
                 "metadata": base_meta,
@@ -855,7 +844,6 @@ def chat():
                         "bot_message": llm_result["bot_message"],
                         "intent": "conversational",
                         "products": [],
-                        "filters_applied": {},
                         "suggestions": [],
                         "session_id": session_id,
                         "metadata": llm_metadata,
@@ -956,7 +944,6 @@ def chat():
                     "bot_message": disambig["bot_message"],
                     "intent": "disambiguation",
                     "products": [],
-                    "filters_applied": {},
                     "suggestions": disambig["suggestions"],
                     "session_id": session_id,
                     "metadata": {
@@ -980,7 +967,6 @@ def chat():
                 "bot_message": disambig["bot_message"],
                 "intent": "disambiguation",
                 "products": [],
-                "filters_applied": {},
                 "suggestions": disambig["suggestions"],
                 "session_id": session_id,
                 "metadata": {
@@ -1119,7 +1105,6 @@ def chat():
                 "bot_message": bot_message,
                 "intent": "order_detail",
                 "products": [],
-                "filters_applied": {},
                 "suggestions": ["Show my orders", "Place a new order", "No, that's all"],
                 "session_id": session_id,
                 "metadata": {
@@ -1280,7 +1265,6 @@ def chat():
                             ),
                             "intent": "guided_flow",
                             "products": [],
-                            "filters_applied": {},
                             "suggestions": ["1", "5", "10", "25"],
                             "session_id": session_id,
                             "metadata": {
@@ -1347,7 +1331,6 @@ def chat():
                             ),
                             "intent": "guided_flow",
                             "products": [],
-                            "filters_applied": {},
                             "suggestions": ["Yes, use this address", "Change address", "Cancel"],
                             "session_id": session_id,
                             "metadata": {**base_meta, "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value},
@@ -1361,7 +1344,6 @@ def chat():
                             "bot_message": "No shipping address is on file. Please type your shipping address (street, city, state, zip code):",
                             "intent": "guided_flow",
                             "products": [],
-                            "filters_applied": {},
                             "suggestions": [],
                             "session_id": session_id,
                             "metadata": {**base_meta, "flow_state": FlowState.AWAITING_NEW_ADDRESS.value},
@@ -1451,7 +1433,6 @@ def chat():
                         "bot_message": prompt_msg,
                         "intent": "guided_flow",
                         "products": [],
-                        "filters_applied": {},
                         "suggestions": [],
                         "session_id": session_id,
                         "metadata": {
@@ -1540,7 +1521,6 @@ def chat():
                         "bot_message": prompt_msg,
                         "intent": INTENT_LABELS.get(intent, "order"),
                         "products": [format_product(_order_product_raw)] if _order_product_raw else [],
-                        "filters_applied": {},
                         "suggestions": [],
                         "session_id": session_id,
                         "metadata": {
@@ -1593,7 +1573,6 @@ def chat():
                                 "bot_message": prompt_msg,
                                 "intent": INTENT_LABELS.get(intent, "order"),
                                 "products": [format_product(_order_product_raw)] if _order_product_raw else [],
-                                "filters_applied": {},
                                 "suggestions": [],
                                 "session_id": session_id,
                                 "metadata": {
@@ -1662,7 +1641,6 @@ def chat():
                     ),
                     "intent": "guided_flow",
                     "products": [],
-                    "filters_applied": {},
                     "suggestions": ["Yes, use this address", "Change address", "Cancel"],
                     "session_id": session_id,
                     "metadata": {**base_meta, "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value},
@@ -1676,7 +1654,6 @@ def chat():
                     "bot_message": "No shipping address is on file. Please type your shipping address (street, city, state, zip code):",
                     "intent": "guided_flow",
                     "products": [],
-                    "filters_applied": {},
                     "suggestions": [],
                     "session_id": session_id,
                     "metadata": {**base_meta, "flow_state": FlowState.AWAITING_NEW_ADDRESS.value},
@@ -1745,7 +1722,6 @@ def chat():
                 bot_message = f"⚠️ {category_mismatch_msg}\n\n{bot_message}"
 
             suggestions = generate_suggestions(intent, entities, products)
-            filters = build_filters(intent, entities, api_calls)
             elapsed = time.time() - start_time
             metadata = {
                 "confidence": round(confidence, 2),
@@ -1770,7 +1746,6 @@ def chat():
                 "bot_message": bot_message,
                 "intent": INTENT_LABELS.get(intent, "unknown"),
                 "products": products,
-                "filters_applied": filters,
                 "suggestions": suggestions,
                 "session_id": session_id,
                 "metadata": metadata,
@@ -1866,7 +1841,6 @@ def chat():
                     "bot_message": suggestion_msg,
                     "intent": INTENT_LABELS.get(intent, "unknown"),
                     "products": [],
-                    "filters_applied": {},
                     "suggestions": [],
                     "session_id": session_id,
                     "metadata": llm_metadata,
@@ -1940,8 +1914,6 @@ def chat():
     # ─── Step 6: Generate suggestions ───
     suggestions = generate_suggestions(intent, entities, products)
 
-    # ─── Step 7: Build filters ───
-    filters = build_filters(intent, entities, api_calls)
 
     # ─── Step 8: Build metadata ───
     elapsed = time.time() - start_time
@@ -1971,7 +1943,6 @@ def chat():
         "bot_message": bot_message,
         "intent": INTENT_LABELS.get(intent, "unknown"),
         "products": products,
-        "filters_applied": filters,
         "suggestions": suggestions,
         "session_id": session_id,
         "metadata": metadata,
@@ -1999,7 +1970,6 @@ def chat():
                 "bot_message": prompt_msg,
                 "intent": INTENT_LABELS.get(intent, "order"),
                 "products": products[:1],
-                "filters_applied": {},
                 "suggestions": [],
                 "session_id": session_id,
                 "metadata": {
@@ -2017,7 +1987,6 @@ def chat():
             "bot_message": f"Sure, I can order **{product['name']}** for you! How many do you need? 🛒",
             "intent": INTENT_LABELS.get(intent, "order"),
             "products": products[:1],
-            "filters_applied": {},
             "suggestions": ["1", "5", "10", "25"],
             "session_id": session_id,
             "metadata": {
@@ -2051,7 +2020,6 @@ def chat():
                 "bot_message": prompt_msg,
                 "intent": INTENT_LABELS.get(intent, "order"),
                 "products": products[:1],
-                "filters_applied": {},
                 "suggestions": [],
                 "session_id": session_id,
                 "metadata": {

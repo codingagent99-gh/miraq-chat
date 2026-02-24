@@ -339,46 +339,6 @@ def generate_suggestions(
 
     return suggestions
 
-
-def build_filters(
-    intent: Intent,
-    entities: ExtractedEntities,
-    api_calls: List[WooAPICall],
-) -> dict:
-    """Build the filters_applied dict for the response."""
-    filters = {
-        "search": None,
-        "category": None,
-        "tag": None,
-        "on_sale": None,
-        "min_price": None,
-        "max_price": None,
-        "orderby": None,
-        "order": None,
-    }
-
-    for call in api_calls:
-        p = call.params
-        if "search" in p:
-            filters["search"] = p["search"]
-        if "category" in p:
-            filters["category"] = p["category"]
-        if "tag" in p:
-            filters["tag"] = p["tag"]
-        if "on_sale" in p:
-            filters["on_sale"] = p["on_sale"]
-        if "min_price" in p:
-            filters["min_price"] = p["min_price"]
-        if "max_price" in p:
-            filters["max_price"] = p["max_price"]
-        if "orderby" in p:
-            filters["orderby"] = p["orderby"]
-        if "order" in p:
-            filters["order"] = p["order"]
-
-    return filters
-
-
 # ── Label mapping for API response ──
 INTENT_LABELS = {
     Intent.PRODUCT_SEARCH: "search",
