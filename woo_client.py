@@ -22,7 +22,7 @@ class WooClient:
     def execute(self, api_call: WooAPICall) -> dict:
         """Execute a single API call and return raw response."""
         params = dict(api_call.params)
-        
+
         # Only add auth params for standard WooCommerce API, not for custom API
         is_custom_api = "/custom-api/" in api_call.endpoint
         if not is_custom_api:
@@ -53,14 +53,30 @@ class WooClient:
                     json=api_call.body,
                     timeout=30,
                 )
+
             resp.raise_for_status()
             logger.info(f"WooCommerce API response: status={resp.status_code}, success=True")
+
+            data = resp.json()
+
+            # Custom API returns pagination metadata in the response body
+            # e.g. {"total": 664, "pages": 166, "products": [...]}
+            if isinstance(data, dict) and "products" in data:
+                return {
+                    "success": True,
+                    "data": data.get("products", []),
+                    "total": str(data.get("total", "")) or None,
+                    "total_pages": str(data.get("pages", "")) or None,
+                }
+
+            # Standard WooCommerce API returns pagination in response headers
             return {
                 "success": True,
-                "data": resp.json(),
+                "data": data,
                 "total": resp.headers.get("X-WP-Total"),
                 "total_pages": resp.headers.get("X-WP-TotalPages"),
             }
+
         except Exception as e:
             logger.error(f"WooCommerce API error: {api_call.method} {sanitized_endpoint} | error={str(e)}", exc_info=True)
             return {"success": False, "data": [], "error": str(e)}

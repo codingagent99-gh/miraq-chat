@@ -44,3 +44,5 @@ python-Levenshtein>=0.25.0,<1.0.0
 
 # Testing
 pytest>=8.0.0,<9.0.0
+
+python-dateutil
