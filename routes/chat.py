@@ -19,6 +19,7 @@ from app_config import (
     ORDER_CREATE_INTENTS,
     LLM_FALLBACK_ENABLED,
     LLM_RETRY_ON_EMPTY_RESULTS,
+    CLASSIFIER_PROVIDER_TAG,
 )
 from woo_client import woo_client
 from formatters import (
@@ -310,14 +311,14 @@ def chat():
         logger.warning(f"POST /chat | session={session_id} | Empty message")
         return jsonify({
             "success": False,
-            "bot_message": "Please type a message! Try asking about our tiles, categories, or products.",
+            "bot_message": "Please type a message! Try asking about our products, categories, or your orders.",
             "intent": "error",
             "products": [],
             "suggestions": [
                 "Show me all products",
                 "What categories do you have?",
-                "Show me marble look tiles",
-                "Quick ship tiles",
+                "Show me all products",
+                "What categories do you have?",
             ],
             "session_id": session_id,
             "metadata": {"error": "Empty message"},
@@ -488,7 +489,7 @@ def chat():
                         f"**Product:** {product_name}\n"
                         f"**Quantity:** {pending_quantity}\n"
                         f"**Total:** {currency_symbol}{float(total):.2f}\n"
-                        f"**Payment Mode:** Cash on Delivery\n"
+                        f"**Payment Mode:** {DEFAULT_PAYMENT_METHOD_TITLE}\n"
                     )
                     
                     elapsed = time.time() - start_time
@@ -736,7 +737,7 @@ def chat():
                     f"**Quantity:** {pending_quantity}\n"
                     f"**Unit Price:** ${_price_display}\n"
                     f"**Estimated Total:** {_total_display}\n"
-                    f"**Payment:** Cash on Delivery\n\n"
+                    f"**Payment:** {DEFAULT_PAYMENT_METHOD_TITLE}\n\n"
                     f"Shall I place this order? ✅"
                 ),
                 "intent": "guided_flow",
@@ -1524,7 +1525,7 @@ def chat():
             _product_type = (_order_product_raw or {}).get("type", "simple")
 
             if _product_type == "variable":
-                has_attrs = any([entities.color_tone, entities.finish, entities.tile_size, entities.sample_size])
+                has_attrs = bool(entities.attributes)
 
                 if not _order_variation_id and not has_attrs:
                     logger.info(f"Step 3.6: Variable product with no variant info | product_id={_order_product_id}")
@@ -1723,10 +1724,7 @@ def chat():
                     )
                     entities.category_name = actual_cats
 
-            has_attributes = any([
-                entities.finish, entities.color_tone, entities.tile_size,
-                entities.thickness, entities.visual, entities.origin,
-            ])
+            has_attributes = bool(entities.attributes)
 
             if variations_raw and has_attributes:
                 filtered_vars = _filter_variations_by_entities(variations_raw, entities)
@@ -1748,7 +1746,7 @@ def chat():
             metadata = {
                 "confidence": round(confidence, 2),
                 "products_count": len(products),
-                "provider": "wgc_intent_classifier",
+                "provider": CLASSIFIER_PROVIDER_TAG,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "response_time_ms": round(elapsed * 1000),
                 "intent_raw": intent.value,
@@ -1786,7 +1784,63 @@ def chat():
         Intent.PRODUCT_BY_VISUAL,
         Intent.PRODUCT_BY_ORIGIN,
     }
-    
+
+    # ── Step 3.8 pre-check: unrecognized search_term returned 0 results ──────
+    # When the classifier extracted an unrecognized descriptor word (e.g.
+    # "kitchen" in "search for kitchen tiles") and stored it in
+    # entities.search_term, the WooCommerce API was called with ?search=<term>.
+    # Zero results here are definitive — the store genuinely doesn't carry that
+    # product type.  We already know WHY there are no results, so we return a
+    # clear local message immediately rather than wasting an LLM call.
+    if (
+        intent in SEARCH_FILTER_INTENTS
+        and len(all_products_raw) == 0
+        and entities.search_term
+    ):
+        _term = entities.search_term
+        _cat  = entities.category_name or "products"
+        _no_results_msg = (
+            f"I couldn't find any **{_term} {_cat.lower()}** in our catalog. "
+            f"We may not carry that specific type. "
+            f"Would you like to browse all **{_cat}** instead, or try a different search?"
+        )
+        logger.info(
+            f"Step 3.8: Unrecognized search_term='{_term}' returned 0 results — "
+            f"returning local no-results response (skipping LLM retry)"
+        )
+        elapsed = time.time() - start_time
+        if session_id and session_id in sessions:
+            sessions[session_id]["history"].append({
+                "role": "bot",
+                "message": _no_results_msg,
+                "intent": intent.value,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+        return jsonify({
+            "success": True,
+            "bot_message": _no_results_msg,
+            "intent": INTENT_LABELS.get(intent, "unknown"),
+            "products": [],
+            "suggestions": [
+                f"Show all {_cat}",
+                "What categories do you have?",
+                "Show me what's on sale",
+            ],
+            "session_id": session_id,
+            "metadata": {
+                "confidence": round(confidence, 2),
+                "products_count": 0,
+                "provider": CLASSIFIER_PROVIDER_TAG,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "response_time_ms": round(elapsed * 1000),
+                "intent_raw": intent.value,
+                "entities": _entities_to_dict(entities),
+                "no_results_reason": "unrecognized_search_term",
+            },
+            "pagination": _default_pagination(page),
+            "flow_state": FlowState.IDLE.value,
+        }), 200
+
     if (
         intent in SEARCH_FILTER_INTENTS
         and len(all_products_raw) == 0
@@ -1799,11 +1853,7 @@ def chat():
         entities_dict = {
             "product_name": entities.product_name,
             "category_name": entities.category_name,
-            "finish": entities.finish,
-            "color_tone": entities.color_tone,
-            "tile_size": entities.tile_size,
-            "application": entities.application,
-            "visual": entities.visual,
+            **entities.attributes,
         }
         
         llm_retry_result = llm_retry_search(
@@ -1942,7 +1992,7 @@ def chat():
     metadata = {
         "confidence": round(confidence, 2),
         "products_count": len(products),
-        "provider": "wgc_intent_classifier",
+        "provider": CLASSIFIER_PROVIDER_TAG,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "response_time_ms": round(elapsed * 1000),
         "intent_raw": intent.value,

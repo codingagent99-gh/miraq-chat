@@ -20,6 +20,30 @@ WOO_CONSUMER_SECRET = os.getenv("WOO_CONSUMER_SECRET", "")
 PORT = int(os.getenv("PORT", 5009))
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
+# Custom API base URL — defaults to deriving from WOO_BASE_URL by replacing the
+# WooCommerce path segment. Set explicitly if your custom API lives elsewhere.
+_custom_api_default = WOO_BASE_URL.replace("/wp-json/wc/v3", "/wp-json/custom-api/v1")
+CUSTOM_API_BASE_URL = os.getenv("CUSTOM_API_BASE_URL", _custom_api_default)
+
+# ═══════════════════════════════════════════════════════════════
+# STORE IDENTITY
+# ═══════════════════════════════════════════════════════════════
+
+# Human-readable store name used in LLM prompts and system messages.
+STORE_NAME = os.getenv("STORE_NAME", "WGC Tiles Store")
+
+# Bot/assistant name shown in closing messages.
+BOT_NAME = os.getenv("BOT_NAME", "MiraQ")
+
+# Singular and plural forms of the primary product type.
+# Used in classifier fallback regexes and user-facing copy.
+PRODUCT_TYPE_SINGULAR = os.getenv("PRODUCT_TYPE_SINGULAR", "tile")
+PRODUCT_TYPE_PLURAL   = os.getenv("PRODUCT_TYPE_PLURAL",   "tiles")
+
+# Short identifier string embedded in API response metadata.
+# Useful for distinguishing traffic in logs when hosting multiple stores.
+CLASSIFIER_PROVIDER_TAG = os.getenv("CLASSIFIER_PROVIDER_TAG", "wgc_intent_classifier")
+
 # ═══════════════════════════════════════════
 # HTTP HEADERS
 # ═══════════════════════════════════════════

@@ -4,7 +4,7 @@ Data models for the WGC Tiles Store Intent Classifier.
 
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 
 class Intent(Enum):
@@ -84,21 +84,17 @@ class ExtractedEntities:
     category_name: Optional[str] = None
     category_slug: Optional[str] = None
 
-    # Attributes
-    visual: Optional[str] = None
-    finish: Optional[str] = None
-    tile_size: Optional[str] = None
-    edge: Optional[str] = None
-    thickness: Optional[str] = None
-    application: Optional[str] = None
-    color: Optional[str] = None
-    color_tone: Optional[str] = None
-    sample_size: Optional[str] = None
-    pricing_tier: Optional[str] = None
-    origin: Optional[str] = None
+    # ──── Dynamic attribute matches ────
+    # Keyed by attribute_label.lower() from the store's live attribute list.
+    # e.g. {"finish": "Matte", "colors": "White", "application": "Interior Wall"}
+    # Works for any store — no hardcoded field names needed.
+    attributes: Dict[str, str] = field(default_factory=dict)
+
+    # Non-attribute entity fields
     quick_ship: Optional[bool] = None
-    variation_level: Optional[str] = None
     collection_year: Optional[str] = None
+    pricing_tier: Optional[str] = None
+    variation_level: Optional[str] = None
 
     # Tags
     tag_slugs: List[str] = field(default_factory=list)

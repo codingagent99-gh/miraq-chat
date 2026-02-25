@@ -12,6 +12,7 @@ import threading
 import requests
 from typing import List, Dict, Optional, Tuple
 from dotenv import load_dotenv
+from config.store_config import TAG_SLUG_QUICK_SHIP, TAG_SLUG_CHIP_CARD
 
 load_dotenv()
 
@@ -130,7 +131,10 @@ class StoreLoader:
         print(f"   ✅ Loaded {len(self.products)} products")
 
         # Also fetch from custom all-attributes API for fresh data
-        custom_api_base = self.base.replace("/wp-json/wc/v3", "/wp-json/custom-api/v1")
+        custom_api_base = os.getenv(
+            "CUSTOM_API_BASE_URL",
+            self.base.replace("/wp-json/wc/v3", "/wp-json/custom-api/v1"),
+        )
         try:
             resp = self.session.get(f"{custom_api_base}/all-attributes", timeout=self.timeout)
             resp.raise_for_status()
@@ -669,11 +673,11 @@ class StoreLoader:
 
     def get_quick_ship_tag_id(self) -> Optional[int]:
         """Convenience: return the Quick Ship tag ID."""
-        return self.get_tag_id_by_slug("quick-ship")
+        return self.get_tag_id_by_slug(TAG_SLUG_QUICK_SHIP)
 
     def get_chip_card_tag_id(self) -> Optional[int]:
         """Convenience: return the Chip Card tag ID."""
-        return self.get_tag_id_by_slug("chip-card")
+        return self.get_tag_id_by_slug(TAG_SLUG_CHIP_CARD)
 
     def is_ready(self) -> bool:
         """True if store data has been loaded at least once."""

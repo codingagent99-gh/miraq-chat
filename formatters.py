@@ -231,35 +231,19 @@ def _filter_variations_by_entities(
     Each variation has attributes like:
       [{"name": "Finish", "option": "Matte"}, {"name": "Tile Size", "option": '24"x48"'}]
     """
-    # Build a set of (attr_name_lower, option_lower) pairs the user asked for
+    # Build filters from entities.attributes — no hardcoded field names.
     filters: List[tuple] = []
+    FINISH_SYNONYMS = {"matt": "matte", "glossy": "polished", "gloss": "polished"}
 
-    if entities.finish:
-        filters.append(("finish", entities.finish.lower()))
-        # Common synonyms handled by normalising both sides to lowercase
-        FINISH_SYNONYMS = {"matt": "matte", "glossy": "polished", "gloss": "polished"}
-        normalized = FINISH_SYNONYMS.get(entities.finish.lower(), entities.finish.lower())
-        if normalized != entities.finish.lower():
-            filters.append(("finish", normalized))
-
-    if entities.color_tone:
-        filters.append(("colors", entities.color_tone.lower()))
-        filters.append(("colors 2", entities.color_tone.lower()))
-
-    if entities.tile_size:
-        filters.append(("tile size", entities.tile_size.lower()))
-
-    if entities.thickness:
-        filters.append(("thickness", entities.thickness.lower()))
-
-    if entities.origin:
-        filters.append(("origin", entities.origin.lower()))
-
-    if entities.visual:
-        filters.append(("visual", entities.visual.lower()))
-
-    if entities.sample_size:
-        filters.append(("sample size", entities.sample_size.lower()))
+    for attr_label, attr_value in entities.attributes.items():
+        val_lower = attr_value.lower()
+        filters.append((attr_label, val_lower))
+        if attr_label == "finish":
+            normalized = FINISH_SYNONYMS.get(val_lower, val_lower)
+            if normalized != val_lower:
+                filters.append((attr_label, normalized))
+        if attr_label == "colors":
+            filters.append(("colors 2", val_lower))
 
     if not filters:
         return variations
@@ -290,14 +274,7 @@ def _entities_to_dict(entities: ExtractedEntities) -> dict:
     if entities.product_id:      d["product_id"] = entities.product_id
     if entities.category_name:   d["category_name"] = entities.category_name
     if entities.category_id:     d["category_id"] = entities.category_id
-    if entities.visual:          d["visual"] = entities.visual
-    if entities.finish:          d["finish"] = entities.finish
-    if entities.color_tone:      d["color_tone"] = entities.color_tone
-    if entities.tile_size:       d["tile_size"] = entities.tile_size
-    if entities.thickness:       d["thickness"] = entities.thickness
-    if entities.origin:          d["origin"] = entities.origin
-    if entities.application:     d["application"] = entities.application
-    if entities.edge:            d["edge"] = entities.edge
+    if entities.attributes:      d["attributes"] = entities.attributes
     if entities.search_term:     d["search_term"] = entities.search_term
     if entities.order_id:        d["order_id"] = entities.order_id
     if entities.order_item_name: d["order_item_name"] = entities.order_item_name

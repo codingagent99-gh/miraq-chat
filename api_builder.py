@@ -1,6 +1,8 @@
 """
 Builds WooCommerce API calls using live StoreLoader data.
 No hardcoded tag/attribute IDs — everything resolved through StoreLoader.
+No hardcoded store URLs or pa_* slugs — attribute taxonomies resolved
+dynamically from loader.all_attributes_raw via _attr_slug_for_label().
 """
 
 import json
@@ -8,10 +10,16 @@ from typing import List, Optional
 from models import Intent, ClassifiedResult, WooAPICall, ExtractedEntities
 from store_registry import get_store_loader
 from config.settings import DEFAULT_PER_PAGE
+from app_config import WOO_BASE_URL, CUSTOM_API_BASE_URL
+from config.store_config import (
+    TAG_SLUG_QUICK_SHIP,
+    TAG_SLUG_CHIP_CARD,
+    FALLBACK_SEARCH_TERM,
+)
 
-
-BASE = "https://wgc.net.in/hn/wp-json/wc/v3"
-CUSTOM_API_BASE = "https://wgc.net.in/hn/wp-json/custom-api/v1"
+# Resolved at import time from env / app_config — no literals here.
+BASE = WOO_BASE_URL
+CUSTOM_API_BASE = CUSTOM_API_BASE_URL
 
 
 def _loader():
@@ -40,6 +48,22 @@ def _category_slug(category_id: int) -> Optional[str]:
     """Get category slug by ID from live data."""
     l = _loader()
     return l.get_category_slug(category_id) if l else None
+
+
+def _attr_slug_for_label(label: str) -> Optional[str]:
+    """
+    Resolve a WooCommerce attribute taxonomy slug from an attribute label.
+    e.g. "finish" → "pa_finish", "tile size" → "pa_tile-size"
+    Uses live all_attributes_raw — no hardcoded ATTR_* constants needed.
+    """
+    l = _loader()
+    if not l or not l.all_attributes_raw:
+        return None
+    label_lower = label.lower().strip()
+    for attr in l.all_attributes_raw:
+        if attr.get("attribute_label", "").lower().strip() == label_lower:
+            return attr.get("taxonomy")
+    return None
 
 
 def _build_advanced_filter_call(
@@ -87,9 +111,8 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
     # ═══════════════════════════════════════════
     # GREETING - No API calls needed
     # ═══════════════════════════════════════════
-    
+
     if intent == Intent.GREETING:
-        # Greetings don't require any WooCommerce API calls
         result.api_calls = []
         return []
 
@@ -184,15 +207,11 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         loader = get_store_loader()
         cat_id = e.category_id
 
-        # Fallback: if category_id wasn't resolved by classifier, try to resolve
-        # category_name directly via store_loader so the API call isn't sent blind
         if not cat_id and e.category_name and loader:
             cat_id = loader.get_category_id(e.category_name)
             if cat_id:
-                e.category_id = cat_id  # patch entity so response_generator sees it too
+                e.category_id = cat_id
 
-        # Use ALL slugs for duplicate-named categories (e.g. "Tile Floor" has 6 WC entries)
-        # so the API returns products from any of them
         if cat_id and loader:
             categories_list = loader.get_all_slugs_for_category(cat_id)
         elif cat_id:
@@ -201,28 +220,22 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         else:
             categories_list = []
 
-        # Collect tag slugs
-        tag_slugs = []
-        if e.tag_slugs:
-            tag_slugs = list(e.tag_slugs)
+        tag_slugs = list(e.tag_slugs) if e.tag_slugs else []
 
-        # Collect attribute filters
+        # Build attribute filters from the dynamic entities.attributes dict.
+        # e.attribute_slug is set by the classifier to the matched taxonomy.
         attr_filters = {}
-        _ATTR_TO_ENTITY = {
-            "pa_tile-size": lambda ent: (ent.tile_size or "").replace('"', ''),
-            "pa_finish": lambda ent: ent.finish or "",
-            "pa_colors": lambda ent: ent.color_tone or "",
-            "pa_thickness": lambda ent: ent.thickness or "",
-            "pa_edge": lambda ent: ent.edge or "",
-            "pa_application": lambda ent: ent.application or "",
-            "pa_visual": lambda ent: ent.visual or "",
-            "pa_origin": lambda ent: ent.origin or "",
-        }
-        if e.attribute_slug:
-            resolver = _ATTR_TO_ENTITY.get(e.attribute_slug)
-            term_value = resolver(e) if resolver else ""
-            if term_value:
-                attr_filters[e.attribute_slug] = term_value
+        if e.attribute_slug and e.attributes:
+            # Find which label maps to this taxonomy slug, then get its value
+            l = get_store_loader()
+            if l and l.all_attributes_raw:
+                for attr in l.all_attributes_raw:
+                    if attr.get("taxonomy") == e.attribute_slug:
+                        label = attr.get("attribute_label", "").lower().strip()
+                        term_value = e.attributes.get(label, "")
+                        if term_value:
+                            attr_filters[e.attribute_slug] = term_value
+                        break
 
         calls.append(_build_advanced_filter_call(
             tags=tag_slugs if tag_slugs else None,
@@ -254,7 +267,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         ))
 
     elif intent == Intent.PRODUCT_SEARCH:
-        has_attributes = any([e.finish, e.color_tone, e.tile_size, e.thickness, e.visual, e.origin, e.application])
+        has_attributes = bool(e.attributes)
         if e.product_id:
             calls.append(WooAPICall(
                 method="GET",
@@ -273,7 +286,8 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
             calls.append(WooAPICall(
                 method="GET",
                 endpoint=f"{BASE}/products",
-                params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish", "search": e.product_name or e.search_term or ""},
+                params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish",
+                        "search": e.product_name or e.search_term or ""},
                 description=f"Search products matching '{e.product_name}'",
             ))
 
@@ -307,7 +321,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
                 description=f"Products from {e.collection_year} collection (tags: {','.join(e.tag_slugs)})",
             ))
         else:
-            # Fallback to standard API with tag IDs (keep existing behavior for when no slugs)
             params = {"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish", "stock_status": "instock"}
             if e.tag_ids:
                 params["tag"] = str(e.tag_ids[0])
@@ -337,15 +350,17 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
             ))
 
     elif intent == Intent.PRODUCT_BY_ORIGIN:
+        origin = e.attributes.get("origin", "")
         calls.append(_build_advanced_filter_call(
-            attributes={"pa_origin": e.origin or ""},
+            attributes={_attr_slug_for_label("origin"): origin} if _attr_slug_for_label("origin") else None,
+            tags=list(e.tag_slugs) if e.tag_slugs else None,
             page=page,
-            description=f"Products from {e.origin}",
+            description=f"Products from {origin}",
         ))
 
     elif intent == Intent.PRODUCT_QUICK_SHIP:
         params = {"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish", "stock_status": "instock"}
-        qs_tag_id = _tag_id("quick-ship")
+        qs_tag_id = _tag_id(TAG_SLUG_QUICK_SHIP)
         if qs_tag_id:
             params["tag"] = str(qs_tag_id)
         calls.append(WooAPICall(
@@ -356,10 +371,11 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         ))
 
     elif intent == Intent.PRODUCT_BY_VISUAL:
+        visual = e.attributes.get("visual", "")
         calls.append(_build_advanced_filter_call(
-            attributes={"pa_visual": e.visual or ""},
+            attributes={_attr_slug_for_label("visual"): visual} if _attr_slug_for_label("visual") else None,
             page=page,
-            description=f"Products with '{e.visual}' visual/look",
+            description=f"Products with '{visual}' visual/look",
         ))
 
     elif intent == Intent.RELATED_PRODUCTS:
@@ -386,7 +402,8 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         ))
 
     elif intent == Intent.PRODUCT_TYPES:
-        attr_id = _attr_id("pa_visual")
+        visual_slug = _attr_slug_for_label("visual")
+        attr_id = _attr_id(visual_slug) if visual_slug else None
         if attr_id:
             calls.append(WooAPICall(
                 method="GET",
@@ -396,54 +413,61 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
             ))
 
     # ═══════════════════════════════════════════
-    # ATTRIBUTE FILTERS — use attribute+term when available
+    # ATTRIBUTE FILTERS
     # ═══════════════════════════════════════════
 
     elif intent == Intent.FILTER_BY_FINISH:
+        finish = e.attributes.get("finish", "")
         calls.append(_build_advanced_filter_call(
-            attributes={"pa_finish": e.finish or ""},
+            attributes={e.attribute_slug: finish} if e.attribute_slug else None,
             page=page,
-            description=f"Filter by finish: {e.finish}",
+            description=f"Filter by finish: {finish}",
         ))
 
     elif intent == Intent.FILTER_BY_SIZE:
-        size_term = e.tile_size.replace('"', '') if e.tile_size else ""
+        size = e.attributes.get("tile size", "").replace('"', '')
         calls.append(_build_advanced_filter_call(
-            attributes={"pa_tile-size": size_term},
+            attributes={e.attribute_slug: size} if e.attribute_slug else None,
             page=page,
-            description=f"Filter by size: {size_term}",
+            description=f"Filter by size: {size}",
         ))
 
     elif intent == Intent.FILTER_BY_COLOR:
+        color = e.attributes.get("colors", "")
         calls.append(_build_advanced_filter_call(
-            attributes={"pa_colors": e.color_tone or ""},
+            attributes={e.attribute_slug: color} if e.attribute_slug else None,
             page=page,
-            description=f"Filter by color: {e.color_tone}",
+            description=f"Filter by color: {color}",
         ))
 
     elif intent == Intent.FILTER_BY_APPLICATION:
+        application = e.attributes.get("application", "")
         calls.append(_build_advanced_filter_call(
-            attributes={"pa_application": e.application or ""},
+            attributes={e.attribute_slug: application} if e.attribute_slug else None,
             page=page,
-            description=f"Filter by application: {e.application}",
+            description=f"Filter by application: {application}",
         ))
 
     elif intent == Intent.FILTER_BY_MATERIAL:
+        visual = e.attributes.get("visual", "")
         calls.append(_build_advanced_filter_call(
-            attributes={"pa_visual": e.visual or ""},
+            attributes={e.attribute_slug: visual} if e.attribute_slug else None,
             page=page,
-            description=f"Filter by material: {e.visual}",
+            description=f"Filter by material: {visual}",
         ))
 
     elif intent == Intent.FILTER_BY_ORIGIN:
+        origin = e.attributes.get("origin", "")
         calls.append(_build_advanced_filter_call(
-            attributes={"pa_origin": e.origin or ""},
+            attributes={e.attribute_slug: origin} if e.attribute_slug else None,
+            tags=list(e.tag_slugs) if e.tag_slugs else None,
             page=page,
-            description=f"Filter by origin: {e.origin}",
+            description=f"Filter by origin: {origin}",
         ))
 
     elif intent == Intent.SIZE_LIST:
-        attr_id = _attr_id("pa_tile-size")
+        size_slug = _attr_slug_for_label("tile size")
+        attr_id = _attr_id(size_slug) if size_slug else None
         if attr_id:
             calls.append(WooAPICall(
                 method="GET",
@@ -454,7 +478,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
 
     # ═══════════════════════════════════════════
     # PRODUCT SUBTYPES
-    # ════════════���══════════════════════════════
+    # ═══════════════════════════════════════════
 
     elif intent == Intent.MOSAIC_PRODUCTS:
         search_term = f"{e.product_name} mosaic" if e.product_name else "mosaic"
@@ -471,7 +495,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
             method="GET",
             endpoint=f"{BASE}/products",
             params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish", "search": search_term},
-            description=f"List trim products",
+            description="List trim products",
         ))
 
     elif intent == Intent.CHIP_CARD:
@@ -484,7 +508,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
                 description=f"Find chip card for '{e.product_name}'",
             ))
         else:
-            cc_tag_id = _tag_id("chip-card")
+            cc_tag_id = _tag_id(TAG_SLUG_CHIP_CARD)
             params = {"per_page": 50, "page": page, "status": "publish"}
             if cc_tag_id:
                 params["tag"] = str(cc_tag_id)
@@ -523,7 +547,8 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
             ))
 
     elif intent == Intent.SAMPLE_REQUEST:
-        attr_id = _attr_id("pa_sample-size")
+        sample_slug = _attr_slug_for_label("sample size")
+        attr_id = _attr_id(sample_slug) if sample_slug else None
         if attr_id:
             calls.append(WooAPICall(
                 method="GET",
@@ -606,9 +631,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
             ))
 
     elif intent == Intent.PLACE_ORDER:
-        # For PLACE_ORDER, we search for the product but don't create the order here
-        # The chat endpoint Step 3.6 handles order creation with proper product resolution
-        # This prevents duplicate order creation
         if e.product_id:
             calls.append(WooAPICall(
                 method="GET",
@@ -630,7 +652,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
                 params={"search": search_term, "status": "publish", "per_page": 5},
                 description=f"Find product '{search_term}' for order placement",
             ))
-        # Note: Order creation happens in Step 3.6 of the chat endpoint
 
     # ═══════════════════════════════════════════
     # FALLBACK
@@ -638,9 +659,10 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
 
     if not calls:
         search = (
-            e.product_name or e.search_term or e.visual
-            or e.finish or e.color_tone or e.origin
-            or e.tile_size or e.thickness or "tiles"
+            e.product_name
+            or e.search_term
+            or next(iter(e.attributes.values()), None)
+            or FALLBACK_SEARCH_TERM
         )
         calls.append(WooAPICall(
             method="GET",

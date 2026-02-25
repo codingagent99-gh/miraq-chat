@@ -10,6 +10,7 @@ Manages multi-turn flows like:
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
+from app_config import BOT_NAME
 
 
 class FlowState(Enum):
@@ -108,9 +109,9 @@ def handle_flow_state(
                     "You can tell me a product name, category, or describe what you need."
                 ),
                 "suggestions": [
-                    "Show me marble look tiles",
+                    "Show me products",
                     "What categories do you have?",
-                    "I'm looking for floor tiles",
+                    "I'm looking for floor products",
                 ],
                 "flow_state": FlowState.AWAITING_PRODUCT_OR_CATEGORY.value,
                 "pass_through": False,
@@ -130,7 +131,7 @@ def handle_flow_state(
                     "You can tell me the product name and quantity."
                 ),
                 "suggestions": [
-                    "Order 5 Affogato tiles",
+                    "Order 5 Affogato",
                     "Show me my last order",
                     "Reorder my previous order",
                 ],
@@ -275,7 +276,7 @@ def handle_flow_state(
     if state == FlowState.AWAITING_ANYTHING_ELSE:
         if any(kw in text for kw in ["no", "nothing", "bye", "that's all", "done", "nope"]):
             return {
-                "bot_message": "Thank you for chatting with MiraQ! 👋 Have a great day! I'll close this chat now. Bye!",
+                "bot_message": f"Thank you for chatting with {BOT_NAME}! 👋 Have a great day! I'll close this chat now. Bye!",
                 "suggestions": [],
                 "flow_state": FlowState.CLOSING.value,
                 "pass_through": False,

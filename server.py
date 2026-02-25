@@ -1,5 +1,5 @@
 """
-WGC Tiles Store — Chat API Backend
+Chat API Backend
 Runs on port 5009 with /chat endpoint.
 
 Usage:
@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify
 from flask_cors import CORS
 
-from app_config import PORT, DEBUG
+from app_config import PORT, DEBUG, STORE_NAME
 from store_registry import set_store_loader, get_store_loader
 from store_loader import StoreLoader
 from session_store import sessions
@@ -100,7 +100,7 @@ def initialize_store():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  WGC Tiles Store — Chat API Server")
+    print(f"  {STORE_NAME} — Chat API Server")
     print("=" * 60)
     print()
 

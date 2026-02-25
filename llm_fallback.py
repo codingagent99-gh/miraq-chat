@@ -28,6 +28,7 @@ from app_config import (
     LLM_TIMEOUT_SECONDS,
     LLM_COST_PER_1K_INPUT,
     LLM_COST_PER_1K_OUTPUT,
+    STORE_NAME,
 )
 
 logger = get_logger("miraq_chat")
@@ -151,7 +152,7 @@ def _build_system_prompt(store_context: Dict[str, Any]) -> str:
     
     attributes_text = "\n".join(attributes_desc) if attributes_desc else "None available"
     
-    prompt = f"""You are an AI assistant for WGC Tiles Store, helping customers find tile products.
+    prompt = f"""You are an AI assistant for {STORE_NAME}, helping customers find products.
 
 **Your task**: Interpret the user's message and return structured JSON to help route their query.
 
@@ -187,7 +188,7 @@ def _build_system_prompt(store_context: Dict[str, Any]) -> str:
     "color_tone": "White",
     "application": "Kitchen"
   }},
-  "bot_message": "I found some beautiful marble tiles for your kitchen!",
+  "bot_message": "I found some great products matching your search!",
   "confidence": 0.85,
   "fallback_type": "intent_resolved"
 }}

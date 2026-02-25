@@ -6,7 +6,7 @@ from typing import List, Optional
 from datetime import datetime
 
 from models import Intent, ExtractedEntities, WooAPICall
-from app_config import MAX_DISPLAYED_ITEMS, USER_PLACEHOLDERS
+from app_config import MAX_DISPLAYED_ITEMS, USER_PLACEHOLDERS, DEFAULT_PAYMENT_METHOD_TITLE
 
 
 def generate_bot_message(
@@ -38,7 +38,7 @@ def generate_bot_message(
     if intent == Intent.GREETING:
         return (
             "👋 Hello! Welcome to our store! How can I help you today?\n\n"
-            "You can ask me about our tiles, browse categories, check your orders, or search for specific products."
+            "You can ask me about our products, browse categories, check your orders, or search for something specific."
         )
 
     # ── Order-specific handling ──
@@ -139,7 +139,7 @@ def generate_bot_message(
                 f"**Product:** {p_name}\n"
                 f"**Quantity:** {quantity}\n"
                 f"**Total:** ${float(total):.2f}\n"
-                f"**Payment Mode:** Cash on Delivery"
+                f"**Payment Mode:** {DEFAULT_PAYMENT_METHOD_TITLE}"
             )
 
         if page_count > 0:
@@ -154,14 +154,14 @@ def generate_bot_message(
     if page_count == 0:
         search = (
             entities.product_name or entities.category_name
-            or entities.visual or entities.finish
-            or entities.color_tone or entities.search_term
+            or next(iter(entities.attributes.values()), None)
+            or entities.search_term
             or "your criteria"
         )
         return (
             f"I couldn't find any products matching **{search}**. 😕\n\n"
             "Try broadening your search or ask me about:\n"
-            "• Our tile collections\n"
+            "• Our product collections\n"
             "• Available categories\n"
             "• Specific finishes or colors"
         )
@@ -171,10 +171,7 @@ def generate_bot_message(
             and entities.product_id and page_count > 0:
         parent = products[0]
         variations = [p for p in products[1:] if p.get("type") == "variation"]
-        has_attributes = any([
-            entities.finish, entities.color_tone, entities.tile_size,
-            entities.thickness, entities.visual, entities.origin,
-        ])
+        has_attributes = bool(entities.attributes)
 
         if intent == Intent.PRODUCT_VARIATIONS or (not has_attributes):
             msg = f"🎯 **{parent['name']}**\n"
@@ -202,10 +199,7 @@ def generate_bot_message(
             return msg
 
         else:
-            attr_desc = " / ".join(filter(None, [
-                entities.finish, entities.tile_size,
-                entities.color_tone, entities.thickness,
-            ]))
+            attr_desc = " / ".join(filter(None, entities.attributes.values()))
             if not variations:
                 return (
                     f"I found **{parent['name']}** but couldn't find variations matching "
@@ -258,11 +252,11 @@ def generate_bot_message(
         else:
             msg += f"Here are **{count}** products in the **{entities.category_name}** category! 📂\n\n"
     elif intent == Intent.PRODUCT_BY_VISUAL:
-        msg += f"Found **{count}** products with **{entities.visual}** look! 🎨\n\n"
+        msg += f"Found **{count}** products with **{entities.attributes.get('visual', '')}** look! 🎨\n\n"
     elif intent == Intent.FILTER_BY_FINISH:
-        msg += f"Here are **{count}** products with **{entities.finish}** finish! ✨\n\n"
+        msg += f"Here are **{count}** products with **{entities.attributes.get('finish', '')}** finish! ✨\n\n"
     elif intent == Intent.FILTER_BY_COLOR:
-        msg += f"Found **{count}** products in **{entities.color_tone}** tones! 🎨\n\n"
+        msg += f"Found **{count}** products in **{entities.attributes.get('colors', '')}** tones! 🎨\n\n"
     elif intent == Intent.PRODUCT_SEARCH:
         msg += f"Found **{count}** products matching your search! 🔍\n\n"
     elif intent == Intent.CHIP_CARD:
@@ -298,9 +292,8 @@ def _get_unresolved_category_qualifier(entities: ExtractedEntities) -> str:
     Check if entities contain filter attributes (like application) that
     the API couldn't resolve, so we can mention them in the response.
     """
-    if entities.application:
-        return entities.application.title()
-    return ""
+    app = entities.attributes.get("application", "")
+    return app.title() if app else ""
 
 
 def generate_suggestions(
