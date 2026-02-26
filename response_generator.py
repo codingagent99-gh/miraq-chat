@@ -47,7 +47,7 @@ def generate_bot_message(
         if intent in (Intent.ORDER_STATUS, Intent.ORDER_TRACKING) and order_data:
             return format_order_detail(order_data[0])
         elif intent == Intent.ORDER_HISTORY and order_data:
-            return _format_order_history_message(order_data)
+            return _format_order_history_message(order_data, date_after=getattr(entities, "date_after", None))
         elif intent == Intent.LAST_ORDER and order_data:
             order = order_data[0]
             order_id = order.get("id", "")
@@ -95,6 +95,20 @@ def generate_bot_message(
             return msg
 
         if page_count == 0 and not order_data:
+            # date_after present → logged-in user with genuinely no orders in that period
+            if getattr(entities, 'date_after', None):
+                period = _describe_date_period(entities.date_after)
+                if intent == Intent.ORDER_HISTORY:
+                    return (
+                        f"📭 You don't have any orders from {period}.\n\n"
+                        "Would you like to see your full order history instead?"
+                    )
+                elif intent == Intent.LAST_ORDER:
+                    return (
+                        f"📭 No orders found from {period}.\n\n"
+                        "Would you like to see your most recent order overall?"
+                    )
+            # No date filter → user likely not logged in
             if intent == Intent.LAST_ORDER:
                 return (
                     "I can show you your most recent order! 📦\n\n"
@@ -396,12 +410,48 @@ def _format_order_date(date_created: str) -> str:
         return date_created
 
 
-def _format_order_history_message(orders: List[dict]) -> str:
+def _describe_date_period(date_after: str) -> str:
+    """Convert a date_after ISO string into a human-readable period description.
+
+    e.g. '2026-02-24T00:00:00' (2 days ago) → 'the last 2 days'
+         '2026-01-26T00:00:00' (1 month ago) → 'the last month'
+    """
+    try:
+        from datetime import timezone, timedelta
+        dt = datetime.fromisoformat(date_after.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = now - dt
+        days = delta.days
+        if days <= 1:
+            return "the last day"
+        elif days <= 14:
+            return f"the last {days} days"
+        elif days <= 60:
+            weeks = round(days / 7)
+            return f"the last {weeks} week{'s' if weeks != 1 else ''}"
+        elif days <= 400:
+            months = round(days / 30)
+            return f"the last {months} month{'s' if months != 1 else ''}"
+        else:
+            years = round(days / 365)
+            return f"the last {years} year{'s' if years != 1 else ''}"
+    except Exception:
+        return "that period"
+
+
+def _format_order_history_message(orders: List[dict], date_after: str = None) -> str:
     """Return a short header — the frontend renders order cards from the structured orders array."""
     if not orders:
         return "No orders found."
     count = len(orders)
-    return f"📦 Here are your {count} most recent order{'s' if count != 1 else ''}. Tap any to see full details."
+    verb = "is" if count == 1 else "are"
+    order_word = "order" if count == 1 else "orders"
+    if date_after:
+        period = _describe_date_period(date_after)
+        return f"📦 Here {verb} your {count} {order_word} from {period}. Tap any to see full details."
+    return f"📦 Here {verb} your {count} most recent {order_word}. Tap any to see full details."
 
 
 def format_order_detail(order: dict) -> str:

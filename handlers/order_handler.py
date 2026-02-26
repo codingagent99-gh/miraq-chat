@@ -232,7 +232,6 @@ def handle_quick_order(
                 all_variations = var_resp.get("data", []) if var_resp.get("success") else []
 
             if all_variations:
-                from formatters import _filter_variations_by_entities
                 matched = _filter_variations_by_entities(all_variations, entities)
                 if len(matched) == 1:
                     _order_variation_id = matched[0]["id"]
@@ -291,7 +290,6 @@ def handle_quick_order(
             shipping_address.get("postcode", ""), shipping_address.get("country", ""),
         ] if p]
         addr_display = ", ".join(addr_parts)
-        elapsed = time.time() - start_time
         return jsonify({
             "success": True,
             "bot_message": (
@@ -307,7 +305,6 @@ def handle_quick_order(
             "pagination": default_pagination(page),
         }), 200
     else:
-        elapsed = time.time() - start_time
         return jsonify({
             "success": True,
             "bot_message": "No shipping address is on file. Please type your shipping address (street, city, state, zip code):",

@@ -9,7 +9,7 @@ import json
 from typing import List, Optional
 from models import Intent, ClassifiedResult, WooAPICall, ExtractedEntities
 from store_registry import get_store_loader
-from config.settings import DEFAULT_PER_PAGE
+from config.settings import DEFAULT_PER_PAGE, DEFAULT_ORDER_PER_PAGE
 from app_config import WOO_BASE_URL, CUSTOM_API_BASE_URL
 from config.store_config import (
     TAG_SLUG_QUICK_SHIP,
@@ -130,7 +130,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         ))
 
     elif intent == Intent.ORDER_HISTORY:
-        count = e.order_count or 10
+        count = e.order_count or DEFAULT_ORDER_PER_PAGE
         _order_params = {"customer": "CURRENT_USER_ID", "per_page": count, "page": page, "orderby": "date", "order": "desc"}
         if getattr(e, "date_after", None):
             _order_params["after"] = e.date_after

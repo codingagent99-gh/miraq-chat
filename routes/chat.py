@@ -395,9 +395,10 @@ def chat():
         "pagination": _pagination_data,
     }
 
-    # Attach structured order data for ORDER_HISTORY / LAST_ORDER
+    # Attach structured order data and pagination for ORDER_HISTORY / LAST_ORDER
     if intent in (Intent.ORDER_HISTORY, Intent.LAST_ORDER) and order_data:
         response["orders"] = [format_order_for_frontend(o) for o in order_data]
+        response["order_pagination"] = build_pagination(page, api_responses, api_calls_to_execute)
 
     # Set flow state
     response["flow_state"] = (

@@ -35,14 +35,15 @@ def classify(utterance: str) -> ClassifiedResult:
             rf'\b{re.escape(entities.category_name.lower())}\b', ' ', attr_text
         ).strip()
 
-    _extract_tag(text, entities)               # extract BEFORE attributes for dedup
-    _extract_attributes(attr_text, entities)   # replaces: color, finish, visual, origin, size, application
+    _extract_attributes(attr_text, entities)   # runs FIRST — captures structured terms before tag scan
+    _extract_tag(text, entities)               # runs SECOND — skips terms already covered by attributes
     _extract_thickness(attr_text, entities)    # numeric fallback only
     _extract_collection_year(text, entities)
     _extract_order_id(text, entities)
     _extract_time_range(text, entities)
     _extract_quantity(text, entities)
     _extract_order_item(text, entities)
+    _extract_unresolved_descriptors(text, entities)
 
     # ─── Intent Classification (priority order) ───
 
@@ -93,33 +94,47 @@ def classify(utterance: str) -> ClassifiedResult:
         intent, confidence = Intent.ORDER_HISTORY, 0.94
         entities.order_count = int(m.group(2))
 
+    # Time-range order history: "orders from last 1 month", "show orders last 3 months"
+    elif re.search(r"\border\b", text) and re.search(
+        r"\b(last|past)\s+\d*\s*(day|week|month|year)s?\b", text
+    ):
+        intent, confidence = Intent.ORDER_HISTORY, 0.93
+
     elif re.search(r"\b(order\s*history|past\s*orders?|previous\s*orders?)\b", text):
         intent, confidence = Intent.ORDER_HISTORY, 0.92
-        entities.order_count = 10
 
     elif re.search(r"\bwhat\b.*\bordered\b.*\bbefore\b", text):
         intent, confidence = Intent.ORDER_HISTORY, 0.91
-        entities.order_count = 10
         
     # NEW: Catch "check my orders", "show my orders", "view my orders",
     #      "see my orders", "show orders", "view orders"
+    #      Allow "last/previous" through only when a time-range phrase is present
+    #      (e.g. "show orders from last month" should reach the time-range branch above,
+    #       but if it somehow lands here, still classify correctly)
     elif re.search(
         r"\b(check|show|view|see|get|list|display)\b.*\b(my\s+)?orders?\b", text
     ) and not re.search(
-        r"\b(track|tracking|status|where|last|latest|most\s+recent|previous)\b", text
+        r"\b(track|tracking|status|where)\b", text
+    ) and not re.search(
+        r"\b(last|latest|most\s+recent|previous)\b", text
+    ) or (
+        re.search(r"\b(check|show|view|see|get|list|display)\b.*\b(my\s+)?orders?\b", text)
+        and re.search(r"\b(last|past)\s+\d*\s*(day|week|month|year)s?\b", text)
     ):
         intent, confidence = Intent.ORDER_HISTORY, 0.92
-        entities.order_count = 10
         
     elif re.search(r"^\s*(my\s+)?orders?\s*[?!.]?\s*$", text):
         intent, confidence = Intent.ORDER_HISTORY, 0.90
-        entities.order_count = 10
 
-    elif re.search(r"\b(last|latest|most\s*recent|previous)\b.*\border\b", text):
+    elif re.search(r"\b(last|latest|most\s*recent|previous)\b.*\border\b", text) and not re.search(
+        r"\b(last|past)\s+\d*\s*(day|week|month|year)s?\b", text
+    ):
         intent, confidence = Intent.LAST_ORDER, 0.94
         entities.order_count = 1
 
-    elif re.search(r"\border\b.*\b(last|latest|most\s*recent|previous)\b", text):
+    elif re.search(r"\border\b.*\b(last|latest|most\s*recent|previous)\b", text) and not re.search(
+        r"\b(last|past)\s+\d*\s*(day|week|month|year)s?\b", text
+    ):
         intent, confidence = Intent.LAST_ORDER, 0.94
         entities.order_count = 1
 
@@ -127,7 +142,9 @@ def classify(utterance: str) -> ClassifiedResult:
         intent, confidence = Intent.LAST_ORDER, 0.93
         entities.order_count = 1
 
-    elif re.search(r"\bmy\s+(last|previous|recent)\s+order\b", text):
+    elif re.search(r"\bmy\s+(last|previous|recent)\s+order\b", text) and not re.search(
+        r"\b(last|past)\s+\d*\s*(day|week|month|year)s?\b", text
+    ):
         intent, confidence = Intent.LAST_ORDER, 0.94
         entities.order_count = 1
 
@@ -214,6 +231,10 @@ def classify(utterance: str) -> ClassifiedResult:
     elif entities.category_id is not None:
         if entities.product_name:
             intent, confidence = Intent.PRODUCT_SEARCH, 0.95
+        elif entities.attributes:
+            # category + attribute filter (e.g. "exterior tiles in 7/16 thick", "exterior pavers")
+            # route to FILTER_BY_ATTRIBUTE with category scope, not plain CATEGORY_BROWSE
+            intent, confidence = Intent.FILTER_BY_ATTRIBUTE, 0.92
         else:
             intent, confidence = Intent.CATEGORY_BROWSE, 0.94
 
@@ -330,6 +351,24 @@ def _extract_product_name(text: str, entities: ExtractedEntities):
             generic_words = {"product", "products", "item", "items"} | set(PRODUCT_TYPE_TERMS)
             if match["name"].lower().strip() in generic_words:
                 return
+            # Guard: if the only reason this product matched is a token that
+            # is also a live tag name, skip it and let _extract_tag() handle it.
+            # e.g. "mosaics under the Wilde tag" — "wilde" is a tag, not a product name.
+            matched_name_lower = match["name"].lower()
+            if matched_name_lower not in text:
+                # Matched via token fallback — check if every matching token is a tag name
+                text_words = set(re.split(r'[\s\-_/]+', text.lower()))
+                product_tokens = set(re.split(r'[\s\-_/]+', matched_name_lower))
+                overlapping_tokens = text_words & product_tokens
+                tag_names_lower = set(loader.tag_by_name_lower.keys())
+                tag_words = {
+                    t
+                    for tag_name in tag_names_lower
+                    for t in re.split(r'[\s\-_/]+', tag_name)
+                    if t and len(t) > 2
+                }
+                if overlapping_tokens and overlapping_tokens.issubset(tag_words):
+                    return  # All matching tokens are tag words — skip product match
             entities.product_name = match["name"]
             entities.product_slug = match.get("slug", "")
             entities.product_id = match.get("id")
@@ -339,6 +378,16 @@ def _extract_product_name(text: str, entities: ExtractedEntities):
                 entities.product_slug = f"{match['slug']}-chip-card"
             elif "ymal" in text:
                 entities.product_slug = f"{match['slug']}-ymal"
+
+
+def _normalize_for_tag_compare(s: str) -> set:
+    """
+    Strip punctuation/symbols and return a token set for fuzzy slug ↔ term-name comparison.
+    e.g. '7/16" thick' → {'7', '16', 'thick'}
+         '7-16-thick'  → {'7', '16', 'thick'}
+         'white tones' → {'white', 'tones'}
+    """
+    return set(re.sub(r'[^a-z0-9 ]', ' ', s.lower()).split())
 
 
 def _extract_attributes(text: str, entities: ExtractedEntities):
@@ -409,20 +458,27 @@ def _extract_attributes(text: str, entities: ExtractedEntities):
             if not term_name_lower or len(term_name_lower) < 3:
                 continue
             try:
-                if re.search(rf"\b{re.escape(term_name_lower)}\b", text):
-                    # Don't double-capture as both a tag AND an attribute filter.
-                    # When a tag has already been resolved for this same concept
-                    # (e.g. "minimalistic-look" tag + "Minimalistic" visual term),
-                    # the tag filter alone is broader and more accurate — adding the
-                    # attribute filter on top would AND-exclude products that share
-                    # the tag but use a different visual attribute value (e.g. "Marble").
+                # Also match plural forms: "pavers" matches term "Paver", "tiles" matches "Tile"
+                matched = (
+                    re.search(rf"\b{re.escape(term_name_lower)}\b", text)
+                    or re.search(rf"\b{re.escape(term_name_lower)}s\b", text)
+                    or (
+                        len(term_name_lower) > 4
+                        and re.search(rf"\b{re.escape(term_name_lower[:-1])}\b", text)
+                    )
+                )
+                if matched:
+                    # Use normalized token comparison so punctuation differences
+                    # (e.g. '7/16" thick' vs '7-16-thick') don't break the check.
                     tag_already_covers = any(
-                        term_name_lower in slug.replace("-", " ")
-                        or slug.replace("-", " ") in term_name_lower
+                        _normalize_for_tag_compare(term_name_lower)
+                        <= _normalize_for_tag_compare(slug.replace("-", " "))
+                        or _normalize_for_tag_compare(slug.replace("-", " "))
+                        <= _normalize_for_tag_compare(term_name_lower)
                         for slug in entities.tag_slugs
                     )
                     if tag_already_covers:
-                        break  # tag is sufficient, skip attribute filter for this term
+                        break
                     entities.attributes[label] = term_name
                     entities.attribute_slug = taxonomy
                     entities.attribute_term_ids = [term["id"]]
@@ -544,8 +600,9 @@ def _extract_quantity(text: str, entities: ExtractedEntities):
 def _extract_tag(text: str, entities: ExtractedEntities):
     """
     Generic tag extractor: matches user text against all live tags.
-    Populates tag_ids/tag_slugs for tags not already found by domain-specific
-    extractors (color, finish, visual, origin, collection_year).
+    Runs AFTER _extract_attributes — skips any tag whose tokens are already
+    covered by a resolved attribute value, preventing double-filtering
+    (e.g. "white-tones" tag skipped when pa_colors-2 "White Tones" already captured).
     Uses word-boundary matching to reduce false positives.
     """
     loader = get_store_loader()
@@ -553,6 +610,14 @@ def _extract_tag(text: str, entities: ExtractedEntities):
         return
 
     existing_ids = set(entities.tag_ids)
+
+    # Build normalized token sets from already-resolved attribute values
+    # so we can skip tags that represent the same concept.
+    resolved_attr_token_sets = [
+        _normalize_for_tag_compare(v)
+        for v in entities.attributes.values()
+        if v
+    ]
 
     for name_lower, tag in loader.tag_by_name_lower.items():
         if tag["id"] in existing_ids:
@@ -563,6 +628,16 @@ def _extract_tag(text: str, entities: ExtractedEntities):
         # Skip very short names — too prone to false positives
         if len(name_lower) < 4:
             continue
+
+        # Skip tags whose token set is already covered by a resolved attribute value.
+        # Handles punctuation differences: "7/16\" thick" (attr) vs "7-16-thick" (tag).
+        tag_tokens = _normalize_for_tag_compare(name_lower)
+        if tag_tokens and any(
+            tag_tokens <= attr_tokens or attr_tokens <= tag_tokens
+            for attr_tokens in resolved_attr_token_sets
+        ):
+            continue
+
         # Word-boundary match on tag name
         try:
             if re.search(rf'\b{re.escape(name_lower)}\b', text):
@@ -618,3 +693,31 @@ def _extract_order_item(text: str, entities: ExtractedEntities):
             if candidate not in skip_words and len(candidate) > 2:
                 entities.order_item_name = candidate.title()
                 return
+
+
+# ─────────────────────────────────────────────
+# UNRESOLVABLE DESCRIPTOR EXTRACTION
+# ─────────────────────────────────────────────
+
+# Words that users say but don't map to any store attribute, tag, or category.
+# Captured into entities.search_hints so the response generator can acknowledge
+# them ("I couldn't filter by 'durable' specifically — here are the closest matches").
+# Extend this list as needed — no other file changes required.
+_UNRESOLVABLE_DESCRIPTORS = [
+    "durable", "heavy-duty", "heavy duty", "premium", "luxury",
+    "rustic", "modern", "classic", "natural", "affordable", "budget",
+]
+
+def _extract_unresolved_descriptors(text: str, entities: ExtractedEntities):
+    """Capture descriptive words that didn't map to any attribute/tag/category."""
+    hints = []
+    for descriptor in _UNRESOLVABLE_DESCRIPTORS:
+        if re.search(rf'\b{re.escape(descriptor.lower())}\b', text):
+            already_covered = (
+                descriptor.lower() in {v.lower() for v in entities.attributes.values()}
+                or any(descriptor.lower() in slug.replace("-", " ") for slug in entities.tag_slugs)
+            )
+            if not already_covered:
+                hints.append(descriptor)
+    if hints and hasattr(entities, 'search_hints'):
+        entities.search_hints = hints

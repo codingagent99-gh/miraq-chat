@@ -23,6 +23,11 @@ WOO_CONSUMER_SECRET = os.getenv("WOO_CONSUMER_SECRET", "")
 # The frontend shows all of them directly (no local pagination).
 # Users click "Load More" to fetch the next page from the server.
 DEFAULT_PER_PAGE = int(os.getenv("CHAT_PER_PAGE", "4"))
+
+# Number of orders per page in chat responses.
+# Works the same way as DEFAULT_PER_PAGE — users can page through with "show more".
+# Override via CHAT_ORDERS_PER_PAGE env var.
+DEFAULT_ORDER_PER_PAGE = int(os.getenv("CHAT_ORDERS_PER_PAGE", "5"))
 DEFAULT_STATUS = "publish"
 DEFAULT_STOCK_STATUS = "instock"
 REQUEST_TIMEOUT = 30  # seconds

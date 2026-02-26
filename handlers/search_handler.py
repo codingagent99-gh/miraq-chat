@@ -7,6 +7,8 @@ Step 3.8 — LLM retry on empty search results, or local no-results message.
 Returns a Flask response if no products found after retry, else None to fall through.
 """
 
+import time
+
 from flask import jsonify
 
 from models import Intent
@@ -23,6 +25,7 @@ from conversation_flow import FlowState
 from chat_logger import get_logger
 from formatters import _entities_to_dict
 from handlers.chat_utils import default_pagination
+from response_generator import INTENT_LABELS
 
 logger = get_logger("miraq_chat")
 
@@ -86,8 +89,6 @@ def handle_empty_results(
     Flask response is non-None only when results are still empty after retry
     and we have a suggestion message to show.
     """
-    import time
-
     if not (intent in _SEARCH_FILTER_INTENTS and len(all_products_raw) == 0):
         return all_products_raw, None
 
@@ -111,7 +112,6 @@ def handle_empty_results(
                 "message": _no_results_msg,
                 "intent": intent.value,
             })
-        from response_generator import INTENT_LABELS
         return all_products_raw, (jsonify({
             "success": True,
             "bot_message": _no_results_msg,
@@ -201,7 +201,6 @@ def handle_empty_results(
                 "intent": intent.value,
             })
 
-        from response_generator import INTENT_LABELS
         return all_products_raw, (jsonify({
             "success": True,
             "bot_message": suggestion_msg,

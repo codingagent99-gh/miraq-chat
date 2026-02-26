@@ -7,6 +7,7 @@ or a Flask response directly for conversational/disambiguation cases.
 """
 
 import dataclasses as _dc
+import time
 
 from flask import jsonify
 
@@ -78,8 +79,6 @@ def run_llm_fallback(
       - Flask response tuple                     — respond directly (conversational/disambiguation)
       - None                                     — LLM not needed, continue with original values
     """
-    import time
-
     should_try_llm = _should_trigger_llm(intent, confidence, entities, order_create_intents, user_context)
     if not should_try_llm:
         return None

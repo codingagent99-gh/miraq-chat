@@ -10,6 +10,8 @@ Endpoint:
     Body: {"message": "...", "session_id": "...", "user_context": {...}}
 """
 
+import logging
+
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify
@@ -92,8 +94,12 @@ def initialize_store():
         # Start background refresh every 6 hours so data stays current
         loader.start_background_refresh()
     except Exception as e:
-        print(f"⚠️  Store loader error: {e}")
-        print("   Server will respond with limited functionality until store data loads.")
+        logging.getLogger("miraq_chat").error(
+            f"Store loader error at startup: {e}", exc_info=True
+        )
+        logging.getLogger("miraq_chat").warning(
+            "Server will respond with limited functionality until store data loads."
+        )
         # Still register the (partially loaded) loader so StoreLoader methods work
         set_store_loader(loader)
 
