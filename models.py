@@ -27,6 +27,7 @@ class Intent(Enum):
 
     # Attribute Filtering
     FILTER_BY_FINISH       = "filter_by_finish"
+    FILTER_BY_ATTRIBUTE    = "filter_by_attribute"   # generic: any store attribute
     FILTER_BY_SIZE         = "filter_by_size"
     FILTER_BY_COLOR        = "filter_by_color"
     FILTER_BY_THICKNESS    = "filter_by_thickness"

@@ -268,7 +268,49 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
 
     elif intent == Intent.PRODUCT_SEARCH:
         has_attributes = bool(e.attributes)
-        if e.product_id:
+
+        # ── Category-scoped product search ──────────────────────────────────
+        # When BOTH a product name AND a category are present, the user wants
+        # to browse that series *within* a category (e.g. "Titan Marbles in
+        # Countertop"). Fetching the specific product's variations would return
+        # ALL variants regardless of category; instead use the advanced filter
+        # endpoint with a search term + category scope so only matching products
+        # are returned with proper pagination.
+        if e.product_name and e.category_id:
+            loader = get_store_loader()
+            cat_id = e.category_id
+            if not cat_id and e.category_name and loader:
+                cat_id = loader.get_category_id(e.category_name)
+            categories_list = loader.get_all_slugs_for_category(cat_id) if (cat_id and loader) else []
+            tag_slugs = list(e.tag_slugs) if e.tag_slugs else []
+            # Build attribute filters if any attributes were also specified
+            attr_filters = {}
+            if e.attribute_slug and e.attributes and loader and loader.all_attributes_raw:
+                for attr in loader.all_attributes_raw:
+                    if attr.get("taxonomy") == e.attribute_slug:
+                        label = attr.get("attribute_label", "").lower().strip()
+                        term_value = e.attributes.get(label, "")
+                        if term_value:
+                            attr_filters[e.attribute_slug] = term_value
+                        break
+            # Use the product name as a search term inside the advanced filter
+            call = _build_advanced_filter_call(
+                tags=tag_slugs if tag_slugs else None,
+                categories=categories_list if categories_list else None,
+                attributes=attr_filters if attr_filters else None,
+                page=page,
+                description=f"Category-scoped search: '{e.product_name}' in '{e.category_name}'",
+            )
+            # Only inject a free-text search term when there are no tag slugs.
+            # When tag_slugs are present they already scope the results precisely
+            # (e.g. "titan-marbles-series" tag + "countertop" category is exact);
+            # adding search="Titan Marbles" on top would further restrict and may
+            # miss products whose title doesn't literally contain those words.
+            if not tag_slugs:
+                call.params["search"] = e.product_name
+            calls.append(call)
+
+        elif e.product_id:
             calls.append(WooAPICall(
                 method="GET",
                 endpoint=f"{BASE}/products/{e.product_id}",
@@ -282,13 +324,37 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
                     params={"per_page": 100, "page": page, "status": "publish"},
                     description=f"Fetch variations for id={e.product_id}",
                 ))
+        elif has_attributes and e.attribute_slug and not e.product_name:
+            # Attribute match without a product name — use the advanced filter
+            # endpoint so the attribute is applied. Dynamically resolves the
+            # term value from e.attribute_slug, no hardcoded label names.
+            attr_filters = {}
+            l = get_store_loader()
+            if l and l.all_attributes_raw:
+                for attr in l.all_attributes_raw:
+                    if attr.get("taxonomy") == e.attribute_slug:
+                        label = attr.get("attribute_label", "").lower().strip()
+                        term_value = e.attributes.get(label, "")
+                        if term_value:
+                            attr_filters[e.attribute_slug] = term_value
+                        break
+            cat_id = e.category_id
+            if not cat_id and e.category_name and l:
+                cat_id = l.get_category_id(e.category_name)
+            categories_list = l.get_all_slugs_for_category(cat_id) if (cat_id and l) else []
+            calls.append(_build_advanced_filter_call(
+                categories=categories_list if categories_list else None,
+                attributes=attr_filters if attr_filters else None,
+                page=page,
+                description=f"Attribute-scoped search: {e.attributes}",
+            ))
         else:
             calls.append(WooAPICall(
                 method="GET",
                 endpoint=f"{BASE}/products",
                 params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish",
                         "search": e.product_name or e.search_term or ""},
-                description=f"Search products matching '{e.product_name}'",
+                description=f"Search products matching '{e.product_name or e.search_term}'",
             ))
 
     elif intent == Intent.PRODUCT_DETAIL:
@@ -416,50 +482,53 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
     # ATTRIBUTE FILTERS
     # ═══════════════════════════════════════════
 
-    elif intent == Intent.FILTER_BY_FINISH:
-        finish = e.attributes.get("finish", "")
+    elif intent == Intent.FILTER_BY_ATTRIBUTE:
+        # ── Dynamic attribute filter — works for any store, any attribute ──
+        # Resolves the matched term value by looking up which attribute label
+        # corresponds to e.attribute_slug, then reads that key from e.attributes.
+        # No hardcoded label names: finish, color, size, material, etc. all go
+        # through the same code path. If the store renames or adds attributes,
+        # this continues to work without any code change.
+        attr_filters = {}
+        if e.attribute_slug:
+            l = get_store_loader()
+            if l and l.all_attributes_raw:
+                for attr in l.all_attributes_raw:
+                    if attr.get("taxonomy") == e.attribute_slug:
+                        label = attr.get("attribute_label", "").lower().strip()
+                        term_value = e.attributes.get(label, "")
+                        if term_value:
+                            attr_filters[e.attribute_slug] = term_value
+                        break
+        # Fallback: take the first attribute value if slug lookup failed
+        if not attr_filters and e.attributes:
+            first_label, first_value = next(iter(e.attributes.items()))
+            slug = _attr_slug_for_label(first_label)
+            if slug and first_value:
+                attr_filters[slug] = first_value
+        # Include category scope if one was extracted
+        cat_id = e.category_id
+        loader = get_store_loader()
+        if not cat_id and e.category_name and loader:
+            cat_id = loader.get_category_id(e.category_name)
+        categories_list = []
+        if cat_id and loader:
+            categories_list = loader.get_all_slugs_for_category(cat_id)
+        attr_label = next(iter(e.attributes.keys()), "attribute")
+        attr_value = next(iter(e.attributes.values()), "")
         calls.append(_build_advanced_filter_call(
-            attributes={e.attribute_slug: finish} if e.attribute_slug else None,
+            categories=categories_list if categories_list else None,
+            attributes=attr_filters if attr_filters else None,
             page=page,
-            description=f"Filter by finish: {finish}",
-        ))
-
-    elif intent == Intent.FILTER_BY_SIZE:
-        size = e.attributes.get("tile size", "").replace('"', '')
-        calls.append(_build_advanced_filter_call(
-            attributes={e.attribute_slug: size} if e.attribute_slug else None,
-            page=page,
-            description=f"Filter by size: {size}",
-        ))
-
-    elif intent == Intent.FILTER_BY_COLOR:
-        color = e.attributes.get("colors", "")
-        calls.append(_build_advanced_filter_call(
-            attributes={e.attribute_slug: color} if e.attribute_slug else None,
-            page=page,
-            description=f"Filter by color: {color}",
-        ))
-
-    elif intent == Intent.FILTER_BY_APPLICATION:
-        application = e.attributes.get("application", "")
-        calls.append(_build_advanced_filter_call(
-            attributes={e.attribute_slug: application} if e.attribute_slug else None,
-            page=page,
-            description=f"Filter by application: {application}",
-        ))
-
-    elif intent == Intent.FILTER_BY_MATERIAL:
-        visual = e.attributes.get("visual", "")
-        calls.append(_build_advanced_filter_call(
-            attributes={e.attribute_slug: visual} if e.attribute_slug else None,
-            page=page,
-            description=f"Filter by material: {visual}",
+            description=f"Filter by {attr_label}: {attr_value}",
         ))
 
     elif intent == Intent.FILTER_BY_ORIGIN:
+        # Kept separate: origin uses tag-based resolution (demonym synonyms),
+        # not just attribute term IDs, so needs both attribute and tag params.
         origin = e.attributes.get("origin", "")
         calls.append(_build_advanced_filter_call(
-            attributes={e.attribute_slug: origin} if e.attribute_slug else None,
+            attributes={e.attribute_slug: origin} if (e.attribute_slug and origin) else None,
             tags=list(e.tag_slugs) if e.tag_slugs else None,
             page=page,
             description=f"Filter by origin: {origin}",

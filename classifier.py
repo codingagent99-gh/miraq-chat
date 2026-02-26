@@ -24,16 +24,25 @@ def classify(utterance: str) -> ClassifiedResult:
 
     # ─── Pre-extract common entities ───
     _extract_product_name(text, entities)
-    _extract_attributes(text, entities)   # replaces: color, finish, visual, origin, size, application
-    _extract_thickness(text, entities)    # numeric fallback only
+    _extract_category(text, entities)      # extract BEFORE attributes so we can mask it
+
+    # Build a scrubbed version of the text with the resolved category name removed.
+    # Prevents category words (e.g. "countertop") from being falsely matched as
+    # attribute terms (e.g. pa_application value "Countertop") by _extract_attributes.
+    attr_text = text
+    if entities.category_name:
+        attr_text = re.sub(
+            rf'\b{re.escape(entities.category_name.lower())}\b', ' ', attr_text
+        ).strip()
+
+    _extract_tag(text, entities)               # extract BEFORE attributes for dedup
+    _extract_attributes(attr_text, entities)   # replaces: color, finish, visual, origin, size, application
+    _extract_thickness(attr_text, entities)    # numeric fallback only
     _extract_collection_year(text, entities)
     _extract_order_id(text, entities)
     _extract_time_range(text, entities)
     _extract_quantity(text, entities)
-    _extract_category(text, entities)
     _extract_order_item(text, entities)
-    _extract_tag(text, entities)
-    _extract_search_modifier(text, entities)  # must run after all other extractors
 
     # ─── Intent Classification (priority order) ───
 
@@ -199,12 +208,11 @@ def classify(utterance: str) -> ClassifiedResult:
         entities.quick_ship = True
 
     # 7. CATEGORY MATCH
-    # If the user also has attribute filters (e.g. visual=Marble) or an
-    # unrecognized search modifier (e.g. "kitchen"), treat as PRODUCT_SEARCH
-    # so the api_builder can pass those as search/attribute parameters.
-    # Pure category browsing (no extra filters) stays as CATEGORY_BROWSE.
+    # If user also mentioned a specific product name, treat as product search
+    # scoped to category — the category context is preserved in entities for
+    # the response. e.g. "show me allspice in countertop" → PRODUCT_SEARCH
     elif entities.category_id is not None:
-        if entities.product_name or entities.attributes or entities.search_term:
+        if entities.product_name:
             intent, confidence = Intent.PRODUCT_SEARCH, 0.95
         else:
             intent, confidence = Intent.CATEGORY_BROWSE, 0.94
@@ -213,29 +221,26 @@ def classify(utterance: str) -> ClassifiedResult:
         intent, confidence = Intent.CATEGORY_LIST, 0.91
 
     # 8. ATTRIBUTE FILTERS
-    elif entities.attributes.get("finish") and not entities.product_name:
-        intent, confidence = Intent.FILTER_BY_FINISH, 0.89
-
-    elif entities.attributes.get("tile size"):
-        intent, confidence = Intent.FILTER_BY_SIZE, 0.90
-
-    elif entities.attributes.get("colors") and not entities.product_name:
-        intent, confidence = Intent.FILTER_BY_COLOR, 0.89
-
-    elif entities.attributes.get("thickness"):
-        intent, confidence = Intent.FILTER_BY_THICKNESS, 0.88
-
+    # Fully dynamic: works for ANY store attribute without hardcoded label names.
+    # FILTER_BY_SIZE and PRODUCT_BY_ORIGIN are the only special cases kept
+    # separate because they have custom extraction logic (numeric pattern and
+    # demonym synonyms respectively). Everything else collapses into one intent.
     elif entities.attributes.get("origin") and not entities.product_name:
         intent, confidence = Intent.PRODUCT_BY_ORIGIN, 0.88
 
-    elif entities.attributes.get("application"):
-        intent, confidence = Intent.FILTER_BY_APPLICATION, 0.87
+    elif entities.attributes and not entities.product_name:
+        # Single generic handler for ALL other attribute matches — finish, color,
+        # colors-2, thickness, application, material, visual, or any future
+        # attribute added to the store. api_builder reads e.attribute_slug and
+        # e.attributes dynamically, so no code change is needed when the store
+        # configuration changes.
+        intent, confidence = Intent.FILTER_BY_ATTRIBUTE, 0.89
 
     # 9. SIZE LIST
     elif re.search(r"\b(what|which)\b.*\bsizes?\b", text):
         intent, confidence = Intent.SIZE_LIST, 0.88
 
-    # 10. VISUAL / LOOK FILTER
+    # 10. VISUAL / LOOK FILTER (kept for explicit "visual" search without product name)
     elif entities.attributes.get("visual"):
         intent, confidence = Intent.PRODUCT_BY_VISUAL, 0.90
 
@@ -286,6 +291,13 @@ def classify(utterance: str) -> ClassifiedResult:
     # Final fallback: QUICK_ORDER if order_item_name extracted but nothing matched
     if intent == Intent.UNKNOWN and entities.order_item_name:
         intent, confidence = Intent.QUICK_ORDER, 0.90
+
+    # ── Prevent product_id from hijacking category-scoped searches ──────────
+    # When both a category and a product name are resolved, the intent is a
+    # filtered catalog search, NOT a "fetch this specific product's variations"
+    # call. Clear product_id so api_builder routes to the category-scoped path.
+    if entities.category_id is not None and entities.product_id is not None:
+        entities.product_id = None
 
     return ClassifiedResult(
         intent=intent,
@@ -398,6 +410,19 @@ def _extract_attributes(text: str, entities: ExtractedEntities):
                 continue
             try:
                 if re.search(rf"\b{re.escape(term_name_lower)}\b", text):
+                    # Don't double-capture as both a tag AND an attribute filter.
+                    # When a tag has already been resolved for this same concept
+                    # (e.g. "minimalistic-look" tag + "Minimalistic" visual term),
+                    # the tag filter alone is broader and more accurate — adding the
+                    # attribute filter on top would AND-exclude products that share
+                    # the tag but use a different visual attribute value (e.g. "Marble").
+                    tag_already_covers = any(
+                        term_name_lower in slug.replace("-", " ")
+                        or slug.replace("-", " ") in term_name_lower
+                        for slug in entities.tag_slugs
+                    )
+                    if tag_already_covers:
+                        break  # tag is sufficient, skip attribute filter for this term
                     entities.attributes[label] = term_name
                     entities.attribute_slug = taxonomy
                     entities.attribute_term_ids = [term["id"]]
@@ -415,6 +440,9 @@ def _extract_thickness(text: str, entities: ExtractedEntities):
     THICKNESS_PATTERNS = [
         r'(\d+(?:\.\d+)?\s*mm)',
         r'(\d+(?:\.\d+)?\s*cm)',
+        r'(\d+/\d+\s*"?\s*(?:inch(?:es)?|in\.?|thick)?)',  # "7/16"", "3/8 inch"
+        r'(\d+(?:\.\d+)?(?:\s*"|\s*inch(?:es)?|\s*in\.?))',  # decimal inches: 0.5", 1.25 inch
+
     ]
     loader = get_store_loader()
     for pattern in THICKNESS_PATTERNS:
@@ -556,99 +584,6 @@ def _extract_tag(text: str, entities: ExtractedEntities):
                 pass
 
 
-def _extract_search_modifier(text: str, entities: ExtractedEntities):
-    """
-    Detect unrecognized descriptor words and store them as entities.search_term.
-
-    Purpose
-    -------
-    When the user says "search for kitchen tiles" and "kitchen" does not match
-    any known attribute, tag, category, or product name, we capture it as
-    entities.search_term so the api_builder can forward it as a WooCommerce
-    ?search= parameter.  This also gives the response generator the information
-    it needs to tell the user "no kitchen tiles found" instead of silently
-    returning all tile products.
-
-    Preconditions (function is a no-op if any is false)
-    ----------------------------------------------------
-    - A category was already found (entities.category_id is set)
-    - No attribute filter was already extracted (entities.attributes is empty)
-    - No product name was already extracted (entities.product_name is empty)
-    - entities.search_term has not been set by another extractor
-    """
-    if entities.search_term or entities.attributes or entities.product_name:
-        return
-    if not entities.category_id:
-        return
-
-    loader = get_store_loader()
-    if not loader:
-        return
-
-    # ── Step 1: find a candidate modifier word ──────────────────────────────
-    # Try explicit search-signal patterns first (most reliable).
-    explicit_patterns = [
-        # "search for kitchen tiles", "find outdoor slabs", "looking for marble tiles"
-        r'\b(?:search(?:\s+for)?|find|looking\s+for)\s+(\w+)',
-    ]
-    candidate = None
-    for pattern in explicit_patterns:
-        m = re.search(pattern, text, re.IGNORECASE)
-        if m:
-            candidate = m.group(1).lower()
-            break
-
-    # Fallback: detect "X [product_type_term]" positionally.
-    # Use PRODUCT_TYPE_TERMS from store config — no domain hardcoding.
-    if not candidate and PRODUCT_TYPE_TERMS:
-        pt_alternatives = "|".join(re.escape(t) for t in PRODUCT_TYPE_TERMS)
-        positional_pattern = rf'\b(\w{{3,}})\s+(?:{pt_alternatives})\b'
-        m = re.search(positional_pattern, text, re.IGNORECASE)
-        if m:
-            candidate = m.group(1).lower()
-
-    if not candidate or len(candidate) < 3:
-        return
-
-    # ── Step 2: skip universal (non-domain) stop words ──────────────────────
-    # Only truly language-level stop words — no product/store terms here.
-    UNIVERSAL_STOP = {
-        "the", "for", "and", "but", "some", "all", "any",
-        "show", "me", "please", "can", "you", "need", "want",
-        "get", "find", "looking", "search", "like", "with",
-        "from", "that", "this", "those", "these",
-    }
-    if candidate in UNIVERSAL_STOP:
-        return
-
-    # ── Step 3: skip if candidate already matched a known entity ────────────
-
-    # Matches an existing category?
-    if loader.get_category_id(candidate):
-        return
-
-    # Matches a known attribute term name?
-    for attr in loader.all_attributes_raw:
-        for term in attr.get("terms", []):
-            if candidate == term.get("name", "").lower().strip():
-                return
-
-    # Matches a known tag name or slug?
-    for name_lower in loader.tag_by_name_lower:
-        if candidate == name_lower or candidate in name_lower.split():
-            return
-
-    # Matches a known product name or token?
-    if candidate in loader.product_by_name_lower:
-        return
-    for token, _ in loader.product_name_tokens:
-        if candidate == token:
-            return
-
-    # ── Step 4: candidate is genuinely unrecognized — store as search_term ──
-    entities.search_term = candidate
-
-
 def _extract_order_item(text: str, entities: ExtractedEntities):
     """Extract a product name from order/buy/purchase queries."""
     if not re.search(r"\b(order|buy|purchase|get|want)\b", text):
@@ -656,14 +591,6 @@ def _extract_order_item(text: str, entities: ExtractedEntities):
 
     ORDER_HISTORY_KEYWORDS = r"\b(history|track|tracking|status|before|past|previous|show|tell|about|detail)\b"
     if re.search(ORDER_HISTORY_KEYWORDS, text):
-        return
-
-    # Skip when "want" appears in a browse/discovery context rather than a
-    # purchase context.  e.g. "I want marble look tiles" / "I want to see X"
-    # should not extract an order item — there is no explicit purchase verb.
-    EXPLICIT_PURCHASE = r"\b(order|buy|purchase|checkout|add\s+to\s+cart)\b"
-    BROWSE_SIGNALS    = r"\b(look(?:ing)?|show|see|search|find|browse|browsing)\b"
-    if re.search(BROWSE_SIGNALS, text) and not re.search(EXPLICIT_PURCHASE, text):
         return
 
     # First, try to match against known products from StoreLoader
