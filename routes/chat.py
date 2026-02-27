@@ -169,6 +169,8 @@ def chat():
                 "product_id": entities.product_id,
                 "order_item_name": entities.order_item_name,
                 "quantity": entities.quantity,
+                "attributes": entities.attributes or None,
+                "tag_slugs": entities.tag_slugs or None,  # ← ADD THIS
             }.items() if v is not None
         }
         logger.info(f"Step 1: Classified intent={intent.value} | confidence={confidence:.2f} | entities={entity_summary}")

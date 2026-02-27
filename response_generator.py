@@ -164,6 +164,17 @@ def generate_bot_message(
             msg += "\n⚠️ Please log in to place an order."
             return msg
 
+    # ── Product attribute info ──
+    if intent == Intent.PRODUCT_ATTRIBUTE_INFO:
+        if page_count > 0:
+            return _generate_attribute_info_message(products, entities)
+        product_name = entities.product_name or "that product"
+        target = getattr(entities, 'target_attribute', None) or 'options'
+        return (
+            f"I couldn't find **{product_name}** in our catalog to check its {target} options. "
+            f"Try searching for it by name, or ask: *'Show me {product_name} products'*"
+        )
+
     # ── No products found ──
     if page_count == 0:
         search = (
@@ -271,6 +282,13 @@ def generate_bot_message(
         msg += f"Here are **{count}** products with **{entities.attributes.get('finish', '')}** finish! ✨\n\n"
     elif intent == Intent.FILTER_BY_COLOR:
         msg += f"Found **{count}** products in **{entities.attributes.get('colors', '')}** tones! 🎨\n\n"
+    elif intent == Intent.FILTER_BY_ATTRIBUTE:
+        # Build a natural description from all matched attributes
+        attr_desc = " · ".join(
+            f"**{v}** {k}" for k, v in entities.attributes.items() if v
+        )
+        category_desc = f" in **{entities.category_name}**" if entities.category_name else ""
+        msg += f"Found **{count}** products{category_desc} matching {attr_desc}! 🔍\n\n"
     elif intent == Intent.PRODUCT_SEARCH:
         msg += f"Found **{count}** products matching your search! 🔍\n\n"
     elif intent == Intent.CHIP_CARD:
@@ -333,6 +351,13 @@ def generate_suggestions(
         if products:
             suggestions.append(f"Order {products[0]['name']}")
             suggestions.append("Show me similar products")
+    elif intent == Intent.PRODUCT_ATTRIBUTE_INFO:
+        if products:
+            p_name = products[0].get('name', '')
+            if p_name:
+                suggestions.append(f"Order {p_name}")
+                suggestions.append(f"Show all {p_name} products")
+        suggestions.append("What categories do you have?")
     elif intent in (Intent.FILTER_BY_FINISH, Intent.FILTER_BY_COLOR, Intent.FILTER_BY_SIZE):
         suggestions.append("Show me all products")
         suggestions.append("What finishes are available?")
@@ -351,6 +376,7 @@ INTENT_LABELS = {
     Intent.PRODUCT_SEARCH: "search",
     Intent.PRODUCT_LIST: "browse",
     Intent.PRODUCT_DETAIL: "detail",
+    Intent.PRODUCT_ATTRIBUTE_INFO: "attribute_info",
     Intent.CATEGORY_BROWSE: "category",
     Intent.CATEGORY_LIST: "categories",
     Intent.PRODUCT_BY_COLLECTION: "collection",
@@ -363,6 +389,7 @@ INTENT_LABELS = {
     Intent.FILTER_BY_APPLICATION: "filter",
     Intent.FILTER_BY_MATERIAL: "filter",
     Intent.FILTER_BY_ORIGIN: "filter",
+    Intent.FILTER_BY_ATTRIBUTE: "filter",
     Intent.SIZE_LIST: "sizes",
     Intent.PRODUCT_TYPES: "types",
     Intent.PRODUCT_CATALOG: "catalog",
@@ -452,6 +479,80 @@ def _format_order_history_message(orders: List[dict], date_after: str = None) ->
         period = _describe_date_period(date_after)
         return f"📦 Here {verb} your {count} {order_word} from {period}. Tap any to see full details."
     return f"📦 Here {verb} your {count} most recent {order_word}. Tap any to see full details."
+
+
+def _generate_attribute_info_message(products: List[dict], entities: ExtractedEntities) -> str:
+    """
+    Build a focused prose answer listing the available options for a specific
+    attribute (e.g. size, finish, color) of a named product.
+
+    products[0] is the formatted parent product whose `attributes` list carries
+    the available option values. Subsequent entries may be formatted variations
+    which let us highlight which options are currently in stock.
+    """
+    target_attr = (getattr(entities, 'target_attribute', None) or 'options').lower()
+
+    # Parent is the first non-variation product in the list
+    parent = next((p for p in products if p.get('type') != 'variation'), products[0])
+    product_name = parent.get('name', 'This product')
+
+    # Find the matching attribute in the parent's attributes list.
+    # Match loosely: "size" matches "Tile Size", "Size", "pa_tile-size", etc.
+    attrs = parent.get('attributes', [])
+    matched_attr = None
+    for attr in attrs:
+        attr_name_lower = attr.get('name', '').lower()
+        if target_attr in attr_name_lower or attr_name_lower in target_attr:
+            matched_attr = attr
+            break
+
+    # Collect formatted variations for in-stock cross-referencing
+    variations = [p for p in products if p.get('type') == 'variation']
+
+    if matched_attr:
+        options = matched_attr.get('options', [])
+        attr_display_name = matched_attr.get('name', target_attr.title())
+
+        if not options:
+            return (
+                f"I found **{product_name}** but the {attr_display_name.lower()} "
+                f"options aren't listed in our catalog. "
+                f"Try asking: *'What variations does {product_name} come in?'*"
+            )
+
+        opts_formatted = ", ".join(f"**{o}**" for o in options)
+        msg = f"📐 **{product_name}** is available in the following {attr_display_name.lower()}:\n\n{opts_formatted}"
+
+        # Cross-reference in-stock options from variations if available
+        if variations:
+            in_stock_opts = set()
+            for v in variations:
+                stock_ok = v.get('in_stock') or v.get('stock_status') == 'instock'
+                if stock_ok:
+                    for a in v.get('attributes', []):
+                        if target_attr in a.get('name', '').lower():
+                            opt = a.get('option', '')
+                            if opt:
+                                in_stock_opts.add(opt)
+            # Only surface the in-stock note when it's a meaningful subset
+            if in_stock_opts and 0 < len(in_stock_opts) < len(options):
+                msg += f"\n\n✅ Currently in stock: {', '.join(sorted(in_stock_opts))}"
+
+        return msg
+
+    # No direct attribute match — show all available attributes as a fallback
+    if attrs:
+        msg = f"📐 Here are the available options for **{product_name}**:\n\n"
+        for attr in attrs[:6]:
+            opts = ', '.join(attr.get('options', [])[:8])
+            msg += f"• **{attr.get('name', '')}:** {opts}\n"
+        return msg
+
+    # Final fallback: product found but no attribute data at all
+    return (
+        f"I found **{product_name}** but couldn't retrieve its {target_attr} options from the catalog. "
+        f"Try asking: *'What variations does {product_name} come in?'*"
+    )
 
 
 def format_order_detail(order: dict) -> str:

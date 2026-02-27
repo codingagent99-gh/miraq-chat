@@ -13,9 +13,9 @@ from config.settings import DEFAULT_PER_PAGE, DEFAULT_ORDER_PER_PAGE
 from app_config import WOO_BASE_URL, CUSTOM_API_BASE_URL
 from config.store_config import (
     TAG_SLUG_QUICK_SHIP,
-    TAG_SLUG_CHIP_CARD,
     FALLBACK_SEARCH_TERM,
 )
+import re
 
 # Resolved at import time from env / app_config — no literals here.
 BASE = WOO_BASE_URL
@@ -379,6 +379,31 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
                 description=f"Search product '{e.product_name}'",
             ))
 
+    elif intent == Intent.PRODUCT_ATTRIBUTE_INFO:
+        # Fetch the product and its variations so the response generator can
+        # read attributes[].options from the parent and cross-reference in-stock
+        # variants. Same two calls as PRODUCT_DETAIL.
+        if e.product_id:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/{e.product_id}",
+                params={},
+                description=f"Fetch product '{e.product_name}' for attribute info",
+            ))
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/{e.product_id}/variations",
+                params={"per_page": 100, "status": "publish"},
+                description=f"Fetch variations for '{e.product_name}' attribute info",
+            ))
+        elif e.product_name:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products",
+                params={"search": e.product_name, "status": "publish", "per_page": 5},
+                description=f"Search product '{e.product_name}' for attribute info",
+            ))
+
     elif intent == Intent.PRODUCT_BY_COLLECTION:
         if e.tag_slugs:
             calls.append(_build_advanced_filter_call(
@@ -436,14 +461,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
             description="Quick ship / in-stock products",
         ))
 
-    elif intent == Intent.PRODUCT_BY_VISUAL:
-        visual = e.attributes.get("visual", "")
-        calls.append(_build_advanced_filter_call(
-            attributes={_attr_slug_for_label("visual"): visual} if _attr_slug_for_label("visual") else None,
-            page=page,
-            description=f"Products with '{visual}' visual/look",
-        ))
-
     elif intent == Intent.RELATED_PRODUCTS:
         if e.product_name:
             calls.append(WooAPICall(
@@ -468,61 +485,64 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         ))
 
     elif intent == Intent.PRODUCT_TYPES:
-        visual_slug = _attr_slug_for_label("visual")
-        attr_id = _attr_id(visual_slug) if visual_slug else None
-        if attr_id:
-            calls.append(WooAPICall(
-                method="GET",
-                endpoint=f"{BASE}/products/attributes/{attr_id}/terms",
-                params={"per_page": 100},
-                description="List all visual/type options",
-            ))
+        # Dynamically find any "visual" or "type" attribute — no hardcoded label needed.
+        l = _loader()
+        if l and l.all_attributes_raw:
+            for attr in l.all_attributes_raw:
+                label = attr.get("attribute_label", "").lower()
+                if "visual" in label or "type" in label:
+                    type_slug = attr.get("taxonomy")
+                    attr_id = _attr_id(type_slug) if type_slug else None
+                    if attr_id:
+                        calls.append(WooAPICall(
+                            method="GET",
+                            endpoint=f"{BASE}/products/attributes/{attr_id}/terms",
+                            params={"per_page": 100},
+                            description="List all product types/visuals",
+                        ))
+                    break
 
     # ═══════════════════════════════════════════
     # ATTRIBUTE FILTERS
     # ═══════════════════════════════════════════
-
+        
     elif intent == Intent.FILTER_BY_ATTRIBUTE:
-        # ── Dynamic attribute filter — works for any store, any attribute ──
-        # Resolves the matched term value by looking up which attribute label
-        # corresponds to e.attribute_slug, then reads that key from e.attributes.
-        # No hardcoded label names: finish, color, size, material, etc. all go
-        # through the same code path. If the store renames or adds attributes,
-        # this continues to work without any code change.
         attr_filters = {}
-        if e.attribute_slug:
-            l = get_store_loader()
-            if l and l.all_attributes_raw:
-                for attr in l.all_attributes_raw:
-                    if attr.get("taxonomy") == e.attribute_slug:
-                        label = attr.get("attribute_label", "").lower().strip()
-                        term_value = e.attributes.get(label, "")
-                        if term_value:
-                            attr_filters[e.attribute_slug] = term_value
-                        break
-        # Fallback: take the first attribute value if slug lookup failed
-        if not attr_filters and e.attributes:
-            first_label, first_value = next(iter(e.attributes.items()))
-            slug = _attr_slug_for_label(first_label)
-            if slug and first_value:
-                attr_filters[slug] = first_value
-        # Include category scope if one was extracted
+        for label, value in e.attributes.items():
+            slug = _attr_slug_for_label(label)
+            if slug and value:
+                attr_filters[slug] = value
+
         cat_id = e.category_id
         loader = get_store_loader()
         if not cat_id and e.category_name and loader:
             cat_id = loader.get_category_id(e.category_name)
-        categories_list = []
-        if cat_id and loader:
-            categories_list = loader.get_all_slugs_for_category(cat_id)
+        categories_list = loader.get_all_slugs_for_category(cat_id) if (cat_id and loader) else []
+
+        # Deduplicate: drop any tag whose slug tokens are fully covered by
+        # already-resolved attribute values. This prevents double-filtering when
+        # e.g. tag "1-4-thick" and attribute pa_thickness "1/4" thick" describe
+        # the same concept. Works dynamically — no hardcoded slug/label names.
+        attr_value_tokens = set()
+        for v in e.attributes.values():
+            attr_value_tokens |= {
+                t for t in re.split(r'[\s\-_"/]+', v.lower()) if len(t) >= 2
+            }
+        deduped_tag_slugs = [
+            slug for slug in (e.tag_slugs or [])
+            if not {t for t in slug.split("-") if len(t) >= 2} <= attr_value_tokens
+        ]
+
         attr_label = next(iter(e.attributes.keys()), "attribute")
         attr_value = next(iter(e.attributes.values()), "")
         calls.append(_build_advanced_filter_call(
             categories=categories_list if categories_list else None,
             attributes=attr_filters if attr_filters else None,
+            tags=deduped_tag_slugs if deduped_tag_slugs else None,
             page=page,
             description=f"Filter by {attr_label}: {attr_value}",
         ))
-
+        
     elif intent == Intent.FILTER_BY_ORIGIN:
         # Kept separate: origin uses tag-based resolution (demonym synonyms),
         # not just attribute term IDs, so needs both attribute and tag params.
@@ -535,60 +555,27 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         ))
 
     elif intent == Intent.SIZE_LIST:
-        size_slug = _attr_slug_for_label("tile size")
-        attr_id = _attr_id(size_slug) if size_slug else None
-        if attr_id:
-            calls.append(WooAPICall(
-                method="GET",
-                endpoint=f"{BASE}/products/attributes/{attr_id}/terms",
-                params={"per_page": 100},
-                description="List all available tile sizes",
-            ))
+        # Dynamically find any "size" attribute — no hardcoded label needed.
+        l = _loader()
+        if l and l.all_attributes_raw:
+            for attr in l.all_attributes_raw:
+                if "size" in attr.get("attribute_label", "").lower():
+                    size_slug = attr.get("taxonomy")
+                    attr_id = _attr_id(size_slug) if size_slug else None
+                    if attr_id:
+                        calls.append(WooAPICall(
+                            method="GET",
+                            endpoint=f"{BASE}/products/attributes/{attr_id}/terms",
+                            params={"per_page": 100},
+                            description="List all available sizes",
+                        ))
+                    break
 
     # ═══════════════════════════════════════════
     # PRODUCT SUBTYPES
     # ═══════════════════════════════════════════
 
-    elif intent == Intent.MOSAIC_PRODUCTS:
-        search_term = f"{e.product_name} mosaic" if e.product_name else "mosaic"
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/products",
-            params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish", "search": search_term},
-            description=f"Search mosaic products: '{search_term}'",
-        ))
-
-    elif intent == Intent.TRIM_PRODUCTS:
-        search_term = f"{e.product_name} bullnose" if e.product_name else "bullnose"
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/products",
-            params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish", "search": search_term},
-            description="List trim products",
-        ))
-
-    elif intent == Intent.CHIP_CARD:
-        if e.product_name:
-            calls.append(WooAPICall(
-                method="GET",
-                endpoint=f"{BASE}/products",
-                params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish",
-                        "search": f"{e.product_name} chip card"},
-                description=f"Find chip card for '{e.product_name}'",
-            ))
-        else:
-            cc_tag_id = _tag_id(TAG_SLUG_CHIP_CARD)
-            params = {"per_page": 50, "page": page, "status": "publish"}
-            if cc_tag_id:
-                params["tag"] = str(cc_tag_id)
-            calls.append(WooAPICall(
-                method="GET",
-                endpoint=f"{BASE}/products",
-                params=params,
-                description="List all chip card products",
-            ))
-
-    # ═══════════════════════════════════════════
+        # ═══════════════════════════════════════════
     # VARIATIONS
     # ═══════════════════════════════════════════
 
@@ -627,7 +614,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
             ))
 
     # ═══════════════════════════════════════════
-    # DISCOUNTS & PROMOTIONS
+    # DISCOUNTS & SALES
     # ═══════════════════════════════════════════
 
     elif intent == Intent.DISCOUNT_INQUIRY:
@@ -638,28 +625,12 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
             description="List products on sale",
         ))
 
-    elif intent == Intent.CLEARANCE_PRODUCTS:
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/products",
-            params={"on_sale": "true", "per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish"},
-            description="List clearance products",
-        ))
-
     elif intent == Intent.BULK_DISCOUNT:
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/products",
             params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish", "search": "bulk"},
             description="Check for bulk discount products",
-        ))
-
-    elif intent == Intent.PROMOTIONS:
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/products",
-            params={"on_sale": "true", "per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish"},
-            description="List current promotions",
         ))
 
     elif intent == Intent.COUPON_INQUIRY:

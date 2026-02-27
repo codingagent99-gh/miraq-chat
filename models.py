@@ -19,6 +19,7 @@ class Intent(Enum):
     PRODUCT_BY_ORIGIN      = "product_by_origin"
     PRODUCT_QUICK_SHIP     = "product_quick_ship"
     PRODUCT_DETAIL         = "product_detail"
+    PRODUCT_ATTRIBUTE_INFO = "product_attribute_info"  # "what sizes does X come in?"
     RELATED_PRODUCTS       = "related_products"
 
     # ──── Category-Based Browsing ────
@@ -120,6 +121,9 @@ class ExtractedEntities:
     reorder: Optional[bool] = None
     order_count: Optional[int] = None          # how many past orders to fetch
     order_item_name: Optional[str] = None      # product name for "order this item X"
+
+    # ──── Attribute info query ────
+    target_attribute: Optional[str] = None     # attribute the user is asking about, e.g. "size", "finish"
 
     # ──── Time range fields (used by ORDER_HISTORY) ────
     date_after: Optional[str] = None           # ISO datetime string e.g. "2026-01-01T00:00:00"

@@ -9,9 +9,7 @@ What remains here is config that genuinely requires human definition:
   1. ORIGIN_KEYWORDS   — demonym synonyms ("italian" → "italy") that WooCommerce
                          terms will never contain.
   2. PRODUCT_TAG_SLUGS — special tags your code treats with distinct logic.
-  3. PRODUCT_SUBTYPE_PATTERNS — business logic mapping user language to search
-                         suffixes ("trim" → search "bullnose").
-  4. FALLBACK_SEARCH_TERM / PRODUCT_TYPE_TERMS — app-level fallback strings.
+  3. FALLBACK_SEARCH_TERM / PRODUCT_TYPE_TERMS — app-level fallback strings.
 """
 
 import json
@@ -81,43 +79,6 @@ PRODUCT_TAG_SLUGS: dict = _load_product_tag_slugs()
 
 TAG_SLUG_QUICK_SHIP = PRODUCT_TAG_SLUGS.get("quick_ship", "quick-ship")
 TAG_SLUG_CHIP_CARD  = PRODUCT_TAG_SLUGS.get("chip_card",  "chip-card")
-
-
-# ═══════════════════════════════════════════════════════════════
-# PRODUCT SUBTYPE PATTERNS
-# Business logic: user says "trim" but products are named "bullnose".
-# Cannot be derived from store data.
-# Override via env var PRODUCT_SUBTYPE_PATTERNS_JSON (JSON object).
-# ═══════════════════════════════════════════════════════════════
-
-_DEFAULT_PRODUCT_SUBTYPE_PATTERNS = {
-    "mosaic": {
-        "regex":         r"\bmosaics?\b",
-        "search_suffix": "mosaic",
-    },
-    "trim": {
-        "regex":         r"\b(trim|bullnose)\b",
-        "search_suffix": "bullnose",
-    },
-    "chip_card": {
-        "regex":         r"\bchip\s*cards?\b",
-        "search_suffix": "chip card",
-        "tag_slug_key":  "chip_card",
-    },
-}
-
-def _load_product_subtype_patterns() -> dict:
-    raw = os.getenv("PRODUCT_SUBTYPE_PATTERNS_JSON", "")
-    if raw:
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
-    return dict(_DEFAULT_PRODUCT_SUBTYPE_PATTERNS)
-
-PRODUCT_SUBTYPE_PATTERNS: dict = _load_product_subtype_patterns()
 
 
 # ═══════════════════════════════════════════════════════════════

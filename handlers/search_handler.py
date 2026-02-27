@@ -33,12 +33,10 @@ _SEARCH_FILTER_INTENTS = {
     Intent.PRODUCT_SEARCH,
     Intent.PRODUCT_LIST,
     Intent.CATEGORY_BROWSE,
-    Intent.FILTER_BY_FINISH,
-    Intent.FILTER_BY_SIZE,
-    Intent.FILTER_BY_COLOR,
-    Intent.FILTER_BY_APPLICATION,
-    Intent.PRODUCT_BY_VISUAL,
+    Intent.FILTER_BY_ATTRIBUTE,
+    Intent.PRODUCT_BY_TAG,
     Intent.PRODUCT_BY_ORIGIN,
+    Intent.PRODUCT_BY_COLLECTION,
 }
 
 
@@ -186,8 +184,25 @@ def handle_empty_results(
         else:
             logger.info("Step 3.8: LLM retry still returned 0 products")
 
-    if len(all_products_raw) == 0 and llm_retry_result.get("suggestion_message"):
-        suggestion_msg = llm_retry_result["suggestion_message"]
+    if len(all_products_raw) == 0:
+        suggestion_msg = llm_retry_result.get("suggestion_message")
+        _cat = entities.category_name or "products"
+
+        if not suggestion_msg:
+            # LLM retry yielded nothing useful — build a sensible fallback message
+            if entities.attributes or getattr(entities, "tag_slugs", None):
+                suggestion_msg = (
+                    f"I couldn't find any products matching those filters in our catalog. "
+                    f"Try broadening your search — for example, removing one of the filters, "
+                    f"or browse all **{_cat}** instead."
+                )
+            else:
+                suggestion_msg = (
+                    f"I couldn't find any **{_cat}** matching your search. "
+                    f"Would you like to browse all **{_cat}** instead?"
+                )
+            logger.info("Step 3.8: LLM retry produced no suggestion — using fallback no-results message")
+
         elapsed = time.time() - start_time
         llm_metadata = llm_retry_result.get("metadata", {})
         llm_metadata["response_time_ms"] = round(elapsed * 1000)
@@ -206,10 +221,15 @@ def handle_empty_results(
             "bot_message": suggestion_msg,
             "intent": INTENT_LABELS.get(intent, "unknown"),
             "products": [],
-            "suggestions": [],
+            "suggestions": [
+                f"Show all {_cat}",
+                "What categories do you have?",
+                "Show me what's on sale",
+            ],
             "session_id": session_id,
             "metadata": llm_metadata,
             "pagination": default_pagination(page),
+            "flow_state": FlowState.IDLE.value,
         }), 200)
 
     return all_products_raw, None

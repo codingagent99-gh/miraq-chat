@@ -552,8 +552,10 @@ class StoreLoader:
             return best_match
 
         # Fall back to token matching (catches "lager" when product is "Lager Matte 24x48")
+        # Use word-boundary matching to prevent e.g. "mosaic" matching "mosaics"
         for token, entry in self.product_name_tokens:
-            if token in text_lower and len(token) > best_match_len:
+            if (re.search(rf'\b{re.escape(token)}\b', text_lower)
+                    and len(token) > best_match_len):
                 best_match = entry
                 best_match_len = len(token)
 
@@ -652,24 +654,22 @@ class StoreLoader:
         return entry["id"] if entry else None
 
     def get_tag_ids_for_keyword(self, keyword: str) -> List[int]:
-        """
-        Find tag IDs matching a keyword against live tag names/slugs.
-        e.g. "matte" → matches "Matte finish" tag → [65]
-             "gray"  → matches "Gray Tones" tag   → [1152]
-             "italy" → matches "Made in Italy" tag → [69]
-        """
         needle = keyword.lower().strip()
-        results = []
+        exact = []
+        partial = []
         seen = set()
 
         for name_lower, entry in self.tag_by_name_lower.items():
             if entry["id"] in seen:
                 continue
-            if needle in name_lower or name_lower in needle:
-                results.append(entry["id"])
+            if needle == name_lower or needle == entry["slug"].replace("-", " "):
+                exact.append(entry["id"])
+                seen.add(entry["id"])
+            elif needle in name_lower or name_lower in needle:
+                partial.append(entry["id"])
                 seen.add(entry["id"])
 
-        return results
+        return exact if exact else partial
 
     def get_quick_ship_tag_id(self) -> Optional[int]:
         """Convenience: return the Quick Ship tag ID."""
