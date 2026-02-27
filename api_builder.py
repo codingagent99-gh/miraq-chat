@@ -6,6 +6,7 @@ dynamically from loader.all_attributes_raw via _attr_slug_for_label().
 """
 
 import json
+import re
 from typing import List, Optional
 from models import Intent, ClassifiedResult, WooAPICall, ExtractedEntities
 from store_registry import get_store_loader
@@ -100,6 +101,55 @@ def _build_advanced_filter_call(
         description=description or "Advanced product filter",
         is_custom_api=True,
     )
+
+
+def match_variation_to_entities(variations: list, entities) -> Optional[dict]:
+    """
+    Given a list of WooCommerce variation dicts and extracted entities, return
+    the variation that best matches the user's requested attributes.
+
+    Scoring: +1 for each variation attribute whose name+option matches an
+    extracted entity attribute value. The variation with the highest score wins.
+    Ties broken by returning the first highest-scoring variation found.
+
+    Returns the best-matching variation dict, or None if no match scored > 0.
+
+    Usage (in chat.py or variant_handler.py after variations are fetched):
+        from api_builder import match_variation_to_entities
+        best = match_variation_to_entities(variations_list, entities)
+        if best:
+            price = best.get("price")
+
+    Example:
+        entities.attributes = {'finish': 'Silky', 'tile size': '3"x3"'}
+        variation attrs      = [{'name': 'Finish', 'option': 'Silky'},
+                                 {'name': 'Tile Size', 'option': '3"x3"'}]
+        → score 2 → this variation wins
+    """
+    if not variations or not entities.attributes:
+        return None
+
+    best_variation = None
+    best_score = 0
+
+    for variation in variations:
+        score = 0
+        for attr in variation.get("attributes", []):
+            attr_label = attr.get("name", "").lower().strip()
+            attr_option = attr.get("option", "").lower().strip()
+            for ent_label, ent_value in entities.attributes.items():
+                if ent_label.lower().strip() == attr_label:
+                    # Normalize both sides: strip quotes and extra spaces
+                    ent_clean = re.sub(r'[\"\'`]', '', ent_value).strip().lower()
+                    opt_clean = re.sub(r'[\"\'`]', '', attr_option).strip().lower()
+                    if ent_clean == opt_clean or ent_clean in opt_clean or opt_clean in ent_clean:
+                        score += 1
+                        break
+        if score > best_score:
+            best_score = score
+            best_variation = variation
+
+    return best_variation if best_score > 0 else None
 
 
 def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]:
@@ -555,21 +605,37 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         ))
 
     elif intent == Intent.SIZE_LIST:
-        # Dynamically find any "size" attribute — no hardcoded label needed.
-        l = _loader()
-        if l and l.all_attributes_raw:
-            for attr in l.all_attributes_raw:
-                if "size" in attr.get("attribute_label", "").lower():
-                    size_slug = attr.get("taxonomy")
-                    attr_id = _attr_id(size_slug) if size_slug else None
-                    if attr_id:
-                        calls.append(WooAPICall(
-                            method="GET",
-                            endpoint=f"{BASE}/products/attributes/{attr_id}/terms",
-                            params={"per_page": 100},
-                            description="List all available sizes",
-                        ))
-                    break
+        if e.product_id:
+            # Product-scoped: fetch this product's variations to extract its actual sizes.
+            # Much more useful than listing all global size terms in the store.
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/{e.product_id}",
+                params={},
+                description=f"Get parent product '{e.product_name}' for size list",
+            ))
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/{e.product_id}/variations",
+                params={"per_page": 100, "status": "publish"},
+                description=f"Get variations to extract available sizes for '{e.product_name}'",
+            ))
+        else:
+            # No specific product — fall back to global size terms
+            l = _loader()
+            if l and l.all_attributes_raw:
+                for attr in l.all_attributes_raw:
+                    if "size" in attr.get("attribute_label", "").lower():
+                        size_slug = attr.get("taxonomy")
+                        attr_id = _attr_id(size_slug) if size_slug else None
+                        if attr_id:
+                            calls.append(WooAPICall(
+                                method="GET",
+                                endpoint=f"{BASE}/products/attributes/{attr_id}/terms",
+                                params={"per_page": 100},
+                                description="List all available sizes",
+                            ))
+                        break
 
     # ═══════════════════════════════════════════
     # PRODUCT SUBTYPES

@@ -33,6 +33,15 @@ def classify(utterance: str) -> ClassifiedResult:
         attr_text = re.sub(
             rf'\b{re.escape(entities.category_name.lower())}\b', ' ', attr_text
         ).strip()
+
+    # Mask resolved product name tokens so they don't bleed into attribute extraction.
+    # e.g. "ALLSPICE Calacatta Oro" must not match pa_colors term "ALLSPICE Calacatta Oro".
+    if entities.product_name:
+        for _tok in re.split(r'[\s\-_/]+', entities.product_name.lower()):
+            _tok = _tok.strip()
+            if _tok and len(_tok) > 2:
+                attr_text = re.sub(rf'\b{re.escape(_tok)}\b', ' ', attr_text).strip()
+
     # Also mask product type terms and store-generic terms so they don't get picked
     # up as attribute values (e.g. pa_product-type: Mosaic) when the user is just
     # describing the product type they want.
@@ -184,7 +193,11 @@ def classify(utterance: str) -> ClassifiedResult:
         entities.on_sale = True
 
     # 3. SAMPLE REQUESTS
-    elif re.search(r"\bsample\b", text):
+    elif re.search(r"\bsample\b", text) and not (
+        entities.product_id and re.search(
+            r"\b(price|cost|how much|detail|info|specs?)\b", text
+        )
+    ):
         intent, confidence = Intent.SAMPLE_REQUEST, 0.90
 
     # 4b. PRODUCT VARIATIONS
@@ -247,7 +260,11 @@ def classify(utterance: str) -> ClassifiedResult:
         intent, confidence = Intent.FILTER_BY_ATTRIBUTE, 0.89
 
     # 9. SIZE LIST
-    elif re.search(r"\b(what|which)\b.*\bsizes?\b", text):
+    elif re.search(r"\b(what|which)\b.*\bsizes?\b", text) and not (
+        entities.product_id and re.search(
+            r"\b(price|cost|how much|detail|info|specs?)\b", text
+        )
+    ):
         intent, confidence = Intent.SIZE_LIST, 0.88
 
     # 10. COLLECTION YEAR
@@ -407,6 +424,19 @@ def _extract_attributes(text: str, entities: ExtractedEntities):
 
         # ── Special case: size attributes — try numeric pattern first ──
         if "size" in label:
+            # Size deduplication with explicit-label priority:
+            # If a size attribute already claimed the slot, only overwrite it if the
+            # user explicitly named THIS label (e.g. "sample size") in their message.
+            # This prevents the first size attribute in all_attributes_raw (e.g. "chip
+            # size") from blindly winning just because it iterates first.
+            existing_size_key = next((k for k in entities.attributes if "size" in k), None)
+            if existing_size_key:
+                user_named_this = re.search(rf'\b{re.escape(label)}\b', text)
+                if not user_named_this:
+                    continue  # another size already won and user didn't name this one
+                # User explicitly named this label — overwrite the previous winner
+                del entities.attributes[existing_size_key]
+
             size_match = re.search(r'(\d+)\s*"?\s*(?:x|by|×|X)\s*(\d+)', text)
             if size_match:
                 w, h = size_match.group(1), size_match.group(2)
@@ -420,7 +450,7 @@ def _extract_attributes(text: str, entities: ExtractedEntities):
                     entities.attribute_term_ids = term_ids
                     continue
 
-        # ── Special case: origin — resolve demonym synonyms first ──
+                # ── Special case: origin — resolve demonym synonyms first ──
         if "origin" in label:
             for keyword, normalized in ORIGIN_KEYWORDS.items():
                 if re.search(rf"\b{re.escape(keyword)}\b", text):
@@ -499,6 +529,11 @@ def _extract_thickness(text: str, entities: ExtractedEntities):
         match = re.search(pattern, text)
         if match and "thickness" not in entities.attributes:
             raw = match.group(1).strip()
+            # Guard: skip if matched token is part of a 2D size (NxM).
+            match_end = match.end()
+            tail = text[match_end:match_end + 6].strip()
+            if re.match(r'^"?\s*(?:x|by|×|X)\s*\d', tail):
+                continue
             entities.attributes["thickness"] = raw
             # find the taxonomy for thickness from live attributes
             if loader:

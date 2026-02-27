@@ -30,6 +30,7 @@ from handlers.chat_utils import (
     _STRIP_QUOTES_RE,
     _TOKENIZE_RE,
 )
+from api_builder import match_variation_to_entities
 
 from datetime import datetime, timezone
 
@@ -427,9 +428,28 @@ def handle_variation_product(
             entities.category_name = actual_cats
 
     has_attributes = bool(entities.attributes)
+    matched_variation = None  # best single-variation match for PRODUCT_DETAIL price lookups
+
     if variations_raw and has_attributes:
-        filtered_vars = _filter_variations_by_entities(variations_raw, entities)
-        variation_products = [format_variation(v, parent_product_raw) for v in filtered_vars]
+        # For PRODUCT_DETAIL: use match_variation_to_entities to find the single best
+        # variation matching the user's requested attributes (e.g. Finish=Silky, Size=3"x3").
+        # This surfaces the correct price instead of returning all 50+ variations.
+        if intent == Intent.PRODUCT_DETAIL:
+            matched_variation = match_variation_to_entities(variations_raw, entities)
+            if matched_variation:
+                logger.info(
+                    f"Step 3.7: Matched variation id={matched_variation.get('id')} | "
+                    f"price={matched_variation.get('price')} | "
+                    f"attrs={[a.get('option') for a in matched_variation.get('attributes', [])]}"
+                )
+                variation_products = [format_variation(matched_variation, parent_product_raw)]
+            else:
+                logger.info("Step 3.7: match_variation_to_entities found no match — falling back to filtered list")
+                filtered_vars = _filter_variations_by_entities(variations_raw, entities)
+                variation_products = [format_variation(v, parent_product_raw) for v in filtered_vars]
+        else:
+            filtered_vars = _filter_variations_by_entities(variations_raw, entities)
+            variation_products = [format_variation(v, parent_product_raw) for v in filtered_vars]
         products = [parent_formatted] + variation_products
     elif variations_raw:
         variation_products = [format_variation(v, parent_product_raw) for v in variations_raw]
@@ -454,6 +474,13 @@ def handle_variation_product(
         "variations_found": len(variations_raw),
         "variations_matched": len(products) - 1 if variations_raw else 0,
         "category_mismatch": bool(category_mismatch_msg),
+        # For PRODUCT_DETAIL: surface matched variation price so response_generator
+        # and frontend can display it directly without scanning the products list.
+        **({"matched_variation_price": (
+            matched_variation.get("sale_price")
+            or matched_variation.get("price")
+            or matched_variation.get("regular_price")
+        ), "matched_variation_id": matched_variation.get("id")} if matched_variation else {}),
     }
 
     if session_id and session_id in sessions:
