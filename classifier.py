@@ -31,17 +31,8 @@ def classify(utterance: str) -> ClassifiedResult:
     attr_text = text
     if entities.category_name:
         attr_text = re.sub(
-            rf'\b{re.escape(entities.category_name.lower())}\b', ' ', attr_text
+            rf'\b{re.escape(entities.category_name.lower())}s?\b', ' ', attr_text
         ).strip()
-
-    # Mask resolved product name tokens so they don't bleed into attribute extraction.
-    # e.g. "ALLSPICE Calacatta Oro" must not match pa_colors term "ALLSPICE Calacatta Oro".
-    if entities.product_name:
-        for _tok in re.split(r'[\s\-_/]+', entities.product_name.lower()):
-            _tok = _tok.strip()
-            if _tok and len(_tok) > 2:
-                attr_text = re.sub(rf'\b{re.escape(_tok)}\b', ' ', attr_text).strip()
-
     # Also mask product type terms and store-generic terms so they don't get picked
     # up as attribute values (e.g. pa_product-type: Mosaic) when the user is just
     # describing the product type they want.
@@ -193,11 +184,7 @@ def classify(utterance: str) -> ClassifiedResult:
         entities.on_sale = True
 
     # 3. SAMPLE REQUESTS
-    elif re.search(r"\bsample\b", text) and not (
-        entities.product_id and re.search(
-            r"\b(price|cost|how much|detail|info|specs?)\b", text
-        )
-    ):
+    elif re.search(r"\bsample\b", text):
         intent, confidence = Intent.SAMPLE_REQUEST, 0.90
 
     # 4b. PRODUCT VARIATIONS
@@ -230,12 +217,16 @@ def classify(utterance: str) -> ClassifiedResult:
     # If user also mentioned a specific product name, treat as product search
     # scoped to category — the category context is preserved in entities for
     # the response. e.g. "show me allspice in countertop" → PRODUCT_SEARCH
+    
+    
     elif entities.category_id is not None:
         if entities.product_name:
             intent, confidence = Intent.PRODUCT_SEARCH, 0.95
         elif entities.attributes:
             # category + attribute filter (e.g. "exterior tiles in 7/16 thick", "exterior pavers")
             # route to FILTER_BY_ATTRIBUTE with category scope, not plain CATEGORY_BROWSE
+            intent, confidence = Intent.FILTER_BY_ATTRIBUTE, 0.92
+        elif entities.tag_slugs:  # ← add this branch
             intent, confidence = Intent.FILTER_BY_ATTRIBUTE, 0.92
         else:
             intent, confidence = Intent.CATEGORY_BROWSE, 0.94
@@ -260,11 +251,7 @@ def classify(utterance: str) -> ClassifiedResult:
         intent, confidence = Intent.FILTER_BY_ATTRIBUTE, 0.89
 
     # 9. SIZE LIST
-    elif re.search(r"\b(what|which)\b.*\bsizes?\b", text) and not (
-        entities.product_id and re.search(
-            r"\b(price|cost|how much|detail|info|specs?)\b", text
-        )
-    ):
+    elif re.search(r"\b(what|which)\b.*\bsizes?\b", text):
         intent, confidence = Intent.SIZE_LIST, 0.88
 
     # 10. COLLECTION YEAR
@@ -424,19 +411,6 @@ def _extract_attributes(text: str, entities: ExtractedEntities):
 
         # ── Special case: size attributes — try numeric pattern first ──
         if "size" in label:
-            # Size deduplication with explicit-label priority:
-            # If a size attribute already claimed the slot, only overwrite it if the
-            # user explicitly named THIS label (e.g. "sample size") in their message.
-            # This prevents the first size attribute in all_attributes_raw (e.g. "chip
-            # size") from blindly winning just because it iterates first.
-            existing_size_key = next((k for k in entities.attributes if "size" in k), None)
-            if existing_size_key:
-                user_named_this = re.search(rf'\b{re.escape(label)}\b', text)
-                if not user_named_this:
-                    continue  # another size already won and user didn't name this one
-                # User explicitly named this label — overwrite the previous winner
-                del entities.attributes[existing_size_key]
-
             size_match = re.search(r'(\d+)\s*"?\s*(?:x|by|×|X)\s*(\d+)', text)
             if size_match:
                 w, h = size_match.group(1), size_match.group(2)
@@ -450,7 +424,7 @@ def _extract_attributes(text: str, entities: ExtractedEntities):
                     entities.attribute_term_ids = term_ids
                     continue
 
-                # ── Special case: origin — resolve demonym synonyms first ──
+        # ── Special case: origin — resolve demonym synonyms first ──
         if "origin" in label:
             for keyword, normalized in ORIGIN_KEYWORDS.items():
                 if re.search(rf"\b{re.escape(keyword)}\b", text):
@@ -497,8 +471,14 @@ def _extract_attributes(text: str, entities: ExtractedEntities):
                             if tag_entry.get("count", 0) == 0:
                                 continue
                             tag_tokens = _normalize_for_tag_compare(tag_name_lower)
-                            if (term_tokens < tag_tokens  # strict subset — term tokens ⊂ tag tokens
-                                    and re.search(rf"\b{re.escape(tag_name_lower)}\b", text)):
+                            # Also match singular form: tag "Gray Tones" suppresses
+                            # attribute term "Gray" even when user wrote "gray tone".
+                            tag_name_singular = tag_name_lower[:-1] if tag_name_lower.endswith("s") else None
+                            if (term_tokens < tag_tokens and (
+                                re.search(rf"\b{re.escape(tag_name_lower)}\b", text)
+                                or (tag_name_singular and len(tag_name_singular) > 3
+                                    and re.search(rf"\b{re.escape(tag_name_singular)}\b", text))
+                            )):
                                 covered_by_tag = True
                                 break
                     if covered_by_tag:
@@ -515,25 +495,40 @@ def _extract_thickness(text: str, entities: ExtractedEntities):
     """
     Thickness is handled by _extract_attributes via live attribute terms.
     This stub exists only as a fallback for numeric patterns not in term names.
+
+    Runs AFTER _extract_tag — skips any numeric thickness value that is already
+    represented by a matched tag slug (e.g. tag "7/16\" thick" → slug "7-16-thick").
+    This prevents double-filtering where the thickness is stored as a tag rather
+    than as a pa_thickness attribute term on some products.
     """
-    # Numeric patterns that may not appear verbatim in term names
     THICKNESS_PATTERNS = [
         r'(\d+(?:\.\d+)?\s*mm)',
         r'(\d+(?:\.\d+)?\s*cm)',
         r'(\d+/\d+\s*"?\s*(?:inch(?:es)?|in\.?|thick)?)',  # "7/16"", "3/8 inch"
         r'(\d+(?:\.\d+)?(?:\s*"|\s*inch(?:es)?|\s*in\.?))',  # decimal inches: 0.5", 1.25 inch
-
     ]
     loader = get_store_loader()
     for pattern in THICKNESS_PATTERNS:
         match = re.search(pattern, text)
         if match and "thickness" not in entities.attributes:
             raw = match.group(1).strip()
-            # Guard: skip if matched token is part of a 2D size (NxM).
-            match_end = match.end()
-            tail = text[match_end:match_end + 6].strip()
-            if re.match(r'^"?\s*(?:x|by|×|X)\s*\d', tail):
-                continue
+
+            # ── Tag-coverage guard ────────────────────────────────────────────
+            # If the numeric value extracted here is already captured by a tag
+            # slug (e.g. raw="7/16"" → digits="716", slug "7-16-thick" →
+            # normalised "716thick"), don't also add it as a pa_thickness filter.
+            # The tag is the canonical representation for this product; adding an
+            # attribute filter on top would exclude products that use the tag
+            # instead of the attribute term to express thickness.
+            raw_digits = re.sub(r'[^0-9]', '', raw)  # "7/16"" → "716", "3/8"" → "38"
+            already_a_tag = any(
+                raw_digits in re.sub(r'[^0-9]', '', slug)
+                for slug in entities.tag_slugs
+            )
+            if already_a_tag:
+                return
+            # ─────────────────────────────────────────────────────────────────
+
             entities.attributes["thickness"] = raw
             # find the taxonomy for thickness from live attributes
             if loader:
@@ -587,7 +582,7 @@ def _extract_time_range(text: str, entities: ExtractedEntities):
         elif unit == 'month':
             entities.date_after = (now - relativedelta(months=n)).strftime('%Y-%m-%dT00:00:00')
         elif unit == 'year':
-            entities.date_after = (now - relativedelta(years=n)).strftime('%Y-%m-%dT00:00:00')
+            entities.date_after = (now - relativedelta(years=1)).strftime('%Y-%m-%dT00:00:00')
         return
 
     # "past month" / "last month" (no number)
@@ -692,6 +687,15 @@ def _extract_tag(text: str, entities: ExtractedEntities):
                         matched = True
                 except re.error:
                     pass
+        # 4. Singular form: "white tone" matches tag "White Tones", "black tone" → "Black Tones"
+        # Strips trailing 's' from the tag name and tries again.
+        if not matched and name_lower.endswith("s") and len(name_lower) > 4:
+            singular = name_lower[:-1]
+            try:
+                if re.search(rf'\b{re.escape(singular)}\b', text):
+                    matched = True
+            except re.error:
+                pass
         if matched:
             candidates.append((tag, name_lower))
 
