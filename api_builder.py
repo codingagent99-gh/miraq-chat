@@ -399,13 +399,22 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
                 description=f"Attribute-scoped search: {e.attributes}",
             ))
         else:
-            calls.append(WooAPICall(
-                method="GET",
-                endpoint=f"{BASE}/products",
-                params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish",
-                        "search": e.product_name or e.search_term or ""},
-                description=f"Search products matching '{e.product_name or e.search_term}'",
-            ))
+            # If tag_slugs are set (e.g. resolved by LLM fallback from origin/demonym),
+            # route through the advanced filter endpoint so the tag is actually applied.
+            if e.tag_slugs:
+                calls.append(_build_advanced_filter_call(
+                    tags=list(e.tag_slugs),
+                    page=page,
+                    description=f"Tag-scoped product search (slugs: {', '.join(e.tag_slugs)})",
+                ))
+            else:
+                calls.append(WooAPICall(
+                    method="GET",
+                    endpoint=f"{BASE}/products",
+                    params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish",
+                            "search": e.product_name or e.search_term or ""},
+                    description=f"Search products matching '{e.product_name or e.search_term}'",
+                ))
 
     elif intent == Intent.PRODUCT_DETAIL:
         if e.product_id:
@@ -764,18 +773,27 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
     # ═══════════════════════════════════════════
 
     if not calls:
-        search = (
-            e.product_name
-            or e.search_term
-            or next(iter(e.attributes.values()), None)
-            or FALLBACK_SEARCH_TERM
-        )
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/products",
-            params={"search": search, "per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish"},
-            description=f"Fallback search: '{search}'",
-        ))
+        # If tag_slugs were resolved (e.g. by LLM fallback) but no branch above fired,
+        # still apply the tag filter rather than ignoring it entirely.
+        if e.tag_slugs:
+            calls.append(_build_advanced_filter_call(
+                tags=list(e.tag_slugs),
+                page=page,
+                description=f"Fallback tag search (slugs: {', '.join(e.tag_slugs)})",
+            ))
+        else:
+            search = (
+                e.product_name
+                or e.search_term
+                or next(iter(e.attributes.values()), None)
+                or FALLBACK_SEARCH_TERM
+            )
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products",
+                params={"search": search, "per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish"},
+                description=f"Fallback search: '{search}'",
+            ))
 
     result.api_calls = calls
     return calls

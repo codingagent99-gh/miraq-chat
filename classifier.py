@@ -33,6 +33,15 @@ def classify(utterance: str) -> ClassifiedResult:
         attr_text = re.sub(
             rf'\b{re.escape(entities.category_name.lower())}s?\b', ' ', attr_text
         ).strip()
+    # Also mask each token of the resolved product_name so that words inside a
+    # series/product name (e.g. "Marbles" in "Titan Marbles Series") are not
+    # falsely extracted as attribute values (e.g. pa_visual: Marble).
+    # Each word is masked individually (with optional trailing 's') so partial
+    # token matches like "marble" → "marbles" are also suppressed.
+    if entities.product_name:
+        for _token in entities.product_name.lower().split():
+            if len(_token) >= 3:
+                attr_text = re.sub(rf'\b{re.escape(_token)}s?\b', ' ', attr_text).strip()
     # Also mask product type terms and store-generic terms so they don't get picked
     # up as attribute values (e.g. pa_product-type: Mosaic) when the user is just
     # describing the product type they want.

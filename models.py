@@ -75,6 +75,28 @@ class Intent(Enum):
 
 
 @dataclass
+class AmbiguousFilter:
+    """
+    Represents a filter term that exists in BOTH a tag and an attribute,
+    making it ambiguous which the user intended.
+
+    e.g. "matte finish" matches:
+      - tag slug "matte-finish"  (editorial/curated label)
+      - pa_finish attribute term "Matte"  (structured product spec)
+
+    The classifier stores this instead of silently picking one, so the
+    response layer can ask the user to clarify before querying the API.
+    """
+    attribute_label: str        # e.g. "finish"
+    attribute_term: str         # e.g. "Matte"
+    attribute_slug: str         # e.g. "pa_finish"
+    attribute_term_id: int      # WooCommerce term ID
+    conflicting_tag_slug: str   # e.g. "matte-finish"
+    conflicting_tag_id: int     # WooCommerce tag ID
+    user_phrase: str            # the phrase in the user's text that triggered this
+
+
+@dataclass
 class ExtractedEntities:
     # Product identification
     product_name: Optional[str] = None
@@ -128,6 +150,13 @@ class ExtractedEntities:
     # ──── Time range fields (used by ORDER_HISTORY) ────
     date_after: Optional[str] = None           # ISO datetime string e.g. "2026-01-01T00:00:00"
     date_before: Optional[str] = None          # ISO datetime string (reserved for future use)
+
+    # ──── Ambiguous filter conflicts ────
+    # Populated when a user phrase matches BOTH a tag and an attribute term.
+    # e.g. "matte finish" → tag "matte-finish" AND pa_finish="Matte".
+    # When non-empty, the response layer should ask the user to clarify
+    # before building the API call, rather than silently picking one.
+    ambiguous_filters: List = field(default_factory=list)  # List[AmbiguousFilter]
 
 
 @dataclass
