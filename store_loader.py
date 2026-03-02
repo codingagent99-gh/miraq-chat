@@ -386,15 +386,27 @@ class StoreLoader:
         # Full name: "Wall/Floor" → "wall/floor"
         _register(name, cat_id)
 
-        # Split by spaces, hyphens, slashes, underscores
+        # Split by spaces, hyphens, slashes, underscores.
         stop_words = {
             "the", "a", "an", "and", "or", "of", "for",
             "in", "on", "to", "is", "all", "our", "new",
         } | self._store_generic_terms
         words = re.split(r'[\s\-_/&]+', name)
-        for word in words:
-            word = word.strip().lower()
-            if word and word not in stop_words and len(word) > 2:
+
+        # Only register individual words for single-word category names.
+        # Compound/slash categories (e.g. "Wall/Floor", "Tile Floor") must NOT
+        # register their individual words — those belong to their own standalone
+        # categories. "floor" must map to Floor, not Wall/Floor.
+        # Single-word is determined by raw word count BEFORE stop-word stripping.
+        raw_words = [w for w in words if w.strip()]
+        meaningful_words = [
+            w for w in raw_words
+            if w not in stop_words and len(w) > 2
+        ]
+        is_single_word_category = len(raw_words) <= 1
+
+        if is_single_word_category:
+            for word in meaningful_words:
                 _register(word, cat_id)
                 # Also register singular form so "mosaic" → Mosaics, "panel" → Panels,
                 # "paver" → Pavers. The classifier's masking already uses an 's?' regex
@@ -414,11 +426,13 @@ class StoreLoader:
                 _register(alt_name, cat_id)
 
         # Add "[category name] + [generic term]" combos
+        # e.g. Floor → "floor tile", "floor tiles"
+        # Only single-word categories get individual word+suffix combos.
+        # Compound categories only get full-name+suffix (e.g. "wall/floor tile").
         for suffix in self._store_generic_terms:
             _register(f"{name} {suffix}", cat_id)
-            for word in words:
-                word = word.strip().lower()
-                if word and word not in stop_words and len(word) > 2:
+            if is_single_word_category:
+                for word in meaningful_words:
                     _register(f"{word} {suffix}", cat_id)
 
     # ─────────────────────────────────────────────
