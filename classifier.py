@@ -25,20 +25,46 @@ def classify(utterance: str) -> ClassifiedResult:
     _extract_product_name(text, entities)
     _extract_category(text, entities)      # extract BEFORE attributes so we can mask it
 
-    # Build a scrubbed version of the text with the resolved category name removed.
-    # Prevents category words (e.g. "countertop") from being falsely matched as
-    # attribute terms (e.g. pa_application value "Countertop") by _extract_attributes.
+    # Build a scrubbed version of the text with ALL resolved category names removed.
+    # Prevents category words from being falsely matched as attribute terms by _extract_attributes.
+    #
+    # IMPORTANT: The s? suffix must be appended to the BASE form (singular), not the full
+    # stored name. e.g. category "Mosaics" → base "mosaic" → pattern \bmosaics?\b which
+    # correctly matches both "mosaic" and "mosaics". Without this normalization the pattern
+    # becomes \bmosaicss?\b which only matches "mosaics"/"mosaicss", missing "mosaic".
+    def _cat_pattern(name_lower: str) -> str:
+        base = name_lower[:-1] if name_lower.endswith("s") and len(name_lower) > 3 else name_lower
+        return rf'\b{re.escape(base)}s?\b'
+
     attr_text = text
+    _all_cat_names = []
     if entities.category_name:
-        attr_text = re.sub(
-            rf'\b{re.escape(entities.category_name.lower())}s?\b', ' ', attr_text
-        ).strip()
+        _all_cat_names.append(entities.category_name.lower())
+    _loader_for_mask = get_store_loader()
+    if entities.extra_category_ids and _loader_for_mask:
+        for _cid in entities.extra_category_ids:
+            _cat = _loader_for_mask.category_by_id.get(_cid)
+            if _cat:
+                _all_cat_names.append(_cat["name"].lower())
+    for _cat_name in _all_cat_names:
+        attr_text = re.sub(_cat_pattern(_cat_name), ' ', attr_text).strip()
+
+    # Mask each token of the resolved product_name so words inside a product/series
+    # name (e.g. "Marbles" in "Titan Marbles Series") aren't extracted as attribute
+    # values. Also applies the same base-form normalization: "marbles" → base "marble"
+    # → pattern \bmarbles?\b so both "marble" and "marbles" are stripped.
+    if entities.product_name:
+        for _token in entities.product_name.lower().split():
+            if len(_token) >= 3:
+                _base = _token[:-1] if _token.endswith("s") and len(_token) > 3 else _token
+                attr_text = re.sub(rf'\b{re.escape(_base)}s?\b', ' ', attr_text).strip()
+
     # Also mask product type terms and store-generic terms so they don't get picked
     # up as attribute values (e.g. pa_product-type: Mosaic) when the user is just
     # describing the product type they want.
     # PRODUCT_TYPE_TERMS covers configured fallback terms (e.g. "tile", "tiles").
     # loader._store_generic_terms covers words auto-derived from category name
-    # frequency (e.g. "mosaic" from Mosaics/Tile Floor Mosaics) — no hardcoding needed.
+    # frequency — no hardcoding needed.
     _loader = get_store_loader()
     _type_mask_terms = set(pt.lower() for pt in PRODUCT_TYPE_TERMS)
     if _loader:
