@@ -54,6 +54,10 @@ _INTENT_MAPPING = {
     "clearance":         Intent.CLEARANCE_PRODUCTS,
     "greeting":          Intent.GREETING,
     "product_attribute_info": Intent.PRODUCT_ATTRIBUTE_INFO,
+    # Origin intents — LLM may return these for "products from Italy / made in X" queries
+    "product_by_origin": Intent.PRODUCT_BY_ORIGIN,
+    "filter_by_origin":  Intent.PRODUCT_BY_ORIGIN,
+    "origin":            Intent.PRODUCT_BY_ORIGIN,
 }
 
 

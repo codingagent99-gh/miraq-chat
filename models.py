@@ -107,6 +107,10 @@ class ExtractedEntities:
     category_id: Optional[int] = None
     category_name: Optional[str] = None
     category_slug: Optional[str] = None
+    # Additional category IDs when the user mentions multiple categories
+    # (e.g. "exterior pavers" → primary=Pavers, extra=[Exterior]).
+    # Used by api_builder to AND-filter across all matched categories.
+    extra_category_ids: List[int] = field(default_factory=list)
 
     # ──── Dynamic attribute matches ────
     # Keyed by attribute_label.lower() from the store's live attribute list.

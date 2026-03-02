@@ -773,8 +773,8 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
     # ═══════════════════════════════════════════
 
     if not calls:
-        # If tag_slugs were resolved (e.g. by LLM fallback) but no branch above fired,
-        # still apply the tag filter rather than ignoring it entirely.
+        # If tag_slugs were resolved (e.g. by LLM fallback for origin queries)
+        # but no intent branch fired, still apply the tag filter.
         if e.tag_slugs:
             calls.append(_build_advanced_filter_call(
                 tags=list(e.tag_slugs),

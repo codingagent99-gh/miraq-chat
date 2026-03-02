@@ -33,15 +33,6 @@ def classify(utterance: str) -> ClassifiedResult:
         attr_text = re.sub(
             rf'\b{re.escape(entities.category_name.lower())}s?\b', ' ', attr_text
         ).strip()
-    # Also mask each token of the resolved product_name so that words inside a
-    # series/product name (e.g. "Marbles" in "Titan Marbles Series") are not
-    # falsely extracted as attribute values (e.g. pa_visual: Marble).
-    # Each word is masked individually (with optional trailing 's') so partial
-    # token matches like "marble" → "marbles" are also suppressed.
-    if entities.product_name:
-        for _token in entities.product_name.lower().split():
-            if len(_token) >= 3:
-                attr_text = re.sub(rf'\b{re.escape(_token)}s?\b', ' ', attr_text).strip()
     # Also mask product type terms and store-generic terms so they don't get picked
     # up as attribute values (e.g. pa_product-type: Mosaic) when the user is just
     # describing the product type they want.
@@ -643,6 +634,12 @@ def _extract_tag(text: str, entities: ExtractedEntities):
     Collects all matches first, then deduplicates: drops any tag whose token
     set is a strict subset of another matched tag's tokens.
     e.g. "mosaic" {mosaic} ⊂ "mosaic look" {mosaic, look} → "mosaic" dropped.
+
+    Priority: Category > Tag.
+    A tag whose full name exactly matches the resolved category base word is
+    suppressed — it adds no information and would create a conflicting AND-filter.
+    e.g. tag "Mosaic" is suppressed when category_name="Mosaics".
+    Compound tags like "Adams Mosaic" are NOT affected — only exact full-name matches.
     """
     loader = get_store_loader()
     if not loader:
@@ -656,6 +653,23 @@ def _extract_tag(text: str, entities: ExtractedEntities):
         if v
     ]
 
+    # Build set of category base words to suppress exact-match tags.
+    # "Mosaics" → "mosaic", "Panels" → "panel", "Wall" → "wall"
+    # Only suppresses tags whose FULL name matches — compound tags are safe.
+    _cat_base_words = set()
+    _all_cat_names = []
+    if entities.category_name:
+        _all_cat_names.append(entities.category_name.lower())
+    if entities.extra_category_ids:
+        for _cid in entities.extra_category_ids:
+            _cat = loader.category_by_id.get(_cid)
+            if _cat:
+                _all_cat_names.append(_cat["name"].lower())
+    for _cname in _all_cat_names:
+        _cat_base_words.add(_cname)
+        if _cname.endswith("s") and len(_cname) > 3:
+            _cat_base_words.add(_cname[:-1])
+
     # Pass 1: collect all candidates
     candidates = []  # list of (tag dict, name_lower)
     for name_lower, tag in loader.tag_by_name_lower.items():
@@ -664,6 +678,12 @@ def _extract_tag(text: str, entities: ExtractedEntities):
         if tag.get("count", 0) == 0:
             continue
         if len(name_lower) < 4:
+            continue
+
+        # Category > Tag: suppress tag whose full name is just a category word.
+        # e.g. tag "Mosaic" suppressed when category is "Mosaics".
+        # Compound tags like "Adams Mosaic" are unaffected.
+        if name_lower in _cat_base_words:
             continue
 
         # Suppress if tokens fully covered by a resolved attribute value
@@ -697,11 +717,21 @@ def _extract_tag(text: str, entities: ExtractedEntities):
                 except re.error:
                     pass
         # 4. Singular form: "white tone" matches tag "White Tones", "black tone" → "Black Tones"
-        # Strips trailing 's' from the tag name and tries again.
         if not matched and name_lower.endswith("s") and len(name_lower) > 4:
             singular = name_lower[:-1]
             try:
                 if re.search(rf'\b{re.escape(singular)}\b', text):
+                    matched = True
+            except re.error:
+                pass
+        # 5. Plural-tolerant word match: each word in the tag name may have a trailing 's'
+        # in user text. e.g. tag "Wilde Mosaic" matches "wilde mosaics" or "wildes mosaic".
+        # Builds pattern: \bwildes?\b\s+\bmosaics?\b — works for any multi-word tag.
+        if not matched and " " in name_lower:
+            words = name_lower.split()
+            pattern = r'\s+'.join(rf'\b{re.escape(w)}s?\b' for w in words)
+            try:
+                if re.search(pattern, text):
                     matched = True
             except re.error:
                 pass
