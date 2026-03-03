@@ -40,17 +40,44 @@ app.register_blueprint(chat_bp)
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Health check endpoint."""
+    """
+    Lightweight liveness check.
+    Returns 200 OK if the server is running, 503 if store is degraded.
+    Use /status for full detail.
+    """
     loader = get_store_loader()
+    degraded = loader._degraded if loader else True
+    status_code = 503 if degraded else 200
     return jsonify({
-        "status": "ok",
+        "status": "degraded" if degraded else "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "store": {
-            "categories_loaded": len(loader.categories) if loader else 0,
-            "tags_loaded": len(loader.tags) if loader else 0,
-            "attributes_loaded": len(loader.attributes) if loader else 0,
-        },
-    })
+        "degraded": degraded,
+        "degraded_reasons": loader._degraded_reasons if loader else ["store not initialised"],
+    }), status_code
+
+
+@app.route("/status", methods=["GET"])
+def status():
+    """
+    Detailed store status endpoint.
+    Returns full load state, per-resource counts, degraded flag, and next retry timing.
+    Use this for monitoring dashboards or manual diagnosis.
+    """
+    loader = get_store_loader()
+    if not loader:
+        return jsonify({
+            "status": "unavailable",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "store": None,
+        }), 503
+
+    store_status = loader.get_status()
+    http_code = 503 if store_status["degraded"] else 200
+    return jsonify({
+        "status": "degraded" if store_status["degraded"] else "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "store": store_status,
+    }), http_code
 
 
 @app.route("/categories", methods=["GET"])
@@ -117,6 +144,7 @@ if __name__ == "__main__":
     print(f"🚀 Starting server on http://localhost:{PORT}")
     print(f"   POST http://localhost:{PORT}/chat")
     print(f"   GET  http://localhost:{PORT}/health")
+    print(f"   GET  http://localhost:{PORT}/status")
     print(f"   GET  http://localhost:{PORT}/categories")
     print()
 

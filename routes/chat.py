@@ -98,6 +98,131 @@ def chat():
         })
         touch_session(session_id)
 
+    # ─── Step 0.5: Suggestion retry intercept ───
+    # When the user taps a filter_suggestion chip, the frontend sends the suggestion
+    # params back as `suggestion_retry`. We bypass the classifier entirely and build
+    # ExtractedEntities directly from the suggestion, then jump to Step 2.
+    _suggestion_retry = body.get("suggestion_retry")
+    if _suggestion_retry:
+        from models import ExtractedEntities, ClassifiedResult
+        from store_registry import get_store_loader as _get_loader
+
+        _sr_label = _suggestion_retry.get("label", "suggestion retry")
+        logger.info(
+            f"Step 0.5: Suggestion retry | session={session_id} | label={_sr_label!r} | "
+            f"tag_slugs={_suggestion_retry.get('tag_slugs')} | "
+            f"category_slug={_suggestion_retry.get('category_slug')!r}"
+        )
+
+        _loader = _get_loader()
+        _sr_entities = ExtractedEntities()
+
+        # Resolve category slug -> name + id
+        _cat_slug = _suggestion_retry.get("category_slug", "")
+        if _cat_slug and _loader:
+            _cat_entry = _loader.category_by_slug.get(_cat_slug)
+            if _cat_entry:
+                _sr_entities.category_name = _cat_entry["name"]
+                _sr_entities.category_id = _cat_entry["id"]
+
+        # Resolve extra category slugs -> extra_category_ids
+        for _extra_slug in (_suggestion_retry.get("extra_category_slugs") or []):
+            if _loader:
+                _extra_entry = _loader.category_by_slug.get(_extra_slug)
+                if _extra_entry:
+                    _sr_entities.extra_category_ids.append(_extra_entry["id"])
+
+        # Tag slugs -> tag_slugs + tag_ids
+        for _tslug in (_suggestion_retry.get("tag_slugs") or []):
+            _sr_entities.tag_slugs.append(_tslug)
+            if _loader:
+                _tid = _loader.get_tag_id_by_slug(_tslug)
+                if _tid:
+                    _sr_entities.tag_ids.append(_tid)
+
+        # Attributes
+        _sr_entities.attributes = dict(_suggestion_retry.get("attributes") or {})
+
+        _sr_intent = Intent.FILTER_BY_ATTRIBUTE
+        _sr_confidence = 1.0
+        _sr_result = ClassifiedResult(
+            intent=_sr_intent,
+            entities=_sr_entities,
+            confidence=_sr_confidence,
+        )
+
+        # Jump straight to Step 2 - build API calls from suggestion entities
+        _sr_api_calls = build_api_calls(_sr_result, page)
+        _sr_endpoint_summary = [f"{c.method} {c.endpoint.split('/')[-1]}" for c in _sr_api_calls]
+        logger.info(
+            f"Step 0.5: Built {len(_sr_api_calls)} API call(s) | "
+            f"endpoints={_sr_endpoint_summary}"
+        )
+
+        _sr_customer_id = user_context.get("customer_id")
+        if _sr_customer_id:
+            _resolve_user_placeholders(_sr_api_calls, _sr_customer_id)
+
+        _sr_responses = woo_client.execute_all(_sr_api_calls)
+        _sr_products_raw = []
+        for _r in _sr_responses:
+            if _r.get("success"):
+                _d = _r.get("data")
+                if isinstance(_d, dict) and "products" in _d:
+                    _sr_products_raw.extend(_d["products"])
+                elif isinstance(_d, list):
+                    _sr_products_raw.extend(_d)
+                elif isinstance(_d, dict):
+                    _sr_products_raw.append(_d)
+
+        logger.info(f"Step 0.5: Suggestion retry returned {len(_sr_products_raw)} products")
+
+        _sr_formatted = []
+        for _p in _sr_products_raw:
+            if _p.get("parent_id"):
+                continue
+            if "featured_image" in _p:
+                _sr_formatted.append(format_custom_product(_p))
+            else:
+                _sr_formatted.append(format_product(_p))
+        _sr_formatted = [p for p in _sr_formatted if p.get("name")]
+
+        _sr_bot_message = (
+            f"Here are results for **{_sr_label}**:"
+            if _sr_formatted
+            else f"No products found for **{_sr_label}** either. Try a different filter."
+        )
+        _sr_pagination = build_pagination(page, _sr_responses, _sr_api_calls)
+        elapsed = time.time() - start_time
+
+        if session_id and session_id in sessions:
+            sessions[session_id]["history"].append({
+                "role": "bot",
+                "message": _sr_bot_message,
+                "intent": "suggestion_retry",
+                "products_count": len(_sr_formatted),
+            })
+
+        return jsonify({
+            "success": True,
+            "bot_message": _sr_bot_message,
+            "intent": "filter",
+            "products": _sr_formatted,
+            "suggestions": [],
+            "filter_suggestions": [],
+            "session_id": session_id,
+            "metadata": {
+                "confidence": 1.0,
+                "products_count": len(_sr_formatted),
+                "provider": CLASSIFIER_PROVIDER_TAG,
+                "response_time_ms": round(elapsed * 1000),
+                "intent_raw": "suggestion_retry",
+                "suggestion_label": _sr_label,
+            },
+            "pagination": _sr_pagination,
+            "flow_state": FlowState.IDLE.value,
+        }), 200
+
     # ─── Step 0: Check conversation flow state ───
     flow_state_str = user_context.get("flow_state", "idle")
     try:

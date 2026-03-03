@@ -75,7 +75,10 @@ class StoreLoader:
         self._lock = threading.Lock()
         self._last_loaded: Optional[float] = None
         self._refresh_interval: int = 6 * 3600
+        self._retry_interval: int = 2 * 60   # 2 min retry when degraded
         self._refresh_thread: Optional[threading.Thread] = None
+        self._degraded: bool = False          # True when critical data failed to load
+        self._degraded_reasons: list = []     # Human-readable list of what's missing
 
     def load_all(self):
         """Fetch all taxonomy data from WooCommerce."""
@@ -88,7 +91,7 @@ class StoreLoader:
             return
 
         self.categories = self._fetch_all_pages(f"{self.base}/products/categories")
-        print(f"   ✅ Loaded {len(self.categories)} categories")
+        print(f"   {'✅' if self.categories else '⚠️ '} Loaded {len(self.categories)} categories")
 
         self.tags = self._fetch_all_pages(f"{self.base}/products/tags")
         print(f"   ✅ Loaded {len(self.tags)} tags")
@@ -108,7 +111,7 @@ class StoreLoader:
             f"{self.base}/products",
             extra_params={"status": "publish"},
         )
-        print(f"   ✅ Loaded {len(self.products)} products")
+        print(f"   {'✅' if self.products else '⚠️ '} Loaded {len(self.products)} products")
 
         custom_api_base = os.getenv(
             "CUSTOM_API_BASE_URL",
@@ -125,6 +128,7 @@ class StoreLoader:
 
         self._build_lookups()
         self._last_loaded = time.time()
+        self._validate_load()
 
         print(f"\n📊 Store Data Summary:")
         print(f"   Categories:   {len(self.categories)}")
@@ -132,24 +136,75 @@ class StoreLoader:
         print(f"   Attributes:   {len(self.attributes)}")
         print(f"   Products:     {len(self.products)}")
         print(f"   Cat Keywords: {len(self.category_keywords)}")
-        print(f"   Ready! ✅\n")
+        if self._degraded:
+            print(f"   ⚠️  DEGRADED — {', '.join(self._degraded_reasons)}")
+            print(f"   🔁 Will auto-retry in {self._retry_interval // 60} min\n")
+        else:
+            print(f"   Ready! ✅\n")
+
+    def _validate_load(self):
+        """
+        Check whether critical data loaded successfully.
+        Sets self._degraded = True and populates self._degraded_reasons
+        if any critical resource is missing.
+
+        Critical resources:
+          - categories: without these, no category detection works at all
+          - products:   without these, product name matching is broken
+          - cat keywords: derived from categories; 0 means category matching is broken
+
+        Tags and attributes are non-critical — missing tags/attributes degrade
+        suggestions and filtering but do not break the core query flow.
+        """
+        reasons = []
+        if len(self.categories) == 0:
+            reasons.append("0 categories (likely 503/maintenance during fetch)")
+        if len(self.products) == 0:
+            reasons.append("0 products")
+        if len(self.category_keywords) == 0:
+            reasons.append("0 category keywords generated")
+
+        self._degraded = len(reasons) > 0
+        self._degraded_reasons = reasons
 
     def start_background_refresh(self):
-        """Start a background thread that reloads store data every 6 hours."""
+        """
+        Start a background thread that keeps store data fresh.
+
+        Normal mode:  refreshes every 6 hours.
+        Degraded mode: retries every 2 minutes until data loads fully,
+                       then switches to the normal 6-hour cadence.
+        """
         if self._refresh_thread and self._refresh_thread.is_alive():
             return
+
         def _refresh_loop():
             while True:
-                time.sleep(self._refresh_interval)
-                print("🔄 Background refresh: reloading store data...")
+                if self._degraded:
+                    interval = self._retry_interval
+                    print(f"⚠️  Store is DEGRADED ({', '.join(self._degraded_reasons)}). "
+                          f"Retrying in {interval // 60} min...")
+                else:
+                    interval = self._refresh_interval
+                time.sleep(interval)
+
+                label = "🔁 Degraded load retry" if self._degraded else "🔄 Background refresh"
+                print(f"{label}: reloading store data...")
                 try:
                     self.load_all()
-                    print("🔄 Background refresh: complete.")
+                    if not self._degraded:
+                        print(f"{label}: complete. ✅")
+                    else:
+                        print(f"{label}: still degraded — {', '.join(self._degraded_reasons)}")
                 except Exception as e:
-                    print(f"🔄 Background refresh failed: {e}")
+                    print(f"{label} failed: {e}")
+
         self._refresh_thread = threading.Thread(target=_refresh_loop, daemon=True)
         self._refresh_thread.start()
-        print(f"⏰ Background refresh scheduled every {self._refresh_interval // 3600}h")
+        if self._degraded:
+            print(f"⚠️  Starting in DEGRADED mode — auto-retry every {self._retry_interval // 60} min")
+        else:
+            print(f"⏰ Background refresh scheduled every {self._refresh_interval // 3600}h")
 
     def _fetch_all_pages(self, url: str, extra_params: Dict = None) -> List[Dict]:
         """Fetch all pages using browser UA + query-string auth."""
@@ -383,7 +438,8 @@ class StoreLoader:
                 if cat_count < existing_count:   # lower count = more specific → wins
                     self.category_keywords[kw] = cid
 
-        # Full name: "Wall/Floor" → "wall/floor"
+        # Full name always registered — this covers single-word categories like "Tile"
+        # even though "tile" is in _store_generic_terms.
         _register(name, cat_id)
 
         # Split by spaces, hyphens, slashes, underscores.
@@ -393,26 +449,24 @@ class StoreLoader:
         } | self._store_generic_terms
         words = re.split(r'[\s\-_/&]+', name)
 
-        # Only register individual words for single-word category names.
+        # Only register individual words for truly single-word category names.
         # Compound/slash categories (e.g. "Wall/Floor", "Tile Floor") must NOT
         # register their individual words — those belong to their own standalone
-        # categories. "floor" must map to Floor, not Wall/Floor.
-        # Single-word is determined by raw word count BEFORE stop-word stripping.
+        # single-word categories. "floor" must map to Floor, not Wall/Floor.
+        # Single-word is determined by RAW word count before any stop-word stripping,
+        # so generic-term categories like "Tile" (1 raw word) still register correctly.
         raw_words = [w for w in words if w.strip()]
-        meaningful_words = [
-            w for w in raw_words
-            if w not in stop_words and len(w) > 2
-        ]
         is_single_word_category = len(raw_words) <= 1
 
         if is_single_word_category:
-            for word in meaningful_words:
-                _register(word, cat_id)
-                # Also register singular form so "mosaic" → Mosaics, "panel" → Panels,
-                # "paver" → Pavers. The classifier's masking already uses an 's?' regex
-                # so once the category is matched, both forms are stripped from attr_text.
-                if word.endswith("s") and len(word) > 3:
-                    _register(word[:-1], cat_id)
+            for word in raw_words:
+                if len(word) > 2:
+                    _register(word, cat_id)
+                    # Register both plural and singular so "tiles"→Tile, "mosaic"→Mosaics etc.
+                    if word.endswith("s") and len(word) > 3:
+                        _register(word[:-1], cat_id)
+                    else:
+                        _register(word + "s", cat_id)
 
         # Slug as words: "wall-floor" → "wall floor"
         slug_words = slug.replace("-", " ")
@@ -425,15 +479,15 @@ class StoreLoader:
                 alt_name = name.replace(original, variant)
                 _register(alt_name, cat_id)
 
-        # Add "[category name] + [generic term]" combos
-        # e.g. Floor → "floor tile", "floor tiles"
-        # Only single-word categories get individual word+suffix combos.
+        # Add "[category name] + [generic term]" combos.
+        # Only single-word categories get individual word+suffix combos (e.g. "floor tile").
         # Compound categories only get full-name+suffix (e.g. "wall/floor tile").
         for suffix in self._store_generic_terms:
             _register(f"{name} {suffix}", cat_id)
             if is_single_word_category:
-                for word in meaningful_words:
-                    _register(f"{word} {suffix}", cat_id)
+                for word in raw_words:
+                    if len(word) > 2:
+                        _register(f"{word} {suffix}", cat_id)
 
     # ─────────────────────────────────────────────
     # QUERY METHODS
@@ -641,6 +695,113 @@ class StoreLoader:
 
         return exact if exact else partial
 
+
+    def get_similar_tags(self, slug: str, limit: int = 3) -> List[Dict]:
+        """
+        Find tags whose slug is similar to the given slug.
+        Used for filter suggestions when a tag returns 0 results.
+
+        Matching strategy (priority order):
+        1. Prefix match: failed slug is a prefix of the candidate
+           e.g. "wilde" -> "wilde-mosaic", "wilde-series"
+        2. Word overlap: candidate shares at least one hyphen-word with failed slug
+           e.g. "gray-tone" -> "gray-tones", "dark-gray-tones"
+
+        Returns tags sorted by score DESC. Excludes the failed slug and count=0 tags.
+        """
+        needle_words = set(slug.split("-")) - {""}
+        candidates = []
+
+        for tag_slug, tag in self.tag_by_slug.items():
+            if tag_slug == slug:
+                continue
+            if tag.get("count", 0) == 0:
+                continue
+            tag_words = set(tag_slug.split("-")) - {""}
+            score = 0
+            if tag_slug.startswith(slug + "-") or tag_slug == slug:
+                score = 100 + tag.get("count", 0)
+            elif needle_words and needle_words & tag_words:
+                overlap = len(needle_words & tag_words) / max(len(needle_words), 1)
+                score = int(overlap * 50) + tag.get("count", 0)
+            if score > 0:
+                candidates.append((score, tag))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return [t for _, t in candidates[:limit]]
+
+    def get_related_categories(self, cat_id: int, limit: int = 3) -> List[Dict]:
+        """
+        Find categories related to the given category.
+        Used for filter suggestions when a category + filter combo returns 0 results.
+
+        Strategy:
+        1. Compound/slash categories (e.g. Wall/Floor) -> return component single-word
+           categories (Floor, Wall) which are more likely to have results with filters.
+        2. Siblings (same parent) sorted by product count DESC.
+
+        Excludes original category and count=0 categories.
+        """
+        cat = self.category_by_id.get(cat_id)
+        if not cat:
+            return []
+
+        results = []
+        seen_ids = {cat_id}
+
+        # Strategy 1: compound category -> component single-word categories
+        name = cat["name"].lower()
+        raw_words = [w for w in re.split(r"[\s\-_/&]+", name) if w.strip()]
+        if len(raw_words) > 1:
+            for word in raw_words:
+                matched_id = self.category_keywords.get(word)
+                if matched_id and matched_id not in seen_ids:
+                    matched_cat = self.category_by_id.get(matched_id)
+                    if matched_cat and matched_cat.get("count", 0) > 0:
+                        results.append(matched_cat)
+                        seen_ids.add(matched_id)
+
+        # Strategy 2: siblings (same parent)
+        parent_id = cat.get("parent", 0)
+        siblings = [
+            c for c in self.categories
+            if c.get("parent", 0) == parent_id
+            and c["id"] not in seen_ids
+            and c.get("slug") != "uncategorized"
+            and c.get("count", 0) > 0
+        ]
+        siblings.sort(key=lambda x: x.get("count", 0), reverse=True)
+        for sibling in siblings:
+            if len(results) >= limit:
+                break
+            results.append(sibling)
+            seen_ids.add(sibling["id"])
+
+        return results[:limit]
+
+    def get_sibling_attribute_terms(
+        self, attr_slug: str, failed_term: str, limit: int = 3
+    ) -> List[str]:
+        """
+        Return other term names for the same attribute, excluding the failed term.
+        Used for filter suggestions when an attribute value returns 0 results.
+
+        e.g. attr_slug="pa_finish", failed_term="Matte" -> ["Polished", "Brushed", "Honed"]
+        Returns term names sorted by count DESC, count=0 terms excluded.
+        """
+        attr = self.attribute_by_slug.get(attr_slug)
+        if not attr:
+            return []
+        terms = self.attribute_terms.get(attr["id"], [])
+        failed_lower = failed_term.lower().strip()
+        candidates = [
+            t for t in terms
+            if t.get("name", "").lower().strip() != failed_lower
+            and t.get("count", 0) > 0
+        ]
+        candidates.sort(key=lambda x: x.get("count", 0), reverse=True)
+        return [t["name"] for t in candidates[:limit]]
+
     def get_quick_ship_tag_id(self) -> Optional[int]:
         """Convenience: return the Quick Ship tag ID."""
         return self.get_tag_id_by_slug(TAG_SLUG_QUICK_SHIP)
@@ -650,8 +811,41 @@ class StoreLoader:
         return self.get_tag_id_by_slug(TAG_SLUG_CHIP_CARD)
 
     def is_ready(self) -> bool:
-        """True if store data has been loaded at least once."""
+        """True if store data has been loaded at least once (even if degraded)."""
         return self._last_loaded is not None
+
+    def get_status(self) -> dict:
+        """
+        Return a structured status dict for the /status health endpoint.
+        Exposes load state, degraded flag, and per-resource counts.
+        """
+        import datetime as _dt
+        last_loaded_iso = (
+            _dt.datetime.fromtimestamp(self._last_loaded, tz=_dt.timezone.utc).isoformat()
+            if self._last_loaded else None
+        )
+        next_retry_in = None
+        if self._degraded and self._last_loaded:
+            import time as _time
+            elapsed = _time.time() - self._last_loaded
+            remaining = max(0, self._retry_interval - elapsed)
+            next_retry_in = f"{int(remaining // 60)}m {int(remaining % 60)}s"
+
+        return {
+            "ready": self.is_ready(),
+            "degraded": self._degraded,
+            "degraded_reasons": self._degraded_reasons,
+            "last_loaded": last_loaded_iso,
+            "next_retry_in": next_retry_in,
+            "counts": {
+                "categories": len(self.categories),
+                "tags": len(self.tags),
+                "attributes": len(self.attributes),
+                "products": len(self.products),
+                "category_keywords": len(self.category_keywords),
+                "attribute_terms": sum(len(v) for v in self.attribute_terms.values()),
+            },
+        }
 
     def print_categories(self):
         """Print categories in a tree structure."""

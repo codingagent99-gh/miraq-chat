@@ -25,6 +25,7 @@ from conversation_flow import FlowState
 from chat_logger import get_logger
 from formatters import _entities_to_dict
 from handlers.chat_utils import default_pagination
+from handlers.suggestion_builder import build_suggestions
 from response_generator import INTENT_LABELS
 
 logger = get_logger("miraq_chat")
@@ -110,6 +111,7 @@ def handle_empty_results(
                 "message": _no_results_msg,
                 "intent": intent.value,
             })
+        _filter_suggestions = build_suggestions(entities, store_loader)
         return all_products_raw, (jsonify({
             "success": True,
             "bot_message": _no_results_msg,
@@ -120,6 +122,7 @@ def handle_empty_results(
                 "What categories do you have?",
                 "Show me what's on sale",
             ],
+            "filter_suggestions": _filter_suggestions,
             "session_id": session_id,
             "metadata": {
                 "confidence": round(confidence, 2),
@@ -216,6 +219,7 @@ def handle_empty_results(
                 "intent": intent.value,
             })
 
+        _filter_suggestions = build_suggestions(entities, store_loader)
         return all_products_raw, (jsonify({
             "success": True,
             "bot_message": suggestion_msg,
@@ -226,6 +230,7 @@ def handle_empty_results(
                 "What categories do you have?",
                 "Show me what's on sale",
             ],
+            "filter_suggestions": _filter_suggestions,
             "session_id": session_id,
             "metadata": llm_metadata,
             "pagination": default_pagination(page),

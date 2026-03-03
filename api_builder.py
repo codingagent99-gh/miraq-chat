@@ -70,6 +70,7 @@ def _attr_slug_for_label(label: str) -> Optional[str]:
 def _build_advanced_filter_call(
     tags: List[str] = None,
     categories: List[str] = None,
+    extra_categories: List[str] = None,
     attributes: dict = None,
     page: int = 1,
     per_page: int = DEFAULT_PER_PAGE,
@@ -77,14 +78,31 @@ def _build_advanced_filter_call(
 ) -> WooAPICall:
     """
     Build a single WooAPICall for the unified products-advanced endpoint.
+
+    categories      — primary category slugs (AND'd with everything else)
+    extra_categories — additional category slugs from multi-category queries
+                       e.g. "interior and exterior" → categories=["interior"],
+                       extra_categories=["exterior"]
+                       Combined into a single category filter so the API
+                       AND-filters across all of them.
     """
     filters = []
 
     if tags:
         filters.append({"tag": ",".join(tags)})
 
-    if categories:
-        filters.append({"category": ",".join(categories)})
+    # Merge primary + extra category slugs into one filter entry.
+    # The API treats comma-separated slugs as AND (product must be in all).
+    all_cat_slugs = list(categories or []) + list(extra_categories or [])
+    # Deduplicate while preserving order
+    seen = set()
+    merged_slugs = []
+    for s in all_cat_slugs:
+        if s not in seen:
+            merged_slugs.append(s)
+            seen.add(s)
+    if merged_slugs:
+        filters.append({"category": ",".join(merged_slugs)})
 
     if attributes:
         for attr_taxonomy, terms_str in attributes.items():
@@ -101,6 +119,19 @@ def _build_advanced_filter_call(
         description=description or "Advanced product filter",
         is_custom_api=True,
     )
+
+
+def _resolve_extra_cat_slugs(entities, loader) -> List[str]:
+    """
+    Resolve entities.extra_category_ids into a flat list of category slugs.
+    Used by any intent that needs multi-category AND-filtering.
+    e.g. "interior and exterior" → extra_category_ids=[interior_id] → ["interior"]
+    """
+    extra_slugs = []
+    for cid in (getattr(entities, "extra_category_ids", None) or []):
+        slugs = loader.get_all_slugs_for_category(cid) if loader else []
+        extra_slugs.extend(slugs)
+    return extra_slugs
 
 
 def match_variation_to_entities(variations: list, entities) -> Optional[dict]:
@@ -287,9 +318,11 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
                             attr_filters[e.attribute_slug] = term_value
                         break
 
+        extra_cat_slugs = _resolve_extra_cat_slugs(e, loader)
         calls.append(_build_advanced_filter_call(
             tags=tag_slugs if tag_slugs else None,
             categories=categories_list if categories_list else None,
+            extra_categories=extra_cat_slugs if extra_cat_slugs else None,
             attributes=attr_filters if attr_filters else None,
             page=page,
             description=f"Browse category '{e.category_name}' (id={e.category_id})",
@@ -392,29 +425,22 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
             if not cat_id and e.category_name and l:
                 cat_id = l.get_category_id(e.category_name)
             categories_list = l.get_all_slugs_for_category(cat_id) if (cat_id and l) else []
+            extra_cat_slugs = _resolve_extra_cat_slugs(e, l)
             calls.append(_build_advanced_filter_call(
                 categories=categories_list if categories_list else None,
+                extra_categories=extra_cat_slugs if extra_cat_slugs else None,
                 attributes=attr_filters if attr_filters else None,
                 page=page,
                 description=f"Attribute-scoped search: {e.attributes}",
             ))
         else:
-            # If tag_slugs are set (e.g. resolved by LLM fallback from origin/demonym),
-            # route through the advanced filter endpoint so the tag is actually applied.
-            if e.tag_slugs:
-                calls.append(_build_advanced_filter_call(
-                    tags=list(e.tag_slugs),
-                    page=page,
-                    description=f"Tag-scoped product search (slugs: {', '.join(e.tag_slugs)})",
-                ))
-            else:
-                calls.append(WooAPICall(
-                    method="GET",
-                    endpoint=f"{BASE}/products",
-                    params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish",
-                            "search": e.product_name or e.search_term or ""},
-                    description=f"Search products matching '{e.product_name or e.search_term}'",
-                ))
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products",
+                params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish",
+                        "search": e.product_name or e.search_term or ""},
+                description=f"Search products matching '{e.product_name or e.search_term}'",
+            ))
 
     elif intent == Intent.PRODUCT_DETAIL:
         if e.product_id:
@@ -483,8 +509,13 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
 
     elif intent == Intent.PRODUCT_BY_TAG:
         if e.tag_slugs:
+            _loader = get_store_loader()
+            _extra_cat_slugs = _resolve_extra_cat_slugs(e, _loader)
+            _primary_cat_slugs = _loader.get_all_slugs_for_category(e.category_id) if (e.category_id and _loader) else []
             calls.append(_build_advanced_filter_call(
                 tags=list(e.tag_slugs),
+                categories=_primary_cat_slugs if _primary_cat_slugs else None,
+                extra_categories=_extra_cat_slugs if _extra_cat_slugs else None,
                 page=page,
                 description=f"Products by tag (slugs: {','.join(e.tag_slugs)})",
             ))
@@ -578,6 +609,13 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
             cat_id = loader.get_category_id(e.category_name)
         categories_list = loader.get_all_slugs_for_category(cat_id) if (cat_id and loader) else []
 
+        # Resolve extra_category_ids → additional slug lists (from multi-category queries
+        # e.g. "interior and exterior" → extra_category_ids=[interior_id])
+        extra_cat_slugs = []
+        for extra_cid in (e.extra_category_ids or []):
+            extra_slugs = loader.get_all_slugs_for_category(extra_cid) if loader else []
+            extra_cat_slugs.extend(extra_slugs)
+
         # Deduplicate: drop any tag whose slug tokens are fully covered by
         # already-resolved attribute values. This prevents double-filtering when
         # e.g. tag "1-4-thick" and attribute pa_thickness "1/4" thick" describe
@@ -596,6 +634,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         attr_value = next(iter(e.attributes.values()), "")
         calls.append(_build_advanced_filter_call(
             categories=categories_list if categories_list else None,
+            extra_categories=extra_cat_slugs if extra_cat_slugs else None,
             attributes=attr_filters if attr_filters else None,
             tags=deduped_tag_slugs if deduped_tag_slugs else None,
             page=page,
@@ -773,27 +812,18 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
     # ═══════════════════════════════════════════
 
     if not calls:
-        # If tag_slugs were resolved (e.g. by LLM fallback for origin queries)
-        # but no intent branch fired, still apply the tag filter.
-        if e.tag_slugs:
-            calls.append(_build_advanced_filter_call(
-                tags=list(e.tag_slugs),
-                page=page,
-                description=f"Fallback tag search (slugs: {', '.join(e.tag_slugs)})",
-            ))
-        else:
-            search = (
-                e.product_name
-                or e.search_term
-                or next(iter(e.attributes.values()), None)
-                or FALLBACK_SEARCH_TERM
-            )
-            calls.append(WooAPICall(
-                method="GET",
-                endpoint=f"{BASE}/products",
-                params={"search": search, "per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish"},
-                description=f"Fallback search: '{search}'",
-            ))
+        search = (
+            e.product_name
+            or e.search_term
+            or next(iter(e.attributes.values()), None)
+            or FALLBACK_SEARCH_TERM
+        )
+        calls.append(WooAPICall(
+            method="GET",
+            endpoint=f"{BASE}/products",
+            params={"search": search, "per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish"},
+            description=f"Fallback search: '{search}'",
+        ))
 
     result.api_calls = calls
     return calls
