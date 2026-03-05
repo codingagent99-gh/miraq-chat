@@ -117,36 +117,45 @@ def _serialize_condition(condition: dict) -> dict:
     }
 
 
-def _serialize_query(conditions: list, page: int, per_page: int) -> dict:
+def _serialize_query(
+    conditions: list,
+    page: int,
+    per_page: int,
+    min_price: float = None,
+    max_price: float = None,
+) -> dict:
     """
     Serialize a list of condition nodes to the POST body format.
 
     Format:
         {
             "page": 1, "per_page": 4,
+            "price": {"min": 20, "max": 80},   # optional
             "filters": {
                 "relation": "AND",
-                "conditions": [
-                    {"taxonomy": "product_cat", "terms": ["countertop"], "operator": "IN"},
-                    {
-                        "relation": "OR",
-                        "conditions": [
-                            {"taxonomy": "product_tag", "terms": ["glossy-finish"], "operator": "IN"},
-                            {"taxonomy": "pa_finish",   "terms": ["Glossy"],        "operator": "IN"}
-                        ]
-                    }
-                ]
+                "conditions": [...]
             }
         }
     """
-    return {
+    body = {
         "page": page,
         "per_page": per_page,
-        "filters": {
-            "relation": "AND",
-            "conditions": [_serialize_condition(c) for c in conditions],
-        },
     }
+
+    # Price range — only include bounds that were specified
+    if min_price is not None or max_price is not None:
+        price = {}
+        if min_price is not None:
+            price["min"] = min_price
+        if max_price is not None:
+            price["max"] = max_price
+        body["price"] = price
+
+    body["filters"] = {
+        "relation": "AND",
+        "conditions": [_serialize_condition(c) for c in conditions],
+    }
+    return body
 
 
 def _make_or_group(conditions: list) -> dict:
@@ -165,6 +174,8 @@ def _build_advanced_filter_call(
     page: int = 1,
     per_page: int = DEFAULT_PER_PAGE,
     description: str = "",
+    min_price: float = None,
+    max_price: float = None,
 ) -> WooAPICall:
     """
     Build a single WooAPICall for the new products-advanced-new endpoint.
@@ -198,7 +209,8 @@ def _build_advanced_filter_call(
     _or_pair_tag_slugs = {p.get("tag_slug") for p in (or_pairs or [])}
     _uncovered_tags = [t for t in (tags or []) if t not in _or_pair_tag_slugs]
     if _uncovered_tags:
-        op = "AND" if tag_operator == "AND" else "IN"
+        # AND only makes sense with multiple tags; a single tag always uses IN
+        op = "AND" if (tag_operator == "AND" and len(_uncovered_tags) > 1) else "IN"
         conditions.append(_make_condition("product_tag", _uncovered_tags, op))
         logger.debug(f"api_builder: Added tag condition | tags={_uncovered_tags} | operator={op}")
     if _or_pair_tag_slugs:
@@ -244,7 +256,7 @@ def _build_advanced_filter_call(
                     _make_condition(attr_taxonomy, [attr_term],  "IN"),
                 ]))
 
-    body = _serialize_query(conditions, page, per_page)
+    body = _serialize_query(conditions, page, per_page, min_price=min_price, max_price=max_price)
 
     logger.debug(
         f"api_builder: Built advanced filter | description={description!r} | "
@@ -312,7 +324,7 @@ def match_variation_to_entities(variations: list, entities) -> Optional[dict]:
     return best_variation if best_score > 0 else None
 
 
-def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]:
+def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str = "", session_id: str = "") -> List[WooAPICall]:
     """Build one or more WooCommerce API calls from classified result."""
     intent = result.intent
     e = result.entities
@@ -457,6 +469,8 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
             tag_operator=e.tag_operator,
             or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
             description=f"Browse category '{e.category_name}' (id={e.category_id})",
+            min_price=e.min_price,
+            max_price=e.max_price,
         ))
 
     elif intent == Intent.CATEGORY_LIST:
@@ -518,6 +532,8 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
                 or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
                 page=page,
                 description=f"Category-scoped search: '{e.product_name}' in '{e.category_name}'",
+                min_price=e.min_price,
+                max_price=e.max_price,
             )
             # Only inject a free-text search term when there are no tag slugs.
             # When tag_slugs are present they already scope the results precisely
@@ -568,6 +584,8 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
                 or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
                 page=page,
                 description=f"Attribute-scoped search: {e.attributes}",
+                min_price=e.min_price,
+                max_price=e.max_price,
             ))
         else:
             calls.append(WooAPICall(
@@ -634,6 +652,8 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
                 or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
                 page=page,
                 description=f"Products from {e.collection_year} collection (tags: {','.join(e.tag_slugs)})",
+                min_price=e.min_price,
+                max_price=e.max_price,
             ))
         else:
             params = {"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish", "stock_status": "instock"}
@@ -656,6 +676,8 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
                 or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
                 page=page,
                 description=f"Products by tag (slugs: {','.join(e.tag_slugs)})",
+                min_price=e.min_price,
+                max_price=e.max_price,
             ))
         else:
             params = {"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish", "stock_status": "instock"}
@@ -669,15 +691,29 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
             ))
 
     elif intent == Intent.PRODUCT_BY_ORIGIN:
+        # Origin can be expressed as a tag ("made-in-sri-lanka") OR an attribute
+        # (pa_origin: "sri-lanka") — products may have one or the other.
+        # Build OR pairs so both are searched, same pattern as finish/color.
         origin = e.attributes.get("origin", "")
+        attr_slug = _attr_slug_for_label("origin") or e.attribute_slug
+        origin_or_pairs = []
+        if attr_slug and origin and e.tag_slugs:
+            for tag_slug in e.tag_slugs:
+                origin_or_pairs.append({
+                    "tag_slug":      tag_slug,
+                    "attr_taxonomy": attr_slug,
+                    "attr_term":     origin,
+                })
         calls.append(_build_advanced_filter_call(
-            attributes={_attr_slug_for_label("origin"): origin} if _attr_slug_for_label("origin") else None,
-            tags=list(e.tag_slugs) if e.tag_slugs else None,
+            tags=None if origin_or_pairs else (list(e.tag_slugs) if e.tag_slugs else None),
+            attributes=None if origin_or_pairs else ({attr_slug: origin} if (attr_slug and origin) else None),
+            or_pairs=origin_or_pairs or (list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None),
             excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
             tag_operator=e.tag_operator,
-            or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
             page=page,
             description=f"Products from {origin}",
+            min_price=e.min_price,
+            max_price=e.max_price,
         ))
 
     elif intent == Intent.PRODUCT_QUICK_SHIP:
@@ -785,20 +821,35 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
             tag_operator=e.tag_operator,
             or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
             description=f"Filter by {attr_label}: {attr_value}",
+            min_price=e.min_price,
+            max_price=e.max_price,
         ))
         
     elif intent == Intent.FILTER_BY_ORIGIN:
-        # Kept separate: origin uses tag-based resolution (demonym synonyms),
-        # not just attribute term IDs, so needs both attribute and tag params.
+        # Origin can be expressed as a tag ("made-in-sri-lanka") OR an attribute
+        # (pa_origin: "sri-lanka") depending on how products were entered in the store.
+        # Build an OR pair so both paths are searched — same pattern as finish/color.
         origin = e.attributes.get("origin", "")
+        origin_or_pairs = []
+        if e.attribute_slug and origin and e.tag_slugs:
+            # Wrap tag + attribute as OR pairs — one per tag slug
+            for tag_slug in e.tag_slugs:
+                origin_or_pairs.append({
+                    "tag_slug":      tag_slug,
+                    "attr_taxonomy": e.attribute_slug,
+                    "attr_term":     origin,
+                })
         calls.append(_build_advanced_filter_call(
-            attributes={e.attribute_slug: origin} if (e.attribute_slug and origin) else None,
-            tags=list(e.tag_slugs) if e.tag_slugs else None,
+            # Don't pass tags/attributes separately — they're in or_pairs now
+            tags=None if origin_or_pairs else (list(e.tag_slugs) if e.tag_slugs else None),
+            attributes=None if origin_or_pairs else ({e.attribute_slug: origin} if (e.attribute_slug and origin) else None),
+            or_pairs=origin_or_pairs if origin_or_pairs else (list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None),
             excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
             tag_operator=e.tag_operator,
-            or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
             page=page,
             description=f"Filter by origin: {origin}",
+            min_price=e.min_price,
+            max_price=e.max_price,
         ))
 
     elif intent == Intent.SIZE_LIST:
@@ -979,4 +1030,10 @@ def build_api_calls(result: ClassifiedResult, page: int = 1) -> List[WooAPICall]
         ))
 
     result.api_calls = calls
+    # Stamp every call with request context for api.txt logging
+    for call in calls:
+        if not call.user_message:
+            call.user_message = user_message
+        if not call.session_id:
+            call.session_id = session_id
     return calls

@@ -33,9 +33,13 @@ def classify(utterance: str) -> ClassifiedResult:
     # attribute terms (e.g. pa_application value "Countertop") by _extract_attributes.
     attr_text = text
     if entities.category_name:
-        attr_text = re.sub(
-            rf'\b{re.escape(entities.category_name.lower())}s?\b', ' ', attr_text
-        ).strip()
+        # Normalize to base form before building pattern — category names may be
+        # plural ("Mosaics") so appending s? would produce "mosaicss?" not "mosaics?".
+        # Strip trailing 's' first so the pattern correctly matches both forms.
+        _cat_base = entities.category_name.lower()
+        if _cat_base.endswith("s") and len(_cat_base) > 3:
+            _cat_base = _cat_base[:-1]
+        attr_text = re.sub(rf'\b{re.escape(_cat_base)}s?\b', ' ', attr_text).strip()
     # Also mask product type terms and store-generic terms so they don't get picked
     # up as attribute values (e.g. pa_product-type: Mosaic) when the user is just
     # describing the product type they want.
@@ -49,8 +53,27 @@ def classify(utterance: str) -> ClassifiedResult:
     for _pt in _type_mask_terms:
         attr_text = re.sub(rf'\b{re.escape(_pt)}\b', ' ', attr_text).strip()
 
-    _extract_attributes(attr_text, entities)   # runs FIRST — captures structured terms before tag scan
-    _extract_tag(text, entities)               # runs SECOND — skips terms already covered by attributes
+    _extract_tag(text, entities)               # PASS 1 — populate tag_slugs so _extract_attributes
+                                               # can use them to suppress false attribute matches
+    _extract_attributes(attr_text, entities)   # uses tag_slugs from pass 1 to guard term matching
+    # Before pass 2, preserve what _extract_attributes added to tag state
+    # (e.g. origin path appends "made-in-sri-lanka" directly to tag_slugs).
+    # Also preserve attr_tag_or_pairs — built by _extract_attributes, not by _extract_tag.
+    _attr_added_tag_ids   = list(entities.tag_ids)
+    _attr_added_tag_slugs = list(entities.tag_slugs)
+    _preserved_or_pairs   = list(entities.attr_tag_or_pairs)
+    # Reset only tag state so pass 2 starts clean and deduplicates properly
+    entities.tag_ids   = []
+    entities.tag_slugs = []
+    _extract_tag(text, entities)               # PASS 2 — full run with attribute-coverage guard
+    # Restore attr-added tags (merge, dedup) and OR pairs
+    for tid in _attr_added_tag_ids:
+        if tid not in entities.tag_ids:
+            entities.tag_ids.append(tid)
+    for slug in _attr_added_tag_slugs:
+        if slug not in entities.tag_slugs:
+            entities.tag_slugs.append(slug)
+    entities.attr_tag_or_pairs = _preserved_or_pairs
     _extract_thickness(attr_text, entities)    # numeric fallback only
     _extract_collection_year(text, entities)
     _extract_order_id(text, entities)
@@ -58,6 +81,7 @@ def classify(utterance: str) -> ClassifiedResult:
     _extract_quantity(text, entities)
     _extract_order_item(text, entities)
     _extract_unresolved_descriptors(text, entities)
+    _extract_price_range(text, entities)       # price range — 'under $40', 'between $20-$80'
     _detect_tag_operator(text, entities)       # OR detection — must run after tags are extracted
     _extract_exclusions(text, entities)        # NOT IN — "without X", "no X", "exclude X"
 
@@ -443,16 +467,49 @@ def _extract_attributes(text: str, entities: ExtractedEntities):
         if not label or not taxonomy or not terms:
             continue
 
-        # Skip hidden attributes (visible=False) — these are internal
-        # classification fields not intended for user-facing filtering.
-        # e.g. pa_colors-2 is visible=False and should not generate OR pairs.
-        if not attr.get("visible", True):
-            logger.debug(f"Classifier _extract_attributes: skipping hidden attribute {taxonomy!r} (visible=False)")
-            continue
-
         # ── Special case: size attributes — try numeric pattern first ──
         if "size" in label:
-            size_match = re.search(r'(\d+)\s*"?\s*(?:x|by|×|X)\s*(\d+)', text)
+            # Dynamic disambiguation: derive the qualifier keyword from the attribute
+            # label itself — "sample size" → "sample", "chip size" → "chip",
+            # "tile size" → "tile". No hardcoded taxonomy slugs or patterns needed.
+            #
+            # Logic:
+            #   - If this attribute's qualifier appears in text → proceed
+            #   - If a sibling size attribute's qualifier matches instead → skip
+            #   - If no qualifier matches at all (ambiguous) → let all proceed
+            def _size_qualifier(attr_label_str):
+                return " ".join(
+                    w for w in attr_label_str.lower().split() if w != "size"
+                ).strip()
+
+            size_attrs_in_store = [
+                a for a in loader.all_attributes_raw
+                if "size" in a.get("attribute_label", "").lower()
+            ]
+            my_qualifier = _size_qualifier(label)
+            other_qualifiers = [
+                _size_qualifier(a.get("attribute_label", ""))
+                for a in size_attrs_in_store
+                if a.get("taxonomy") != taxonomy
+            ]
+
+            my_matches = bool(
+                my_qualifier and re.search(rf"\b{re.escape(my_qualifier)}s?\b", text)
+            )
+            other_matches = any(
+                bool(q and re.search(rf"\b{re.escape(q)}s?\b", text))
+                for q in other_qualifiers
+            )
+
+            if other_matches and not my_matches:
+                logger.debug(
+                    f"Classifier _extract_attributes: skipping size attr {taxonomy!r} "
+                    f"(qualifier={my_qualifier!r} absent, sibling matched)"
+                )
+                continue
+            # my_matches=True → proceed; both False (ambiguous) → all proceed
+
+            size_match = re.search(r'(\d+)\s*"?\s*(?:x|by|\xd7|X)\s*(\d+)', text)
             if size_match:
                 w, h = size_match.group(1), size_match.group(2)
                 size_str = f"{w}x{h}"
@@ -460,33 +517,55 @@ def _extract_attributes(text: str, entities: ExtractedEntities):
                 if not term_ids:
                     term_ids = loader.get_attribute_term_ids(taxonomy, f'{w}"x{h}"')
                 if term_ids:
-                    entities.attributes[label] = f'{w}"x{h}"'
+                    term_slug = loader.get_attribute_term_slug(taxonomy, f'{w}x{h}') or f'{w}x{h}'
+                    entities.attributes[label] = term_slug
                     entities.attribute_slug = taxonomy
                     entities.attribute_term_ids = term_ids
                     continue
 
-        # ── Special case: origin — resolve demonym synonyms first ──
+        # ── Special case: origin — resolve demonym synonyms first, then ──
+        # fall through to live term scan for country names not in ORIGIN_KEYWORDS
+        # (e.g. "Sri Lanka" has no demonym entry but IS a pa_origin term).
         if "origin" in label:
+            matched_origin = False
             for keyword, normalized in ORIGIN_KEYWORDS.items():
                 if re.search(rf"\b{re.escape(keyword)}\b", text):
                     tag_ids = loader.get_tag_ids_for_keyword(normalized)
                     if not tag_ids:
                         tag_ids = loader.get_tag_ids_for_keyword(f"made in {normalized}")
-                    entities.attributes[label] = normalized.title()
+                    term_slug = loader.get_attribute_term_slug(taxonomy, normalized) or normalized
+                    entities.attributes[label] = term_slug
                     entities.tag_ids.extend(tag_ids)
                     for tid in tag_ids:
                         tag = loader.tag_by_id.get(tid)
                         if tag:
                             entities.tag_slugs.append(tag["slug"])
+                    matched_origin = True
                     break
-            continue
+            if matched_origin:
+                continue
+            # No demonym match — fall through to general term scan below
+            # so live pa_origin terms like "Sri Lanka" are matched directly
 
         # ── General case: scan all terms for this attribute ──
+        # Build a set of "noise tokens" from the matched product name and tag slugs.
+        # Attribute terms whose text is entirely contained within the product name
+        # or a tag slug are false positives — e.g. "Marble" matching pa_visual
+        # because the user said "Titan Marbles Series" (tag: titan-marbles-series).
+        _product_name_lower = (entities.product_name or "").lower()
         for term in terms:
             term_name = term.get("name", "")
             term_name_lower = term_name.lower().strip()
             if not term_name_lower or len(term_name_lower) < 3:
                 continue
+
+            # Skip if the term is a substring of the matched product name
+            # e.g. term="Marble" inside product_name="Titan Marbles" → skip
+            if _product_name_lower and term_name_lower in _product_name_lower:
+                continue
+
+
+
             try:
                 # Also match plural forms: "pavers" matches term "Paver", "tiles" matches "Tile"
                 matched = (
@@ -525,29 +604,60 @@ def _extract_attributes(text: str, entities: ExtractedEntities):
                                 covering_tag_slug = tag_entry.get("slug", "")
                                 break
                     if covered_by_tag:
-                        # Instead of silently dropping the attribute, store both the
-                        # matching tag slug and the attribute term as an OR pair.
-                        # api_builder will wrap them in a nested OR condition so
-                        # products are found whether they use the tag or the attribute.
-                        # e.g. "glossy finish" → OR(tag:glossy-finish, pa_finish:Glossy)
-                        if covering_tag_slug:
+                        # Decide between OR pair vs tag-only suppression:
+                        #
+                        # OR pair  — when the attribute label word appears in the tag slug.
+                        #            The tag was named after the attribute, so products may
+                        #            use either representation.
+                        #            e.g. pa_finish + "glossy-finish" → "finish" in slug ✓
+                        #            e.g. pa_origin (explicit exception — "made-in-X" tags
+                        #            never contain "origin" but both forms exist in store data)
+                        #
+                        # Tag only — when the tag is a semantic grouping that supersedes
+                        #            the attribute. e.g. "white-tones" groups many white
+                        #            shades; pa_colors-2 "colors" not in slug → tag only.
+                        label_words = {w for w in label.split() if len(w) > 2}
+                        slug_words  = set(covering_tag_slug.replace("-", " ").split())
+                        is_origin   = "origin" in label
+                        use_or_pair = bool(label_words & slug_words) or is_origin
+
+                        if covering_tag_slug and use_or_pair:
                             entities.attr_tag_or_pairs.append({
                                 "tag_slug":      covering_tag_slug,
                                 "attr_taxonomy": taxonomy,
-                                "attr_term":     term_name,
+                                "attr_term":     term.get("slug", term_name),
                             })
                             logger.debug(
                                 f"Classifier _extract_attributes: OR pair | "
-                                f"term={term_name!r} ({taxonomy}) suppressed by tag={covering_tag_slug!r} | "
+                                f"term={term_name!r} ({taxonomy}) covered by tag={covering_tag_slug!r} | "
                                 f"stored as attr_tag_or_pair"
                             )
+                        else:
+                            logger.debug(
+                                f"Classifier _extract_attributes: suppressed | "
+                                f"term={term_name!r} ({taxonomy}) covered by tag={covering_tag_slug!r} | "
+                                f"label∩slug=∅ → tag only"
+                            )
                         break
-                    entities.attributes[label] = term_name
+                    term_slug = term.get("slug", term_name)
+                    entities.attributes[label] = term_slug
                     entities.attribute_slug = taxonomy
                     entities.attribute_term_ids = [term["id"]]
+                    # For origin terms matched via general scan (e.g. "Sri Lanka"),
+                    # also resolve the corresponding "made in X" tag so api_builder
+                    # can emit an OR(tag, attribute) condition.
+                    if "origin" in label:
+                        tag_ids = loader.get_tag_ids_for_keyword(term_name_lower)
+                        if not tag_ids:
+                            tag_ids = loader.get_tag_ids_for_keyword(f"made in {term_name_lower}")
+                        entities.tag_ids.extend(tag_ids)
+                        for tid in tag_ids:
+                            tag = loader.tag_by_id.get(tid)
+                            if tag:
+                                entities.tag_slugs.append(tag["slug"])
                     logger.debug(
                         f"Classifier _extract_attributes: matched | "
-                        f"label={label!r} term={term_name!r} taxonomy={taxonomy!r}"
+                        f"label={label!r} term={term_name!r} slug={term_slug!r} taxonomy={taxonomy!r}"
                     )
                     break  # first match per attribute wins
             except re.error:
@@ -564,6 +674,12 @@ def _extract_thickness(text: str, entities: ExtractedEntities):
     This prevents double-filtering where the thickness is stored as a tag rather
     than as a pa_thickness attribute term on some products.
     """
+    # Guard: if the text contains a size pattern like "3x3" or "3"x3"",
+    # those are tile/sample sizes — not thickness. Let _extract_attributes
+    # handle them via pa_sample-size / pa_tile-size term scan.
+    if re.search(r'\d+\s*"?\s*(?:x|×|by)\s*\d+', text):
+        return
+
     THICKNESS_PATTERNS = [
         r'(\d+(?:\.\d+)?\s*mm)',
         r'(\d+(?:\.\d+)?\s*cm)',
@@ -1015,3 +1131,65 @@ def _extract_exclusions(text: str, entities: ExtractedEntities):
                     logger.debug(
                         f"Classifier _extract_exclusions: excluded category={slug!r} | phrase={phrase!r}"
                     )
+
+
+# ─────────────────────────────────────────────
+# PRICE RANGE EXTRACTION
+# ─────────────────────────────────────────────
+
+def _extract_price_range(text: str, entities: ExtractedEntities):
+    """
+    Extract min/max price from natural language price expressions.
+
+    Patterns detected:
+      "under $40"          → max_price=40
+      "below $100"         → max_price=100
+      "less than $60"      → max_price=60
+      "cheaper than $50"   → max_price=50
+      "over $50"           → min_price=50
+      "above $100"         → min_price=100
+      "more than $80"      → min_price=80
+      "between $20 and $80"→ min_price=20, max_price=80
+      "$20 to $80"         → min_price=20, max_price=80
+      "$20-$80"            → min_price=20, max_price=80
+    """
+    # Range patterns — must check before single-bound patterns
+    range_patterns = [
+        r'between\s+\$?(\d+(?:\.\d+)?)\s+(?:and|to|-)\s+\$?(\d+(?:\.\d+)?)',
+        r'\$(\d+(?:\.\d+)?)\s+to\s+\$?(\d+(?:\.\d+)?)',
+        r'\$(\d+(?:\.\d+)?)\s*[-–]\s*\$?(\d+(?:\.\d+)?)',
+    ]
+    for pattern in range_patterns:
+        m = re.search(pattern, text)
+        if m:
+            entities.min_price = float(m.group(1))
+            entities.max_price = float(m.group(2))
+            logger.debug(
+                f"Classifier _extract_price_range: range | "
+                f"min={entities.min_price} max={entities.max_price}"
+            )
+            return
+
+    # Max price (upper bound)
+    max_patterns = [
+        r'(?:under|below|less\s+than|cheaper\s+than|max(?:imum)?|at\s+most|up\s+to)\s+\$?(\d+(?:\.\d+)?)',
+        r'\$(\d+(?:\.\d+)?)\s+(?:or\s+)?(?:less|under|below)',
+    ]
+    for pattern in max_patterns:
+        m = re.search(pattern, text)
+        if m:
+            entities.max_price = float(m.group(1))
+            logger.debug(f"Classifier _extract_price_range: max_price={entities.max_price}")
+            return
+
+    # Min price (lower bound)
+    min_patterns = [
+        r'(?:over|above|more\s+than|at\s+least|min(?:imum)?)\s+\$?(\d+(?:\.\d+)?)',
+        r'\$(\d+(?:\.\d+)?)\s+(?:or\s+)?(?:more|above|over)',
+    ]
+    for pattern in min_patterns:
+        m = re.search(pattern, text)
+        if m:
+            entities.min_price = float(m.group(1))
+            logger.debug(f"Classifier _extract_price_range: min_price={entities.min_price}")
+            return

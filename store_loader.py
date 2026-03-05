@@ -652,6 +652,38 @@ class StoreLoader:
 
         return exact if exact else partial
 
+    def get_attribute_term_slug(self, attr_slug: str, user_value: str) -> str:
+        """
+        Like get_attribute_term_ids but returns the slug of the first matched term.
+        Returns empty string if no match found.
+        e.g. get_attribute_term_slug("pa_sample-size", '3"x3"') → "3x3"
+             get_attribute_term_slug("pa_finish", "matte")        → "matte"
+        """
+        attr = self.attribute_by_slug.get(attr_slug)
+        if not attr:
+            return ""
+        terms = self.attribute_terms.get(attr["id"], [])
+        needle = re.sub(r'[\"\'`]', '', user_value.lower().strip())
+
+        exact_slug = ""
+        partial_slug = ""
+        for term in terms:
+            term_name  = term.get("name", "").lower()
+            term_slug  = term.get("slug", "").lower()
+            term_clean = re.sub(r'[\"\'`]', '', term_name).strip()
+
+            if term_clean == needle or term_slug == needle:
+                exact_slug = term.get("slug", "")
+                break
+            if not partial_slug and (
+                needle in term_clean or term_clean in needle
+                or (re.sub(r'[^\dx]', '', needle) and
+                    re.sub(r'[^\dx]', '', needle) in re.sub(r'[^\dx]', '', term_clean))
+            ):
+                partial_slug = term.get("slug", "")
+
+        return exact_slug or partial_slug
+
     def get_all_attribute_terms(self, attr_slug: str) -> List[Dict]:
         """Return all terms for an attribute slug."""
         attr = self.attribute_by_slug.get(attr_slug)

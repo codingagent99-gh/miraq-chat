@@ -159,6 +159,10 @@ class ExtractedEntities:
     # ──── Attribute info query ────
     target_attribute: Optional[str] = None     # attribute the user is asking about, e.g. "size", "finish"
 
+    # ──── Price range fields ────
+    min_price: Optional[float] = None   # e.g. "over $50" → 50.0
+    max_price: Optional[float] = None   # e.g. "under $40" → 40.0
+
     # ──── Time range fields (used by ORDER_HISTORY) ────
     date_after: Optional[str] = None           # ISO datetime string e.g. "2026-01-01T00:00:00"
     date_before: Optional[str] = None          # ISO datetime string (reserved for future use)
@@ -190,6 +194,8 @@ class WooAPICall:
     description: str = ""
     requires_resolution: List[str] = field(default_factory=list)
     is_custom_api: bool = False
+    user_message: str = ""    # logged to api.txt for request context
+    session_id: str = ""      # logged to api.txt for request context
 
 
 @dataclass
