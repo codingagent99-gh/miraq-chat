@@ -39,9 +39,13 @@ class WooClient:
         safe_params = {k: v for k, v in params.items() if k not in ("consumer_key", "consumer_secret")}
 
         # ── REQUEST: log full details to api.txt ──────────────────────────────
+        context = ""
+        if api_call.session_id or api_call.user_message:
+            context = f" | session={api_call.session_id} | q={api_call.user_message!r}"
+
         if api_call.method == "GET":
             api_logger.info(
-                f"REQUEST {api_call.method} {sanitized_endpoint} | params={safe_params}"
+                f"REQUEST {api_call.method} {sanitized_endpoint} | params={safe_params}{context}"
             )
         else:
             try:
@@ -49,7 +53,7 @@ class WooClient:
             except Exception:
                 body_str = str(api_call.body)
             api_logger.info(
-                f"REQUEST {api_call.method} {sanitized_endpoint} | body={body_str}"
+                f"REQUEST {api_call.method} {sanitized_endpoint} | body={body_str}{context}"
             )
 
         # Also keep a brief line in the main chat log
