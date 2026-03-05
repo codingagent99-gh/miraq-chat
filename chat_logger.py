@@ -2,7 +2,7 @@
 chat_logger.py - Centralized logging configuration for miraq-chat
 
 Sets up Python logging with:
-- File handler: logs/YYYY-MM-DD/chat.txt (daily rotation)
+- File handler: <project_root>/logs/YYYY-MM-DD/chat.txt (daily rotation, absolute path)
 - Console handler: stdout (maintains existing print-like behavior)
 - Configurable log level via LOG_LEVEL env variable
 - Sanitization of sensitive data (consumer keys, secrets)
@@ -14,15 +14,21 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+# ── Anchor log directory to THIS file's location, not the process CWD ──────
+# Previously used Path("logs") which is relative to wherever you launch the
+# server from — so if the CWD changed, logs silently went somewhere else.
+_PROJECT_ROOT = Path(__file__).resolve().parent
+_LOG_BASE_DIR = _PROJECT_ROOT / "logs"
+
 
 def sanitize_log_string(text: str) -> str:
     """
     Sanitize string for logging to prevent log injection attacks.
     Removes newlines, carriage returns, and other control characters.
-    
+
     Args:
         text: String to sanitize
-    
+
     Returns:
         Sanitized string safe for logging
     """
@@ -35,68 +41,70 @@ def sanitize_log_string(text: str) -> str:
     return text
 
 
+class _MillisecondFormatter(logging.Formatter):
+    """Formatter that appends milliseconds to the timestamp."""
+    def formatTime(self, record, datefmt=None):
+        if datefmt:
+            import time
+            ct = self.converter(record.created)
+            s = time.strftime(datefmt, ct)
+            ms = int((record.created - int(record.created)) * 1000)
+            return f"{s}.{ms:03d}"
+        return super().formatTime(record, datefmt)
+
+
 def setup_logger(name: str = "miraq_chat", log_level: str = "INFO") -> logging.Logger:
     """
     Configure and return a logger with file and console handlers.
-    
+
+    Safe to call multiple times — duplicate handlers are skipped.
+
     Args:
-        name: Logger name
+        name:      Logger name
         log_level: Log level string (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-    
+
     Returns:
         Configured logger instance
     """
-    # Create logger
     logger = logging.getLogger(name)
-    logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
-    
-    # Prevent duplicate handlers if setup is called multiple times
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    logger.setLevel(level)
+
+    # ── Stop records bubbling up to the root logger ──────────────────────────
+    # Without this, Flask/Werkzeug's root handlers can swallow or duplicate
+    # your records, making it look like logging has stopped.
+    logger.propagate = False
+
+    # Guard: don't add handlers a second time (e.g. Flask debug reloader)
     if logger.handlers:
         return logger
-    
-    # Create log format
-    log_format = logging.Formatter(
+
+    formatter = _MillisecondFormatter(
         fmt="[%(asctime)s] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
-    
-    # Trim microseconds to 3 digits (milliseconds)
-    class MillisecondFormatter(logging.Formatter):
-        def formatTime(self, record, datefmt=None):
-            if datefmt:
-                import time
-                ct = self.converter(record.created)
-                s = time.strftime(datefmt, ct)
-                # Add milliseconds
-                ms = int((record.created - int(record.created)) * 1000)
-                s = f"{s}.{ms:03d}"
-                return s
-            else:
-                return super().formatTime(record, datefmt)
-    
-    formatter = MillisecondFormatter(
-        fmt="[%(asctime)s] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-    
-    # ─── File Handler (daily rotation) ───
-    # Create logs directory with today's date subfolder
+
+    # ── File Handler (daily rotation, absolute path) ──────────────────────
     today = datetime.now().strftime("%Y-%m-%d")
-    log_dir = Path("logs") / today
-    log_dir.mkdir(parents=True, exist_ok=True)
-    
-    log_file = log_dir / "chat.txt"
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)  # Log everything to file
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    
-    # ─── Console Handler ───
+    log_dir = _LOG_BASE_DIR / today
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "chat.txt"
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)   # capture everything in file
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except OSError as exc:
+        # Fall back gracefully — at least console logging will still work
+        print(f"[chat_logger] WARNING: Could not create log file at {log_dir}: {exc}")
+
+    # ── Console Handler ───────────────────────────────────────────────────
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+    console_handler.setLevel(level)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
-    
+
+    logger.debug(f"Logger '{name}' initialised | log_file={log_dir / 'chat.txt'} | level={log_level.upper()}")
     return logger
 
 
@@ -104,17 +112,15 @@ def sanitize_url(url: str) -> str:
     """
     Remove sensitive query parameters from URLs.
     Strips consumer_key and consumer_secret.
-    
+
     Args:
         url: URL string potentially containing sensitive params
-    
+
     Returns:
         Sanitized URL string
     """
     if not url:
         return url
-    
-    # Remove consumer_key and consumer_secret query params
     url = re.sub(r'consumer_key=[^&]*', 'consumer_key=***', url)
     url = re.sub(r'consumer_secret=[^&]*', 'consumer_secret=***', url)
     return url
@@ -123,17 +129,63 @@ def sanitize_url(url: str) -> str:
 def get_logger(name: str = "miraq_chat") -> logging.Logger:
     """
     Get the configured logger instance.
-    If logger doesn't exist, create it with default settings.
-    
+    Creates and configures it on first call; returns cached instance thereafter.
+
     Args:
         name: Logger name
-    
+
     Returns:
         Logger instance
     """
     logger = logging.getLogger(name)
     if not logger.handlers:
-        # Logger not yet configured, set it up with default level
         log_level = os.getenv("LOG_LEVEL", "INFO")
         setup_logger(name, log_level)
+    return logger
+
+
+def get_api_logger() -> logging.Logger:
+    """
+    Get a dedicated logger for outbound WooCommerce API calls.
+
+    Writes to logs/YYYY-MM-DD/api.txt — separate from chat.txt so API
+    traffic can be tailed or parsed independently.
+
+    Always logs at DEBUG level to file so full request bodies are captured.
+    Console output follows the LOG_LEVEL env var, same as the main logger.
+
+    Returns:
+        Logger instance named "miraq_api"
+    """
+    name = "miraq_api"
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+
+    formatter = _MillisecondFormatter(
+        fmt="[%(asctime)s] [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_dir = _LOG_BASE_DIR / today
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "api.txt"
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except OSError as exc:
+        print(f"[chat_logger] WARNING: Could not create api log file at {log_dir}: {exc}")
+
+    # Console: only show at WARNING+ by default to keep stdout clean
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
     return logger

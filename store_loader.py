@@ -13,8 +13,11 @@ import requests
 from typing import List, Dict, Optional, Tuple
 from dotenv import load_dotenv
 from config.store_config import TAG_SLUG_QUICK_SHIP, TAG_SLUG_CHIP_CARD
+from chat_logger import get_logger
 
 load_dotenv()
+
+logger = get_logger("miraq_chat")
 
 WOO_BASE_URL = os.getenv("WOO_BASE_URL", "https://wgc.net.in/hn/wp-json/wc/v3")
 WOO_CONSUMER_KEY = os.getenv("WOO_CONSUMER_KEY", "")
@@ -82,22 +85,21 @@ class StoreLoader:
 
     def load_all(self):
         """Fetch all taxonomy data from WooCommerce."""
-        print("📡 Loading store data from WooCommerce...")
-        print(f"   Base URL: {self.base}")
-        print(f"   Auth Key: {self.consumer_key[:12]}...")
+        logger.info("StoreLoader: Loading store data from WooCommerce...")
+        logger.info(f"StoreLoader: Base URL={self.base}")
 
         if not self.consumer_key or self.consumer_key.startswith("ck_your"):
-            print("\n   ❌ API keys not configured! Update .env file.")
+            logger.error("StoreLoader: API keys not configured! Update .env file.")
             return
 
         self.categories = self._fetch_all_pages(f"{self.base}/products/categories")
-        print(f"   {'✅' if self.categories else '⚠️ '} Loaded {len(self.categories)} categories")
+        logger.info(f"StoreLoader: Loaded {len(self.categories)} categories {'✅' if self.categories else '⚠️ EMPTY'}")
 
         self.tags = self._fetch_all_pages(f"{self.base}/products/tags")
-        print(f"   ✅ Loaded {len(self.tags)} tags")
+        logger.info(f"StoreLoader: Loaded {len(self.tags)} tags")
 
         self.attributes = self._fetch_all_pages(f"{self.base}/products/attributes")
-        print(f"   ✅ Loaded {len(self.attributes)} attributes")
+        logger.info(f"StoreLoader: Loaded {len(self.attributes)} attributes")
 
         for attr in self.attributes:
             attr_id = attr["id"]
@@ -105,13 +107,13 @@ class StoreLoader:
                 f"{self.base}/products/attributes/{attr_id}/terms"
             )
             self.attribute_terms[attr_id] = terms
-            print(f"   ✅ Loaded {len(terms)} terms for '{attr['name']}' (id={attr_id})")
+            logger.info(f"StoreLoader: Loaded {len(terms)} terms for '{attr['name']}' (id={attr_id})")
 
         self.products = self._fetch_all_pages(
             f"{self.base}/products",
             extra_params={"status": "publish"},
         )
-        print(f"   {'✅' if self.products else '⚠️ '} Loaded {len(self.products)} products")
+        logger.info(f"StoreLoader: Loaded {len(self.products)} products {'✅' if self.products else '⚠️ EMPTY'}")
 
         custom_api_base = os.getenv(
             "CUSTOM_API_BASE_URL",
@@ -121,26 +123,24 @@ class StoreLoader:
             resp = self.session.get(f"{custom_api_base}/all-attributes", timeout=self.timeout)
             resp.raise_for_status()
             self.all_attributes_raw = resp.json()
-            print(f"   ✅ Loaded {len(self.all_attributes_raw)} attributes from custom API")
+            logger.info(f"StoreLoader: Loaded {len(self.all_attributes_raw)} attributes from custom API")
         except Exception as e:
-            print(f"   ⚠️  Custom all-attributes API failed: {e}")
+            logger.warning(f"StoreLoader: Custom all-attributes API failed | error={e}")
             self.all_attributes_raw = []
 
         self._build_lookups()
         self._last_loaded = time.time()
         self._validate_load()
 
-        print(f"\n📊 Store Data Summary:")
-        print(f"   Categories:   {len(self.categories)}")
-        print(f"   Tags:         {len(self.tags)}")
-        print(f"   Attributes:   {len(self.attributes)}")
-        print(f"   Products:     {len(self.products)}")
-        print(f"   Cat Keywords: {len(self.category_keywords)}")
+        logger.info(
+            f"StoreLoader: Summary | categories={len(self.categories)} | tags={len(self.tags)} | "
+            f"attributes={len(self.attributes)} | products={len(self.products)} | "
+            f"cat_keywords={len(self.category_keywords)}"
+        )
         if self._degraded:
-            print(f"   ⚠️  DEGRADED — {', '.join(self._degraded_reasons)}")
-            print(f"   🔁 Will auto-retry in {self._retry_interval // 60} min\n")
+            logger.warning(f"StoreLoader: DEGRADED — {', '.join(self._degraded_reasons)} | retry_in={self._retry_interval // 60}min")
         else:
-            print(f"   Ready! ✅\n")
+            logger.info("StoreLoader: Store data loaded successfully ✅")
 
     def _validate_load(self):
         """
@@ -182,29 +182,28 @@ class StoreLoader:
             while True:
                 if self._degraded:
                     interval = self._retry_interval
-                    print(f"⚠️  Store is DEGRADED ({', '.join(self._degraded_reasons)}). "
-                          f"Retrying in {interval // 60} min...")
+                    logger.warning(f"StoreLoader: DEGRADED ({', '.join(self._degraded_reasons)}) — retrying in {interval // 60}min")
                 else:
                     interval = self._refresh_interval
                 time.sleep(interval)
 
                 label = "🔁 Degraded load retry" if self._degraded else "🔄 Background refresh"
-                print(f"{label}: reloading store data...")
+                logger.info(f"StoreLoader: {label} — reloading store data...")
                 try:
                     self.load_all()
                     if not self._degraded:
-                        print(f"{label}: complete. ✅")
+                        logger.info(f"StoreLoader: {label} complete ✅")
                     else:
-                        print(f"{label}: still degraded — {', '.join(self._degraded_reasons)}")
+                        logger.warning(f"StoreLoader: {label} still degraded — {', '.join(self._degraded_reasons)}")
                 except Exception as e:
-                    print(f"{label} failed: {e}")
+                    logger.error(f"StoreLoader: {label} failed | error={e}", exc_info=True)
 
         self._refresh_thread = threading.Thread(target=_refresh_loop, daemon=True)
         self._refresh_thread.start()
         if self._degraded:
-            print(f"⚠️  Starting in DEGRADED mode — auto-retry every {self._retry_interval // 60} min")
+            logger.warning(f"StoreLoader: Starting in DEGRADED mode — auto-retry every {self._retry_interval // 60}min")
         else:
-            print(f"⏰ Background refresh scheduled every {self._refresh_interval // 3600}h")
+            logger.info(f"StoreLoader: Background refresh scheduled every {self._refresh_interval // 3600}h")
 
     def _fetch_all_pages(self, url: str, extra_params: Dict = None) -> List[Dict]:
         """Fetch all pages using browser UA + query-string auth."""
@@ -240,10 +239,10 @@ class StoreLoader:
             except requests.exceptions.HTTPError as e:
                 status = e.response.status_code if e.response is not None else "?"
                 body = e.response.text[:300] if e.response is not None else "N/A"
-                print(f"   ⚠️  HTTP {status} at {url} page {page}: {body}")
+                logger.warning(f"StoreLoader: HTTP {status} at {url} page {page} | body={body}")
                 break
             except Exception as e:
-                print(f"   ⚠️  Error fetching {url}: {e}")
+                logger.warning(f"StoreLoader: Error fetching {url} | error={e}")
                 break
 
         return all_items
@@ -850,29 +849,31 @@ class StoreLoader:
     def print_categories(self):
         """Print categories in a tree structure."""
         if not self.categories:
-            print("\n📂 No categories loaded")
+            logger.info("StoreLoader: No categories loaded")
             return
 
-        print("\n📂 Store Categories:")
+        lines = ["StoreLoader: Store Categories:"]
         top_level = [c for c in self.categories if c.get("parent", 0) == 0]
         for cat in sorted(top_level, key=lambda x: x.get("name", "")):
             count = cat.get("count", 0)
             slug = cat.get("slug", "")
             if slug == "uncategorized" and count == 0:
                 continue
-            print(f"   ├── {cat['name']} (id={cat['id']}, slug={slug}, count={count})")
+            lines.append(f"  ├── {cat['name']} (id={cat['id']}, slug={slug}, count={count})")
             children = [c for c in self.categories if c.get("parent") == cat["id"]]
             for child in sorted(children, key=lambda x: x.get("name", "")):
                 child_count = child.get("count", 0)
-                print(f"   │   └── {child['name']} (id={child['id']}, count={child_count})")
+                lines.append(f"  │   └── {child['name']} (id={child['id']}, count={child_count})")
+        logger.info("\n".join(lines))
 
     def print_keywords(self):
         """Print all auto-generated category keywords."""
         if not self.category_keywords:
-            print("\n🔑 No category keywords generated")
+            logger.info("StoreLoader: No category keywords generated")
             return
 
-        print("\n🔑 Category Keywords → Category Mapping:")
+        lines = ["StoreLoader: Category Keywords → Category Mapping:"]
         for kw, cat_id in sorted(self.category_keywords.items()):
             cat_name = self.category_by_id.get(cat_id, {}).get("name", "?")
-            print(f"   '{kw}' → {cat_name} (id={cat_id})")
+            lines.append(f"  '{kw}' → {cat_name} (id={cat_id})")
+        logger.info("\n".join(lines))

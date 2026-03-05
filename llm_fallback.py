@@ -164,13 +164,18 @@ def _build_system_prompt(store_context: Dict[str, Any]) -> str:
 {attributes_text}
 
 **Valid Intents**:
-- product_search: User wants to find a specific product
-- category_browse: User wants to browse a category
-- filter_by_finish: User wants tiles by finish (matte, polished, etc.)
-- filter_by_color: User wants tiles by color
-- filter_by_size: User wants tiles by size
-- filter_by_application: User wants tiles for specific use (floor, wall, etc.)
-- order_inquiry: User asking about orders
+- product_search: User wants to find a specific product by name
+- category_browse: User wants to browse a category (no attribute filters)
+- filter_by_attribute: User wants to filter by any attribute (finish, size, color, application, etc.)
+- product_by_tag: User wants products matching a specific tag or collection
+- product_by_origin: User wants products from a specific country/region
+- order_history: User asking about their past orders
+- order_status: User asking about a specific order status
+- last_order: User asking about their most recent order
+- reorder: User wants to reorder something they bought before
+- place_order: User wants to place/create an order
+- discount_inquiry: User asking about sales or discounts
+- greeting: Simple greeting, no product intent
 - general_question: General question about products/services
 
 **IMPORTANT Privacy Rules**:
@@ -180,18 +185,28 @@ def _build_system_prompt(store_context: Dict[str, Any]) -> str:
 
 **Response Format** (JSON only):
 {{
-  "intent": "product_search",
+  "intent": "filter_by_attribute",
   "entities": {{
-    "product_name": "Marble",
-    "category_name": "Floor Tiles",
+    "product_name": null,
+    "category_name": "Floor",
     "finish": "Polished",
     "color_tone": "White",
-    "application": "Kitchen"
+    "application": "Kitchen",
+    "tag_operator": "AND",
+    "excluded_tags": [],
+    "excluded_categories": []
   }},
   "bot_message": "I found some great products matching your search!",
   "confidence": 0.85,
   "fallback_type": "intent_resolved"
 }}
+
+**Key entity rules**:
+- Use `tag_operator: "OR"` when the user says "X or Y", "either X or Y", "X and Y tones" (colour mixing). Default is "AND".
+- Use `excluded_tags: ["slug-name"]` when user says "no X", "without X", "exclude X" for a tag.
+- Use `excluded_categories: ["slug-name"]` when user says "not in X category", "no marble", "exclude mosaic".
+- Attribute filters (finish, color, size, application, etc.) go as flat keys in entities — NOT nested.
+- Use exact attribute term names from the Available Attributes list above.
 
 **fallback_type options**:
 - "intent_resolved": You identified a clear intent and entities

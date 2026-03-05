@@ -58,6 +58,12 @@ _INTENT_MAPPING = {
     "product_by_origin": Intent.PRODUCT_BY_ORIGIN,
     "filter_by_origin":  Intent.PRODUCT_BY_ORIGIN,
     "origin":            Intent.PRODUCT_BY_ORIGIN,
+    # Attribute / tag filter intents added to match updated system prompt
+    "filter_by_attribute": Intent.FILTER_BY_ATTRIBUTE,
+    "product_by_tag":    Intent.PRODUCT_BY_TAG,
+    "product_by_collection": Intent.PRODUCT_BY_COLLECTION,
+    "category_list":     Intent.CATEGORY_LIST,
+    "general_question":  Intent.PRODUCT_LIST,
 }
 
 

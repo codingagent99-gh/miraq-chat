@@ -12,6 +12,9 @@ from config.store_config import (
     PRODUCT_TYPE_TERMS,
     ORIGIN_KEYWORDS,
 )
+from chat_logger import get_logger
+
+logger = get_logger("miraq_chat")
 
 
 def classify(utterance: str) -> ClassifiedResult:
@@ -55,6 +58,8 @@ def classify(utterance: str) -> ClassifiedResult:
     _extract_quantity(text, entities)
     _extract_order_item(text, entities)
     _extract_unresolved_descriptors(text, entities)
+    _detect_tag_operator(text, entities)       # OR detection — must run after tags are extracted
+    _extract_exclusions(text, entities)        # NOT IN — "without X", "no X", "exclude X"
 
     # ─── Intent Classification (priority order) ───
 
@@ -325,22 +330,39 @@ def _extract_category(text: str, entities: ExtractedEntities):
     if not loader:
         return
 
-    # Use get_all_categories_for_text so multi-category queries like
-    # "interior and exterior" resolve both categories, not just one.
-    # Primary category (index 0) goes into category_name/id/slug as before.
-    # Additional categories (index 1+) go into extra_category_ids for AND-filtering.
     matches = loader.get_all_categories_for_text(text)
     if not matches:
         return
 
-    primary = matches[0]
-    entities.category_id = primary["id"]
-    entities.category_name = primary["name"]
-    entities.category_slug = primary.get("slug", "")
+    # Prune ancestors: if a child category is already in matches, its parent
+    # is redundant — WooCommerce child queries implicitly scope to the parent.
+    # e.g. "exterior wall tiles" → [Wall (parent=Exterior), Exterior]
+    # → Exterior is pruned because Wall is already in the match set.
+    # Genuine multi-category queries (e.g. "pavers and mosaics") are unaffected
+    # because neither is an ancestor of the other.
+    matched_ids = {m["id"] for m in matches}
+    child_parent_ids = {
+        loader.category_by_id.get(m["id"], {}).get("parent", 0)
+        for m in matches
+    }
+    # Only prune a parent if it was itself matched (not just any ancestor)
+    pruned = [m for m in matches if m["id"] not in (child_parent_ids & matched_ids)]
 
-    for extra in matches[1:]:
-        if extra["id"] not in entities.extra_category_ids:
-            entities.extra_category_ids.append(extra["id"])
+    # Fallback: if pruning removed everything (shouldn't happen), keep original
+    if not pruned:
+        pruned = matches
+
+    entities.category_id   = pruned[0]["id"]
+    entities.category_name = pruned[0]["name"]
+    pruned_ids = {m["id"] for m in matches} - {m["id"] for m in pruned}
+    logger.debug(
+        f"Classifier _extract_category: matched={[m['name'] for m in matches]} | "
+        f"pruned_as_parent={[loader.category_by_id.get(i, {}).get('name') for i in pruned_ids]} | "
+        f"primary={entities.category_name!r} | extra_ids={entities.extra_category_ids}"
+    )
+    entities.category_slug = pruned[0].get("slug", "")
+    # Remaining matches are independent co-filters (e.g. "pavers and mosaics")
+    entities.extra_category_ids = [m["id"] for m in pruned[1:]]
 
 
 def _extract_product_name(text: str, entities: ExtractedEntities):
@@ -421,6 +443,13 @@ def _extract_attributes(text: str, entities: ExtractedEntities):
         if not label or not taxonomy or not terms:
             continue
 
+        # Skip hidden attributes (visible=False) — these are internal
+        # classification fields not intended for user-facing filtering.
+        # e.g. pa_colors-2 is visible=False and should not generate OR pairs.
+        if not attr.get("visible", True):
+            logger.debug(f"Classifier _extract_attributes: skipping hidden attribute {taxonomy!r} (visible=False)")
+            continue
+
         # ── Special case: size attributes — try numeric pattern first ──
         if "size" in label:
             size_match = re.search(r'(\d+)\s*"?\s*(?:x|by|×|X)\s*(\d+)', text)
@@ -478,6 +507,7 @@ def _extract_attributes(text: str, entities: ExtractedEntities):
                     # runs after attributes), so we must check live tag store data.
                     term_tokens = _normalize_for_tag_compare(term_name_lower)
                     covered_by_tag = False
+                    covering_tag_slug = None
                     if term_tokens and loader:
                         for tag_name_lower, tag_entry in loader.tag_by_name_lower.items():
                             if tag_entry.get("count", 0) == 0:
@@ -492,12 +522,33 @@ def _extract_attributes(text: str, entities: ExtractedEntities):
                                     and re.search(rf"\b{re.escape(tag_name_singular)}\b", text))
                             )):
                                 covered_by_tag = True
+                                covering_tag_slug = tag_entry.get("slug", "")
                                 break
                     if covered_by_tag:
+                        # Instead of silently dropping the attribute, store both the
+                        # matching tag slug and the attribute term as an OR pair.
+                        # api_builder will wrap them in a nested OR condition so
+                        # products are found whether they use the tag or the attribute.
+                        # e.g. "glossy finish" → OR(tag:glossy-finish, pa_finish:Glossy)
+                        if covering_tag_slug:
+                            entities.attr_tag_or_pairs.append({
+                                "tag_slug":      covering_tag_slug,
+                                "attr_taxonomy": taxonomy,
+                                "attr_term":     term_name,
+                            })
+                            logger.debug(
+                                f"Classifier _extract_attributes: OR pair | "
+                                f"term={term_name!r} ({taxonomy}) suppressed by tag={covering_tag_slug!r} | "
+                                f"stored as attr_tag_or_pair"
+                            )
                         break
                     entities.attributes[label] = term_name
                     entities.attribute_slug = taxonomy
                     entities.attribute_term_ids = [term["id"]]
+                    logger.debug(
+                        f"Classifier _extract_attributes: matched | "
+                        f"label={label!r} term={term_name!r} taxonomy={taxonomy!r}"
+                    )
                     break  # first match per attribute wins
             except re.error:
                 pass
@@ -762,6 +813,9 @@ def _extract_tag(text: str, entities: ExtractedEntities):
         if not shadowed:
             entities.tag_ids.append(tag["id"])
             entities.tag_slugs.append(tag["slug"])
+            logger.debug(f"Classifier _extract_tag: matched tag={tag['slug']!r} (id={tag['id']})")
+        else:
+            logger.debug(f"Classifier _extract_tag: dropped tag={tag['slug']!r} — tokens are subset of another match")
 
 def _extract_order_item(text: str, entities: ExtractedEntities):
     """Extract a product name from order/buy/purchase queries."""
@@ -825,3 +879,139 @@ def _extract_unresolved_descriptors(text: str, entities: ExtractedEntities):
                 hints.append(descriptor)
     if hints and hasattr(entities, 'search_hints'):
         entities.search_hints = hints
+
+# ─────────────────────────────────────────────
+# OR OPERATOR DETECTION
+# ─────────────────────────────────────────────
+
+def _detect_tag_operator(text: str, entities: ExtractedEntities):
+    """
+    Detect explicit OR intent between tags and set tag_operator accordingly.
+
+    Patterns detected:
+      "white or glossy tiles"         → OR between tags
+      "matte or polished finish"      → OR between attribute terms (same property)
+      "countertop or wall tiles"      → OR between categories (handled separately)
+
+    Only switches to OR when there are 2+ tag_slugs AND an explicit "or"/"either"
+    connector is present between two recognised filter terms in the user text.
+    Single-tag queries are unaffected.
+
+    Note: "and" between tags keeps the default AND — this function only fires
+    when OR is explicit, preserving backward compatibility.
+    """
+    if len(entities.tag_slugs) < 2:
+        return  # nothing to OR — single tag or no tags
+
+    # Check for explicit OR connector in the text
+    # Covers: "X or Y", "either X or Y", "X / Y"
+    if not re.search(r'\bor\b|\beither\b', text):
+        return
+
+    # Confirm at least two of the resolved tag slugs appear as words near an "or"
+    # e.g. "white or glossy" — both "white" and "glossy" are in the text around "or"
+    # Slug words: "white-tones" → "white tones", "glossy-finish" → "glossy finish"
+    slug_word_sets = [
+        set(slug.replace("-", " ").split())
+        for slug in entities.tag_slugs
+    ]
+    text_words = set(text.split())
+    # Count how many slugs have at least one word present in the text around "or"
+    slugs_in_text = sum(
+        1 for words in slug_word_sets
+        if words & text_words  # at least one word from the slug appears in text
+    )
+    if slugs_in_text >= 2:
+        entities.tag_operator = "OR"
+        logger.debug(
+            f"Classifier _detect_tag_operator: OR detected | "
+            f"tag_slugs={entities.tag_slugs} | text={text!r}"
+        )
+
+
+# ─────────────────────────────────────────────
+# EXCLUSION EXTRACTION
+# ─────────────────────────────────────────────
+
+# Negation phrases that signal the user wants to exclude something.
+_NEGATION_PATTERNS = [
+    r'\bwithout\s+(.+?)(?:\s+(?:tiles?|products?|ones?)|$)',
+    r'\bno\s+(.+?)(?:\s+(?:tiles?|products?|ones?)|$)',
+    r'\bnot\s+(.+?)(?:\s+(?:tiles?|products?|ones?)|$)',
+    r'\bexclude\s+(.+?)(?:\s+(?:tiles?|products?|ones?)|$)',
+    r'\bavoid\s+(.+?)(?:\s+(?:tiles?|products?|ones?)|$)',
+    r'\bdon\'?t\s+(?:want|include|show)\s+(.+?)(?:\s+(?:tiles?|products?|ones?)|$)',
+]
+
+
+def _extract_exclusions(text: str, entities: ExtractedEntities):
+    """
+    Detect negation phrases and populate excluded_tags / excluded_categories.
+
+    Examples:
+      "countertop tiles without glossy finish"
+        → excluded_tags = ["glossy-finish"]
+      "show me tiles, no matte"
+        → excluded_tags = ["matte-finish"]  (resolved from live store tags)
+      "exterior tiles not wall"
+        → excluded_categories = ["wall"]  (resolved from loader)
+
+    Strategy:
+      1. Extract the phrase after the negation keyword.
+      2. Try to match it against live tags (slug or name).
+      3. Try to match it against live categories.
+      4. Add to the appropriate exclusion list.
+
+    Excluded slugs are NOT added to tag_slugs/tag_ids — purely for NOT IN filter.
+    """
+    loader = get_store_loader()
+    if not loader:
+        return
+
+    for pattern in _NEGATION_PATTERNS:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            phrase = match.group(1).strip().lower()
+            if not phrase or len(phrase) < 2:
+                continue
+
+            _resolved = False
+
+            # ── Try matching against live tags ──
+            # Check full phrase, then individual words (longest match wins)
+            candidates = [phrase]
+            candidates += phrase.split()  # fallback to individual words
+
+            for candidate in candidates:
+                if len(candidate) < 3:
+                    continue
+                # Direct name match
+                tag_entry = loader.tag_by_name_lower.get(candidate)
+                if not tag_entry:
+                    # Slug-words match: "glossy finish" → slug "glossy-finish"
+                    slug_candidate = candidate.replace(" ", "-")
+                    tag_entry = loader.tag_by_slug.get(slug_candidate)
+                if tag_entry and tag_entry.get("slug"):
+                    slug = tag_entry["slug"]
+                    if slug not in entities.excluded_tags and slug not in entities.tag_slugs:
+                        entities.excluded_tags.append(slug)
+                        logger.debug(
+                            f"Classifier _extract_exclusions: excluded tag={slug!r} | phrase={phrase!r}"
+                        )
+                        _resolved = True
+                    break
+
+            if _resolved:
+                continue
+
+            # ── Try matching against live categories ──
+            cat = loader.category_by_name_lower.get(phrase)
+            if not cat:
+                cat_id = loader.get_category_id(phrase)
+                cat = loader.category_by_id.get(cat_id) if cat_id else None
+            if cat and cat.get("slug") and cat["slug"] != "uncategorized":
+                slug = cat["slug"]
+                if slug not in entities.excluded_categories:
+                    entities.excluded_categories.append(slug)
+                    logger.debug(
+                        f"Classifier _extract_exclusions: excluded category={slug!r} | phrase={phrase!r}"
+                    )

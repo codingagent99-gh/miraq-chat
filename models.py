@@ -107,10 +107,6 @@ class ExtractedEntities:
     category_id: Optional[int] = None
     category_name: Optional[str] = None
     category_slug: Optional[str] = None
-    # Additional category IDs when the user mentions multiple categories
-    # (e.g. "exterior pavers" → primary=Pavers, extra=[Exterior]).
-    # Used by api_builder to AND-filter across all matched categories.
-    extra_category_ids: List[int] = field(default_factory=list)
 
     # ──── Dynamic attribute matches ────
     # Keyed by attribute_label.lower() from the store's live attribute list.
@@ -127,6 +123,18 @@ class ExtractedEntities:
     # Tags
     tag_slugs: List[str] = field(default_factory=list)
     tag_ids: List[int] = field(default_factory=list)
+    # tag_operator controls how multiple tag_slugs are combined in the query tree.
+    # "AND" → product must have ALL tags (default — matches current behaviour).
+    # "OR"  → product must have AT LEAST ONE tag (use when user says "X or Y").
+    tag_operator: str = "AND"
+
+    # Exclusion filters — populate when user says "no marble", "without X", etc.
+    excluded_tags: List[str] = field(default_factory=list)
+    excluded_categories: List[str] = field(default_factory=list)
+
+    # Multi-category AND-filter: primary category is category_id/category_name;
+    # additional categories go here so api_builder can AND them together.
+    extra_category_ids: List[int] = field(default_factory=list)
 
     # Attribute term resolution (for WooCommerce attribute=&attribute_term= filtering)
     attribute_slug: Optional[str] = None          # e.g. "pa_tile-size"
@@ -161,6 +169,16 @@ class ExtractedEntities:
     # When non-empty, the response layer should ask the user to clarify
     # before building the API call, rather than silently picking one.
     ambiguous_filters: List = field(default_factory=list)  # List[AmbiguousFilter]
+
+    # ──── Tag+attribute OR pairs ────
+    # Populated when a term matches BOTH a tag slug AND a pa_* attribute term.
+    # Rather than picking one silently or asking for disambiguation, api_builder
+    # wraps each pair in a nested OR condition so products are found regardless
+    # of whether they use the tag or the attribute to express the property.
+    # e.g. "glossy finish" → [{"tag_slug": "glossy-finish",
+    #                           "attr_taxonomy": "pa_finish",
+    #                           "attr_term": "Glossy"}]
+    attr_tag_or_pairs: List[dict] = field(default_factory=list)
 
 
 @dataclass

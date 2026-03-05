@@ -16,34 +16,14 @@ def format_category(raw: dict) -> dict:
         image_url = image.get("src", "")
 
     return {
-        "id": raw.get("id"),
-        "name": raw.get("name", ""),
-        "slug": raw.get("slug", ""),
-        "parent": raw.get("parent", 0),
-        "count": raw.get("count", 0),
+        "id":          raw.get("id"),
+        "name":        raw.get("name", ""),
+        "slug":        raw.get("slug", ""),
+        "parent":      raw.get("parent", 0),
+        "count":       raw.get("count", 0),
         "description": _clean_html(raw.get("description", "")),
-        "image": image_url,
-        # Keep product-compatible fields so the response schema stays consistent
-        "price": 0.0,
-        "regular_price": 0.0,
-        "sale_price": None,
-        "on_sale": False,
-        "in_stock": True,
-        "stock_status": "",
-        "sku": "",
-        "permalink": "",
-        "total_sales": 0,
-        "short_description": _clean_html(raw.get("description", "")),
-        "categories": [],
-        "tags": [],
-        "images": [image_url] if image_url else [],
-        "average_rating": "0.00",
-        "rating_count": 0,
-        "weight": "",
-        "dimensions": {"length": "", "width": "", "height": ""},
-        "attributes": [],
-        "variations": [],
-        "type": "category",
+        "image":       image_url,
+        "type":        "category",
     }
 
 
@@ -79,37 +59,28 @@ def format_product(raw: dict) -> dict:
         elif isinstance(t, str) and t:
             tag_names.append(t)
 
-    # Parse prices safely
     price = _safe_float(raw.get("price", ""))
     regular_price = _safe_float(raw.get("regular_price", ""))
     sale_price_raw = raw.get("sale_price", "")
     sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
 
     return {
-        "id": raw.get("id"),
-        "name": raw.get("name", ""),
-        "slug": raw.get("slug", ""),
-        "sku": raw.get("sku", ""),
-        "permalink": raw.get("permalink", ""),
-        "price": price,
+        "id":            raw.get("id"),
+        "name":          raw.get("name", ""),
+        "slug":          raw.get("slug", ""),
+        "sku":           raw.get("sku", ""),
+        "permalink":     raw.get("permalink", ""),
+        "type":          raw.get("type", "simple"),
+        "price":         price,
         "regular_price": regular_price,
-        "sale_price": sale_price,
-        "on_sale": raw.get("on_sale", False),
-        "in_stock": raw.get("stock_status") == "instock",
-        "stock_status": raw.get("stock_status", ""),
-        "total_sales": raw.get("total_sales", 0),
-        "description": _clean_html(raw.get("description", "")),
-        "short_description": _clean_html(raw.get("short_description", "")),
-        "categories": cat_names,
-        "tags": tag_names,
-        "images": image_urls,
-        "average_rating": raw.get("average_rating", "0.00"),
-        "rating_count": raw.get("rating_count", 0),
-        "weight": raw.get("weight", ""),
-        "dimensions": raw.get("dimensions", {"length": "", "width": "", "height": ""}),
-        "attributes": _format_attributes(raw.get("attributes", [])),
-        "variations": raw.get("variations", []),
-        "type": raw.get("type", "simple"),
+        "sale_price":    sale_price,
+        "on_sale":       raw.get("on_sale", False),
+        "in_stock":      raw.get("stock_status") == "instock",
+        "categories":    cat_names,
+        "tags":          tag_names,
+        "images":        image_urls,
+        "attributes":    _format_attributes(raw.get("attributes", [])),
+        "variations":    raw.get("variations", []),
     }
 
 
@@ -119,7 +90,7 @@ def _format_attributes(attrs: list) -> list:
     for attr in attrs:
         if isinstance(attr, dict) and attr.get("visible", False):
             result.append({
-                "name": attr.get("name", ""),
+                "name":    attr.get("name", ""),
                 "options": attr.get("options", []),
             })
     return result
@@ -127,61 +98,40 @@ def _format_attributes(attrs: list) -> list:
 
 def format_custom_product(raw: dict) -> dict:
     """Convert raw custom API product to clean response format."""
-    # Images are already a list of URLs (not objects like standard WC)
     image_urls = raw.get("images", [])
-    
-    # Categories are already a list of strings (not objects)
-    cat_names = raw.get("categories", [])
-    
-    # Parse prices safely
+    cat_names  = raw.get("categories", [])
+
     price = _safe_float(raw.get("price", ""))
-    regular_price = _safe_float(raw.get("regular_price", ""))
-    sale_price_raw = raw.get("sale_price", "")
+    regular_price = _safe_float(raw.get("regular_price") or raw.get("regular", ""))
+    sale_price_raw = raw.get("sale_price", "") or raw.get("sale", "")
     sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
-    
-    # Derive on_sale from sale_price being non-empty
     on_sale = bool(sale_price_raw and sale_price_raw != "")
-    
-    # Attributes come as a dict {slug: {}} rather than a list
-    # Convert to list format for consistency
+
+    # Attributes come as {slug: {...}} — convert to [{name, options}]
     attributes_dict = raw.get("attributes", {})
     attributes = []
     for slug, attr_data in attributes_dict.items():
         if isinstance(attr_data, dict):
-            # Extract options if available, otherwise empty list
             options = attr_data.get("options", []) if attr_data else []
-            # Convert slug to readable name (e.g., pa_finish -> Finish)
             name = slug.replace("pa_", "").replace("-", " ").title()
-            attributes.append({
-                "name": name,
-                "options": options,
-            })
-    
+            attributes.append({"name": name, "options": options})
+
     return {
-        "id": raw.get("id"),
-        "name": raw.get("name", ""),
-        "slug": raw.get("slug", ""),
-        "sku": raw.get("sku", ""),
-        "permalink": raw.get("permalink", ""),
-        "price": price,
+        "id":            raw.get("id"),
+        "name":          raw.get("name", ""),
+        "slug":          raw.get("slug", ""),
+        "sku":           raw.get("sku", ""),
+        "permalink":     raw.get("permalink", ""),
+        "type":          "simple",
+        "price":         price,
         "regular_price": regular_price,
-        "sale_price": sale_price,
-        "on_sale": on_sale,
-        "in_stock": raw.get("stock_status") == "instock",
-        "stock_status": raw.get("stock_status", ""),
-        "total_sales": 0,  # Not provided by custom API
-        "description": _clean_html(raw.get("description", "")),
-        "short_description": _clean_html(raw.get("short_description", "")),
-        "categories": cat_names,
-        "tags": [],  # Not provided by custom API
-        "images": image_urls,
-        "average_rating": "0.00",  # Not provided by custom API
-        "rating_count": 0,  # Not provided by custom API
-        "weight": "",  # Not provided by custom API
-        "dimensions": {"length": "", "width": "", "height": ""},  # Not provided by custom API
-        "attributes": attributes,
-        "variations": [],  # Not provided by custom API
-        "type": "simple",  # Not provided by custom API
+        "sale_price":    sale_price,
+        "on_sale":       on_sale,
+        "in_stock":      raw.get("stock_status") == "instock",
+        "categories":    cat_names,
+        "images":        image_urls,
+        "attributes":    attributes,
+        "variations":    raw.get("variations", []),
     }
 
 
@@ -192,8 +142,13 @@ def format_variation(raw: dict, parent: dict = None) -> dict:
     sale_price_raw = raw.get("sale_price", "")
     sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
 
-    # Build attribute label from variation attributes e.g. "Matte / 24x48 / Grey"
-    attrs = raw.get("attributes", [])
+    attrs_raw = raw.get("attributes", [])
+    # Custom API returns attributes as a flat dict {pa_finish: "matte"};
+    # standard WC API returns a list [{name, option}]. Normalise to list.
+    if isinstance(attrs_raw, dict):
+        attrs = [{"name": k, "option": v} for k, v in attrs_raw.items() if v]
+    else:
+        attrs = attrs_raw
     attr_label = " / ".join(
         a.get("option", "") for a in attrs if a.get("option")
     )
@@ -204,21 +159,19 @@ def format_variation(raw: dict, parent: dict = None) -> dict:
     image_url = images.get("src", "") if isinstance(images, dict) else ""
 
     return {
-        "id": raw.get("id"),
-        "parent_id": raw.get("parent_id") or (parent.get("id") if parent else None),
-        "name": name,
-        "slug": raw.get("slug", ""),
-        "sku": raw.get("sku", ""),
-        "permalink": parent.get("permalink", "") if parent else "",
-        "price": price,
-        "regular_price": regular_price,
-        "sale_price": sale_price,
-        "on_sale": raw.get("on_sale", False),
-        "in_stock": raw.get("stock_status") == "instock",
-        "stock_status": raw.get("stock_status", ""),
-        "images": [image_url] if image_url else (parent.get("images", []) if parent else []),
-        "attributes": attrs,
-        "type": "variation",
+        "id":              raw.get("id"),
+        "parent_id":       raw.get("parent_id") or (parent.get("id") if parent else None),
+        "name":            name,
+        "sku":             raw.get("sku", ""),
+        "permalink":       parent.get("permalink", "") if parent else "",
+        "type":            "variation",
+        "price":           price,
+        "regular_price":   regular_price,
+        "sale_price":      sale_price,
+        "on_sale":         raw.get("on_sale", False),
+        "in_stock":        raw.get("stock_status") == "instock",
+        "images":          [image_url] if image_url else (parent.get("images", []) if parent else []),
+        "attributes":      attrs,
         "variation_label": attr_label,
     }
 
@@ -231,7 +184,6 @@ def _filter_variations_by_entities(
     Each variation has attributes like:
       [{"name": "Finish", "option": "Matte"}, {"name": "Tile Size", "option": '24"x48"'}]
     """
-    # Build filters from entities.attributes — no hardcoded field names.
     filters: List[tuple] = []
     FINISH_SYNONYMS = {"matt": "matte", "glossy": "polished", "gloss": "polished"}
 
@@ -256,7 +208,6 @@ def _filter_variations_by_entities(
             a.get("name", "").lower(): a.get("option", "").lower()
             for a in var.get("attributes", [])
         }
-        # Variation matches if ALL specified filters are satisfied
         if all(
             any(f_val in var_attrs.get(f_name, "") for f_name in var_attrs if f_name == attr_name or f_name.startswith(attr_name))
             or any(f_val in opt for opt in var_attrs.values())
@@ -264,7 +215,7 @@ def _filter_variations_by_entities(
         ):
             matched.append(var)
 
-    return matched if matched else variations  # if nothing matched, return all (don't blank out)
+    return matched if matched else variations
 
 
 def _entities_to_dict(entities: ExtractedEntities) -> dict:
