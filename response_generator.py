@@ -320,7 +320,10 @@ def generate_bot_message(
     if intent == Intent.CATEGORY_BROWSE:
         # ── FIX: Detect unresolved qualifiers the API couldn't filter on ──
         qualifier = _get_unresolved_category_qualifier(entities)
-        if qualifier:
+        if not entities.category_name:
+            # No specific category — we're showing all categories
+            msg += f"Here are our **{count}** product categories! 📂\n\n"
+        elif qualifier:
             msg += (
                 f"We don't have a specific **{qualifier} {entities.category_name}** "
                 f"sub-category, but here are all **{count}** products in "
@@ -329,6 +332,7 @@ def generate_bot_message(
             )
         else:
             msg += f"Here are **{count}** products in the **{entities.category_name}** category! 📂\n\n"
+    
     elif intent == Intent.PRODUCT_BY_VISUAL:
         msg += f"Found **{count}** products with **{entities.attributes.get('visual', '')}** look! 🎨\n\n"
     elif intent == Intent.FILTER_BY_FINISH:
@@ -555,8 +559,12 @@ def _generate_attribute_info_message(products: List[dict], entities: ExtractedEn
     # Find the matching attribute in the parent's attributes list.
     # Match loosely: "size" matches "Tile Size", "Size", "pa_tile-size", etc.
     attrs = parent.get('attributes', [])
+    # For attribute info queries, also check hidden attributes
+    # (e.g. sample-size is often hidden from storefront but user explicitly asked)
+    all_attrs = parent.get('raw_attributes', attrs)
+    
     matched_attr = None
-    for attr in attrs:
+    for attr in all_attrs:
         attr_name_lower = attr.get('name', '').lower()
         if target_attr in attr_name_lower or attr_name_lower in target_attr:
             matched_attr = attr

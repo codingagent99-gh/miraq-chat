@@ -80,15 +80,16 @@ def format_product(raw: dict) -> dict:
         "tags":          tag_names,
         "images":        image_urls,
         "attributes":    _format_attributes(raw.get("attributes", [])),
+        "raw_attributes": _format_attributes(raw.get("attributes", []), include_hidden=True),
         "variations":    raw.get("variations", []),
     }
 
 
-def _format_attributes(attrs: list) -> list:
+def _format_attributes(attrs: list, include_hidden: bool = False) -> list:
     """Format product attributes for response."""
     result = []
     for attr in attrs:
-        if isinstance(attr, dict) and attr.get("visible", False):
+        if isinstance(attr, dict) and (include_hidden or attr.get("visible", False)):
             result.append({
                 "name":    attr.get("name", ""),
                 "options": attr.get("options", []),

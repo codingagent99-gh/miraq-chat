@@ -434,45 +434,51 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             if cat_id:
                 e.category_id = cat_id
 
-        if cat_id and loader:
-            categories_list = loader.get_all_slugs_for_category(cat_id)
-        elif cat_id:
-            cat_slug = _category_slug(cat_id)
-            categories_list = [cat_slug] if cat_slug else []
+        # ── No category resolved — fall back to listing all categories ──
+        if not cat_id:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/categories",
+                params={"per_page": 100, "page": page, "hide_empty": True,
+                        "orderby": "name", "order": "asc"},
+                description="List all product categories (no category specified)",
+            ))
         else:
-            categories_list = []
+            # cat_id is guaranteed truthy here
+            if loader:
+                categories_list = loader.get_all_slugs_for_category(cat_id)
+            else:
+                cat_slug = _category_slug(cat_id)
+                categories_list = [cat_slug] if cat_slug else []
 
-        tag_slugs = list(e.tag_slugs) if e.tag_slugs else []
+            tag_slugs = list(e.tag_slugs) if e.tag_slugs else []
 
-        # Build attribute filters from the dynamic entities.attributes dict.
-        # e.attribute_slug is set by the classifier to the matched taxonomy.
-        attr_filters = {}
-        if e.attribute_slug and e.attributes:
-            # Find which label maps to this taxonomy slug, then get its value
-            l = get_store_loader()
-            if l and l.all_attributes_raw:
-                for attr in l.all_attributes_raw:
-                    if attr.get("taxonomy") == e.attribute_slug:
-                        label = attr.get("attribute_label", "").lower().strip()
-                        term_value = e.attributes.get(label, "")
-                        if term_value:
-                            attr_filters[e.attribute_slug] = term_value
-                        break
+            attr_filters = {}
+            if e.attribute_slug and e.attributes:
+                l = get_store_loader()
+                if l and l.all_attributes_raw:
+                    for attr in l.all_attributes_raw:
+                        if attr.get("taxonomy") == e.attribute_slug:
+                            label = attr.get("attribute_label", "").lower().strip()
+                            term_value = e.attributes.get(label, "")
+                            if term_value:
+                                attr_filters[e.attribute_slug] = term_value
+                            break
 
-        calls.append(_build_advanced_filter_call(
-            tags=tag_slugs if tag_slugs else None,
-            categories=categories_list if categories_list else None,
-            attributes=attr_filters if attr_filters else None,
-            page=page,
-            excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
-            excluded_categories=list(e.excluded_categories) if e.excluded_categories else None,
-            tag_operator=e.tag_operator,
-            or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
-            description=f"Browse category '{e.category_name}' (id={e.category_id})",
-            min_price=e.min_price,
-            max_price=e.max_price,
-        ))
-
+            calls.append(_build_advanced_filter_call(
+                tags=tag_slugs if tag_slugs else None,
+                categories=categories_list if categories_list else None,
+                attributes=attr_filters if attr_filters else None,
+                page=page,
+                excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
+                excluded_categories=list(e.excluded_categories) if e.excluded_categories else None,
+                tag_operator=e.tag_operator,
+                or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
+                description=f"Browse category '{e.category_name}' (id={e.category_id})",
+                min_price=e.min_price,
+                max_price=e.max_price,
+            ))
+            
     elif intent == Intent.CATEGORY_LIST:
         calls.append(WooAPICall(
             method="GET",

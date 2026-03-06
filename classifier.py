@@ -214,10 +214,55 @@ def classify(utterance: str) -> ClassifiedResult:
         intent, confidence = Intent.DISCOUNT_INQUIRY, 0.91
         entities.on_sale = True
 
-    # 3. SAMPLE REQUESTS
-    elif re.search(r"\bsample\b", text):
-        intent, confidence = Intent.SAMPLE_REQUEST, 0.90
+    # 4a. PRODUCT ATTRIBUTE INFO — user asks about a *specific* attribute of a named product
+    #     Built dynamically from live store attribute labels — no hardcoded keywords.
+    elif entities.product_name and re.search(
+        r"\b(what|which)\b.*\b(available|come|have|does|do|offer)\b", text
+    ):
+        _loader_ref = get_store_loader()
+        if _loader_ref and _loader_ref.all_attributes_raw:
+            _matched_label = None
 
+            # ── Pass 1: Full multi-word label match (highest priority) ──
+            # "sample size" matches "what sample sizes are available..."
+            # This ensures "Sample Size" wins over "Chip Size" when user said "sample sizes".
+            for _attr in _loader_ref.all_attributes_raw:
+                _label = _attr.get("attribute_label", "").lower().strip()
+                if not _label:
+                    continue
+                # For multi-word labels, build a flexible regex:
+                # "sample size" → r'\bsample\s+sizes?\b'
+                _words = _label.split()
+                if len(_words) > 1:
+                    _pattern = r"\b" + r"\s+".join(re.escape(w) for w in _words) + r"s?\b"
+                    if re.search(_pattern, text):
+                        _matched_label = _label
+                        break
+                else:
+                    # Single-word label (e.g. "Finish", "Colors")
+                    if re.search(rf"\b{re.escape(_label)}s?\b", text):
+                        _matched_label = _label
+                        break
+
+            # ── Pass 2: Single-word fallback — only if pass 1 found nothing ──
+            # "size" alone matches "Tile Size" when user said "what sizes are available"
+            # without a qualifying word like "sample" or "tile".
+            if not _matched_label:
+                for _attr in _loader_ref.all_attributes_raw:
+                    _label = _attr.get("attribute_label", "").lower().strip()
+                    if not _label:
+                        continue
+                    for _word in _label.split():
+                        if len(_word) >= 4 and re.search(rf"\b{re.escape(_word)}s?\b", text):
+                            _matched_label = _label
+                            break
+                    if _matched_label:
+                        break
+
+            if _matched_label:
+                intent, confidence = Intent.PRODUCT_ATTRIBUTE_INFO, 0.91
+                entities.target_attribute = _matched_label    # 4b. PRODUCT VARIATIONS (existing, unchanged — catches broader "what variations" queries)
+    
     # 4b. PRODUCT VARIATIONS
     elif re.search(
         r"\b(colors?|variants?|variations?|options?|finishes|sizes)\b.*\b(come|available|does|do)\b",
