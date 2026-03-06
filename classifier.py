@@ -343,9 +343,26 @@ def classify(utterance: str) -> ClassifiedResult:
     # When both a category and a product name are resolved, the intent is a
     # filtered catalog search, NOT a "fetch this specific product's variations"
     # call. Clear product_id so api_builder routes to the category-scoped path.
+    # BUT: if the intent is product-specific (variations, detail, size list, etc.),
+    # the user is asking about that exact product — keep product_id and clear
+    # the accidental category match instead.
+    PRODUCT_SPECIFIC_INTENTS = {
+        Intent.PRODUCT_VARIATIONS,
+        Intent.PRODUCT_DETAIL,
+        Intent.PRODUCT_SEARCH,
+        Intent.SIZE_LIST,
+        Intent.PRODUCT_ATTRIBUTE_INFO,
+    }
     if entities.category_id is not None and entities.product_id is not None:
-        entities.product_id = None
-
+        if intent in PRODUCT_SPECIFIC_INTENTS:
+            # The category was an accidental side-effect of the product name
+            # (e.g. "Ansel Mosaic" triggering "Mosaics" category).
+            # Keep product_id, clear the spurious category.
+            entities.category_id = None
+            entities.category_name = None
+            entities.category_slug = None
+        else:
+            entities.product_id = None
     return ClassifiedResult(
         intent=intent,
         entities=entities,
