@@ -152,14 +152,14 @@ def chat():
         )
 
         # Jump straight to Step 2 - build API calls from suggestion entities
-        _sr_api_calls = build_api_calls(_sr_result, page)
+        _sr_customer_id = user_context.get("customer_id")
+        _sr_api_calls = build_api_calls(_sr_result, page, user_message=message, session_id=session_id, customer_id=_sr_customer_id)
         _sr_endpoint_summary = [f"{c.method} {c.endpoint.split('/')[-1]}" for c in _sr_api_calls]
         logger.info(
             f"Step 0.5: Built {len(_sr_api_calls)} API call(s) | "
             f"endpoints={_sr_endpoint_summary}"
         )
 
-        _sr_customer_id = user_context.get("customer_id")
         if _sr_customer_id:
             _resolve_user_placeholders(_sr_api_calls, _sr_customer_id)
 
@@ -331,11 +331,12 @@ def chat():
                 intent, entities, confidence, result = llm_outcome
 
         # ─── Step 2: Build API calls ───
-        api_calls = build_api_calls(result, page)
+        # Resolve customer_id before build so UPDATE_CUSTOMER gets the correct ID
+        customer_id = user_context.get("customer_id")
+        api_calls = build_api_calls(result, page, user_message=message, session_id=session_id, customer_id=customer_id)
         endpoint_summary = [f"{c.method} {c.endpoint.split('/')[-1]}" for c in api_calls]
         logger.info(f"Step 2: Built {len(api_calls)} API call(s) | endpoints={endpoint_summary}")
 
-        customer_id = user_context.get("customer_id")
         if customer_id:
             logger.info(f"Step 2.5: Resolved customer_id={customer_id}")
             _resolve_user_placeholders(api_calls, customer_id)
@@ -380,6 +381,71 @@ def chat():
 
         # ─── Step 3.1: Debug — log matched product context ───
         log_matched_products(all_products_raw, api_calls_to_execute)
+    
+    # After Step 3.1
+    if intent == Intent.FETCH_CUSTOMER:
+        elapsed = int((time.time() - start_time) * 1000)
+        customer_raw = order_data[0] if order_data else {}
+        
+        # Pull requested fields from the API response
+        display = {}
+        for field_key in entities.customer_fields_requested:
+            if "." in field_key:
+                section, key = field_key.split(".", 1)
+                display[field_key] = customer_raw.get(section, {}).get(key)
+            elif field_key == "full_name":
+                display["name"] = f"{customer_raw.get('first_name', '')} {customer_raw.get('last_name', '')}".strip()
+            else:
+                display[field_key] = customer_raw.get(field_key)
+        
+        lines = [f"**{k}**: {v or 'not set'}" for k, v in display.items()]
+        bot_message = "Here's what I have on file:\n" + "\n".join(lines)
+        
+        return jsonify({
+            "success": True,
+            "bot_message": bot_message,
+            "intent": "fetch_customer",
+            "products": [],
+            "suggestions": [],
+            "session_id": session_id,
+            "metadata": {"confidence": round(confidence, 2), "response_time_ms": elapsed},
+            "pagination": default_pagination(page),
+            "flow_state": FlowState.IDLE.value,
+        }), 200
+
+    # ─── Step 3.2: Customer update response ───
+    if intent == Intent.UPDATE_CUSTOMER:
+        elapsed = int((time.time() - start_time) * 1000)
+        # Find the PUT /customers response specifically — don't trust a fallback GET
+        update_success = False
+        for _api_call, _api_resp in zip(api_calls_to_execute, api_responses):
+            if _api_call.method == "PUT" and "/customers/" in _api_call.endpoint:
+                update_success = _api_resp.get("success", False)
+                break
+        _update_signal = [{"success": update_success}]
+        bot_message = generate_bot_message(intent, entities, [], confidence, _update_signal)
+        suggestions = generate_suggestions(intent, entities, [])
+        metadata = {
+            "confidence":       round(confidence, 2),
+            "products_count":   0,
+            "provider":         CLASSIFIER_PROVIDER_TAG,
+            "timestamp":        datetime.now(timezone.utc).isoformat(),
+            "response_time_ms": elapsed,
+            "intent_raw":       intent.value,
+            "entities":         _entities_to_dict(entities),
+        }
+        logger.info(f"Step 10: Response sent | intent=update_customer | success={update_success} | response_time_ms={elapsed} | flow_state=idle")
+        return jsonify({
+            "success":     update_success,
+            "bot_message": bot_message,
+            "intent":      INTENT_LABELS.get(intent, "update_customer"),
+            "products":    [],
+            "suggestions": suggestions,
+            "session_id":  session_id,
+            "metadata":    metadata,
+            "pagination":  default_pagination(page),
+            "flow_state":  FlowState.IDLE.value,
+        }), 200
 
     # ─── Step 3.5: Reorder ───
     handle_reorder(intent, order_data, customer_id, session_id)

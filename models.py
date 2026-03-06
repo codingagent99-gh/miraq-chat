@@ -69,6 +69,8 @@ class Intent(Enum):
     QUICK_ORDER            = "quick_order"
 
     # ──── Chit-Chat ────
+    UPDATE_CUSTOMER        = "update_customer"   # update profile fields (no role/email/create)
+    FETCH_CUSTOMER         = "fetch_customer"
     GREETING               = "greeting"
 
     UNKNOWN                = "unknown"
@@ -183,6 +185,14 @@ class ExtractedEntities:
     #                           "attr_taxonomy": "pa_finish",
     #                           "attr_term": "Glossy"}]
     attr_tag_or_pairs: List[dict] = field(default_factory=list)
+
+    # ──── Customer update fields ────
+    # Populated for UPDATE_CUSTOMER intent. Only allowed fields — role/email excluded.
+    customer_updates: Dict[str, object] = field(default_factory=dict)
+    # Structured sub-objects for billing/shipping address updates
+    billing_updates: Dict[str, str]  = field(default_factory=dict)
+    shipping_updates: Dict[str, str] = field(default_factory=dict)
+    customer_fields_requested: List[str] = field(default_factory=list)  # e.g. ["first_name", "phone"]
 
 
 @dataclass

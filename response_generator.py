@@ -34,6 +34,20 @@ def generate_bot_message(
     # otherwise fall back to the number of products on this page.
     count = total_items if total_items is not None else page_count
 
+    # ── Customer update intent ──
+    if intent == Intent.UPDATE_CUSTOMER:
+        # success/failure is signalled via the `order_data` list repurposed as
+        # a one-element list containing the WC API response dict.
+        # chat.py sets order_data=[{"success": True/False}] before calling here.
+        # Fallback: if called without that signal, default to success message.
+        update_ok = True
+        if order_data and isinstance(order_data[0], dict):
+            update_ok = order_data[0].get("success", True)
+        if update_ok:
+            return "Your account details have been updated successfully."
+        else:
+            return "Sorry, I wasn't able to update your details. Please try again or contact support."
+
     # ── Greeting intent ──
     if intent == Intent.GREETING:
         return (
@@ -232,8 +246,7 @@ def generate_bot_message(
         return f"I couldn't find specific size options for **{product_name}**."
 
     # ── Variation results ──
-    if intent in (Intent.PRODUCT_SEARCH, Intent.PRODUCT_DETAIL, Intent.PRODUCT_VARIATIONS) \
-            and entities.product_id and page_count > 0:
+    if intent in (Intent.PRODUCT_SEARCH, Intent.PRODUCT_DETAIL, Intent.PRODUCT_VARIATIONS) and entities.product_id and page_count > 0:
         parent = products[0]
         variations = [p for p in products[1:] if p.get("type") == "variation"]
         has_attributes = bool(entities.attributes)
@@ -401,6 +414,8 @@ def generate_suggestions(
     elif intent in (Intent.FILTER_BY_FINISH, Intent.FILTER_BY_COLOR, Intent.FILTER_BY_SIZE):
         suggestions.append("Show me all products")
         suggestions.append("What finishes are available?")
+    elif intent == Intent.UPDATE_CUSTOMER:
+        return ["Show me products on sale", "What categories do you have?", "Show me new releases"]
     elif intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY):
         suggestions.append("Reorder my last order")
         suggestions.append("Show me products")
@@ -455,6 +470,7 @@ INTENT_LABELS = {
     Intent.COUPON_INQUIRY: "coupon",
     Intent.SAVE_FOR_LATER: "wishlist",
     Intent.GREETING: "greeting",
+    Intent.UPDATE_CUSTOMER: "update_customer",
 }
 
 

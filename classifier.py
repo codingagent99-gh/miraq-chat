@@ -82,8 +82,10 @@ def classify(utterance: str) -> ClassifiedResult:
     _extract_order_item(text, entities)
     _extract_unresolved_descriptors(text, entities)
     _extract_price_range(text, entities)       # price range — 'under $40', 'between $20-$80'
+    _extract_customer_updates(text, entities)  # profile field updates
     _detect_tag_operator(text, entities)       # OR detection — must run after tags are extracted
     _extract_exclusions(text, entities)        # NOT IN — "without X", "no X", "exclude X"
+    _extract_customer_fetch(text, entities)
 
     # ─── Intent Classification (priority order) ───
 
@@ -218,13 +220,13 @@ def classify(utterance: str) -> ClassifiedResult:
 
     # 4b. PRODUCT VARIATIONS
     elif re.search(
-        r"\b(colors?|variants?|variations?|options?|finishes)\b.*\b(come|available|does|do)\b",
+        r"\b(colors?|variants?|variations?|options?|finishes|sizes)\b.*\b(come|available|does|do)\b",
         text,
     ):
         intent, confidence = Intent.PRODUCT_VARIATIONS, 0.89
 
     elif entities.product_name and re.search(
-        r"\b(colors?|variants?|variations?)\b", text
+        r"\b(colors?|variants?|variations?|sizes)\b", text
     ):
         intent, confidence = Intent.PRODUCT_VARIATIONS, 0.89
 
@@ -250,7 +252,10 @@ def classify(utterance: str) -> ClassifiedResult:
     
     elif entities.category_id is not None:
         if entities.product_name:
-            intent, confidence = Intent.PRODUCT_SEARCH, 0.95
+            if re.search(r"\b(tell|about|detail|info|specs?|specification|price|cost|how\s+much)\b", text):
+                intent, confidence = Intent.PRODUCT_DETAIL, 0.91
+            else:
+                intent, confidence = Intent.PRODUCT_SEARCH, 0.92
         elif entities.attributes:
             # category + attribute filter (e.g. "exterior tiles in 7/16 thick", "exterior pavers")
             # route to FILTER_BY_ATTRIBUTE with category scope, not plain CATEGORY_BROWSE
@@ -295,17 +300,20 @@ def classify(utterance: str) -> ClassifiedResult:
         intent, confidence = Intent.PRODUCT_BY_TAG, 0.88
 
     # 12. EXPLICIT "show me more/all products" RULE
+    # ── CUSTOMER UPDATE ──────────────────────────────────────────────────────
+    elif (
+        entities.customer_updates or entities.billing_updates or entities.shipping_updates
+    ):
+        intent, confidence = Intent.UPDATE_CUSTOMER, 0.93
+
+    elif entities.customer_fields_requested:
+        intent, confidence = Intent.FETCH_CUSTOMER, 0.93
+
     # Must be BEFORE product_name check to override generic product matches
     # Catches patterns like "show me more products" even if product_name was extracted
     elif re.search(r"\b(show|list|get|see)\b.*\b(more|all)\b.*\bproducts?\b", text):
         intent, confidence = Intent.PRODUCT_LIST, 0.87
 
-    # 13. PRODUCT SEARCH BY NAME
-    elif entities.product_name:
-        if re.search(r"\b(tell|about|detail|info|specs?|specification|price|cost|how\s+much)\b", text):
-            intent, confidence = Intent.PRODUCT_DETAIL, 0.91
-        else:
-            intent, confidence = Intent.PRODUCT_SEARCH, 0.92
 
     # 14. CATALOG / TYPES
     elif re.search(r"\b(catalog|catalogue|collection|range|portfolio)\b", text):
@@ -662,6 +670,131 @@ def _extract_attributes(text: str, entities: ExtractedEntities):
                     break  # first match per attribute wins
             except re.error:
                 pass
+
+def _extract_customer_fetch(text: str, entities: ExtractedEntities):
+    """
+    Detect "show/get/what is my [field]" queries.
+    Populates entities.customer_fields_requested.
+    """
+    FETCH_RE = r"\b(?:show|get|what(?:'?s| is)|display|tell me)\b"
+    
+    FIELD_PHRASES = {
+        "first name":   "first_name",
+        "last name":    "last_name",
+        "username":     "username",
+        "name":         "full_name",        # special: fetch both first+last
+        "billing phone":    "billing.phone",
+        "billing address":  "billing.address_1",
+        "billing city":     "billing.city",
+        "billing email":    "billing.email",
+        "shipping address": "shipping.address_1",
+        "shipping city":    "shipping.city",
+        "shipping phone":   "shipping.phone",
+        # extend as needed
+    }
+
+    for phrase, field_key in FIELD_PHRASES.items():
+        m = re.search(
+            rf"{FETCH_RE}[^.]*?\bmy\b[^.]*?\b{re.escape(phrase)}\b",
+            text, re.IGNORECASE
+        )
+        if m:
+            entities.customer_fields_requested.append(field_key)
+
+def _extract_customer_updates(text: str, entities: ExtractedEntities):
+    """
+    Extract customer profile field updates from natural language.
+    Handles top-level fields and nested billing/shipping address fields.
+    Blocked: role, email (cannot be changed via this interface).
+
+    Examples:
+      "change my first name to John"         -> customer_updates={first_name: "John"}
+      "update my billing phone to 555-1234"  -> billing_updates={phone: "555-1234"}
+      "set shipping city to Austin"          -> shipping_updates={city: "Austin"}
+      "change my name to Kupa Popol"         -> customer_updates={first_name: "Kupa", last_name: "Popol"}
+    """
+    TOP_LEVEL_FIELDS = {
+        "first name": "first_name",
+        "last name":  "last_name",
+        "username":   "username",
+        "first_name": "first_name",
+        "last_name":  "last_name",
+    }
+    BILLING_FIELDS = {
+        "billing first name":  "first_name",
+        "billing last name":   "last_name",
+        "billing company":     "company",
+        "billing address":     "address_1",
+        "billing address 1":   "address_1",
+        "billing address 2":   "address_2",
+        "billing city":        "city",
+        "billing state":       "state",
+        "billing postcode":    "postcode",
+        "billing zip":         "postcode",
+        "billing country":     "country",
+        "billing phone":       "phone",
+        "billing email":       "email",
+    }
+    SHIPPING_FIELDS = {
+        "shipping first name": "first_name",
+        "shipping last name":  "last_name",
+        "shipping company":    "company",
+        "shipping address":    "address_1",
+        "shipping address 1":  "address_1",
+        "shipping address 2":  "address_2",
+        "shipping city":       "city",
+        "shipping state":      "state",
+        "shipping postcode":   "postcode",
+        "shipping zip":        "postcode",
+        "shipping country":    "country",
+        "shipping phone":      "phone",
+    }
+
+    _UPDATE_RE = r"\b(?:change|update|set|edit|modify)\b"
+
+    def _extract_value(phrase):
+        m = re.search(
+            rf"{_UPDATE_RE}[^.]*?\b{re.escape(phrase)}\b[^.]*?\bto\b\s+(.+?)(?:\s*[.,]|$)",
+            text, re.IGNORECASE
+        )
+        if m:
+            return m.group(1).strip().strip("\"'")
+        m = re.search(
+            rf"\bmy\b[^.]*?\b{re.escape(phrase)}\b[^.]*?\b(?:is|should be|will be)\b\s+(.+?)(?:\s*[.,]|$)",
+            text, re.IGNORECASE
+        )
+        if m:
+            return m.group(1).strip().strip("\"'")
+        return None
+
+    for phrase, field_key in TOP_LEVEL_FIELDS.items():
+        val = _extract_value(phrase)
+        if val:
+            entities.customer_updates[field_key] = val
+
+    # Handle plain "name" → split into first_name / last_name
+    if not entities.customer_updates.get("first_name"):
+        m = re.search(
+            r"\b(?:change|update|set|edit|modify)\b[^.]*?\bmy\s+name\b[^.]*?\bto\b\s+(.+?)(?:\s*[.,]|$)",
+            text, re.IGNORECASE
+        )
+        if m:
+            parts = m.group(1).strip().strip("\"'").split()
+            if len(parts) >= 2:
+                entities.customer_updates["first_name"] = parts[0]
+                entities.customer_updates["last_name"]  = " ".join(parts[1:])
+            elif len(parts) == 1:
+                entities.customer_updates["first_name"] = parts[0]
+
+    for phrase, field_key in BILLING_FIELDS.items():
+        val = _extract_value(phrase)
+        if val:
+            entities.billing_updates[field_key] = val
+
+    for phrase, field_key in SHIPPING_FIELDS.items():
+        val = _extract_value(phrase)
+        if val:
+            entities.shipping_updates[field_key] = val
 
 
 def _extract_thickness(text: str, entities: ExtractedEntities):

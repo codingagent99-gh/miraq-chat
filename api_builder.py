@@ -324,7 +324,7 @@ def match_variation_to_entities(variations: list, entities) -> Optional[dict]:
     return best_variation if best_score > 0 else None
 
 
-def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str = "", session_id: str = "") -> List[WooAPICall]:
+def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str = "", session_id: str = "", customer_id: Optional[int] = None) -> List[WooAPICall]:
     """Build one or more WooCommerce API calls from classified result."""
     intent = result.intent
     e = result.entities
@@ -1006,6 +1006,35 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
                 params={"search": search_term, "status": "publish", "per_page": 5},
                 description=f"Find product '{search_term}' for order placement",
             ))
+
+    # ─── UPDATE_CUSTOMER ─────────────────────────────────────────────────────
+    elif intent == Intent.UPDATE_CUSTOMER:
+        # PUT /wp-json/wc/v3/customers/{customer_id}
+        # role and email are never sent even if extracted.
+        if not customer_id:
+            logger.warning("api_builder: UPDATE_CUSTOMER intent but no customer_id resolved")
+        else:
+            payload = {}
+            for field_key, value in (e.customer_updates or {}).items():
+                if field_key not in ("role", "email", "password"):
+                    payload[field_key] = value
+            if e.billing_updates:
+                payload["billing"] = dict(e.billing_updates)
+            if e.shipping_updates:
+                payload["shipping"] = dict(e.shipping_updates)
+            if payload:
+                calls.append(WooAPICall(
+                    method="PUT",
+                    endpoint=f"{BASE}/customers/{customer_id}",
+                    params={},
+                    body=payload,
+                    description=f"Update customer id={customer_id} | fields={list(payload.keys())}",
+                ))
+                logger.debug(
+                    f"api_builder: UPDATE_CUSTOMER | customer_id={customer_id} | payload_keys={list(payload.keys())}"
+                )
+            else:
+                logger.warning("api_builder: UPDATE_CUSTOMER payload empty after field filtering")
 
     # ═══════════════════════════════════════════
     # FALLBACK
