@@ -223,42 +223,40 @@ def classify(utterance: str) -> ClassifiedResult:
         if _loader_ref and _loader_ref.all_attributes_raw:
             _matched_label = None
 
-            # ── Pass 1: Full multi-word label match (highest priority) ──
-            # "sample size" matches "what sample sizes are available..."
-            # This ensures "Sample Size" wins over "Chip Size" when user said "sample sizes".
+            # ── Pass 1 ──
             for _attr in _loader_ref.all_attributes_raw:
                 _label = _attr.get("attribute_label", "").lower().strip()
                 if not _label:
                     continue
-                # For multi-word labels, build a flexible regex:
-                # "sample size" → r'\bsample\s+sizes?\b'
                 _words = _label.split()
                 if len(_words) > 1:
                     _pattern = r"\b" + r"\s+".join(re.escape(w) for w in _words) + r"s?\b"
                     if re.search(_pattern, text):
                         _matched_label = _label
                         break
+                    # Also try with last word singularized
+                    if _words[-1].endswith("s") and len(_words[-1]) > 3:
+                        _pattern_sg = r"\b" + r"\s+".join(re.escape(w) for w in _words[:-1]) + r"\s+" + re.escape(_words[-1][:-1]) + r"\b"
+                        if re.search(_pattern_sg, text):
+                            _matched_label = _label
+                            break
                 else:
-                    # Single-word label (e.g. "Finish", "Colors")
-                    if re.search(rf"\b{re.escape(_label)}s?\b", text):
+                    if _label_word_matches(_label, text):
                         _matched_label = _label
                         break
 
-            # ── Pass 2: Single-word fallback — only if pass 1 found nothing ──
-            # "size" alone matches "Tile Size" when user said "what sizes are available"
-            # without a qualifying word like "sample" or "tile".
+            # ── Pass 2 (single-word fallback) ──
             if not _matched_label:
                 for _attr in _loader_ref.all_attributes_raw:
                     _label = _attr.get("attribute_label", "").lower().strip()
                     if not _label:
                         continue
                     for _word in _label.split():
-                        if len(_word) >= 4 and re.search(rf"\b{re.escape(_word)}s?\b", text):
+                        if len(_word) >= 4 and _label_word_matches(_word, text):
                             _matched_label = _label
                             break
                     if _matched_label:
                         break
-
             if _matched_label:
                 intent, confidence = Intent.PRODUCT_ATTRIBUTE_INFO, 0.91
                 entities.target_attribute = _matched_label    # 4b. PRODUCT VARIATIONS (existing, unchanged — catches broader "what variations" queries)
@@ -994,6 +992,21 @@ def _extract_quantity(text: str, entities: ExtractedEntities):
     if match:
         entities.quantity = int(match.group(1))
 
+# For single-word labels or individual words from multi-word labels,
+# handle both plural→singular and singular→plural matching.
+# "Colors" (label) should match "color" (user text) and vice versa.
+def _label_word_matches(word, text):
+    """Check if an attribute label word matches in text, handling plurals."""
+    w = re.escape(word)
+    # Direct match or user used plural: "finish" matches "finishes", "finish"
+    if re.search(rf"\b{w}s?\b", text) or re.search(rf"\b{w}es?\b", text):
+        return True
+    # Label is plural, user used singular: "colors" → check for "color"
+    if word.endswith("s") and len(word) > 3:
+        singular = re.escape(word[:-1])
+        if re.search(rf"\b{singular}\b", text):
+            return True
+    return False
 
 def _extract_tag(text: str, entities: ExtractedEntities):
     """
