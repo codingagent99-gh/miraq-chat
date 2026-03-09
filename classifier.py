@@ -395,6 +395,10 @@ def classify(utterance: str) -> ClassifiedResult:
         Intent.PRODUCT_SEARCH,
         Intent.SIZE_LIST,
         Intent.PRODUCT_ATTRIBUTE_INFO,
+        Intent.QUICK_ORDER,
+        Intent.PLACE_ORDER,
+        Intent.ORDER_ITEM,
+
     }
     if entities.category_id is not None and entities.product_id is not None:
         if intent in PRODUCT_SPECIFIC_INTENTS:

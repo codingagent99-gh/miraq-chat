@@ -279,7 +279,8 @@ def handle_variant_selection(
     # ── Multiple or no match — ask user to narrow down ──
     logger.info(f"Step 3.55: Could not resolve to single variation | matched={len(matched)} of {len(all_variations)}")
     resolved_attributes = {}
-    if len(matched) > 1 and len(matched) < len(all_variations):
+        # Calculate resolved attributes when matched > 1 (regardless of whether it equals all_variations)
+    if len(matched) > 1:
         attr_values = {}
         for v in matched:
             for a in v.get("attributes", []):
@@ -291,7 +292,7 @@ def handle_variant_selection(
             if len(options) == 1:
                 resolved_attributes[attr_name] = list(options)[0]
         logger.info(f"Step 3.55: Resolved attributes so far: {resolved_attributes}")
-
+        
     if prev_resolved:
         for k, v in prev_resolved.items():
             if k not in resolved_attributes:
@@ -313,7 +314,7 @@ def handle_variant_selection(
         parent_resp = woo_client.execute(parent_call)
         parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
 
-    if len(matched) > 1 and len(matched) < len(all_variations):
+    if len(matched) > 1:
         attr_values_all = {}
         for v in matched:
             for a in v.get("attributes", []):
