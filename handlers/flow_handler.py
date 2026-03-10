@@ -15,6 +15,7 @@ from app_config import (
     WOO_BASE_URL,
     DEFAULT_PAYMENT_METHOD,
     DEFAULT_PAYMENT_METHOD_TITLE,
+    CURRENCY_SYMBOL,
 )
 from models import WooAPICall
 from woo_client import woo_client
@@ -88,6 +89,7 @@ def handle_flow(
 
 
 def _handle_create_order(flow_result, user_context, session_id, customer_id, page, start_time, sessions):
+    CS = CURRENCY_SYMBOL
     pending_product_id = user_context.get("pending_product_id")
     pending_product_name = user_context.get("pending_product_name", "")
     pending_quantity = user_context.get("pending_quantity", 1)
@@ -165,13 +167,14 @@ def _handle_create_order(flow_result, user_context, session_id, customer_id, pag
         if created_order.get("line_items"):
             product_name = created_order["line_items"][0].get("name") or product_name
 
-        currency_symbol = created_order.get("currency_symbol", "$")
+        # Prefer currency_symbol from WooCommerce order response, fall back to configured symbol
+        currency = created_order.get("currency_symbol") or CS
 
         bot_message = (
             f"✅ **Order #{order_number} placed successfully!**\n\n"
             f"**Product:** {product_name}\n"
             f"**Quantity:** {pending_quantity}\n"
-            f"**Total:** {currency_symbol}{float(total):.2f}\n"
+            f"**Total:** {currency}{float(total):.2f}\n"
             f"**Payment Mode:** {DEFAULT_PAYMENT_METHOD_TITLE}\n"
         )
 
@@ -333,6 +336,7 @@ def _handle_fetch_address(flow_result, user_context, session_id, customer_id, pa
 
 
 def _handle_price_summary(flow_result, user_context, session_id, customer_id, page, start_time):
+    CS = CURRENCY_SYMBOL
     pending_product_id = user_context.get("pending_product_id")
     pending_product_name = user_context.get("pending_product_name", "the product")
     pending_quantity = user_context.get("pending_quantity", 1)
@@ -360,7 +364,7 @@ def _handle_price_summary(flow_result, user_context, session_id, customer_id, pa
 
     try:
         _total = float(_price_display) * int(pending_quantity)
-        _total_display = f"${_total:.2f}"
+        _total_display = f"{CS}{_total:.2f}"
     except (ValueError, TypeError):
         _total_display = "N/A"
 
@@ -392,7 +396,7 @@ def _handle_price_summary(flow_result, user_context, session_id, customer_id, pa
             f"📋 **Order Summary**\n\n"
             f"**Product:** {_product_line}\n"
             f"**Quantity:** {pending_quantity}\n"
-            f"**Unit Price:** ${_price_display}\n"
+            f"**Unit Price:** {CS}{_price_display}\n"
             f"**Estimated Total:** {_total_display}\n"
             f"**Payment:** {DEFAULT_PAYMENT_METHOD_TITLE}\n\n"
             f"Shall I place this order? ✅"

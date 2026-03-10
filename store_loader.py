@@ -3,13 +3,20 @@ Store Loader — Fetches categories, tags, and attributes from WooCommerce.
 
 Auth method: Browser User-Agent + Query-string auth
 (Test 3 confirmed this bypasses ModSecurity 406 on wgc.net.in)
+
+Dev mode: Set DEV_CACHE=true in .env to cache all store data to a local
+JSON file. On subsequent restarts, data loads from disk in ~50ms instead
+of fetching from WooCommerce (~15-30s). Run with DEV_CACHE_BUST=true
+(or delete .dev_cache/store_data.json) to force a fresh fetch.
 """
 
 import os
 import re
+import json
 import time
 import threading
 import requests
+from collections import OrderedDict
 from typing import List, Dict, Optional, Tuple
 from dotenv import load_dotenv
 from config.store_config import TAG_SLUG_QUICK_SHIP, TAG_SLUG_CHIP_CARD
@@ -24,6 +31,12 @@ WOO_CONSUMER_KEY = os.getenv("WOO_CONSUMER_KEY", "")
 WOO_CONSUMER_SECRET = os.getenv("WOO_CONSUMER_SECRET", "")
 REQUEST_TIMEOUT = 30
 
+# Dev cache settings
+DEV_CACHE_ENABLED = os.getenv("DEV_CACHE", "false").lower() == "true"
+DEV_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dev_cache")
+DEV_CACHE_FILE = os.path.join(DEV_CACHE_DIR, "store_data.json")
+DEV_CACHE_BUST = os.getenv("DEV_CACHE_BUST", "false").lower() == "true"
+
 BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -34,6 +47,69 @@ BROWSER_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
 }
+
+
+# ═══════════════════════════════════════════
+# BOUNDED LRU CACHE FOR VARIATION DETAILS
+# ═══════════════════════════════════════════
+
+class BoundedVariationCache:
+    """
+    LRU cache with max size and TTL for variation data.
+
+    - max_size: max number of product_ids to cache (default 200)
+    - ttl: seconds before an entry expires (default 1 hour)
+
+    When full, the least-recently-accessed entry is evicted.
+    When accessed, expired entries return None (cache miss → re-fetch from API).
+    """
+
+    def __init__(self, max_size: int = 200, ttl: int = 3600):
+        self._cache: OrderedDict = OrderedDict()
+        self.max_size = max_size
+        self.ttl = ttl
+
+    def get(self, product_id: int):
+        """Get cached variations. Returns None on miss or expiry."""
+        entry = self._cache.get(product_id)
+        if entry is None:
+            return None
+
+        # Check TTL
+        if time.time() - entry["cached_at"] > self.ttl:
+            del self._cache[product_id]
+            return None
+
+        # Cache hit — move to end (most recently used)
+        self._cache.move_to_end(product_id)
+        return entry["variations"]
+
+    def __setitem__(self, product_id: int, variations: list):
+        """Cache variations for a product_id."""
+        if product_id in self._cache:
+            self._cache.move_to_end(product_id)
+        self._cache[product_id] = {
+            "variations": variations,
+            "cached_at": time.time(),
+        }
+        # Evict oldest if over capacity
+        while len(self._cache) > self.max_size:
+            evicted_key, _ = self._cache.popitem(last=False)
+            logger.debug(f"BoundedVariationCache: Evicted product_id={evicted_key} (capacity={self.max_size})")
+
+    def __len__(self):
+        return len(self._cache)
+
+    def clear(self):
+        """Clear all cached entries."""
+        self._cache.clear()
+
+    def pop(self, product_id: int, default=None):
+        """Remove and return variations for a product_id, or default."""
+        entry = self._cache.pop(product_id, None)
+        if entry is None:
+            return default
+        return entry["variations"]
 
 
 class StoreLoader:
@@ -69,7 +145,7 @@ class StoreLoader:
         self._category_synonyms: Dict[str, str] = self._load_category_synonyms()
 
         self.product_variation_schema: Dict[int, Dict] = {}
-        self.variation_detail_cache: Dict[int, List[Dict]] = {}
+        self.variation_detail_cache = BoundedVariationCache(max_size=200, ttl=3600)
 
         self.attribute_by_slug: Dict[str, Dict] = {}
         self.attribute_by_id: Dict[int, Dict] = {}
@@ -82,9 +158,74 @@ class StoreLoader:
         self._refresh_thread: Optional[threading.Thread] = None
         self._degraded: bool = False          # True when critical data failed to load
         self._degraded_reasons: list = []     # Human-readable list of what's missing
+        self._expected_product_count: Optional[int] = None
+        self._loaded_from_cache: bool = False  # True when data came from dev cache
+
+    # ───────────────────��─────────────────────────
+    # DEV CACHE — save/load store data to disk
+    # ─────────────────────────────────────────────
+
+    def _save_dev_cache(self, data: dict):
+        """Save fetched store data to .dev_cache/store_data.json for fast restarts."""
+        try:
+            os.makedirs(DEV_CACHE_DIR, exist_ok=True)
+            data["_cache_meta"] = {
+                "saved_at": time.time(),
+                "saved_at_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "base_url": self.base,
+            }
+            with open(DEV_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            size_kb = os.path.getsize(DEV_CACHE_FILE) / 1024
+            logger.info(f"StoreLoader: 💾 Dev cache saved → {DEV_CACHE_FILE} ({size_kb:.0f} KB)")
+        except Exception as e:
+            logger.warning(f"StoreLoader: Could not save dev cache | error={e}")
+
+    def _load_dev_cache(self) -> Optional[dict]:
+        """Load store data from .dev_cache/store_data.json if it exists.
+        Returns the data dict, or None if cache doesn't exist / is invalid.
+        """
+        if DEV_CACHE_BUST:
+            logger.info("StoreLoader: 🔄 DEV_CACHE_BUST=true — forcing fresh fetch")
+            return None
+
+        if not os.path.exists(DEV_CACHE_FILE):
+            return None
+
+        try:
+            with open(DEV_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            # Validate it has the expected keys
+            required = {"categories", "tags", "attributes", "attribute_terms", "products"}
+            if not required.issubset(data.keys()):
+                logger.warning("StoreLoader: Dev cache file is missing required keys — ignoring")
+                return None
+
+            # Check if the cache was for the same base URL
+            meta = data.get("_cache_meta", {})
+            cached_url = meta.get("base_url", "")
+            if cached_url and cached_url != self.base:
+                logger.warning(
+                    f"StoreLoader: Dev cache is for {cached_url} but current base is {self.base} — ignoring"
+                )
+                return None
+
+            saved_at = meta.get("saved_at_iso", "unknown")
+            size_kb = os.path.getsize(DEV_CACHE_FILE) / 1024
+            logger.info(f"StoreLoader: 📦 Dev cache found ({size_kb:.0f} KB, saved {saved_at})")
+            return data
+
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"StoreLoader: Dev cache file is corrupt — ignoring | error={e}")
+            return None
 
     def load_all(self):
-        """Fetch all taxonomy data from WooCommerce."""
+        """Fetch all taxonomy data from WooCommerce.
+
+        In dev mode (DEV_CACHE=true): loads from local JSON file if available,
+        skipping all network calls. Falls back to live fetch if no cache exists.
+        """
         logger.info("StoreLoader: Loading store data from WooCommerce...")
         logger.info(f"StoreLoader: Base URL={self.base}")
 
@@ -92,51 +233,119 @@ class StoreLoader:
             logger.error("StoreLoader: API keys not configured! Update .env file.")
             return
 
-        self.categories = self._fetch_all_pages(f"{self.base}/products/categories")
-        logger.info(f"StoreLoader: Loaded {len(self.categories)} categories {'✅' if self.categories else '⚠️ EMPTY'}")
+        # ── Try dev cache first ──
+        if DEV_CACHE_ENABLED:
+            cached = self._load_dev_cache()
+            if cached is not None:
+                load_start = time.time()
+                with self._lock:
+                    self.categories = cached.get("categories", [])
+                    self.tags = cached.get("tags", [])
+                    self.attributes = cached.get("attributes", [])
+                    # attribute_terms keys are ints but JSON serializes them as strings
+                    self.attribute_terms = {
+                        int(k): v for k, v in cached.get("attribute_terms", {}).items()
+                    }
+                    self.products = cached.get("products", [])
+                    self.all_attributes_raw = cached.get("all_attributes_raw", [])
+                    self._expected_product_count = cached.get("expected_product_count")
+                    self._loaded_from_cache = True
+                    self._build_lookups()
+                    self._last_loaded = time.time()
+                    self._validate_load()
 
-        self.tags = self._fetch_all_pages(f"{self.base}/products/tags")
-        logger.info(f"StoreLoader: Loaded {len(self.tags)} tags")
+                elapsed_ms = round((time.time() - load_start) * 1000)
+                logger.info(
+                    f"StoreLoader: ⚡ Loaded from dev cache in {elapsed_ms}ms | "
+                    f"categories={len(self.categories)} | tags={len(self.tags)} | "
+                    f"products={len(self.products)}"
+                )
+                return
 
-        self.attributes = self._fetch_all_pages(f"{self.base}/products/attributes")
-        logger.info(f"StoreLoader: Loaded {len(self.attributes)} attributes")
+        # ── Live fetch from WooCommerce ──
+        fetch_start = time.time()
 
-        for attr in self.attributes:
+        new_categories = self._fetch_all_pages(f"{self.base}/products/categories")
+        logger.info(f"StoreLoader: Loaded {len(new_categories)} categories {'✅' if new_categories else '⚠️ EMPTY'}")
+
+        new_tags = self._fetch_all_pages(f"{self.base}/products/tags")
+        logger.info(f"StoreLoader: Loaded {len(new_tags)} tags")
+
+        new_attributes = self._fetch_all_pages(f"{self.base}/products/attributes")
+        logger.info(f"StoreLoader: Loaded {len(new_attributes)} attributes")
+
+        new_attribute_terms: Dict[int, List[Dict]] = {}
+        for attr in new_attributes:
             attr_id = attr["id"]
             terms = self._fetch_all_pages(
                 f"{self.base}/products/attributes/{attr_id}/terms"
             )
-            self.attribute_terms[attr_id] = terms
+            new_attribute_terms[attr_id] = terms
             logger.info(f"StoreLoader: Loaded {len(terms)} terms for '{attr['name']}' (id={attr_id})")
 
-        self.products = self._fetch_all_pages(
+        raw_products, expected_total = self._fetch_all_pages_with_total(
             f"{self.base}/products",
             extra_params={"status": "publish"},
         )
-        logger.info(f"StoreLoader: Loaded {len(self.products)} products {'✅' if self.products else '⚠️ EMPTY'}")
+        logger.info(f"StoreLoader: Fetched {len(raw_products)} raw products {'✅' if raw_products else '⚠️ EMPTY'}")
+
+        # Strip product JSON to only the fields we actually use
+        _PRODUCT_FIELDS_USED = {
+            "id", "name", "slug", "type",
+            "attributes", "default_attributes", "variations",
+        }
+        new_products = [
+            {k: p[k] for k in _PRODUCT_FIELDS_USED if k in p}
+            for p in raw_products
+        ]
 
         custom_api_base = os.getenv(
             "CUSTOM_API_BASE_URL",
             self.base.replace("/wp-json/wc/v3", "/wp-json/custom-api/v1"),
         )
+        new_all_attributes_raw: List[Dict] = []
         try:
             resp = self.session.get(f"{custom_api_base}/all-attributes", timeout=self.timeout)
             resp.raise_for_status()
-            self.all_attributes_raw = resp.json()
-            logger.info(f"StoreLoader: Loaded {len(self.all_attributes_raw)} attributes from custom API")
+            new_all_attributes_raw = resp.json()
+            logger.info(f"StoreLoader: Loaded {len(new_all_attributes_raw)} attributes from custom API")
         except Exception as e:
             logger.warning(f"StoreLoader: Custom all-attributes API failed | error={e}")
-            self.all_attributes_raw = []
 
-        self._build_lookups()
-        self._last_loaded = time.time()
-        self._validate_load()
+        fetch_elapsed = round(time.time() - fetch_start, 1)
+
+        # ── Atomic swap under lock ──
+        with self._lock:
+            self.categories = new_categories
+            self.tags = new_tags
+            self.attributes = new_attributes
+            self.attribute_terms = new_attribute_terms
+            self.products = new_products
+            self.all_attributes_raw = new_all_attributes_raw
+            self._expected_product_count = expected_total
+            self._loaded_from_cache = False
+            self._build_lookups()
+            self._last_loaded = time.time()
+            self._validate_load()
 
         logger.info(
             f"StoreLoader: Summary | categories={len(self.categories)} | tags={len(self.tags)} | "
             f"attributes={len(self.attributes)} | products={len(self.products)} | "
-            f"cat_keywords={len(self.category_keywords)}"
+            f"cat_keywords={len(self.category_keywords)} | fetch_time={fetch_elapsed}s"
         )
+
+        # ── Save to dev cache for next restart ──
+        if DEV_CACHE_ENABLED and not self._degraded:
+            self._save_dev_cache({
+                "categories": new_categories,
+                "tags": new_tags,
+                "attributes": new_attributes,
+                "attribute_terms": {str(k): v for k, v in new_attribute_terms.items()},
+                "products": new_products,
+                "all_attributes_raw": new_all_attributes_raw,
+                "expected_product_count": expected_total,
+            })
+
         if self._degraded:
             logger.warning(f"StoreLoader: DEGRADED — {', '.join(self._degraded_reasons)} | retry_in={self._retry_interval // 60}min")
         else:
@@ -145,22 +354,19 @@ class StoreLoader:
     def _validate_load(self):
         """
         Check whether critical data loaded successfully.
-        Sets self._degraded = True and populates self._degraded_reasons
-        if any critical resource is missing.
-
-        Critical resources:
-          - categories: without these, no category detection works at all
-          - products:   without these, product name matching is broken
-          - cat keywords: derived from categories; 0 means category matching is broken
-
-        Tags and attributes are non-critical — missing tags/attributes degrade
-        suggestions and filtering but do not break the core query flow.
         """
         reasons = []
         if len(self.categories) == 0:
             reasons.append("0 categories (likely 503/maintenance during fetch)")
         if len(self.products) == 0:
             reasons.append("0 products")
+        elif self._expected_product_count and self._expected_product_count > 0:
+            ratio = len(self.products) / self._expected_product_count
+            if ratio < 0.8:
+                reasons.append(
+                    f"partial products: {len(self.products)}/{self._expected_product_count} "
+                    f"({ratio:.0%} loaded)"
+                )
         if len(self.category_keywords) == 0:
             reasons.append("0 category keywords generated")
 
@@ -174,7 +380,15 @@ class StoreLoader:
         Normal mode:  refreshes every 6 hours.
         Degraded mode: retries every 2 minutes until data loads fully,
                        then switches to the normal 6-hour cadence.
+
+        In dev mode: background refresh is disabled — you're restarting
+        the server manually anyway. Use DEV_CACHE_BUST=true or delete
+        .dev_cache/ to force fresh data.
         """
+        if DEV_CACHE_ENABLED:
+            logger.info("StoreLoader: 🛑 Background refresh DISABLED in dev mode (DEV_CACHE=true)")
+            return
+
         if self._refresh_thread and self._refresh_thread.is_alive():
             return
 
@@ -205,8 +419,8 @@ class StoreLoader:
         else:
             logger.info(f"StoreLoader: Background refresh scheduled every {self._refresh_interval // 3600}h")
 
-    def _fetch_all_pages(self, url: str, extra_params: Dict = None) -> List[Dict]:
-        """Fetch all pages using browser UA + query-string auth."""
+    def _fetch_all_pages(self, url: str, extra_params: Dict = None, max_retries: int = 3) -> List[Dict]:
+        """Fetch all pages using browser UA + query-string auth with retry."""
         all_items = []
         page = 1
         per_page = 100
@@ -221,31 +435,113 @@ class StoreLoader:
             if extra_params:
                 params.update(extra_params)
 
-            try:
-                resp = self.session.get(url, params=params, timeout=self.timeout)
-                resp.raise_for_status()
-                data = resp.json()
-
-                if not data:
+            data = None
+            resp = None
+            for attempt in range(max_retries):
+                try:
+                    resp = self.session.get(url, params=params, timeout=self.timeout)
+                    resp.raise_for_status()
+                    data = resp.json()
                     break
+                except (requests.exceptions.HTTPError,
+                        requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout) as e:
+                    if attempt < max_retries - 1:
+                        wait = 2 ** attempt
+                        status_code = getattr(getattr(e, 'response', None), 'status_code', '?')
+                        logger.warning(
+                            f"StoreLoader: Retry {attempt + 1}/{max_retries} for {url} "
+                            f"page {page} in {wait}s | HTTP {status_code} | {e}"
+                        )
+                        time.sleep(wait)
+                    else:
+                        status_code = getattr(getattr(e, 'response', None), 'status_code', '?')
+                        body = getattr(getattr(e, 'response', None), 'text', 'N/A')
+                        body = body[:300] if body else 'N/A'
+                        logger.error(
+                            f"StoreLoader: All {max_retries} retries failed for {url} "
+                            f"page {page} | HTTP {status_code} | body={body}"
+                        )
+                        return all_items
+                except Exception as e:
+                    logger.warning(f"StoreLoader: Unexpected error fetching {url} page {page} | error={e}")
+                    return all_items
 
-                all_items.extend(data)
+            if data is None or not data:
+                break
 
+            all_items.extend(data)
+
+            total_pages = int(resp.headers.get("X-WP-TotalPages", 1)) if resp else 1
+            if page >= total_pages:
+                break
+            page += 1
+
+        return all_items
+
+    def _fetch_all_pages_with_total(self, url: str, extra_params: Dict = None, max_retries: int = 3) -> Tuple[List[Dict], Optional[int]]:
+        """Like _fetch_all_pages but also returns the X-WP-Total header value."""
+        all_items = []
+        page = 1
+        per_page = 100
+        expected_total: Optional[int] = None
+
+        while True:
+            params = {
+                "per_page": per_page,
+                "page": page,
+                "consumer_key": self.consumer_key,
+                "consumer_secret": self.consumer_secret,
+            }
+            if extra_params:
+                params.update(extra_params)
+
+            data = None
+            resp = None
+            for attempt in range(max_retries):
+                try:
+                    resp = self.session.get(url, params=params, timeout=self.timeout)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    break
+                except (requests.exceptions.HTTPError,
+                        requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout) as e:
+                    if attempt < max_retries - 1:
+                        wait = 2 ** attempt
+                        logger.warning(
+                            f"StoreLoader: Retry {attempt + 1}/{max_retries} for {url} "
+                            f"page {page} in {wait}s | {e}"
+                        )
+                        time.sleep(wait)
+                    else:
+                        logger.error(
+                            f"StoreLoader: All {max_retries} retries failed for {url} page {page}"
+                        )
+                        return all_items, expected_total
+                except Exception as e:
+                    logger.warning(f"StoreLoader: Unexpected error fetching {url} page {page} | error={e}")
+                    return all_items, expected_total
+
+            if data is None or not data:
+                break
+
+            all_items.extend(data)
+
+            if resp:
+                if expected_total is None:
+                    try:
+                        expected_total = int(resp.headers.get("X-WP-Total", 0))
+                    except (ValueError, TypeError):
+                        pass
                 total_pages = int(resp.headers.get("X-WP-TotalPages", 1))
                 if page >= total_pages:
                     break
-                page += 1
-
-            except requests.exceptions.HTTPError as e:
-                status = e.response.status_code if e.response is not None else "?"
-                body = e.response.text[:300] if e.response is not None else "N/A"
-                logger.warning(f"StoreLoader: HTTP {status} at {url} page {page} | body={body}")
+            else:
                 break
-            except Exception as e:
-                logger.warning(f"StoreLoader: Error fetching {url} | error={e}")
-                break
+            page += 1
 
-        return all_items
+        return all_items, expected_total
 
     # ─────────────────────────────────────────────
     # LOOKUP BUILDERS
@@ -263,13 +559,7 @@ class StoreLoader:
         return {}
 
     def _build_store_generic_terms(self) -> set:
-        """Derive generic/filler terms from the store's own category names.
-
-        Words appearing in >30% of category names are too broad to be useful
-        as standalone keywords — treat them as suffixes for combo generation instead.
-        e.g. "tile" appears in Tile, Tile Floor, Tile Wall → auto-detected as generic.
-        Works for any store: a furniture store would detect "furniture", etc.
-        """
+        """Derive generic/filler terms from the store's own category names."""
         from collections import Counter
         word_counts = Counter()
         valid_cats = [c for c in self.categories if c.get("slug") != "uncategorized" and c.get("count", 0) > 0]
@@ -322,6 +612,12 @@ class StoreLoader:
             if slug_words != name_lower:
                 self.tag_by_name_lower.setdefault(slug_words, entry)
 
+        self.category_by_slug = {}
+        self.category_by_id = {}
+        self.category_by_name_lower = {}
+        self.category_slugs_by_name = {}
+        self.category_keywords = {}
+
         for cat in self.categories:
             cat_id = cat["id"]
             slug = cat.get("slug", "")
@@ -353,6 +649,8 @@ class StoreLoader:
             if slug != "uncategorized" and count > 0:
                 self._generate_category_keywords(entry)
 
+        self.tag_by_slug = {}
+        self.tag_by_id = {}
         for tag in self.tags:
             tag_id = tag["id"]
             slug = tag.get("slug", "")
@@ -365,6 +663,8 @@ class StoreLoader:
             self.tag_by_slug[slug] = entry
             self.tag_by_id[tag_id] = entry
 
+        self.product_by_name_lower = {}
+        self.product_name_tokens = []
         for product in self.products:
             name = product.get("name", "")
             slug = product.get("slug", "")
@@ -406,54 +706,28 @@ class StoreLoader:
             }
 
     def _generate_category_keywords(self, cat_entry: Dict):
-        """
-        Auto-generate NLP keywords from category name/slug.
-
-        For your store's real categories like:
-          Countertop, New Releases, Wall, Wall/Floor
-        This generates keywords:
-          "countertop" → id, "wall" → id, "floor" → id,
-          "wall/floor" → id, "new releases" → id, etc.
-
-        Also registers singular forms (strip trailing 's') so that e.g.
-          "mosaic" → Mosaics, "panel" → Panels, "paver" → Pavers.
-        This prevents singular user terms from leaking into _extract_attributes.
-        """
+        """Auto-generate NLP keywords from category name/slug."""
         cat_id = cat_entry["id"]
         name = cat_entry["name"].lower().strip()
         slug = cat_entry["slug"]
-
         cat_count = cat_entry.get("count", 0)
 
         def _register(kw: str, cid: int):
-            """Register keyword, preferring the most specific category (lowest product count).
-            Consistent with get_category_for_text / get_all_categories_for_text which also
-            rank by lowest count first."""
             if kw not in self.category_keywords:
                 self.category_keywords[kw] = cid
             else:
                 existing_id = self.category_keywords[kw]
                 existing_count = (self.category_by_id.get(existing_id) or {}).get("count", 0)
-                if cat_count < existing_count:   # lower count = more specific → wins
+                if cat_count < existing_count:
                     self.category_keywords[kw] = cid
 
-        # Full name always registered — this covers single-word categories like "Tile"
-        # even though "tile" is in _store_generic_terms.
         _register(name, cat_id)
 
-        # Split by spaces, hyphens, slashes, underscores.
         stop_words = {
             "the", "a", "an", "and", "or", "of", "for",
             "in", "on", "to", "is", "all", "our", "new",
         } | self._store_generic_terms
         words = re.split(r'[\s\-_/&]+', name)
-
-        # Only register individual words for truly single-word category names.
-        # Compound/slash categories (e.g. "Wall/Floor", "Tile Floor") must NOT
-        # register their individual words — those belong to their own standalone
-        # single-word categories. "floor" must map to Floor, not Wall/Floor.
-        # Single-word is determined by RAW word count before any stop-word stripping,
-        # so generic-term categories like "Tile" (1 raw word) still register correctly.
         raw_words = [w for w in words if w.strip()]
         is_single_word_category = len(raw_words) <= 1
 
@@ -461,26 +735,20 @@ class StoreLoader:
             for word in raw_words:
                 if len(word) > 2:
                     _register(word, cat_id)
-                    # Register both plural and singular so "tiles"→Tile, "mosaic"→Mosaics etc.
                     if word.endswith("s") and len(word) > 3:
                         _register(word[:-1], cat_id)
                     else:
                         _register(word + "s", cat_id)
 
-        # Slug as words: "wall-floor" → "wall floor"
         slug_words = slug.replace("-", " ")
         if slug_words != name:
             _register(slug_words, cat_id)
 
-        # Add synonym variations from config (store-specific, empty by default)
         for original, variant in self._category_synonyms.items():
             if original in name:
                 alt_name = name.replace(original, variant)
                 _register(alt_name, cat_id)
 
-        # Add "[category name] + [generic term]" combos.
-        # Only single-word categories get individual word+suffix combos (e.g. "floor tile").
-        # Compound categories only get full-name+suffix (e.g. "wall/floor tile").
         for suffix in self._store_generic_terms:
             _register(f"{name} {suffix}", cat_id)
             if is_single_word_category:
@@ -488,7 +756,7 @@ class StoreLoader:
                     if len(word) > 2:
                         _register(f"{word} {suffix}", cat_id)
 
-    # ─────────────────────────────────────────────
+    # ─────────────────��───────────────────────────
     # QUERY METHODS
     # ─────────────────────────────────────────────
 
@@ -523,27 +791,10 @@ class StoreLoader:
         return None
 
     def get_category_for_text(self, text: str) -> Optional[Dict]:
-        """
-        Scan user text for any category keyword match.
-        Returns the most specific matching category (lowest product count), or None.
-
-        For multi-category queries use get_all_categories_for_text() instead.
-        """
         results = self.get_all_categories_for_text(text)
         return results[0] if results else None
 
     def get_all_categories_for_text(self, text: str) -> List[Dict]:
-        """
-        Scan user text for ALL matching category keywords.
-        Returns a list sorted by specificity (lowest count first, longest keyword as
-        tiebreaker) so callers can AND-filter across multiple categories.
-
-        e.g. "exterior pavers in gray"
-          → [Pavers (count=5), Exterior (count=17)]
-          Primary = Pavers (index 0), Extra = [Exterior] (index 1+)
-
-        Deduplicates by category ID so the same category is never returned twice.
-        """
         text_lower = text.lower()
         best_per_cat: Dict[int, tuple] = {}
 
@@ -564,10 +815,6 @@ class StoreLoader:
         return [c[2] for c in candidates]
 
     def get_product_for_text(self, text: str) -> Optional[Dict]:
-        """
-        Scan user text for any known product name or token.
-        Returns the best (longest name) matching product or None.
-        """
         text_lower = text.lower()
         best_match = None
         best_match_len = 0
@@ -593,14 +840,10 @@ class StoreLoader:
     # ─────────────────────────────────────────────
 
     def get_category_slug(self, category_id: int) -> Optional[str]:
-        """Return category slug for an ID."""
         entry = self.category_by_id.get(category_id)
         return entry["slug"] if entry else None
 
     def get_all_slugs_for_category(self, category_id: int) -> List[str]:
-        """Return ALL slugs for categories sharing the same name as category_id.
-        Useful when WooCommerce has duplicate category entries with different slugs.
-        e.g. 'Tile Floor' → ['tile-floor', 'tile-floor-mosaics-4', ...]"""
         entry = self.category_by_id.get(category_id)
         if not entry:
             return []
@@ -608,23 +851,14 @@ class StoreLoader:
         return self.category_slugs_by_name.get(name_lower, [entry["slug"]])
 
     def get_attribute_id(self, slug: str) -> Optional[int]:
-        """Return WooCommerce attribute ID for a slug, e.g. 'pa_tile-size' → 5."""
         entry = self.attribute_by_slug.get(slug)
         return entry["id"] if entry else None
 
     def get_attribute_slug(self, attr_id: int) -> Optional[str]:
-        """Return attribute slug for an ID."""
         entry = self.attribute_by_id.get(attr_id)
         return entry["slug"] if entry else None
 
     def get_attribute_term_ids(self, attr_slug: str, user_value: str) -> List[int]:
-        """
-        Fuzzy-match user_value against live attribute terms for attr_slug.
-        e.g. get_attribute_term_ids("pa_tile-size", "24x48") → [123]
-             get_attribute_term_ids("pa_finish", "matte")     → [45]
-             get_attribute_term_ids("pa_application", "interior wall") → [67]
-        Returns list of matching term IDs (may be multiple partial matches).
-        """
         attr = self.attribute_by_slug.get(attr_slug)
         if not attr:
             return []
@@ -653,12 +887,6 @@ class StoreLoader:
         return exact if exact else partial
 
     def get_attribute_term_slug(self, attr_slug: str, user_value: str) -> str:
-        """
-        Like get_attribute_term_ids but returns the slug of the first matched term.
-        Returns empty string if no match found.
-        e.g. get_attribute_term_slug("pa_sample-size", '3"x3"') → "3x3"
-             get_attribute_term_slug("pa_finish", "matte")        → "matte"
-        """
         attr = self.attribute_by_slug.get(attr_slug)
         if not attr:
             return ""
@@ -685,26 +913,21 @@ class StoreLoader:
         return exact_slug or partial_slug
 
     def get_all_attribute_terms(self, attr_slug: str) -> List[Dict]:
-        """Return all terms for an attribute slug."""
         attr = self.attribute_by_slug.get(attr_slug)
         if not attr:
             return []
         return self.attribute_terms.get(attr["id"], [])
 
     def get_variation_schema(self, product_id: int) -> Optional[Dict]:
-        """Return cached variation schema for a product (built at startup)."""
         return self.product_variation_schema.get(product_id)
 
     def get_cached_variations(self, product_id: int) -> Optional[List[Dict]]:
-        """Return cached variation detail objects if already fetched, else None."""
         return self.variation_detail_cache.get(product_id)
 
     def cache_variations(self, product_id: int, variations: List[Dict]) -> None:
-        """Store fetched variation details in the global cache (shared across sessions)."""
         self.variation_detail_cache[product_id] = variations
 
     def get_tag_id_by_slug(self, slug: str) -> Optional[int]:
-        """Return tag ID by slug. Uses live data."""
         entry = self.tag_by_slug.get(slug)
         return entry["id"] if entry else None
 
@@ -726,20 +949,7 @@ class StoreLoader:
 
         return exact if exact else partial
 
-
     def get_similar_tags(self, slug: str, limit: int = 3) -> List[Dict]:
-        """
-        Find tags whose slug is similar to the given slug.
-        Used for filter suggestions when a tag returns 0 results.
-
-        Matching strategy (priority order):
-        1. Prefix match: failed slug is a prefix of the candidate
-           e.g. "wilde" -> "wilde-mosaic", "wilde-series"
-        2. Word overlap: candidate shares at least one hyphen-word with failed slug
-           e.g. "gray-tone" -> "gray-tones", "dark-gray-tones"
-
-        Returns tags sorted by score DESC. Excludes the failed slug and count=0 tags.
-        """
         needle_words = set(slug.split("-")) - {""}
         candidates = []
 
@@ -762,17 +972,6 @@ class StoreLoader:
         return [t for _, t in candidates[:limit]]
 
     def get_related_categories(self, cat_id: int, limit: int = 3) -> List[Dict]:
-        """
-        Find categories related to the given category.
-        Used for filter suggestions when a category + filter combo returns 0 results.
-
-        Strategy:
-        1. Compound/slash categories (e.g. Wall/Floor) -> return component single-word
-           categories (Floor, Wall) which are more likely to have results with filters.
-        2. Siblings (same parent) sorted by product count DESC.
-
-        Excludes original category and count=0 categories.
-        """
         cat = self.category_by_id.get(cat_id)
         if not cat:
             return []
@@ -780,7 +979,6 @@ class StoreLoader:
         results = []
         seen_ids = {cat_id}
 
-        # Strategy 1: compound category -> component single-word categories
         name = cat["name"].lower()
         raw_words = [w for w in re.split(r"[\s\-_/&]+", name) if w.strip()]
         if len(raw_words) > 1:
@@ -792,7 +990,6 @@ class StoreLoader:
                         results.append(matched_cat)
                         seen_ids.add(matched_id)
 
-        # Strategy 2: siblings (same parent)
         parent_id = cat.get("parent", 0)
         siblings = [
             c for c in self.categories
@@ -813,13 +1010,6 @@ class StoreLoader:
     def get_sibling_attribute_terms(
         self, attr_slug: str, failed_term: str, limit: int = 3
     ) -> List[str]:
-        """
-        Return other term names for the same attribute, excluding the failed term.
-        Used for filter suggestions when an attribute value returns 0 results.
-
-        e.g. attr_slug="pa_finish", failed_term="Matte" -> ["Polished", "Brushed", "Honed"]
-        Returns term names sorted by count DESC, count=0 terms excluded.
-        """
         attr = self.attribute_by_slug.get(attr_slug)
         if not attr:
             return []
@@ -834,22 +1024,15 @@ class StoreLoader:
         return [t["name"] for t in candidates[:limit]]
 
     def get_quick_ship_tag_id(self) -> Optional[int]:
-        """Convenience: return the Quick Ship tag ID."""
         return self.get_tag_id_by_slug(TAG_SLUG_QUICK_SHIP)
 
     def get_chip_card_tag_id(self) -> Optional[int]:
-        """Convenience: return the Chip Card tag ID."""
         return self.get_tag_id_by_slug(TAG_SLUG_CHIP_CARD)
 
     def is_ready(self) -> bool:
-        """True if store data has been loaded at least once (even if degraded)."""
         return self._last_loaded is not None
 
     def get_status(self) -> dict:
-        """
-        Return a structured status dict for the /status health endpoint.
-        Exposes load state, degraded flag, and per-resource counts.
-        """
         import datetime as _dt
         last_loaded_iso = (
             _dt.datetime.fromtimestamp(self._last_loaded, tz=_dt.timezone.utc).isoformat()
@@ -868,18 +1051,21 @@ class StoreLoader:
             "degraded_reasons": self._degraded_reasons,
             "last_loaded": last_loaded_iso,
             "next_retry_in": next_retry_in,
+            "loaded_from_cache": self._loaded_from_cache,
+            "dev_cache_enabled": DEV_CACHE_ENABLED,
             "counts": {
                 "categories": len(self.categories),
                 "tags": len(self.tags),
                 "attributes": len(self.attributes),
                 "products": len(self.products),
+                "expected_products": self._expected_product_count,
                 "category_keywords": len(self.category_keywords),
                 "attribute_terms": sum(len(v) for v in self.attribute_terms.values()),
+                "variation_cache_size": len(self.variation_detail_cache),
             },
         }
 
     def print_categories(self):
-        """Print categories in a tree structure."""
         if not self.categories:
             logger.info("StoreLoader: No categories loaded")
             return
@@ -899,7 +1085,6 @@ class StoreLoader:
         logger.info("\n".join(lines))
 
     def print_keywords(self):
-        """Print all auto-generated category keywords."""
         if not self.category_keywords:
             logger.info("StoreLoader: No category keywords generated")
             return

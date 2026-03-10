@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from flask import jsonify
 from config.settings import DEFAULT_PER_PAGE
-from app_config import WOO_BASE_URL
+from app_config import WOO_BASE_URL, CURRENCY_SYMBOL
 from models import WooAPICall
 from woo_client import woo_client
 from conversation_flow import FlowState
@@ -138,7 +138,7 @@ def format_order_for_frontend(order: dict) -> dict:
         "id": order.get("id"),
         "order_number": str(order.get("number") or order.get("id", "")),
         "status": order.get("status", "unknown"),
-        "currency": order.get("currency_symbol", "$"),
+        "currency": order.get("currency_symbol") or CURRENCY_SYMBOL,
         "total": total,
         "subtotal": order.get("subtotal", "0"),
         "shipping_total": order.get("shipping_total", "0"),

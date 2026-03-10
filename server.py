@@ -19,11 +19,11 @@ from flask_cors import CORS
 
 from app_config import PORT, DEBUG, STORE_NAME
 from store_registry import set_store_loader, get_store_loader
-from store_loader import StoreLoader
+from store_loader import StoreLoader, DEV_CACHE_ENABLED
 from session_store import sessions
 from routes.chat import chat_bp
 
-# ═══════════════════════════════════════════
+# ══════════════════════════════════════��════
 # FLASK APP
 # ═══════════════════════════════════════════
 
@@ -112,14 +112,41 @@ def get_session(session_id):
 # STARTUP
 # ═══════════════════════════════════════════
 
+def _print_dev_banner():
+    """Print a big obvious DEV MODE banner so you never mistake it for production."""
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+    DIM = "\033[2m"
+
+    print()
+    print(f"{RED}{BOLD}{'━' * 60}")
+    print(f"{'':>10}🚧  D E V   M O D E  🚧")
+    print(f"{'━' * 60}{RESET}")
+    print(f"{YELLOW}{BOLD}")
+    print(f"  ██████╗ ███████╗██╗   ██╗")
+    print(f"  ██╔══██╗██╔═���══╝██║   ██║")
+    print(f"  ██║  ██║█████╗  ██║   ██║")
+    print(f"  ██║  ██║██╔══╝  ╚██╗ ██╔╝")
+    print(f"  ██████╔╝███████╗ ╚████╔╝ ")
+    print(f"  ╚═════╝ ╚══════╝  ╚═══╝  ")
+    print(f"{RESET}")
+    print(f"{YELLOW}  Store data loaded from LOCAL CACHE (not live API)")
+    print(f"  Cache file: .dev_cache/store_data.json")
+    print()
+    print(f"  {DIM}• Data may be stale — prices/stock not real-time{RESET}")
+    print(f"  {DIM}• To refresh: set DEV_CACHE_BUST=true or delete .dev_cache/{RESET}")
+    print(f"  {DIM}• To disable: remove DEV_CACHE=true from .env{RESET}")
+    print(f"{RED}{BOLD}{'━' * 60}{RESET}")
+    print()
+
+
 def initialize_store():
     """Load store data from WooCommerce at startup, then start background refresh."""
     loader = StoreLoader()
     try:
         loader.load_all()
-        set_store_loader(loader)
-        # Start background refresh every 6 hours so data stays current
-        loader.start_background_refresh()
     except Exception as e:
         logging.getLogger("miraq_chat").error(
             f"Store loader error at startup: {e}", exc_info=True
@@ -127,8 +154,13 @@ def initialize_store():
         logging.getLogger("miraq_chat").warning(
             "Server will respond with limited functionality until store data loads."
         )
-        # Still register the (partially loaded) loader so StoreLoader methods work
-        set_store_loader(loader)
+    # Always register and always start background refresh
+    set_store_loader(loader)
+    loader.start_background_refresh()
+
+    # Show dev mode banner if data came from cache
+    if DEV_CACHE_ENABLED and loader._loaded_from_cache:
+        _print_dev_banner()
 
 
 if __name__ == "__main__":

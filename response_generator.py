@@ -6,7 +6,7 @@ from typing import List, Optional
 from datetime import datetime
 
 from models import Intent, ExtractedEntities, WooAPICall
-from app_config import MAX_DISPLAYED_ITEMS, USER_PLACEHOLDERS, DEFAULT_PAYMENT_METHOD_TITLE
+from app_config import MAX_DISPLAYED_ITEMS, USER_PLACEHOLDERS, DEFAULT_PAYMENT_METHOD_TITLE, CURRENCY_SYMBOL
 
 
 def generate_bot_message(
@@ -25,6 +25,7 @@ def generate_bot_message(
                      the message instead of len(products) which is just the
                      current page size.
     """
+    CS = CURRENCY_SYMBOL
 
     if order_data is None:
         order_data = []
@@ -36,10 +37,6 @@ def generate_bot_message(
 
     # ── Customer update intent ──
     if intent == Intent.UPDATE_CUSTOMER:
-        # success/failure is signalled via the `order_data` list repurposed as
-        # a one-element list containing the WC API response dict.
-        # chat.py sets order_data=[{"success": True/False}] before calling here.
-        # Fallback: if called without that signal, default to success message.
         update_ok = True
         if order_data and isinstance(order_data[0], dict):
             update_ok = order_data[0].get("success", True)
@@ -73,7 +70,7 @@ def generate_bot_message(
             msg = f"📦 **Your Last Order** (#{order_number})\n\n"
             msg += f"**Status:** {status}\n"
             msg += f"**Date:** {_format_order_date(date_created)}\n"
-            msg += f"**Total:** ${total}\n\n"
+            msg += f"**Total:** {CS}{total}\n\n"
 
             line_items = order.get("line_items", [])
             if line_items:
@@ -82,7 +79,7 @@ def generate_bot_message(
                     qty = item.get("quantity", 0)
                     name = item.get("name") or "Unknown Item"
                     item_total = item.get("total", "0")
-                    msg += f"  • {name} × {qty} — ${item_total}\n"
+                    msg += f"  • {name} × {qty} — {CS}{item_total}\n"
 
             return msg
 
@@ -166,7 +163,7 @@ def generate_bot_message(
                 f"✅ **Order #{order_number} placed successfully!**\n\n"
                 f"**Product:** {p_name}\n"
                 f"**Quantity:** {quantity}\n"
-                f"**Total:** ${float(total):.2f}\n"
+                f"**Total:** {CS}{float(total):.2f}\n"
                 f"**Payment Mode:** {DEFAULT_PAYMENT_METHOD_TITLE}"
             )
 
@@ -174,7 +171,7 @@ def generate_bot_message(
             p = products[0]
             msg = f"Found **{p['name']}** 🎯\n\n"
             if p.get("price", 0) > 0:
-                msg += f"💰 Price: ${p['price']:.2f}\n"
+                msg += f"💰 Price: {CS}{p['price']:.2f}\n"
             msg += "\n⚠️ Please log in to place an order."
             return msg
 
@@ -213,10 +210,7 @@ def generate_bot_message(
                 f"I couldn't find any size information for **{product_name}**. "
                 f"Try asking: *'Show me {product_name} products'*"
             )
-        # Extract size options from variation attributes dynamically.
-        # Variations are in products[1:] (products[0] is the parent).
-        # Collect all unique values for any attribute whose name contains "size".
-        size_map = {}  # attr_name → set of options
+        size_map = {}
         for p in products[1:]:
             for attr in p.get("attributes", []):
                 attr_name = attr.get("name", "")
@@ -226,7 +220,6 @@ def generate_bot_message(
                         size_map.setdefault(attr_name, set()).add(option)
 
         if not size_map:
-            # Fallback: read from parent product's attribute options (products[0])
             parent = products[0]
             for attr in parent.get("attributes", []):
                 attr_name = attr.get("name", "")
@@ -254,14 +247,14 @@ def generate_bot_message(
         if intent == Intent.PRODUCT_VARIATIONS or (not has_attributes):
             msg = f"🎯 **{parent['name']}**\n"
             if parent.get("price", 0) > 0:
-                msg += f"💰 Starting from ${parent['price']:.2f}\n"
+                msg += f"💰 Starting from {CS}{parent['price']:.2f}\n"
             if parent.get("short_description"):
                 msg += f"\n{parent['short_description']}\n"
             if variations:
                 msg += f"\n**Available variations ({len(variations)}):**\n"
                 for v in variations[:10]:
                     label = v.get("variation_label") or v.get("name", "")
-                    price_str = f"${v['price']:.2f}" if v.get("price", 0) > 0 else ""
+                    price_str = f"{CS}{v['price']:.2f}" if v.get("price", 0) > 0 else ""
                     stock = "✅" if v.get("in_stock") else "❌"
                     line = f"  {stock} {label}"
                     if price_str:
@@ -288,7 +281,7 @@ def generate_bot_message(
             msg += f"Found **{len(variations)}** matching variation(s):\n\n"
             for v in variations[:10]:
                 label = v.get("variation_label") or v.get("name", "")
-                price_str = f"${v['price']:.2f}" if v.get("price", 0) > 0 else ""
+                price_str = f"{CS}{v['price']:.2f}" if v.get("price", 0) > 0 else ""
                 stock = "✅ In stock" if v.get("in_stock") else "❌ Out of stock"
                 line = f"• **{label}** — {stock}"
                 if price_str:
@@ -303,9 +296,9 @@ def generate_bot_message(
         p = products[0]
         msg = f"I found the perfect match! 🎯\n\n**{p['name']}**\n"
         if p.get("price", 0) > 0:
-            msg += f"💰 Price: ${p['price']:.2f}\n"
+            msg += f"💰 Price: {CS}{p['price']:.2f}\n"
         if p.get("on_sale") and p.get("sale_price") and float(p.get("sale_price", 0)) > 0:
-            msg += f"🏷️ Sale Price: ${p['sale_price']:.2f}\n"
+            msg += f"🏷️ Sale Price: {CS}{p['sale_price']:.2f}\n"
         if p.get("short_description"):
             msg += f"\n{p['short_description']}\n"
         if p.get("attributes"):
@@ -318,10 +311,8 @@ def generate_bot_message(
     msg = ""
 
     if intent == Intent.CATEGORY_BROWSE:
-        # ── FIX: Detect unresolved qualifiers the API couldn't filter on ──
         qualifier = _get_unresolved_category_qualifier(entities)
         if not entities.category_name:
-            # No specific category — we're showing all categories
             msg += f"Here are our **{count}** product categories! 📂\n\n"
         elif qualifier:
             msg += (
@@ -340,7 +331,6 @@ def generate_bot_message(
     elif intent == Intent.FILTER_BY_COLOR:
         msg += f"Found **{count}** products in **{entities.attributes.get('colors', '')}** tones! 🎨\n\n"
     elif intent == Intent.FILTER_BY_ATTRIBUTE:
-        # Build a natural description from all matched attributes
         attr_desc = " · ".join(
             f"**{v}** {k}" for k, v in entities.attributes.items() if v
         )
@@ -366,7 +356,7 @@ def generate_bot_message(
 
     for p in products[:5]:
         if p.get("price", 0) > 0:
-            msg += f"• **{p['name']}** — ${p['price']:.2f}\n"
+            msg += f"• **{p['name']}** — {CS}{p['price']:.2f}\n"
         else:
             msg += f"• **{p['name']}**\n"
 
@@ -498,11 +488,7 @@ def _format_order_date(date_created: str) -> str:
 
 
 def _describe_date_period(date_after: str) -> str:
-    """Convert a date_after ISO string into a human-readable period description.
-
-    e.g. '2026-02-24T00:00:00' (2 days ago) → 'the last 2 days'
-         '2026-01-26T00:00:00' (1 month ago) → 'the last month'
-    """
+    """Convert a date_after ISO string into a human-readable period description."""
     try:
         from datetime import timezone, timedelta
         dt = datetime.fromisoformat(date_after.replace("Z", "+00:00"))
@@ -545,22 +531,13 @@ def _generate_attribute_info_message(products: List[dict], entities: ExtractedEn
     """
     Build a focused prose answer listing the available options for a specific
     attribute (e.g. size, finish, color) of a named product.
-
-    products[0] is the formatted parent product whose `attributes` list carries
-    the available option values. Subsequent entries may be formatted variations
-    which let us highlight which options are currently in stock.
     """
     target_attr = (getattr(entities, 'target_attribute', None) or 'options').lower()
 
-    # Parent is the first non-variation product in the list
     parent = next((p for p in products if p.get('type') != 'variation'), products[0])
     product_name = parent.get('name', 'This product')
 
-    # Find the matching attribute in the parent's attributes list.
-    # Match loosely: "size" matches "Tile Size", "Size", "pa_tile-size", etc.
     attrs = parent.get('attributes', [])
-    # For attribute info queries, also check hidden attributes
-    # (e.g. sample-size is often hidden from storefront but user explicitly asked)
     all_attrs = parent.get('raw_attributes', attrs)
     
     matched_attr = None
@@ -570,7 +547,6 @@ def _generate_attribute_info_message(products: List[dict], entities: ExtractedEn
             matched_attr = attr
             break
 
-    # Collect formatted variations for in-stock cross-referencing
     variations = [p for p in products if p.get('type') == 'variation']
 
     if matched_attr:
@@ -587,7 +563,6 @@ def _generate_attribute_info_message(products: List[dict], entities: ExtractedEn
         opts_formatted = ", ".join(f"**{o}**" for o in options)
         msg = f"📐 **{product_name}** is available in the following {attr_display_name.lower()}:\n\n{opts_formatted}"
 
-        # Cross-reference in-stock options from variations if available
         if variations:
             in_stock_opts = set()
             for v in variations:
@@ -598,13 +573,11 @@ def _generate_attribute_info_message(products: List[dict], entities: ExtractedEn
                             opt = a.get('option', '')
                             if opt:
                                 in_stock_opts.add(opt)
-            # Only surface the in-stock note when it's a meaningful subset
             if in_stock_opts and 0 < len(in_stock_opts) < len(options):
                 msg += f"\n\n✅ Currently in stock: {', '.join(sorted(in_stock_opts))}"
 
         return msg
 
-    # No direct attribute match — show all available attributes as a fallback
     if attrs:
         msg = f"📐 Here are the available options for **{product_name}**:\n\n"
         for attr in attrs[:6]:
@@ -612,7 +585,6 @@ def _generate_attribute_info_message(products: List[dict], entities: ExtractedEn
             msg += f"• **{attr.get('name', '')}:** {opts}\n"
         return msg
 
-    # Final fallback: product found but no attribute data at all
     return (
         f"I found **{product_name}** but couldn't retrieve its {target_attr} options from the catalog. "
         f"Try asking: *'What variations does {product_name} come in?'*"
@@ -621,12 +593,15 @@ def _generate_attribute_info_message(products: List[dict], entities: ExtractedEn
 
 def format_order_detail(order: dict) -> str:
     """Format a single order into a rich detail message."""
+    CS = CURRENCY_SYMBOL
+
     if not order:
         return "Order details not available."
 
     order_number = order.get("number", str(order.get("id", "N/A")))
     status = order.get("status", "unknown").title()
-    currency_symbol = order.get("currency_symbol", "$")
+    # Prefer currency_symbol from WooCommerce order response, fall back to configured symbol
+    currency = order.get("currency_symbol") or CS
     total = order.get("total", "0")
     subtotal = order.get("subtotal", "")
     date_created = order.get("date_created", "")
@@ -670,12 +645,12 @@ def format_order_detail(order: dict) -> str:
             msg += f"  • {name}"
             if sku:
                 msg += f" _(SKU: {sku})_"
-            msg += f" × {qty} — {currency_symbol}{item_total}\n"
+            msg += f" × {qty} — {currency}{item_total}\n"
 
     # Totals
-    msg += f"\n**Order Total:** {currency_symbol}{total}"
+    msg += f"\n**Order Total:** {currency}{total}"
     shipping_total = order.get("shipping_total", "0")
     if float(shipping_total or 0) > 0:
-        msg += f"\n**Shipping:** {currency_symbol}{shipping_total}"
+        msg += f"\n**Shipping:** {currency}{shipping_total}"
 
     return msg
