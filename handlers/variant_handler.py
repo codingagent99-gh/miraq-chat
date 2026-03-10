@@ -13,6 +13,7 @@ import time
 from flask import jsonify
 
 from app_config import WOO_BASE_URL, CLASSIFIER_PROVIDER_TAG, get_currency_symbol
+from config.settings import DEFAULT_PER_PAGE
 from models import Intent, WooAPICall
 from woo_client import woo_client
 from formatters import format_product, format_variation, _filter_variations_by_entities
@@ -452,8 +453,19 @@ def handle_variation_product(
             variation_products = [format_variation(v, parent_product_raw) for v in filtered_vars]
         products = [parent_formatted] + variation_products
     elif variations_raw:
-        variation_products = [format_variation(v, parent_product_raw) for v in variations_raw]
+        # ── No specific attributes requested — paginate variations in-memory ──
+        # The API fetched all variations (per_page=100) because attribute-matching
+        # needs the full set. For display, slice to DEFAULT_PER_PAGE per page.
+        total_variations = len(variations_raw)
+        start = (page - 1) * DEFAULT_PER_PAGE
+        end = start + DEFAULT_PER_PAGE
+        page_slice = variations_raw[start:end]
+        variation_products = [format_variation(v, parent_product_raw) for v in page_slice]
         products = [parent_formatted] + variation_products
+        logger.info(
+            f"Step 3.7: No attribute filter — returning {len(variation_products)} of "
+            f"{total_variations} variations (page {page})"
+        )
     else:
         products = [parent_formatted]
 
@@ -490,6 +502,20 @@ def handle_variation_product(
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
+    # ── Build pagination — override for in-memory paginated variations ──
+    if variations_raw and not has_attributes:
+        total_variations = len(variations_raw)
+        total_pages = max(1, -(-total_variations // DEFAULT_PER_PAGE))  # ceil division
+        pagination = {
+            "page": page,
+            "per_page": DEFAULT_PER_PAGE,
+            "total_items": total_variations,
+            "total_pages": total_pages,
+            "has_more": page < total_pages,
+        }
+    else:
+        pagination = build_pagination(page, api_responses, api_calls_to_execute)
+
     from response_generator import INTENT_LABELS as _IL
     return jsonify({
         "success": True,
@@ -499,7 +525,7 @@ def handle_variation_product(
         "suggestions": suggestions,
         "session_id": session_id,
         "metadata": metadata,
-        "pagination": build_pagination(page, api_responses, api_calls_to_execute),
+        "pagination": pagination,
     }), 200
 
 
