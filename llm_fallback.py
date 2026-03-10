@@ -6,7 +6,8 @@ Handles two scenarios:
 2. Post-API fallback (Step 3.8) — when WooCommerce API returns 0 products
 
 Privacy-First Design:
-- Only sends public store catalog data (product names, categories, attributes)
+- Sends only what the local classifier already resolved (intent, confidence, entities)
+- No store catalog data (product names, categories, attributes, tags)
 - Sanitizes user messages to remove PII (emails, phone numbers)
 - Never sends customer IDs, order history, or payment information
 """
@@ -28,10 +29,14 @@ from app_config import (
     LLM_TIMEOUT_SECONDS,
     LLM_COST_PER_1K_INPUT,
     LLM_COST_PER_1K_OUTPUT,
-    STORE_NAME,
 )
+from models import Intent
 
 logger = get_logger("miraq_chat")
+
+# Closed set of valid intent values derived from the Intent enum.
+# Used in the LLM system prompt so it can only pick from this fixed list.
+_VALID_INTENTS = ", ".join(i.value for i in Intent if i != Intent.UNKNOWN) + ", unknown"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -75,146 +80,97 @@ def _sanitize_for_llm(text: str) -> str:
     return text
 
 
-def _build_store_context(store_loader) -> Dict[str, Any]:
+def _build_classifier_context(
+    original_intent: str,
+    original_confidence: float,
+    entities_summary: Optional[Dict] = None,
+) -> Dict[str, Any]:
     """
-    Build public store context from StoreLoader.
-    ONLY includes public catalog data — no customer PII.
-    
+    Build a lean context from what the classifier already resolved.
+    No store catalog data — just the classifier's output.
+
     Args:
-        store_loader: StoreLoader instance
-        
+        original_intent: Intent string returned by the local classifier
+        original_confidence: Confidence score from the local classifier
+        entities_summary: Compact dict of non-None entities the classifier extracted
+
     Returns:
-        Dict with public store data
+        Dict with classifier intent, confidence, and resolved entities
     """
-    context = {
-        "products": [],
-        "categories": [],
-        "attributes": {},
-        "tags": [],
+    return {
+        "classifier_intent": original_intent,
+        "classifier_confidence": original_confidence,
+        "resolved_entities": entities_summary or {},
     }
-    
-    if not store_loader:
-        return context
-    
-    # Product names (first 100 to keep prompt size reasonable)
-    context["products"] = [
-        p.get("name", "") for p in store_loader.products[:100]
-        if p.get("name")
-    ]
-    
-    # Category names
-    context["categories"] = [
-        {"id": c.get("id"), "name": c.get("name", ""), "slug": c.get("slug", "")}
-        for c in store_loader.categories
-        if c.get("name")
-    ]
-    
-    # Attribute terms (finishes, sizes, colors, etc.)
-    for attr in store_loader.attributes:
-        attr_slug = attr.get("slug", "")
-        if attr_slug:
-            terms = store_loader.get_all_attribute_terms(attr_slug)
-            if terms:
-                context["attributes"][attr_slug] = [
-                    t.get("name", "") for t in terms if t.get("name")
-                ]
-    
-    # Tag names (first 50 for prompt size limit)
-    context["tags"] = [
-        {"id": t.get("id"), "name": t.get("name", ""), "slug": t.get("slug", "")}
-        for t in store_loader.tags[:50]  # Limit to first 50 tags
-        if t.get("name")
-    ]
-    
-    return context
 
 
-def _build_system_prompt(store_context: Dict[str, Any]) -> str:
+def _build_system_prompt(
+    classifier_context: Dict[str, Any],
+    session_history: Optional[List[Dict]] = None,
+) -> str:
     """
-    Construct system prompt with store catalog data.
-    
+    Construct a lean intent-only system prompt.
+
+    No store catalog data is included. The LLM's sole job is to pick the correct
+    intent from the closed enum. Entity extraction stays with the local classifier.
+
     Args:
-        store_context: Public store data from _build_store_context()
-        
+        classifier_context: Output of _build_classifier_context()
+        session_history: Last few conversation turns for multi-turn context (optional)
+
     Returns:
         System prompt string
     """
-    # Extract context
-    products_sample = ", ".join(store_context.get("products", [])[:50])
-    categories = ", ".join([c["name"] for c in store_context.get("categories", [])])
-    
-    # Build attribute descriptions
-    attributes_desc = []
-    for attr_slug, terms in store_context.get("attributes", {}).items():
-        attr_name = attr_slug.replace("pa_", "").replace("-", " ").title()
-        terms_sample = ", ".join(terms[:10])
-        attributes_desc.append(f"- {attr_name}: {terms_sample}")
-    
-    attributes_text = "\n".join(attributes_desc) if attributes_desc else "None available"
-    
-    prompt = f"""You are an AI assistant for {STORE_NAME}, helping customers find products.
+    # All valid intent enum values — LLM must pick exactly one
+    valid_intents = _VALID_INTENTS
 
-**Your task**: Interpret the user's message and return structured JSON to help route their query.
+    # Format classifier context
+    classifier_intent = classifier_context.get("classifier_intent", "unknown")
+    classifier_confidence = classifier_context.get("classifier_confidence", 0.0)
+    resolved_entities = classifier_context.get("resolved_entities", {})
+    entities_str = json.dumps(resolved_entities) if resolved_entities else "none"
 
-**Available Products** (sample): {products_sample}
+    # Format conversation history (last 3 turns)
+    history_lines = []
+    if session_history:
+        for msg in session_history[-3:]:
+            role = msg.get("role", "user")
+            content = _sanitize_for_llm(msg.get("message", ""))
+            history_lines.append(f"{role}: {content}")
+    history_text = "\n".join(history_lines) if history_lines else "none"
 
-**Categories**: {categories}
+    prompt = f"""You are an intent classifier for a WooCommerce store chatbot.
 
-**Available Attributes**:
-{attributes_text}
+Your ONLY job is to determine the user's intent from their message.
+Do NOT extract entities — that is already handled by the local classifier.
 
-**Valid Intents**:
-- product_search: User wants to find a specific product by name
-- category_browse: User wants to browse a category (no attribute filters)
-- filter_by_attribute: User wants to filter by any attribute (finish, size, color, application, etc.)
-- product_by_tag: User wants products matching a specific tag or collection
-- product_by_origin: User wants products from a specific country/region
-- order_history: User asking about their past orders
-- order_status: User asking about a specific order status
-- last_order: User asking about their most recent order
-- reorder: User wants to reorder something they bought before
-- place_order: User wants to place/create an order
-- discount_inquiry: User asking about sales or discounts
-- greeting: Simple greeting, no product intent
-- general_question: General question about products/services
+**Valid intents** (pick exactly one):
+{valid_intents}
 
-**IMPORTANT Privacy Rules**:
-- NEVER ask for or reference customer personal information
-- NEVER mention customer IDs, emails, phone numbers, or addresses
-- Only work with public product catalog information
+**Classifier context** (what the local classifier already resolved):
+- Intent: {classifier_intent} (confidence: {classifier_confidence:.2f})
+- Resolved entities: {entities_str}
 
-**Response Format** (JSON only):
+**Conversation history** (last 3 turns):
+{history_text}
+
+Return ONLY valid JSON:
 {{
-  "intent": "filter_by_attribute",
-  "entities": {{
-    "product_name": null,
-    "category_name": "Floor",
-    "finish": "Polished",
-    "color_tone": "White",
-    "application": "Kitchen",
-    "tag_operator": "AND",
-    "excluded_tags": [],
-    "excluded_categories": []
-  }},
-  "bot_message": "I found some great products matching your search!",
+  "intent": "category_browse",
   "confidence": 0.85,
   "fallback_type": "intent_resolved"
 }}
 
-**Key entity rules**:
-- Use `tag_operator: "OR"` when the user says "X or Y", "either X or Y", "X and Y tones" (colour mixing). Default is "AND".
-- Use `excluded_tags: ["slug-name"]` when user says "no X", "without X", "exclude X" for a tag.
-- Use `excluded_categories: ["slug-name"]` when user says "not in X category", "no marble", "exclude mosaic".
-- Attribute filters (finish, color, size, application, etc.) go as flat keys in entities — NOT nested.
-- Use exact attribute term names from the Available Attributes list above.
-
-**fallback_type options**:
-- "intent_resolved": You identified a clear intent and entities
-- "entity_extracted": You extracted additional entities to help with search
-- "conversational": General Q&A response, no specific product intent
+If the user's intent is genuinely unclear even with context, return:
+{{
+  "intent": "unknown",
+  "confidence": 0.0,
+  "fallback_type": "conversational",
+  "bot_message": "I wasn't sure what you were looking for. Did you mean:\n\u2022 **Browse products** in a specific category\n\u2022 **Check your order status**\n\u2022 **Search for a specific product**"
+}}
 
 Return ONLY valid JSON. No markdown, no explanation, just the JSON object."""
-    
+
     return prompt
 
 
@@ -411,25 +367,29 @@ def llm_fallback(
     session_id: str,
     store_loader,
     session_history: Optional[List[Dict]] = None,
+    entities_summary: Optional[Dict] = None,
 ) -> Dict[str, Any]:
     """
     LLM fallback when classifier fails (UNKNOWN intent, low confidence, or missing entities).
-    
+
+    The LLM performs intent-only classification. Entity extraction remains with the
+    local classifier. No store catalog data is sent to the LLM.
+
     Args:
         user_message: User's original message
         original_intent: Intent from regex classifier
         original_confidence: Confidence from regex classifier
         trigger_reason: Why LLM was triggered (unknown_intent, low_confidence, missing_entities)
         session_id: Session identifier
-        store_loader: StoreLoader instance for catalog data
+        store_loader: StoreLoader instance (kept for backward compatibility, not used for prompts)
         session_history: Last few messages for context (optional)
-        
+        entities_summary: Compact dict of non-None entities from classifier (optional)
+
     Returns:
         Dict with:
             - success: bool
-            - fallback_type: str (intent_resolved, entity_extracted, conversational)
+            - fallback_type: str (intent_resolved, conversational)
             - intent: str (if resolved)
-            - entities: dict (if extracted)
             - bot_message: str
             - confidence: float
             - metadata: dict with LLM call details
@@ -440,30 +400,21 @@ def llm_fallback(
         f"reason={trigger_reason} | original_intent={original_intent} | "
         f"confidence={original_confidence:.2f} | message=\"{sanitize_log_string(user_message)}\""
     )
-    
+
     try:
         # Sanitize user message
         sanitized_message = _sanitize_for_llm(user_message)
-        
-        # Build store context
-        store_context = _build_store_context(store_loader)
-        
-        # Build system prompt
-        system_prompt = _build_system_prompt(store_context)
-        
-        # Add session history context if available
-        context_messages = []
-        if session_history:
-            recent = session_history[-3:]  # Last 3 messages
-            for msg in recent:
-                role = msg.get("role", "user")
-                content = _sanitize_for_llm(msg.get("message", ""))
-                context_messages.append(f"{role}: {content}")
-        
-        # Construct user prompt
+
+        # Build lean classifier context (no store catalog data)
+        classifier_context = _build_classifier_context(
+            original_intent, original_confidence, entities_summary
+        )
+
+        # Build system prompt with classifier context and conversation history
+        system_prompt = _build_system_prompt(classifier_context, session_history)
+
+        # User prompt is the sanitized message only
         user_prompt = sanitized_message
-        if context_messages:
-            user_prompt = f"Context:\n" + "\n".join(context_messages) + f"\n\nCurrent: {sanitized_message}"
         
         # Call LLM
         llm_client = LLMClient()
@@ -506,24 +457,21 @@ def llm_fallback(
         # Extract fields
         fallback_type = parsed.get("fallback_type", "conversational")
         resolved_intent = parsed.get("intent", "unknown")
-        resolved_entities = parsed.get("entities", {})
         bot_message = parsed.get("bot_message", "")
         new_confidence = parsed.get("confidence", 0.70)
-        
+
         # Log resolution
         logger.info(
             f"Step 1.5: LLM fallback resolved | fallback_type={fallback_type} | "
             f"resolved_intent={resolved_intent} | "
-            f"resolved_entities={resolved_entities} | "
             f"new_confidence={new_confidence:.2f}"
         )
-        
-        # Return result
+
+        # Return result — no entities; entity extraction stays with the local classifier
         return {
             "success": True,
             "fallback_type": fallback_type,
             "intent": resolved_intent,
-            "entities": resolved_entities,
             "bot_message": bot_message,
             "confidence": new_confidence,
             "metadata": {
@@ -562,19 +510,17 @@ def llm_retry_search(
 ) -> Dict[str, Any]:
     """
     LLM retry when WooCommerce API returns 0 products for a search.
-    
-    Suggests:
-    - Spelling corrections
-    - Broader search terms
-    - Alternative categories
-    
+
+    Suggests spelling corrections or broader search terms based on the user's
+    search text. No store catalog data is sent to the LLM.
+
     Args:
         user_message: User's original message
         original_intent: Intent from classifier
-        entities: Extracted entities
+        entities: Extracted entities (used for logging context)
         session_id: Session identifier
-        store_loader: StoreLoader instance
-        
+        store_loader: StoreLoader instance (kept for backward compatibility, not used)
+
     Returns:
         Dict with:
             - success: bool
@@ -589,27 +535,19 @@ def llm_retry_search(
         f"reason=empty_search_results | original_intent={original_intent} | "
         f"entities={entities} | message=\"{sanitize_log_string(user_message)}\""
     )
-    
+
     try:
         # Sanitize user message
         sanitized_message = _sanitize_for_llm(user_message)
-        
-        # Build store context
-        store_context = _build_store_context(store_loader)
-        
-        # Build specialized system prompt for empty results
-        products_sample = ", ".join(store_context.get("products", [])[:50])
-        categories = ", ".join([c["name"] for c in store_context.get("categories", [])])
-        
-        system_prompt = f"""You are an AI assistant helping customers find products when their search returned no results.
 
-**Available Products** (sample): {products_sample}
-
-**Categories**: {categories}
+        # Build specialized system prompt for empty results — no store catalog data.
+        # The LLM can suggest "Did you mean X?" based on the user's text alone.
+        system_prompt = f"""You are an AI assistant helping customers when their product search returned no results.
 
 **User searched for**: {sanitized_message}
+**Search intent**: {original_intent}
 
-**Task**: Suggest a corrected search term OR provide a helpful alternative.
+**Task**: Based only on the user's search text, suggest a spelling correction OR provide helpful guidance. Do NOT invent product names or categories — rely only on the user's own words.
 
 **Response Format** (JSON only):
 {{
@@ -622,20 +560,20 @@ OR
 
 {{
   "retry_type": "suggestion",
-  "suggestion_message": "I couldn't find that specific product. Here are some similar options you might like: [list alternatives]"
+  "suggestion_message": "I couldn't find that specific product. You can try:\n\u2022 Browsing by category\n\u2022 Using a broader search term\n\u2022 Checking if the product name is spelled correctly"
 }}
 
 Return ONLY valid JSON."""
-        
+
         # Call LLM
         llm_client = LLMClient()
         llm_response = llm_client.chat_completion(system_prompt, sanitized_message)
-        
+
         # Calculate cost
         input_cost = (llm_response["input_tokens"] / 1000) * LLM_COST_PER_1K_INPUT
         output_cost = (llm_response["output_tokens"] / 1000) * LLM_COST_PER_1K_OUTPUT
         total_cost = input_cost + output_cost
-        
+
         # Log API call
         logger.info(
             f"Step 3.8: LLM API call | model={llm_response['model']} | "

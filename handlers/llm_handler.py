@@ -6,8 +6,6 @@ the LLM fallback. Returns (intent, entities, confidence, result) on success,
 or a Flask response directly for conversational/disambiguation cases.
 """
 
-import dataclasses as _dc
-
 from flask import jsonify
 
 from models import Intent, ExtractedEntities, ClassifiedResult
@@ -124,6 +122,16 @@ def run_llm_fallback(
         f"original_intent={intent.value} | confidence={confidence:.2f} | message={message!r}"
     )
 
+    # Build a compact entities summary from the classifier's ExtractedEntities
+    _entity_keys = [
+        "product_name", "category_name", "attributes", "tag_slugs",
+        "order_id", "order_item_name", "search_term",
+    ]
+    entities_summary = {
+        k: getattr(entities, k) for k in _entity_keys
+        if getattr(entities, k)
+    }
+
     llm_result = llm_fallback(
         user_message=message,
         original_intent=intent.value,
@@ -132,6 +140,7 @@ def run_llm_fallback(
         session_id=session_id,
         store_loader=store_loader,
         session_history=session_history,
+        entities_summary=entities_summary,
     )
 
     if not llm_result.get("success"):
@@ -247,58 +256,14 @@ def _get_trigger_reason(intent, confidence, entities, order_create_intents, user
 
 
 def _merge_llm_entities(llm_result, original_entities, fallback_type, store_loader, log):
-    """Merge LLM-returned entities onto a fresh ExtractedEntities instance."""
-    llm_entities_dict = llm_result.get("entities", {})
-    new_entities = ExtractedEntities()
+    """
+    Resolve intent and confidence from the LLM result.
 
-    # Reflect actual fields on ExtractedEntities at runtime —
-    # no hardcoded list that can go stale with models.py changes.
-    _entity_fields = {f.name for f in _dc.fields(ExtractedEntities)}
-
-    for llm_field, llm_value in llm_entities_dict.items():
-        if not llm_value:
-            continue
-        if llm_field == "origin":
-            # Origin needs tag resolution — store as attribute AND resolve to
-            # made-in-X tag slug so api_builder can filter correctly.
-            new_entities.attributes["origin"] = llm_value
-            if store_loader:
-                _tag_ids = store_loader.get_tag_ids_for_keyword(llm_value)
-                if not _tag_ids:
-                    _tag_ids = store_loader.get_tag_ids_for_keyword(f"made in {llm_value.lower()}")
-                if _tag_ids:
-                    new_entities.tag_ids.extend(_tag_ids)
-                    for _tid in _tag_ids:
-                        _tag = store_loader.tag_by_id.get(_tid)
-                        if _tag:
-                            new_entities.tag_slugs.append(_tag["slug"])
-                    log.info(f"Step 1.5: Origin resolved | origin={llm_value!r} | tag_slugs={new_entities.tag_slugs}")
-                else:
-                    log.warning(f"Step 1.5: Origin not resolved to tag | origin={llm_value!r}")
-        elif llm_field in _entity_fields:
-            setattr(new_entities, llm_field, llm_value)
-        else:
-            # Dynamic attribute (finish, visual, color, size, etc.)
-            new_entities.attributes[llm_field] = llm_value
-
-    # For entity_extracted, preserve original entities not overridden by LLM
-    if fallback_type == "entity_extracted":
-        for _f in _entity_fields:
-            if getattr(new_entities, _f, None) is None:
-                orig_val = getattr(original_entities, _f, None)
-                if orig_val is not None:
-                    setattr(new_entities, _f, orig_val)
-        for _k, _v in original_entities.attributes.items():
-            if _k not in new_entities.attributes:
-                new_entities.attributes[_k] = _v
-        existing_tag_ids = set(new_entities.tag_ids)
-        for _tid in original_entities.tag_ids:
-            if _tid not in existing_tag_ids:
-                new_entities.tag_ids.append(_tid)
-        existing_tag_slugs = set(new_entities.tag_slugs)
-        for _slug in original_entities.tag_slugs:
-            if _slug not in existing_tag_slugs:
-                new_entities.tag_slugs.append(_slug)
+    The LLM performs intent-only classification — it does not return entities.
+    Original entities from the local classifier are preserved unchanged.
+    """
+    # Keep the classifier's entities as-is; the LLM only resolves intent
+    new_entities = original_entities
 
     # Resolve intent string
     llm_intent_str = llm_result.get("intent", "unknown")
