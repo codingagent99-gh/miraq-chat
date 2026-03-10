@@ -338,10 +338,6 @@ def generate_bot_message(
         msg += f"Found **{count}** products{category_desc} matching {attr_desc}! 🔍\n\n"
     elif intent == Intent.PRODUCT_SEARCH:
         msg += f"Found **{count}** products matching your search! 🔍\n\n"
-    elif intent == Intent.CHIP_CARD:
-        msg += f"Here are **{count}** chip cards available! 🃏\n\n"
-    elif intent == Intent.MOSAIC_PRODUCTS:
-        msg += f"Found **{count}** mosaic products! 🧩\n\n"
     elif intent == Intent.CATEGORY_LIST:
         msg += f"Here are our product categories! 📂\n\n"
         for p in products[:MAX_DISPLAYED_ITEMS]:
@@ -443,9 +439,9 @@ INTENT_LABELS = {
     Intent.PRODUCT_TYPES: "types",
     Intent.PRODUCT_CATALOG: "catalog",
     Intent.RELATED_PRODUCTS: "related",
-    Intent.MOSAIC_PRODUCTS: "mosaic",
-    Intent.TRIM_PRODUCTS: "trim",
-    Intent.CHIP_CARD: "chip_card",
+    # Intent.MOSAIC_PRODUCTS: "mosaic",
+    # Intent.TRIM_PRODUCTS: "trim",
+    # Intent.CHIP_CARD: "chip_card",
     Intent.SAMPLE_REQUEST: "sample",
     Intent.PRODUCT_VARIATIONS: "variations",
     Intent.PRODUCT_BY_ORIGIN: "origin",

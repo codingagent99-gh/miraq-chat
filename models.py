@@ -38,11 +38,6 @@ class Intent(Enum):
     FILTER_BY_ORIGIN       = "filter_by_origin"
     SIZE_LIST              = "size_list"
 
-    # Product Subtypes
-    MOSAIC_PRODUCTS        = "mosaic_products"
-    TRIM_PRODUCTS          = "trim_products"
-    CHIP_CARD              = "chip_card"
-
     # Discounts & Promotions
     DISCOUNT_INQUIRY       = "discount_inquiry"
     BULK_DISCOUNT          = "bulk_discount"
@@ -61,7 +56,7 @@ class Intent(Enum):
     PRODUCT_VARIATIONS     = "product_variations"
     SAMPLE_REQUEST         = "sample_request"
 
-    # ──── NEW: Order History & Reorder ────
+    # ──── Order History & Reorder ────
     ORDER_HISTORY          = "order_history"
     LAST_ORDER             = "last_order"
     REORDER                = "reorder"
@@ -74,7 +69,6 @@ class Intent(Enum):
     GREETING               = "greeting"
 
     UNKNOWN                = "unknown"
-
 
 @dataclass
 class AmbiguousFilter:
