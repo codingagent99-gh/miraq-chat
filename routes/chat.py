@@ -12,6 +12,7 @@ from app_config import (
     ORDER_INTENTS,
     ORDER_CREATE_INTENTS,
     CLASSIFIER_PROVIDER_TAG,
+    get_currency_symbol,
 )
 from woo_client import woo_client
 from formatters import format_product, format_custom_product, format_category, _entities_to_dict
@@ -533,15 +534,15 @@ def chat():
                 line_total = sum(float(item.get("total") or 0) for item in placed_order["line_items"])
                 if line_total > 0:
                     total = line_total
-                    logger.warning(f"Step 5: Order total was $0.00, used line_item total=${line_total:.2f} instead")
+                    logger.warning(f"Step 5: Order total was {get_currency_symbol()}0.00, used line_item total={get_currency_symbol()}{line_total:.2f} instead")
             except (ValueError, TypeError) as e:
                 logger.warning(f"Step 5: Error calculating line_item total: {e}")
 
-        logger.info(f"Step 5: Bot message generated | product_name=\"{sanitize_log_string(used_product_name)}\" | total=${total:.2f}")
+        logger.info(f"Step 5: Bot message generated | product_name=\"{sanitize_log_string(used_product_name)}\" | total={get_currency_symbol()}{total:.2f}")
         if used_product_name == "your item":
             logger.warning("Step 5: Used fallback 'your item' - no product name available")
         if total == 0.0:
-            logger.warning("Step 5: Order total is $0.00 - possible pricing issue")
+            logger.warning(f"Step 5: Order total is {get_currency_symbol()}0.00 - possible pricing issue")
 
     # ─── Step 5.5: Quantity / variant still needed? ───
     resp = handle_quantity_and_variant_check(

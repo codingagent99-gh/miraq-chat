@@ -15,7 +15,7 @@ from app_config import (
     WOO_BASE_URL,
     DEFAULT_PAYMENT_METHOD,
     DEFAULT_PAYMENT_METHOD_TITLE,
-    CURRENCY_SYMBOL,
+    get_currency_symbol,
 )
 from models import WooAPICall
 from woo_client import woo_client
@@ -89,7 +89,7 @@ def handle_flow(
 
 
 def _handle_create_order(flow_result, user_context, session_id, customer_id, page, start_time, sessions):
-    CS = CURRENCY_SYMBOL
+    CS = get_currency_symbol()
     pending_product_id = user_context.get("pending_product_id")
     pending_product_name = user_context.get("pending_product_name", "")
     pending_quantity = user_context.get("pending_quantity", 1)
@@ -336,7 +336,7 @@ def _handle_fetch_address(flow_result, user_context, session_id, customer_id, pa
 
 
 def _handle_price_summary(flow_result, user_context, session_id, customer_id, page, start_time):
-    CS = CURRENCY_SYMBOL
+    CS = get_currency_symbol()
     pending_product_id = user_context.get("pending_product_id")
     pending_product_name = user_context.get("pending_product_name", "the product")
     pending_quantity = user_context.get("pending_quantity", 1)

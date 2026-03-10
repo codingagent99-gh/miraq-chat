@@ -115,6 +115,22 @@ class BoundedVariationCache:
 class StoreLoader:
     """Fetches and caches all WooCommerce taxonomy data."""
 
+    # ISO 4217 currency code → symbol mapping used by _currency_code_to_symbol().
+    _CURRENCY_MAP: Dict[str, str] = {
+        "USD": "$", "EUR": "€", "GBP": "£", "INR": "₹",
+        "JPY": "¥", "CNY": "¥", "AUD": "A$", "CAD": "C$",
+        "CHF": "CHF", "SEK": "kr", "NOK": "kr", "DKK": "kr",
+        "NZD": "NZ$", "SGD": "S$", "HKD": "HK$", "KRW": "₩",
+        "TRY": "₺", "BRL": "R$", "ZAR": "R", "MXN": "MX$",
+        "MYR": "RM", "THB": "฿", "PHP": "₱", "IDR": "Rp",
+        "AED": "د.إ", "SAR": "﷼", "PLN": "zł", "CZK": "Kč",
+        "HUF": "Ft", "RUB": "₽", "ILS": "₪", "CLP": "CL$",
+        "COP": "COL$", "PEN": "S/.", "ARS": "AR$", "TWD": "NT$",
+        "VND": "₫", "PKR": "₨", "BDT": "৳", "LKR": "Rs",
+        "NGN": "₦", "KES": "KSh", "EGP": "E£", "UAH": "₴",
+        "RON": "lei", "BGN": "лв", "HRK": "kn", "ISK": "kr",
+    }
+
     def __init__(self):
         self.base = WOO_BASE_URL
         self.consumer_key = WOO_CONSUMER_KEY
@@ -150,6 +166,7 @@ class StoreLoader:
         self.attribute_by_slug: Dict[str, Dict] = {}
         self.attribute_by_id: Dict[int, Dict] = {}
         self.tag_by_name_lower: Dict[str, Dict] = {}
+        self.currency_symbol: str = "$"
 
         self._lock = threading.Lock()
         self._last_loaded: Optional[float] = None
@@ -249,6 +266,7 @@ class StoreLoader:
                     self.products = cached.get("products", [])
                     self.all_attributes_raw = cached.get("all_attributes_raw", [])
                     self._expected_product_count = cached.get("expected_product_count")
+                    self.currency_symbol = cached.get("currency_symbol", "$")
                     self._loaded_from_cache = True
                     self._build_lookups()
                     self._last_loaded = time.time()
@@ -312,6 +330,12 @@ class StoreLoader:
         except Exception as e:
             logger.warning(f"StoreLoader: Custom all-attributes API failed | error={e}")
 
+        fetched_currency = self._fetch_currency_symbol()
+        if fetched_currency:
+            logger.info(f"StoreLoader: Currency symbol fetched: {fetched_currency}")
+        else:
+            logger.warning(f"StoreLoader: Currency fetch failed — using fallback symbol '{self.currency_symbol}'")
+
         fetch_elapsed = round(time.time() - fetch_start, 1)
 
         # ── Atomic swap under lock ──
@@ -323,6 +347,8 @@ class StoreLoader:
             self.products = new_products
             self.all_attributes_raw = new_all_attributes_raw
             self._expected_product_count = expected_total
+            if fetched_currency:
+                self.currency_symbol = fetched_currency
             self._loaded_from_cache = False
             self._build_lookups()
             self._last_loaded = time.time()
@@ -344,6 +370,7 @@ class StoreLoader:
                 "products": new_products,
                 "all_attributes_raw": new_all_attributes_raw,
                 "expected_product_count": expected_total,
+                "currency_symbol": self.currency_symbol,
             })
 
         if self._degraded:
@@ -372,6 +399,29 @@ class StoreLoader:
 
         self._degraded = len(reasons) > 0
         self._degraded_reasons = reasons
+
+    def _fetch_currency_symbol(self) -> Optional[str]:
+        """Fetch the store's currency symbol from WooCommerce settings API."""
+        try:
+            url = f"{self.base}/settings/general/woocommerce_currency"
+            params = {
+                "consumer_key": self.consumer_key,
+                "consumer_secret": self.consumer_secret,
+            }
+            resp = self.session.get(url, params=params, timeout=self.timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            currency_code = data.get("value", "")
+            if currency_code:
+                return self._currency_code_to_symbol(currency_code)
+        except Exception as e:
+            logger.warning(f"StoreLoader: Could not fetch currency setting | error={e}")
+        return None
+
+    @staticmethod
+    def _currency_code_to_symbol(code: str) -> str:
+        """Map ISO 4217 currency code to its symbol."""
+        return StoreLoader._CURRENCY_MAP.get(code.upper(), code)
 
     def start_background_refresh(self):
         """
