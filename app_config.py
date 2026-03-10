@@ -45,6 +45,15 @@ PRODUCT_TYPE_PLURAL   = os.getenv("PRODUCT_TYPE_PLURAL",   "tiles")
 CLASSIFIER_PROVIDER_TAG = os.getenv("CLASSIFIER_PROVIDER_TAG", "wgc_intent_classifier")
 
 # ═══════════════════════════════════════════
+# CURRENCY
+# ═══════════════════════════════════════════
+
+# Currency symbol used in all price displays (product browsing, order summaries,
+# confirmation messages). Set to your store's currency symbol.
+# Common values: "$", "₹", "€", "£", "A$", "C$", "¥"
+CURRENCY_SYMBOL = os.getenv("CURRENCY_SYMBOL", "$")
+
+# ═══════════════════════════════════════════
 # HTTP HEADERS
 # ═══════════════════════════════════════════
 
