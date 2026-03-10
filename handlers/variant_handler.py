@@ -12,7 +12,7 @@ import time
 
 from flask import jsonify
 
-from app_config import WOO_BASE_URL
+from app_config import WOO_BASE_URL, CLASSIFIER_PROVIDER_TAG, get_currency_symbol
 from models import Intent, WooAPICall
 from woo_client import woo_client
 from formatters import format_product, format_variation, _filter_variations_by_entities
@@ -20,7 +20,6 @@ from response_generator import generate_bot_message, generate_suggestions, INTEN
 from conversation_flow import FlowState
 from chat_logger import get_logger, sanitize_log_string
 from formatters import _entities_to_dict
-from app_config import CLASSIFIER_PROVIDER_TAG
 from handlers.chat_utils import (
     default_pagination,
     build_pagination,
@@ -201,7 +200,7 @@ def handle_variant_selection(
 
         if not _var_quantity:
             logger.info(f"Step 3.55: Variant resolved, asking for quantity | price={_variant_price}")
-            _price_line = f"\n**Unit Price:** ${_variant_price}" if _variant_price else ""
+            _price_line = f"\n**Unit Price:** {get_currency_symbol()}{_variant_price}" if _variant_price else ""
             elapsed = time.time() - start_time
             return jsonify({
                 "success": True,

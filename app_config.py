@@ -48,10 +48,20 @@ CLASSIFIER_PROVIDER_TAG = os.getenv("CLASSIFIER_PROVIDER_TAG", "wgc_intent_class
 # CURRENCY
 # ═══════════════════════════════════════════
 
-# Currency symbol used in all price displays (product browsing, order summaries,
-# confirmation messages). Set to your store's currency symbol.
-# Common values: "$", "₹", "€", "£", "A$", "C$", "¥"
-CURRENCY_SYMBOL = os.getenv("CURRENCY_SYMBOL", "₹")
+# Static fallback symbol used before StoreLoader has fetched the live value.
+# Prefer get_currency_symbol() at runtime for the dynamically-fetched symbol.
+CURRENCY_SYMBOL = "$"
+
+
+def get_currency_symbol() -> str:
+    """Get the currency symbol dynamically from the StoreLoader.
+    Falls back to '$' if StoreLoader hasn't loaded yet.
+    """
+    from store_registry import get_store_loader
+    loader = get_store_loader()
+    if loader and hasattr(loader, "currency_symbol"):
+        return loader.currency_symbol
+    return "$"
 
 # ═══════════════════════════════════════════
 # HTTP HEADERS

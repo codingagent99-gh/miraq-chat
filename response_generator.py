@@ -6,7 +6,7 @@ from typing import List, Optional
 from datetime import datetime
 
 from models import Intent, ExtractedEntities, WooAPICall
-from app_config import MAX_DISPLAYED_ITEMS, USER_PLACEHOLDERS, DEFAULT_PAYMENT_METHOD_TITLE, CURRENCY_SYMBOL
+from app_config import MAX_DISPLAYED_ITEMS, USER_PLACEHOLDERS, DEFAULT_PAYMENT_METHOD_TITLE, get_currency_symbol
 
 
 def generate_bot_message(
@@ -25,7 +25,7 @@ def generate_bot_message(
                      the message instead of len(products) which is just the
                      current page size.
     """
-    CS = CURRENCY_SYMBOL
+    CS = get_currency_symbol()
 
     if order_data is None:
         order_data = []
@@ -593,7 +593,7 @@ def _generate_attribute_info_message(products: List[dict], entities: ExtractedEn
 
 def format_order_detail(order: dict) -> str:
     """Format a single order into a rich detail message."""
-    CS = CURRENCY_SYMBOL
+    CS = get_currency_symbol()
 
     if not order:
         return "Order details not available."
