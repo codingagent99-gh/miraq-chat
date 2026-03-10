@@ -277,5 +277,25 @@ def _merge_llm_entities(llm_result, original_entities, fallback_type, store_load
                 f"falling back to PRODUCT_LIST. Consider adding it to _INTENT_MAPPING."
             )
 
+    # ── Remap attribute-filter intents to PRODUCT_ATTRIBUTE_INFO ──
+    # When the user asks "what finish on Ansel?" the LLM resolves to
+    # FILTER_BY_FINISH, but the user wants the finish *options* for a specific
+    # product — not a catalog-wide filter. Remap to PRODUCT_ATTRIBUTE_INFO
+    # so the api_builder fetches the product + variations and the response
+    # generator lists the attribute options.
+    _ATTR_FILTER_TO_TARGET = {
+        Intent.FILTER_BY_FINISH:  "finish",
+        Intent.FILTER_BY_COLOR:   "colors",
+        Intent.FILTER_BY_SIZE:    "tile size",
+    }
+    if new_intent in _ATTR_FILTER_TO_TARGET and new_entities.product_name:
+        target = _ATTR_FILTER_TO_TARGET[new_intent]
+        log.info(
+            f"Step 1.5: Remapping {new_intent.value} → product_attribute_info | "
+            f"product_name={new_entities.product_name!r} | target_attribute={target}"
+        )
+        new_intent = Intent.PRODUCT_ATTRIBUTE_INFO
+        new_entities.target_attribute = target
+
     new_confidence = llm_result.get("confidence", 0.70)
     return new_intent, new_entities, new_confidence

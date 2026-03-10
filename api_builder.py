@@ -831,6 +831,46 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             max_price=e.max_price,
         ))
         
+    # ── FILTER_BY_FINISH — catalog-wide finish filter ──
+    # e.g. "show me matte tiles", "polished finish products"
+    # When a product_name is present, llm_handler remaps this to
+    # PRODUCT_ATTRIBUTE_INFO so we only reach here for catalog-wide queries.
+    elif intent == Intent.FILTER_BY_FINISH:
+        finish_value = e.attributes.get("finish", "")
+        finish_slug = _attr_slug_for_label("finish") or e.attribute_slug
+        finish_or_pairs = []
+        if finish_slug and finish_value and e.tag_slugs:
+            # Finish can be a tag OR an attribute — build OR pair like origin/color
+            finish_or_pairs = [
+                {"attribute": finish_slug, "value": finish_value},
+                {"tag": list(e.tag_slugs)[0]},
+            ]
+
+        cat_id = e.category_id
+        loader = get_store_loader()
+        if not cat_id and e.category_name and loader:
+            cat_id = loader.get_category_id(e.category_name)
+        categories_list = loader.get_all_slugs_for_category(cat_id) if (cat_id and loader) else []
+
+        attr_filters = {}
+        if finish_slug and finish_value:
+            attr_filters[finish_slug] = finish_value
+
+        calls.append(_build_advanced_filter_call(
+            tags=list(e.tag_slugs) if e.tag_slugs else None,
+            categories=categories_list if categories_list else None,
+            attributes=attr_filters if attr_filters else None,
+            page=page,
+            excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
+            excluded_categories=list(e.excluded_categories) if e.excluded_categories else None,
+            tag_operator=e.tag_operator,
+            or_pairs=finish_or_pairs if finish_or_pairs else None,
+            description=f"Filter by finish: {finish_value}",
+            min_price=e.min_price,
+            max_price=e.max_price,
+        ))
+
+        
     elif intent == Intent.FILTER_BY_ORIGIN:
         # Origin can be expressed as a tag ("made-in-sri-lanka") OR an attribute
         # (pa_origin: "sri-lanka") depending on how products were entered in the store.
