@@ -200,6 +200,14 @@ def classify(utterance: str) -> ClassifiedResult:
 
     elif re.search(r"\bwishlist\b", text):
         intent, confidence = Intent.WISHLIST, 0.91
+        
+    # SAMPLE REQUEST — "do you have 3x3 sample for ansel?", "sample size for X"
+    elif re.search(r"\bsamples?\b", text) and (
+        entities.product_name
+        or re.search(r"\bsample\s+size\b", text)
+        or re.search(r'\d+\s*"?\s*(?:x|by|×)\s*\d+', text)
+    ):
+        intent, confidence = Intent.SAMPLE_REQUEST, 0.93
 
     # 2. COUPONS & DISCOUNTS
     elif re.search(r"\bcoupon\b|\bpromo\s*code\b|\bdiscount\s*code\b", text):
@@ -213,6 +221,10 @@ def classify(utterance: str) -> ClassifiedResult:
         # on_sale filter — no reason to route them to separate intents.
         intent, confidence = Intent.DISCOUNT_INQUIRY, 0.91
         entities.on_sale = True
+        
+    elif entities.product_name and re.search(r"\bsamples?\b", text):
+        intent, confidence = Intent.PRODUCT_ATTRIBUTE_INFO, 0.93
+        entities.target_attribute = "sample size"
 
     # 4a. PRODUCT ATTRIBUTE INFO — user asks about a *specific* attribute of a named product
     #     Built dynamically from live store attribute labels — no hardcoded keywords.
@@ -398,7 +410,7 @@ def classify(utterance: str) -> ClassifiedResult:
         Intent.QUICK_ORDER,
         Intent.PLACE_ORDER,
         Intent.ORDER_ITEM,
-
+        Intent.SAMPLE_REQUEST
     }
     if entities.category_id is not None and entities.product_id is not None:
         if intent in PRODUCT_SPECIFIC_INTENTS:

@@ -492,13 +492,38 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
     # ═══════════════════════════════════════════
 
     elif intent == Intent.PRODUCT_LIST:
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/products",
-            params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish", "stock_status": "instock",
-                    "orderby": "menu_order", "order": "asc"},
-            description="List all published, in-stock products",
-        ))
+        # ── If a specific product was identified, fetch that product + variations ──
+        # The classifier sometimes picks product_list for "show all X products"
+        # when product_search or product_detail would be correct.
+        if e.product_id:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/{e.product_id}",
+                params={},
+                description=f"Get details for product id={e.product_id} ('{e.product_name}')",
+            ))
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/{e.product_id}/variations",
+                params={"per_page": 100, "status": "publish"},
+                description=f"Get variations for '{e.product_name}'",
+            ))
+        elif e.product_name:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products",
+                params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish",
+                        "search": e.product_name},
+                description=f"Search products matching '{e.product_name}'",
+            ))
+        else:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products",
+                params={"per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish",
+                        "stock_status": "instock", "orderby": "menu_order", "order": "asc"},
+                description="List all published, in-stock products",
+            ))
 
     elif intent == Intent.PRODUCT_SEARCH:
         has_attributes = bool(e.attributes)
@@ -963,16 +988,42 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             ))
 
     elif intent == Intent.SAMPLE_REQUEST:
-        sample_slug = _attr_slug_for_label("sample size")
-        attr_id = _attr_id(sample_slug) if sample_slug else None
-        if attr_id:
+        # ── NEW: product-aware sample request ──
+        # When a specific product is identified, fetch the product + its
+        # variations so the response generator can check which sample sizes
+        # are available for THAT product (via pa_sample-size variation attrs).
+        if e.product_id:
             calls.append(WooAPICall(
                 method="GET",
-                endpoint=f"{BASE}/products/attributes/{attr_id}/terms",
-                params={"per_page": 100},
-                description="List available sample sizes",
+                endpoint=f"{BASE}/products/{e.product_id}",
+                params={},
+                description=f"Get parent product '{e.product_name}' for sample sizes",
             ))
-
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products/{e.product_id}/variations",
+                params={"per_page": 100, "page": page, "status": "publish"},
+                description=f"Get all variations for '{e.product_name}' (sample size check)",
+            ))
+        elif e.product_name:
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/products",
+                params={"search": e.product_name, "status": "publish",
+                        "type": "variable", "per_page": 5},
+                description=f"Find variable product '{e.product_name}' for sample sizes",
+            ))
+        else:
+            # No product context — fall back to global sample size terms list
+            sample_slug = _attr_slug_for_label("sample size")
+            attr_id = _attr_id(sample_slug) if sample_slug else None
+            if attr_id:
+                calls.append(WooAPICall(
+                    method="GET",
+                    endpoint=f"{BASE}/products/attributes/{attr_id}/terms",
+                    params={"per_page": 100},
+                    description="List available sample sizes",
+                ))                
     # ═══════════════════════════════════════════
     # DISCOUNTS & SALES
     # ═══════════════════════════════════════════

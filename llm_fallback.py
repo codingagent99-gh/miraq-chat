@@ -147,6 +147,14 @@ Do NOT extract entities — that is already handled by the local classifier.
 **Valid intents** (pick exactly one):
 {valid_intents}
 
+**Important disambiguation rules:**
+- If the user mentions a SPECIFIC PRODUCT NAME and asks about "sample", "sample size",
+  or a specific size dimension (like 3"x3", 6"x6"), use "product_attribute_info"
+  (NOT "sample_request"). "sample_request" is ONLY for generic questions like
+  "what sample sizes do you offer?" without a specific product.
+- If the user mentions a product and asks about sizes, colors, finishes, or variations,
+  use "product_variations" or "product_attribute_info" — not "sample_request".
+
 **Classifier context** (what the local classifier already resolved):
 - Intent: {classifier_intent} (confidence: {classifier_confidence:.2f})
 - Resolved entities: {entities_str}
@@ -166,7 +174,7 @@ If the user's intent is genuinely unclear even with context, return:
   "intent": "unknown",
   "confidence": 0.0,
   "fallback_type": "conversational",
-  "bot_message": "I wasn't sure what you were looking for. Did you mean:\n\u2022 **Browse products** in a specific category\n\u2022 **Check your order status**\n\u2022 **Search for a specific product**"
+  "bot_message": "I wasn't sure what you were looking for. Did you mean:\\n• **Browse products** in a specific category\\n• **Check your order status**\\n• **Search for a specific product**"
 }}
 
 Return ONLY valid JSON. No markdown, no explanation, just the JSON object."""
