@@ -110,27 +110,14 @@ def _build_system_prompt(
 ) -> str:
     """
     Construct a lean intent-only system prompt.
-
-    No store catalog data is included. The LLM's sole job is to pick the correct
-    intent from the closed enum. Entity extraction stays with the local classifier.
-
-    Args:
-        classifier_context: Output of _build_classifier_context()
-        session_history: Last few conversation turns for multi-turn context (optional)
-
-    Returns:
-        System prompt string
     """
-    # All valid intent enum values — LLM must pick exactly one
     valid_intents = _VALID_INTENTS
 
-    # Format classifier context
     classifier_intent = classifier_context.get("classifier_intent", "unknown")
     classifier_confidence = classifier_context.get("classifier_confidence", 0.0)
     resolved_entities = classifier_context.get("resolved_entities", {})
     entities_str = json.dumps(resolved_entities) if resolved_entities else "none"
 
-    # Format conversation history (last 3 turns)
     history_lines = []
     if session_history:
         for msg in session_history[-3:]:
@@ -148,12 +135,9 @@ Do NOT extract entities — that is already handled by the local classifier.
 {valid_intents}
 
 **Important disambiguation rules:**
-- If the user mentions a SPECIFIC PRODUCT NAME and asks about "sample", "sample size",
-  or a specific size dimension (like 3"x3", 6"x6"), use "product_attribute_info"
-  (NOT "sample_request"). "sample_request" is ONLY for generic questions like
-  "what sample sizes do you offer?" without a specific product.
-- If the user mentions a product and asks about sizes, colors, finishes, or variations,
-  use "product_variations" or "product_attribute_info" — not "sample_request".
+- If the user asks to check if a specific product comes in a certain attribute (e.g., "Do you have 3x3 for Ansel?", "Does the subway tile come in matte?"), use "product_search".
+- If the user asks for a general list of options without specifying what they want (e.g., "What sizes does Ansel come in?", "Show me the colors for this tile"), use "product_attribute_info".
+- If the user asks for generic samples without a specific product, use "sample_request".
 
 **Classifier context** (what the local classifier already resolved):
 - Intent: {classifier_intent} (confidence: {classifier_confidence:.2f})
@@ -164,8 +148,8 @@ Do NOT extract entities — that is already handled by the local classifier.
 
 Return ONLY valid JSON:
 {{
-  "intent": "category_browse",
-  "confidence": 0.85,
+  "intent": "product_search",
+  "confidence": 0.90,
   "fallback_type": "intent_resolved"
 }}
 

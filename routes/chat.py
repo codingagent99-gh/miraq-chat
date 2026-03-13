@@ -265,6 +265,27 @@ def chat():
 
     # Capture resolve_variant flag
     _resolve_variant = bool(flow_result and flow_result.get("resolve_variant"))
+    
+    if not _resolve_variant and current_flow_state == FlowState.IDLE:
+        from services.chit_chat_router import route_query
+        
+        router_result = route_query(message)
+        if router_result.get("handled"):
+            elapsed = time.time() - start_time
+            return jsonify({
+                "success": True,
+                "bot_message": router_result["response"],
+                "intent": router_result["intent"],
+                "products": [],
+                "suggestions": ["Show me tiles", "View my orders"],
+                "session_id": session_id,
+                "metadata": {
+                    "response_time_ms": round(elapsed * 1000),
+                    "layer_used": router_result["metadata"].get("layer_used")
+                },
+                "pagination": default_pagination(page),
+                "flow_state": FlowState.IDLE.value,
+            }), 200
 
     # ─── Steps 1–3: Classify + API execution (skipped in variant resolution mode) ───
     if _resolve_variant:
@@ -282,6 +303,7 @@ def chat():
         last_product_ctx = None
         logger.info("Steps 1-3: Skipped (variant resolution mode — Step 3.55 will handle)")
     else:
+           
         # ─── Step 1: Classify intent ───
         result = classify(message)
         intent = result.intent
@@ -350,29 +372,29 @@ def chat():
             
         # ─── Step 2.7: OFFLINE / DRY RUN INTERCEPT ───
         # Stop here and return the constructed parameters instead of calling WooCommerce
-        if body.get("dry_run") or os.getenv("DRY_RUN", "false").lower() == "true":
-            elapsed = time.time() - start_time
-            logger.info(f"Step 2.7: Dry run return | intent={intent.value}")
-            return jsonify({
-                "success": True,
-                "bot_message": "Offline Mode: API calls built using local JSON data.",
-                "intent": intent.value,
-                "extracted_entities": _entities_to_dict(entities),
-                "constructed_api_calls": [
-                    {
-                        "description": call.description,
-                        "method": call.method,
-                        "endpoint": call.endpoint.split('/')[-1], # Shortened for easy reading
-                        "params": call.params,
-                        "body": call.body
-                    } for call in api_calls
-                ],
-                "metadata": {
-                    "confidence": round(confidence, 2),
-                    "response_time_ms": round(elapsed * 1000),
-                    "data_source": "local_json_files"
-                }
-            }), 200
+        # if body.get("dry_run") or os.getenv("DRY_RUN", "false").lower() == "true":
+        #     elapsed = time.time() - start_time
+        #     logger.info(f"Step 2.7: Dry run return | intent={intent.value}")
+        #     return jsonify({
+        #         "success": True,
+        #         "bot_message": "Offline Mode: API calls built using local JSON data.",
+        #         "intent": intent.value,
+        #         "extracted_entities": _entities_to_dict(entities),
+        #         "constructed_api_calls": [
+        #             {
+        #                 "description": call.description,
+        #                 "method": call.method,
+        #                 "endpoint": call.endpoint.split('/')[-1], # Shortened for easy reading
+        #                 "params": call.params,
+        #                 "body": call.body
+        #             } for call in api_calls
+        #         ],
+        #         "metadata": {
+        #             "confidence": round(confidence, 2),
+        #             "response_time_ms": round(elapsed * 1000),
+        #             "data_source": "local_json_files"
+        #         }
+        #     }), 200
 
         # ─── Step 3: Execute API calls ───
         all_products_raw = []

@@ -251,6 +251,7 @@ class StoreLoader:
         except (json.JSONDecodeError, OSError) as e:
             logger.warning(f"StoreLoader: Dev cache file is corrupt — ignoring | error={e}")
             return None
+        
 
     def _dump_lookups_for_debugging(self):
         """Dump the processed lookup dictionaries to a file in dev mode for inspection."""
@@ -270,6 +271,8 @@ class StoreLoader:
                 "tag_by_id": self.tag_by_id,
                 "tag_by_slug": self.tag_by_slug,
                 "tag_by_name_lower": self.tag_by_name_lower,
+                "product_by_name_lower": self.product_by_name_lower,
+                "product_name_tokens": self.product_name_tokens,
             }
             
             # Ensure the .dev_cache directory exists
@@ -280,6 +283,7 @@ class StoreLoader:
             logger.info(f"StoreLoader: Dumped lookup dictionaries to {dump_path} for debugging")
         except Exception as e:
             logger.error(f"StoreLoader: Failed to dump lookups: {e}")
+
             
     def load_all(self):
         """Loads data from local JSON files to bypass the offline WP API."""
@@ -303,6 +307,9 @@ class StoreLoader:
                 # Populate the internal lookup dictionaries for classification
                 self._build_lookups()
                 self._last_loaded = time.time()
+                
+                # 👇 ADD THIS LINE to generate the debug file
+                self._dump_lookups_for_debugging()
                 
             logger.info(f"StoreLoader: ✅ Local load complete. Products: {len(self.products)}")
         except Exception as e:
@@ -628,61 +635,75 @@ class StoreLoader:
             self.tag_by_slug[tag["slug"]] = entry
             self.tag_by_name_lower[name_lower] = entry
 
-        # 5. Process Products (Ensure Ansel is indexed)
+         # 5. Process Products (Ensure Ansel is indexed)
         for product in self.products:
             name = product.get("name", "").strip()
             if not name: continue
-            self.product_by_name_lower[name.lower()] = {"id": product.get("id"), "name": name, "slug": product.get("slug", "")}
-        def _generate_category_keywords(self, cat_entry: Dict):
-            """Auto-generate NLP keywords from category name/slug."""
-            cat_id = cat_entry["id"]
-            name = cat_entry["name"].lower().strip()
-            slug = cat_entry["slug"]
-            cat_count = cat_entry.get("count", 0)
+            
+            name_lower = name.lower()
+            entry = {"id": product.get("id"), "name": name, "slug": product.get("slug", "")}
+            
+            # 1. Exact match dictionary
+            self.product_by_name_lower[name_lower] = entry
+            
+            # 2. Token match list (ADD THIS LOGIC)
+            # Split the name by spaces, hyphens, or underscores
+            words = re.split(r'[\s\-_]+', name_lower)
+            for word in words:
+                # Only save tokens that are more than 2 letters and aren't generic words like "tile"
+                if len(word) > 2 and word not in self._store_generic_terms:
+                    self.product_name_tokens.append((word, entry))
+    
+    def _generate_category_keywords(self, cat_entry: Dict):
+        """Auto-generate NLP keywords from category name/slug."""
+        cat_id = cat_entry["id"]
+        name = cat_entry["name"].lower().strip()
+        slug = cat_entry["slug"]
+        cat_count = cat_entry.get("count", 0)
 
-            def _register(kw: str, cid: int):
-                if kw not in self.category_keywords:
+        def _register(kw: str, cid: int):
+            if kw not in self.category_keywords:
+                self.category_keywords[kw] = cid
+            else:
+                existing_id = self.category_keywords[kw]
+                existing_count = (self.category_by_id.get(existing_id) or {}).get("count", 0)
+                if cat_count < existing_count:
                     self.category_keywords[kw] = cid
-                else:
-                    existing_id = self.category_keywords[kw]
-                    existing_count = (self.category_by_id.get(existing_id) or {}).get("count", 0)
-                    if cat_count < existing_count:
-                        self.category_keywords[kw] = cid
 
-            _register(name, cat_id)
+        _register(name, cat_id)
 
-            stop_words = {
-                "the", "a", "an", "and", "or", "of", "for",
-                "in", "on", "to", "is", "all", "our", "new",
-            } | self._store_generic_terms
-            words = re.split(r'[\s\-_/&]+', name)
-            raw_words = [w for w in words if w.strip()]
-            is_single_word_category = len(raw_words) <= 1
+        stop_words = {
+            "the", "a", "an", "and", "or", "of", "for",
+            "in", "on", "to", "is", "all", "our", "new",
+        } | self._store_generic_terms
+        words = re.split(r'[\s\-_/&]+', name)
+        raw_words = [w for w in words if w.strip()]
+        is_single_word_category = len(raw_words) <= 1
 
+        if is_single_word_category:
+            for word in raw_words:
+                if len(word) > 2:
+                    _register(word, cat_id)
+                    if word.endswith("s") and len(word) > 3:
+                        _register(word[:-1], cat_id)
+                    else:
+                        _register(word + "s", cat_id)
+
+        slug_words = slug.replace("-", " ")
+        if slug_words != name:
+            _register(slug_words, cat_id)
+
+        for original, variant in self._category_synonyms.items():
+            if original in name:
+                alt_name = name.replace(original, variant)
+                _register(alt_name, cat_id)
+
+        for suffix in self._store_generic_terms:
+            _register(f"{name} {suffix}", cat_id)
             if is_single_word_category:
                 for word in raw_words:
                     if len(word) > 2:
-                        _register(word, cat_id)
-                        if word.endswith("s") and len(word) > 3:
-                            _register(word[:-1], cat_id)
-                        else:
-                            _register(word + "s", cat_id)
-
-            slug_words = slug.replace("-", " ")
-            if slug_words != name:
-                _register(slug_words, cat_id)
-
-            for original, variant in self._category_synonyms.items():
-                if original in name:
-                    alt_name = name.replace(original, variant)
-                    _register(alt_name, cat_id)
-
-            for suffix in self._store_generic_terms:
-                _register(f"{name} {suffix}", cat_id)
-                if is_single_word_category:
-                    for word in raw_words:
-                        if len(word) > 2:
-                            _register(f"{word} {suffix}", cat_id)
+                        _register(f"{word} {suffix}", cat_id)
 
     # ─────────────────��───────────────────────────
     # QUERY METHODS

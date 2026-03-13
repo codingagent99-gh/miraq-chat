@@ -28,15 +28,15 @@ class IntentEvaluator(ABC):
         pass
 
 
-class GreetingEvaluator(IntentEvaluator):
-    def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
-        if re.search(r"^\s*(hi|hello|hey|hiya|howdy|yo|sup)\s*[!.]?\s*$", text) or \
-           re.search(r"^\s*good\s+(morning|afternoon|evening|day)\s*[!.]?\s*$", text) or \
-           re.search(r"^\s*(how\s+are\s+you|how'?s\s+it\s+going|what'?s\s+up)\s*[?!.]?\s*$", text) or \
-           re.search(r"^\s*hi\s+there\s*[!.]?\s*$", text) or \
-           re.search(r"^\s*hey\s+there\s*[!.]?\s*$", text):
-            return Intent.GREETING, 0.99
-        return None, 0.0
+# class GreetingEvaluator(IntentEvaluator):
+#     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
+#         if re.search(r"^\s*(hi|hello|hey|hiya|howdy|yo|sup)\s*[!.]?\s*$", text) or \
+#            re.search(r"^\s*good\s+(morning|afternoon|evening|day)\s*[!.]?\s*$", text) or \
+#            re.search(r"^\s*(how\s+are\s+you|how'?s\s+it\s+going|what'?s\s+up)\s*[?!.]?\s*$", text) or \
+#            re.search(r"^\s*hi\s+there\s*[!.]?\s*$", text) or \
+#            re.search(r"^\s*hey\s+there\s*[!.]?\s*$", text):
+#             return Intent.GREETING, 0.99
+#         return None, 0.0
 
 
 class OrderActionEvaluator(IntentEvaluator):
@@ -189,6 +189,10 @@ class ProductDetailEvaluator(IntentEvaluator):
 
 class CatalogSearchEvaluator(IntentEvaluator):
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
+        # If we have a product AND an attribute (like 'Ansel' + '3x3'), it's a specific product search
+        if entities.product_id and entities.attributes:
+            return Intent.PRODUCT_SEARCH, 0.93
+        
         if entities.category_id is not None:
             if entities.product_name:
                 if re.search(r"\b(tell|about|detail|info|specs?|specification|price|cost|how\s+much)\b", text):
@@ -312,7 +316,7 @@ def classify(utterance: str) -> ClassifiedResult:
     
     entities.tag_ids   = []
     entities.tag_slugs = []
-    _extract_tag(text, entities)               
+    _extract_tag(text, entities)            
     
     for tid in _attr_added_tag_ids:
         if tid not in entities.tag_ids:
@@ -337,7 +341,7 @@ def classify(utterance: str) -> ClassifiedResult:
 
     # ─── Execute Intent Pipeline ───
     pipeline = ClassifierPipeline([
-        GreetingEvaluator(),
+        # GreetingEvaluator(),
         OrderActionEvaluator(),
         DiscountEvaluator(),
         ProductDetailEvaluator(),
