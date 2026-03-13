@@ -5,7 +5,7 @@ Chat endpoint as a Flask Blueprint.
 import time
 import uuid
 from datetime import datetime, timezone
-
+import os
 from flask import Blueprint, request, jsonify
 
 from app_config import (
@@ -347,6 +347,32 @@ def chat():
             logger.info(f"Step 2.6: last_product_ctx found: id={last_product_ctx.get('id')}, name=\"{sanitize_log_string(last_product_ctx.get('name', ''))}\"")
         else:
             logger.info("Step 2.6: No last_product_ctx")
+            
+        # ─── Step 2.7: OFFLINE / DRY RUN INTERCEPT ───
+        # Stop here and return the constructed parameters instead of calling WooCommerce
+        if body.get("dry_run") or os.getenv("DRY_RUN", "false").lower() == "true":
+            elapsed = time.time() - start_time
+            logger.info(f"Step 2.7: Dry run return | intent={intent.value}")
+            return jsonify({
+                "success": True,
+                "bot_message": "Offline Mode: API calls built using local JSON data.",
+                "intent": intent.value,
+                "extracted_entities": _entities_to_dict(entities),
+                "constructed_api_calls": [
+                    {
+                        "description": call.description,
+                        "method": call.method,
+                        "endpoint": call.endpoint.split('/')[-1], # Shortened for easy reading
+                        "params": call.params,
+                        "body": call.body
+                    } for call in api_calls
+                ],
+                "metadata": {
+                    "confidence": round(confidence, 2),
+                    "response_time_ms": round(elapsed * 1000),
+                    "data_source": "local_json_files"
+                }
+            }), 200
 
         # ─── Step 3: Execute API calls ───
         all_products_raw = []
@@ -502,11 +528,13 @@ def chat():
         for p in all_products_raw:
             if p.get("parent_id"):
                 continue
-            if "featured_image" in p:
+            # Custom API returns attributes as a dict: {"pa_colors": [...]}
+            # Standard WC returns attributes as a list: [{"name": "Colors", "options": [...]}]
+            if isinstance(p.get("attributes"), dict):
                 products.append(format_custom_product(p))
             else:
                 products.append(format_product(p))
-
+    
     products = [p for p in products if p.get("name")]
     logger.info(f"Step 4: Formatted {len(products)} products")
 

@@ -17,7 +17,6 @@ from config.store_config import (
     FALLBACK_SEARCH_TERM,
 )
 from chat_logger import get_logger
-import re
 
 logger = get_logger("miraq_chat")
 
@@ -72,18 +71,6 @@ def _attr_slug_for_label(label: str) -> Optional[str]:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # QUERY TREE BUILDER
-#
-# Internal representation: a flat list of condition dicts.
-# Each condition:
-#   {"taxonomy": str, "field": "slug", "terms": List[str], "operator": str}
-#
-# Supported operators:
-#   "IN"     → product has at least one of these terms  (OR logic)
-#   "AND"    → product must have ALL of these terms
-#   "NOT IN" → product must not have any of these terms
-#
-# Serialization is isolated in _serialize_query() so tomorrow's API format
-# swap is a ~10-line change in ONE function only.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_condition(taxonomy: str, terms: List[str], operator: str = "IN") -> dict:
@@ -99,17 +86,12 @@ def _make_condition(taxonomy: str, terms: List[str], operator: str = "IN") -> di
 def _serialize_condition(condition: dict) -> dict:
     """
     Recursively serialize a single condition node.
-
-    A node is either:
-      - A flat condition: {"taxonomy": ..., "terms": ..., "operator": ...}
-      - A nested group:   {"relation": "OR", "conditions": [...]}
     """
     if "conditions" in condition:
         return {
             "relation": condition["relation"],
             "conditions": [_serialize_condition(sub) for sub in condition["conditions"]],
         }
-    # Flat condition — return without "field" key (new API format)
     return {
         "taxonomy": condition["taxonomy"],
         "terms":    condition["terms"],
@@ -126,23 +108,12 @@ def _serialize_query(
 ) -> dict:
     """
     Serialize a list of condition nodes to the POST body format.
-
-    Format:
-        {
-            "page": 1, "per_page": 4,
-            "price": {"min": 20, "max": 80},   # optional
-            "filters": {
-                "relation": "AND",
-                "conditions": [...]
-            }
-        }
     """
     body = {
         "page": page,
         "per_page": per_page,
     }
 
-    # Price range — only include bounds that were specified
     if min_price is not None or max_price is not None:
         price = {}
         if min_price is not None:
@@ -166,9 +137,11 @@ def _make_or_group(conditions: list) -> dict:
 def _build_advanced_filter_call(
     tags: List[str] = None,
     categories: List[str] = None,
+    extra_categories: List[List[str]] = None, 
     attributes: dict = None,
     excluded_tags: List[str] = None,
     excluded_categories: List[str] = None,
+    excluded_attributes: dict = None, 
     tag_operator: str = "AND",
     or_pairs: list = None,
     page: int = 1,
@@ -177,93 +150,96 @@ def _build_advanced_filter_call(
     min_price: float = None,
     max_price: float = None,
 ) -> WooAPICall:
-    """
-    Build a single WooAPICall for the new products-advanced-new endpoint.
-
-    Translates flat entity lists into a query condition tree then serializes
-    to the current POST body format via _serialize_query().
-
-    Args:
-        tags:                Tag slugs to include.
-        categories:          Category slugs to include (AND'd with other conditions).
-        attributes:          {pa_taxonomy: term_value} attribute filters.
-        excluded_tags:       Tag slugs to exclude (NOT IN).
-        excluded_categories: Category slugs to exclude (NOT IN).
-        tag_operator:        "AND" (must have all tags) or "OR" (must have any tag).
-                             Maps to "AND" or "IN" in the query tree.
-        or_pairs:            List of {tag_slug, attr_taxonomy, attr_term} dicts from
-                             entities.attr_tag_or_pairs. Each pair becomes a nested OR
-                             condition: OR(tag:slug, pa_taxonomy:term) so products are
-                             found whether they use the tag or the attribute to express
-                             the property. e.g. "glossy finish" →
-                               OR(post_tag:glossy-finish, pa_finish:Glossy)
-    """
+    
     conditions = []
+    l = _loader() 
 
-    # ── Tags (include) ───────────────────────────────────────────────────────
-    # Only add a flat tag condition for tags NOT already covered by an or_pair.
-    # or_pairs emit a nested OR(tag:slug, pa_taxonomy:term) per tag, so adding
-    # the same slugs again as a hard AND condition would override those ORs —
-    # any product missing either tag would be excluded even if it matched via
-    # the attribute side of the OR pair.
+    # ── Tags (include) ──
     _or_pair_tag_slugs = {p.get("tag_slug") for p in (or_pairs or [])}
     _uncovered_tags = [t for t in (tags or []) if t not in _or_pair_tag_slugs]
     if _uncovered_tags:
-        # AND only makes sense with multiple tags; a single tag always uses IN
         op = "AND" if (tag_operator == "AND" and len(_uncovered_tags) > 1) else "IN"
         conditions.append(_make_condition("product_tag", _uncovered_tags, op))
-        logger.debug(f"api_builder: Added tag condition | tags={_uncovered_tags} | operator={op}")
-    if _or_pair_tag_slugs:
-        logger.debug(f"api_builder: Skipping flat AND for or_pair-covered tags={list(_or_pair_tag_slugs)}")
 
-    # ── Tags (exclude) ───────────────────────────────────────────────────────
+    # ── Tags (exclude) ──
     if excluded_tags:
         conditions.append(_make_condition("product_tag", list(excluded_tags), "NOT IN"))
 
-    # ── Categories (include) ─────────────────────────────────────────────────
+    # ── Categories (include) ──
     if categories:
         conditions.append(_make_condition("product_cat", list(categories), "IN"))
 
-    # ── Categories (exclude) ─────────────────────────────────────────────────
+    # ── Extra Categories (AND logic) ── 
+    if extra_categories:
+        for extra_slug_list in extra_categories:
+            if extra_slug_list:
+                conditions.append(_make_condition("product_cat", extra_slug_list, "IN"))
+
+    # ── Categories (exclude) ──
     if excluded_categories:
         conditions.append(_make_condition("product_cat", list(excluded_categories), "NOT IN"))
 
-    # ── Attributes ───────────────────────────────────────────────────────────
-    # Each attribute is its own condition so different attributes are AND'd.
-    # Terms within a single attribute are comma-separated and treated as IN.
-    if attributes:
-        for attr_taxonomy, terms_value in attributes.items():
-            terms_list = (
-                [t.strip() for t in terms_value.split(",") if t.strip()]
-                if isinstance(terms_value, str)
-                else list(terms_value)
-            )
-            if terms_list:
-                conditions.append(_make_condition(attr_taxonomy, terms_list, "IN"))
+    # ── Attributes (exclude) ──
+    if excluded_attributes:
+        for attr_taxonomy, slug_list in excluded_attributes.items():
+            if slug_list:
+                conditions.append(_make_condition(attr_taxonomy, slug_list, "NOT IN"))
 
-    # ── Ambiguous tag+attribute OR pairs ─────────────────────────────────────
-    # Each pair wraps two equivalent conditions in a nested OR so the API
-    # matches products regardless of which representation they use.
-    # e.g. "glossy finish" → OR(post_tag:glossy-finish, pa_finish:Glossy)
+    # ── Attributes (include) ──
+    if attributes:
+        # Step 1: Group attribute labels by their requested value
+        value_groups = {}
+        for attr_taxonomy, terms_value in attributes.items():
+            raw_terms = terms_value if isinstance(terms_value, str) else ",".join(terms_value)
+            val_key = raw_terms.lower().strip()
+            
+            if val_key not in value_groups:
+                value_groups[val_key] = []
+            value_groups[val_key].append(attr_taxonomy)
+
+        # Step 2: Build the conditions
+        for val_key, taxonomies in value_groups.items():
+            raw_terms_list = [t.strip() for t in val_key.split(",") if t.strip()]
+            
+            or_conditions = []
+            for taxonomy in taxonomies:
+                slug_list = []
+                for raw_term in raw_terms_list:
+                    term_slug = l.get_attribute_term_slug(taxonomy, raw_term) if l else None
+                    if term_slug:
+                        slug_list.append(term_slug)
+                    else:
+                        slug_list.append(raw_term.replace(" ", "-").replace('"', '').replace("'", ""))
+                
+                if slug_list:
+                    or_conditions.append(_make_condition(taxonomy, slug_list, "IN"))
+            
+            # Step 3: Apply AND vs OR logic
+            if len(or_conditions) == 1:
+                # Unique value -> standard AND condition
+                conditions.append(or_conditions[0])
+            elif len(or_conditions) > 1:
+                # Same value across multiple taxonomies -> OR condition
+                conditions.append(_make_or_group(or_conditions))
+                              
+    # ── Ambiguous tag+attribute OR pairs ──
     if or_pairs:
         for pair in or_pairs:
             tag_slug      = pair.get("tag_slug", "")
             attr_taxonomy = pair.get("attr_taxonomy", "")
-            attr_term     = pair.get("attr_term", "")
-            if tag_slug and attr_taxonomy and attr_term:
+            raw_attr_term = pair.get("attr_term", "")
+            
+            if tag_slug and attr_taxonomy and raw_attr_term:
+                term_slug = l.get_attribute_term_slug(attr_taxonomy, raw_attr_term) if l else None
+                if not term_slug:
+                     term_slug = raw_attr_term.lower().replace(" ", "-")
+
                 conditions.append(_make_or_group([
-                    _make_condition("product_tag",    [tag_slug],   "IN"),
-                    _make_condition(attr_taxonomy, [attr_term],  "IN"),
+                    _make_condition("product_tag", [tag_slug], "IN"),
+                    _make_condition(attr_taxonomy, [term_slug], "IN"),
                 ]))
 
     body = _serialize_query(conditions, page, per_page, min_price=min_price, max_price=max_price)
-
-    logger.debug(
-        f"api_builder: Built advanced filter | description={description!r} | "
-        f"tags={tags} | categories={categories} | attributes={attributes} | "
-        f"excluded_tags={excluded_tags} | tag_operator={tag_operator} | "
-        f"or_pairs={or_pairs} | body={body}"
-    )
 
     return WooAPICall(
         method="POST",
@@ -279,24 +255,6 @@ def match_variation_to_entities(variations: list, entities) -> Optional[dict]:
     """
     Given a list of WooCommerce variation dicts and extracted entities, return
     the variation that best matches the user's requested attributes.
-
-    Scoring: +1 for each variation attribute whose name+option matches an
-    extracted entity attribute value. The variation with the highest score wins.
-    Ties broken by returning the first highest-scoring variation found.
-
-    Returns the best-matching variation dict, or None if no match scored > 0.
-
-    Usage (in chat.py or variant_handler.py after variations are fetched):
-        from api_builder import match_variation_to_entities
-        best = match_variation_to_entities(variations_list, entities)
-        if best:
-            price = best.get("price")
-
-    Example:
-        entities.attributes = {'finish': 'Silky', 'tile size': '3"x3"'}
-        variation attrs      = [{'name': 'Finish', 'option': 'Silky'},
-                                 {'name': 'Tile Size', 'option': '3"x3"'}]
-        → score 2 → this variation wins
     """
     if not variations or not entities.attributes:
         return None
@@ -311,7 +269,6 @@ def match_variation_to_entities(variations: list, entities) -> Optional[dict]:
             attr_option = attr.get("option", "").lower().strip()
             for ent_label, ent_value in entities.attributes.items():
                 if ent_label.lower().strip() == attr_label:
-                    # Normalize both sides: strip quotes and extra spaces
                     ent_clean = re.sub(r'[\"\'`]', '', ent_value).strip().lower()
                     opt_clean = re.sub(r'[\"\'`]', '', attr_option).strip().lower()
                     if ent_clean == opt_clean or ent_clean in opt_clean or opt_clean in ent_clean:
@@ -331,7 +288,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
     calls = []
 
     # ═══════════════════════════════════════════
-    # GREETING - No API calls needed
+    # GREETING 
     # ═══════════════════════════════════════════
 
     if intent == Intent.GREETING:
@@ -434,7 +391,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             if cat_id:
                 e.category_id = cat_id
 
-        # ── No category resolved — fall back to listing all categories ──
         if not cat_id:
             calls.append(WooAPICall(
                 method="GET",
@@ -444,7 +400,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
                 description="List all product categories (no category specified)",
             ))
         else:
-            # cat_id is guaranteed truthy here
             if loader:
                 categories_list = loader.get_all_slugs_for_category(cat_id)
             else:
@@ -472,6 +427,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
                 page=page,
                 excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
                 excluded_categories=list(e.excluded_categories) if e.excluded_categories else None,
+                excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None,
                 tag_operator=e.tag_operator,
                 or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
                 description=f"Browse category '{e.category_name}' (id={e.category_id})",
@@ -492,9 +448,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
     # ═══════════════════════════════════════════
 
     elif intent == Intent.PRODUCT_LIST:
-        # ── If a specific product was identified, fetch that product + variations ──
-        # The classifier sometimes picks product_list for "show all X products"
-        # when product_search or product_detail would be correct.
         if e.product_id:
             calls.append(WooAPICall(
                 method="GET",
@@ -528,13 +481,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
     elif intent == Intent.PRODUCT_SEARCH:
         has_attributes = bool(e.attributes)
 
-        # ── Category-scoped product search ──────────────────────────────────
-        # When BOTH a product name AND a category are present, the user wants
-        # to browse that series *within* a category (e.g. "Titan Marbles in
-        # Countertop"). Fetching the specific product's variations would return
-        # ALL variants regardless of category; instead use the advanced filter
-        # endpoint with a search term + category scope so only matching products
-        # are returned with proper pagination.
         if e.product_name and e.category_id:
             loader = get_store_loader()
             cat_id = e.category_id
@@ -542,7 +488,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
                 cat_id = loader.get_category_id(e.category_name)
             categories_list = loader.get_all_slugs_for_category(cat_id) if (cat_id and loader) else []
             tag_slugs = list(e.tag_slugs) if e.tag_slugs else []
-            # Build attribute filters if any attributes were also specified
             attr_filters = {}
             if e.attribute_slug and e.attributes and loader and loader.all_attributes_raw:
                 for attr in loader.all_attributes_raw:
@@ -552,13 +497,13 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
                         if term_value:
                             attr_filters[e.attribute_slug] = term_value
                         break
-            # Use the product name as a search term inside the advanced filter
             call = _build_advanced_filter_call(
                 tags=tag_slugs if tag_slugs else None,
                 categories=categories_list if categories_list else None,
                 attributes=attr_filters if attr_filters else None,
                 excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
                 excluded_categories=list(e.excluded_categories) if e.excluded_categories else None,
+                excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None,
                 tag_operator=e.tag_operator,
                 or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
                 page=page,
@@ -566,11 +511,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
                 min_price=e.min_price,
                 max_price=e.max_price,
             )
-            # Only inject a free-text search term when there are no tag slugs.
-            # When tag_slugs are present they already scope the results precisely
-            # (e.g. "titan-marbles-series" tag + "countertop" category is exact);
-            # adding search="Titan Marbles" on top would further restrict and may
-            # miss products whose title doesn't literally contain those words.
             if not tag_slugs:
                 call.params["search"] = e.product_name
             calls.append(call)
@@ -590,9 +530,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
                     description=f"Fetch variations for id={e.product_id}",
                 ))
         elif has_attributes and e.attribute_slug and not e.product_name:
-            # Attribute match without a product name — use the advanced filter
-            # endpoint so the attribute is applied. Dynamically resolves the
-            # term value from e.attribute_slug, no hardcoded label names.
             attr_filters = {}
             l = get_store_loader()
             if l and l.all_attributes_raw:
@@ -611,6 +548,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
                 categories=categories_list if categories_list else None,
                 attributes=attr_filters if attr_filters else None,
                 excluded_categories=list(e.excluded_categories) if e.excluded_categories else None,
+                excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None,
                 tag_operator=e.tag_operator,
                 or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
                 page=page,
@@ -650,9 +588,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             ))
 
     elif intent == Intent.PRODUCT_ATTRIBUTE_INFO:
-        # Fetch the product and its variations so the response generator can
-        # read attributes[].options from the parent and cross-reference in-stock
-        # variants. Same two calls as PRODUCT_DETAIL.
         if e.product_id:
             calls.append(WooAPICall(
                 method="GET",
@@ -679,6 +614,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             calls.append(_build_advanced_filter_call(
                 tags=list(e.tag_slugs),
                 excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
+                excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None,
                 tag_operator=e.tag_operator,
                 or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
                 page=page,
@@ -703,6 +639,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
                 tags=list(e.tag_slugs),
                 excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
                 excluded_categories=list(e.excluded_categories) if e.excluded_categories else None,
+                excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None,
                 tag_operator=e.tag_operator,
                 or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
                 page=page,
@@ -722,9 +659,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             ))
 
     elif intent == Intent.PRODUCT_BY_ORIGIN:
-        # Origin can be expressed as a tag ("made-in-sri-lanka") OR an attribute
-        # (pa_origin: "sri-lanka") — products may have one or the other.
-        # Build OR pairs so both are searched, same pattern as finish/color.
         origin = e.attributes.get("origin", "")
         attr_slug = _attr_slug_for_label("origin") or e.attribute_slug
         origin_or_pairs = []
@@ -740,6 +674,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             attributes=None if origin_or_pairs else ({attr_slug: origin} if (attr_slug and origin) else None),
             or_pairs=origin_or_pairs or (list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None),
             excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
+            excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None,
             tag_operator=e.tag_operator,
             page=page,
             description=f"Products from {origin}",
@@ -783,7 +718,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
         ))
 
     elif intent == Intent.PRODUCT_TYPES:
-        # Dynamically find any "visual" or "type" attribute — no hardcoded label needed.
         l = _loader()
         if l and l.all_attributes_raw:
             for attr in l.all_attributes_raw:
@@ -817,19 +751,13 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             cat_id = loader.get_category_id(e.category_name)
         categories_list = loader.get_all_slugs_for_category(cat_id) if (cat_id and loader) else []
 
-        # AND-filter across extra categories (multi-category queries).
-        # Each extra category gets its own IN condition so all must match.
         extra_conditions_categories = []
         for extra_cid in (e.extra_category_ids or []):
             if loader:
                 extra_slugs = loader.get_all_slugs_for_category(extra_cid)
                 if extra_slugs:
-                    extra_conditions_categories.extend(extra_slugs)
+                    extra_conditions_categories.append(extra_slugs)
 
-        # Deduplicate: drop any tag whose slug tokens are fully covered by
-        # already-resolved attribute values. This prevents double-filtering when
-        # e.g. tag "1-4-thick" and attribute pa_thickness "1/4" thick" describe
-        # the same concept. Works dynamically — no hardcoded slug/label names.
         attr_value_tokens = set()
         for v in e.attributes.values():
             attr_value_tokens |= {
@@ -843,29 +771,26 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
         attr_label = next(iter(e.attributes.keys()), "attribute")
         attr_value = next(iter(e.attributes.values()), "")
         calls.append(_build_advanced_filter_call(
-            categories=categories_list if categories_list else None,
-            attributes=attr_filters if attr_filters else None,
             tags=deduped_tag_slugs if deduped_tag_slugs else None,
-            page=page,
+            attributes=attr_filters if attr_filters else None,
+            or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
             excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
             excluded_categories=list(e.excluded_categories) if e.excluded_categories else None,
             tag_operator=e.tag_operator,
-            or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
-            description=f"Filter by {attr_label}: {attr_value}",
+            page=page,
             min_price=e.min_price,
             max_price=e.max_price,
-        ))
-        
-    # ── FILTER_BY_FINISH — catalog-wide finish filter ──
-    # e.g. "show me matte tiles", "polished finish products"
-    # When a product_name is present, llm_handler remaps this to
-    # PRODUCT_ATTRIBUTE_INFO so we only reach here for catalog-wide queries.
+            categories=categories_list if categories_list else None,
+            extra_categories=extra_conditions_categories if extra_conditions_categories else None,
+            excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None,
+            description=f"Filter by {attr_label}: {attr_value}",
+        ))        
+
     elif intent == Intent.FILTER_BY_FINISH:
         finish_value = e.attributes.get("finish", "")
         finish_slug = _attr_slug_for_label("finish") or e.attribute_slug
         finish_or_pairs = []
         if finish_slug and finish_value and e.tag_slugs:
-            # Finish can be a tag OR an attribute — build OR pair like origin/color
             finish_or_pairs = [
                 {"attribute": finish_slug, "value": finish_value},
                 {"tag": list(e.tag_slugs)[0]},
@@ -888,6 +813,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             page=page,
             excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
             excluded_categories=list(e.excluded_categories) if e.excluded_categories else None,
+            excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None,
             tag_operator=e.tag_operator,
             or_pairs=finish_or_pairs if finish_or_pairs else None,
             description=f"Filter by finish: {finish_value}",
@@ -897,13 +823,15 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
 
         
     elif intent == Intent.FILTER_BY_ORIGIN:
-        # Origin can be expressed as a tag ("made-in-sri-lanka") OR an attribute
-        # (pa_origin: "sri-lanka") depending on how products were entered in the store.
-        # Build an OR pair so both paths are searched — same pattern as finish/color.
+        cat_id = e.category_id
+        loader = get_store_loader()
+        if not cat_id and e.category_name and loader:
+            cat_id = loader.get_category_id(e.category_name)
+        categories_list = loader.get_all_slugs_for_category(cat_id) if (cat_id and loader) else []
+
         origin = e.attributes.get("origin", "")
         origin_or_pairs = []
         if e.attribute_slug and origin and e.tag_slugs:
-            # Wrap tag + attribute as OR pairs — one per tag slug
             for tag_slug in e.tag_slugs:
                 origin_or_pairs.append({
                     "tag_slug":      tag_slug,
@@ -911,11 +839,13 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
                     "attr_term":     origin,
                 })
         calls.append(_build_advanced_filter_call(
-            # Don't pass tags/attributes separately — they're in or_pairs now
             tags=None if origin_or_pairs else (list(e.tag_slugs) if e.tag_slugs else None),
+            categories=categories_list if categories_list else None,
             attributes=None if origin_or_pairs else ({e.attribute_slug: origin} if (e.attribute_slug and origin) else None),
             or_pairs=origin_or_pairs if origin_or_pairs else (list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None),
             excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
+            excluded_categories=list(e.excluded_categories) if e.excluded_categories else None, 
+            excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None, 
             tag_operator=e.tag_operator,
             page=page,
             description=f"Filter by origin: {origin}",
@@ -925,8 +855,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
 
     elif intent == Intent.SIZE_LIST:
         if e.product_id:
-            # Product-scoped: fetch this product's variations to extract its actual sizes.
-            # Much more useful than listing all global size terms in the store.
             calls.append(WooAPICall(
                 method="GET",
                 endpoint=f"{BASE}/products/{e.product_id}",
@@ -940,7 +868,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
                 description=f"Get variations to extract available sizes for '{e.product_name}'",
             ))
         else:
-            # No specific product — fall back to global size terms
             l = _loader()
             if l and l.all_attributes_raw:
                 for attr in l.all_attributes_raw:
@@ -957,10 +884,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
                         break
 
     # ═══════════════════════════════════════════
-    # PRODUCT SUBTYPES
-    # ═══════════════════════════════════════════
-
-        # ═══════════════════════════════════════════
     # VARIATIONS
     # ═══════════════════════════════════════════
 
@@ -988,10 +911,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             ))
 
     elif intent == Intent.SAMPLE_REQUEST:
-        # ── NEW: product-aware sample request ──
-        # When a specific product is identified, fetch the product + its
-        # variations so the response generator can check which sample sizes
-        # are available for THAT product (via pa_sample-size variation attrs).
         if e.product_id:
             calls.append(WooAPICall(
                 method="GET",
@@ -1014,7 +933,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
                 description=f"Find variable product '{e.product_name}' for sample sizes",
             ))
         else:
-            # No product context — fall back to global sample size terms list
             sample_slug = _attr_slug_for_label("sample size")
             attr_id = _attr_id(sample_slug) if sample_slug else None
             if attr_id:
@@ -1024,6 +942,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
                     params={"per_page": 100},
                     description="List available sample sizes",
                 ))                
+
     # ═══════════════════════════════════════════
     # DISCOUNTS & SALES
     # ═══════════════════════════════════════════
@@ -1106,8 +1025,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
 
     # ─── UPDATE_CUSTOMER ─────────────────────────────────────────────────────
     elif intent == Intent.UPDATE_CUSTOMER:
-        # PUT /wp-json/wc/v3/customers/{customer_id}
-        # role and email are never sent even if extracted.
         if not customer_id:
             logger.warning("api_builder: UPDATE_CUSTOMER intent but no customer_id resolved")
         else:
@@ -1156,7 +1073,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
         ))
 
     result.api_calls = calls
-    # Stamp every call with request context for api.txt logging
     for call in calls:
         if not call.user_message:
             call.user_message = user_message

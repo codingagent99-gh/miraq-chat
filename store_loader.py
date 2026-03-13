@@ -37,6 +37,14 @@ DEV_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dev_c
 DEV_CACHE_FILE = os.path.join(DEV_CACHE_DIR, "store_data.json")
 DEV_CACHE_BUST = os.getenv("DEV_CACHE_BUST", "false").lower() == "true"
 
+# Path configuration based on your folder structure
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+FILE_MAP = {
+    "attributes": "all-attributes-and-terms.json",
+    "tags":       "list-of-all-tags.json",
+    "categories": "product-category.json",
+    "products":   "product-list.json"
+}
 BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -68,6 +76,13 @@ class BoundedVariationCache:
         self._cache: OrderedDict = OrderedDict()
         self.max_size = max_size
         self.ttl = ttl
+        self.all_attributes_raw = []
+        self.categories = []
+        self.tags = []
+        self.products = []
+        self.attribute_terms = {}
+        self._lock = threading.Lock()
+        self._last_loaded = None
 
     def get(self, product_id: int):
         """Get cached variations. Returns None on miss or expiry."""
@@ -237,146 +252,78 @@ class StoreLoader:
             logger.warning(f"StoreLoader: Dev cache file is corrupt — ignoring | error={e}")
             return None
 
-    def load_all(self):
-        """Fetch all taxonomy data from WooCommerce.
-
-        In dev mode (DEV_CACHE=true): loads from local JSON file if available,
-        skipping all network calls. Falls back to live fetch if no cache exists.
-        """
-        logger.info("StoreLoader: Loading store data from WooCommerce...")
-        logger.info(f"StoreLoader: Base URL={self.base}")
-
-        if not self.consumer_key or self.consumer_key.startswith("ck_your"):
-            logger.error("StoreLoader: API keys not configured! Update .env file.")
+    def _dump_lookups_for_debugging(self):
+        """Dump the processed lookup dictionaries to a file in dev mode for inspection."""
+        if not DEV_CACHE_ENABLED:
             return
 
-        # ── Try dev cache first ──
-        if DEV_CACHE_ENABLED:
-            cached = self._load_dev_cache()
-            if cached is not None:
-                load_start = time.time()
-                with self._lock:
-                    self.categories = cached.get("categories", [])
-                    self.tags = cached.get("tags", [])
-                    self.attributes = cached.get("attributes", [])
-                    # attribute_terms keys are ints but JSON serializes them as strings
-                    self.attribute_terms = {
-                        int(k): v for k, v in cached.get("attribute_terms", {}).items()
-                    }
-                    self.products = cached.get("products", [])
-                    self.all_attributes_raw = cached.get("all_attributes_raw", [])
-                    self._expected_product_count = cached.get("expected_product_count")
-                    self.currency_symbol = cached.get("currency_symbol", "$")
-                    self._loaded_from_cache = True
-                    self._build_lookups()
-                    self._last_loaded = time.time()
-                    self._validate_load()
-
-                elapsed_ms = round((time.time() - load_start) * 1000)
-                logger.info(
-                    f"StoreLoader: ⚡ Loaded from dev cache in {elapsed_ms}ms | "
-                    f"categories={len(self.categories)} | tags={len(self.tags)} | "
-                    f"products={len(self.products)}"
-                )
-                return
-
-        # ── Live fetch from WooCommerce ──
-        fetch_start = time.time()
-
-        new_categories = self._fetch_all_pages(f"{self.base}/products/categories")
-        logger.info(f"StoreLoader: Loaded {len(new_categories)} categories {'✅' if new_categories else '⚠️ EMPTY'}")
-
-        new_tags = self._fetch_all_pages(f"{self.base}/products/tags")
-        logger.info(f"StoreLoader: Loaded {len(new_tags)} tags")
-
-        new_attributes = self._fetch_all_pages(f"{self.base}/products/attributes")
-        logger.info(f"StoreLoader: Loaded {len(new_attributes)} attributes")
-
-        new_attribute_terms: Dict[int, List[Dict]] = {}
-        for attr in new_attributes:
-            attr_id = attr["id"]
-            terms = self._fetch_all_pages(
-                f"{self.base}/products/attributes/{attr_id}/terms"
-            )
-            new_attribute_terms[attr_id] = terms
-            logger.info(f"StoreLoader: Loaded {len(terms)} terms for '{attr['name']}' (id={attr_id})")
-
-        raw_products, expected_total = self._fetch_all_pages_with_total(
-            f"{self.base}/products",
-            extra_params={"status": "publish"},
-        )
-        logger.info(f"StoreLoader: Fetched {len(raw_products)} raw products {'✅' if raw_products else '⚠️ EMPTY'}")
-
-        # Strip product JSON to only the fields we actually use
-        _PRODUCT_FIELDS_USED = {
-            "id", "name", "slug", "type",
-            "attributes", "default_attributes", "variations",
-        }
-        new_products = [
-            {k: p[k] for k in _PRODUCT_FIELDS_USED if k in p}
-            for p in raw_products
-        ]
-
-        custom_api_base = os.getenv(
-            "CUSTOM_API_BASE_URL",
-            self.base.replace("/wp-json/wc/v3", "/wp-json/custom-api/v1"),
-        )
-        new_all_attributes_raw: List[Dict] = []
+        dump_path = os.path.join(".dev_cache", "lookups_debug.json")
         try:
-            resp = self.session.get(f"{custom_api_base}/all-attributes", timeout=self.timeout)
-            resp.raise_for_status()
-            new_all_attributes_raw = resp.json()
-            logger.info(f"StoreLoader: Loaded {len(new_all_attributes_raw)} attributes from custom API")
+            dump_data = {
+                "store_generic_terms": list(self._store_generic_terms) if self._store_generic_terms else [],
+                "attribute_by_slug": self.attribute_by_slug,
+                "attribute_by_id": self.attribute_by_id,
+                "attribute_terms": self.attribute_terms,
+                "category_by_id": self.category_by_id,
+                "category_by_name_lower": self.category_by_name_lower,
+                "category_keywords": self.category_keywords,
+                "tag_by_id": self.tag_by_id,
+                "tag_by_slug": self.tag_by_slug,
+                "tag_by_name_lower": self.tag_by_name_lower,
+            }
+            
+            # Ensure the .dev_cache directory exists
+            os.makedirs(".dev_cache", exist_ok=True)
+            
+            with open(dump_path, "w", encoding="utf-8") as f:
+                json.dump(dump_data, f, indent=2)
+            logger.info(f"StoreLoader: Dumped lookup dictionaries to {dump_path} for debugging")
         except Exception as e:
-            logger.warning(f"StoreLoader: Custom all-attributes API failed | error={e}")
+            logger.error(f"StoreLoader: Failed to dump lookups: {e}")
+            
+    def load_all(self):
+        """Loads data from local JSON files to bypass the offline WP API."""
+        logger.info(f"StoreLoader: 📁 Loading local data from {DATA_DIR}")
+        
+        try:
+            with self._lock:
+                # Load the four files
+                self.categories = self._read_json(FILE_MAP["categories"]) or []
+                self.tags = self._read_json(FILE_MAP["tags"]) or []
+                self.products = self._read_json(FILE_MAP["products"]) or []
+                self.all_attributes_raw = self._read_json(FILE_MAP["attributes"]) or []
 
-        fetched_currency = self._fetch_currency_symbol()
-        if fetched_currency:
-            logger.info(f"StoreLoader: Currency symbol fetched: {fetched_currency}")
-        else:
-            logger.warning(f"StoreLoader: Currency fetch failed — using fallback symbol '{self.currency_symbol}'")
+                # Map attributes and terms for dynamic resolution
+                self.attribute_terms = {
+                    int(attr["attribute_id"]): attr.get("terms", [])
+                    for attr in self.all_attributes_raw 
+                    if attr.get("attribute_id")
+                }
 
-        fetch_elapsed = round(time.time() - fetch_start, 1)
+                # Populate the internal lookup dictionaries for classification
+                self._build_lookups()
+                self._last_loaded = time.time()
+                
+            logger.info(f"StoreLoader: ✅ Local load complete. Products: {len(self.products)}")
+        except Exception as e:
+            logger.error(f"StoreLoader: ❌ Failed to load local files: {e}")
 
-        # ── Atomic swap under lock ──
-        with self._lock:
-            self.categories = new_categories
-            self.tags = new_tags
-            self.attributes = new_attributes
-            self.attribute_terms = new_attribute_terms
-            self.products = new_products
-            self.all_attributes_raw = new_all_attributes_raw
-            self._expected_product_count = expected_total
-            if fetched_currency:
-                self.currency_symbol = fetched_currency
-            self._loaded_from_cache = False
-            self._build_lookups()
-            self._last_loaded = time.time()
-            self._validate_load()
+    def _read_json(self, filename: str) -> Optional[List]:
+        path = os.path.join(DATA_DIR, filename)
+        if not os.path.exists(path):
+            logger.warning(f"StoreLoader: File not found: {filename}")
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
-        logger.info(
-            f"StoreLoader: Summary | categories={len(self.categories)} | tags={len(self.tags)} | "
-            f"attributes={len(self.attributes)} | products={len(self.products)} | "
-            f"cat_keywords={len(self.category_keywords)} | fetch_time={fetch_elapsed}s"
-        )
-
-        # ── Save to dev cache for next restart ──
-        if DEV_CACHE_ENABLED and not self._degraded:
-            self._save_dev_cache({
-                "categories": new_categories,
-                "tags": new_tags,
-                "attributes": new_attributes,
-                "attribute_terms": {str(k): v for k, v in new_attribute_terms.items()},
-                "products": new_products,
-                "all_attributes_raw": new_all_attributes_raw,
-                "expected_product_count": expected_total,
-                "currency_symbol": self.currency_symbol,
-            })
-
-        if self._degraded:
-            logger.warning(f"StoreLoader: DEGRADED — {', '.join(self._degraded_reasons)} | retry_in={self._retry_interval // 60}min")
-        else:
-            logger.info("StoreLoader: Store data loaded successfully ✅")
+    def _load_json_file(self, filename: str) -> Optional[List]:
+        """Helper to read individual JSON files."""
+        path = os.path.join(DATA_DIR, filename)
+        if not os.path.exists(path):
+            logger.warning(f"StoreLoader: Missing file {filename}")
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
     def _validate_load(self):
         """
@@ -632,179 +579,110 @@ class StoreLoader:
         return generic
 
     def _build_lookups(self):
-        """Build lookup dicts and NLP keyword maps from loaded data."""
-
         self._store_generic_terms = self._build_store_generic_terms()
 
+        # 1. ALWAYS Reset/Initialize lookups
         self.attribute_by_slug = {}
         self.attribute_by_id = {}
-        for attr in self.attributes:
-            entry = {
-                "id": attr["id"],
-                "name": attr.get("name", ""),
-                "slug": attr.get("slug", ""),
-            }
-            self.attribute_by_slug[attr.get("slug", "")] = entry
-            self.attribute_by_id[attr["id"]] = entry
-
-        self.tag_by_name_lower = {}
-        for tag in self.tags:
-            name_lower = tag.get("name", "").lower()
-            slug = tag.get("slug", "")
-            entry = {
-                "id": tag["id"],
-                "name": tag.get("name", ""),
-                "slug": slug,
-                "count": tag.get("count", 0),
-            }
-            self.tag_by_name_lower[name_lower] = entry
-            slug_words = slug.replace("-", " ")
-            if slug_words != name_lower:
-                self.tag_by_name_lower.setdefault(slug_words, entry)
-
         self.category_by_slug = {}
         self.category_by_id = {}
         self.category_by_name_lower = {}
-        self.category_slugs_by_name = {}
-        self.category_keywords = {}
-
-        for cat in self.categories:
-            cat_id = cat["id"]
-            slug = cat.get("slug", "")
-            name = cat.get("name", "")
-            name_lower = name.lower()
-            count = cat.get("count", 0)
-            parent = cat.get("parent", 0)
-
-            entry = {
-                "id": cat_id,
-                "name": name,
-                "slug": slug,
-                "count": count,
-                "parent": parent,
-                "description": cat.get("description", ""),
-                "image": cat.get("image"),
-            }
-
-            self.category_by_slug[slug] = entry
-            self.category_by_id[cat_id] = entry
-            existing = self.category_by_name_lower.get(name_lower)
-            if not existing or count > existing.get("count", 0):
-                self.category_by_name_lower[name_lower] = entry
-            if name_lower not in self.category_slugs_by_name:
-                self.category_slugs_by_name[name_lower] = []
-            if slug not in self.category_slugs_by_name[name_lower]:
-                self.category_slugs_by_name[name_lower].append(slug)
-
-            if slug != "uncategorized" and count > 0:
-                self._generate_category_keywords(entry)
-
         self.tag_by_slug = {}
         self.tag_by_id = {}
-        for tag in self.tags:
-            tag_id = tag["id"]
-            slug = tag.get("slug", "")
-            entry = {
-                "id": tag_id,
-                "name": tag.get("name", ""),
-                "slug": slug,
-                "count": tag.get("count", 0),
-            }
-            self.tag_by_slug[slug] = entry
-            self.tag_by_id[tag_id] = entry
-
+        self.tag_by_name_lower = {}
         self.product_by_name_lower = {}
-        self.product_name_tokens = []
+
+        # 2. Process Attributes (Custom or Standard)
+        if self.all_attributes_raw:
+            for attr in self.all_attributes_raw:
+                if not attr.get("visible", True): continue
+                taxonomy_slug = attr.get("taxonomy", "")
+                attr_id = attr.get("attribute_id")
+                entry = {"id": attr_id, "name": attr.get("attribute_label", ""), "slug": taxonomy_slug}
+                self.attribute_by_slug[taxonomy_slug] = entry
+                self.attribute_by_id[attr_id] = entry
+                self.attribute_terms[attr_id] = attr.get("terms", [])
+        else:
+            # Standard WC logic for attributes if raw is missing
+            for attr in self.attributes:
+                entry = {"id": attr["id"], "name": attr.get("name", ""), "slug": attr.get("slug", "")}
+                self.attribute_by_slug[attr.get("slug", "")] = entry
+                self.attribute_by_id[attr["id"]] = entry
+
+        # 3. MOVE THIS OUTSIDE THE ELSE: Process Categories
+        for cat in self.categories:
+            cat_id = cat["id"]
+            name_lower = cat.get("name", "").lower()
+            entry = {"id": cat_id, "name": cat["name"], "slug": cat.get("slug", ""), "count": cat.get("count", 0)}
+            self.category_by_id[cat_id] = entry
+            self.category_by_slug[entry["slug"]] = entry
+            self.category_by_name_lower[name_lower] = entry
+            if entry["slug"] != "uncategorized" and entry["count"] > 0:
+                self._generate_category_keywords(entry)
+
+        # 4. Process Tags
+        for tag in self.tags:
+            name_lower = tag.get("name", "").lower()
+            entry = {"id": tag["id"], "name": tag["name"], "slug": tag["slug"], "count": tag.get("count", 0)}
+            self.tag_by_id[tag["id"]] = entry
+            self.tag_by_slug[tag["slug"]] = entry
+            self.tag_by_name_lower[name_lower] = entry
+
+        # 5. Process Products (Ensure Ansel is indexed)
         for product in self.products:
-            name = product.get("name", "")
-            slug = product.get("slug", "")
-            if not name:
-                continue
-            entry = {
-                "id": product.get("id"),
-                "name": name,
-                "slug": slug,
-            }
-            self.product_by_name_lower[name.lower()] = entry
-            stop = {"the", "a", "an", "and", "or", "of", "series", "product", "products"} | self._store_generic_terms
-            for token in re.split(r'[\s\-_/]+', name.lower()):
-                token = token.strip()
-                if token and token not in stop and len(token) > 2:
-                    self.product_name_tokens.append((token, entry))
+            name = product.get("name", "").strip()
+            if not name: continue
+            self.product_by_name_lower[name.lower()] = {"id": product.get("id"), "name": name, "slug": product.get("slug", "")}
+        def _generate_category_keywords(self, cat_entry: Dict):
+            """Auto-generate NLP keywords from category name/slug."""
+            cat_id = cat_entry["id"]
+            name = cat_entry["name"].lower().strip()
+            slug = cat_entry["slug"]
+            cat_count = cat_entry.get("count", 0)
 
-        self.product_variation_schema = {}
-        for product in self.products:
-            pid = product.get("id")
-            if not pid or product.get("type") != "variable":
-                continue
-            attrs = product.get("attributes", [])
-            variation_axes = {}
-            for attr in attrs:
-                if attr.get("variation"):
-                    variation_axes[attr["slug"]] = {
-                        "name": attr["name"],
-                        "options": attr.get("options", []),
-                    }
-            self.product_variation_schema[pid] = {
-                "variation_axes": variation_axes,
-                "default_attributes": {
-                    a["name"].lower(): a["option"]
-                    for a in product.get("default_attributes", [])
-                },
-                "variation_ids": product.get("variations", []),
-                "variation_count": len(product.get("variations", [])),
-            }
-
-    def _generate_category_keywords(self, cat_entry: Dict):
-        """Auto-generate NLP keywords from category name/slug."""
-        cat_id = cat_entry["id"]
-        name = cat_entry["name"].lower().strip()
-        slug = cat_entry["slug"]
-        cat_count = cat_entry.get("count", 0)
-
-        def _register(kw: str, cid: int):
-            if kw not in self.category_keywords:
-                self.category_keywords[kw] = cid
-            else:
-                existing_id = self.category_keywords[kw]
-                existing_count = (self.category_by_id.get(existing_id) or {}).get("count", 0)
-                if cat_count < existing_count:
+            def _register(kw: str, cid: int):
+                if kw not in self.category_keywords:
                     self.category_keywords[kw] = cid
+                else:
+                    existing_id = self.category_keywords[kw]
+                    existing_count = (self.category_by_id.get(existing_id) or {}).get("count", 0)
+                    if cat_count < existing_count:
+                        self.category_keywords[kw] = cid
 
-        _register(name, cat_id)
+            _register(name, cat_id)
 
-        stop_words = {
-            "the", "a", "an", "and", "or", "of", "for",
-            "in", "on", "to", "is", "all", "our", "new",
-        } | self._store_generic_terms
-        words = re.split(r'[\s\-_/&]+', name)
-        raw_words = [w for w in words if w.strip()]
-        is_single_word_category = len(raw_words) <= 1
+            stop_words = {
+                "the", "a", "an", "and", "or", "of", "for",
+                "in", "on", "to", "is", "all", "our", "new",
+            } | self._store_generic_terms
+            words = re.split(r'[\s\-_/&]+', name)
+            raw_words = [w for w in words if w.strip()]
+            is_single_word_category = len(raw_words) <= 1
 
-        if is_single_word_category:
-            for word in raw_words:
-                if len(word) > 2:
-                    _register(word, cat_id)
-                    if word.endswith("s") and len(word) > 3:
-                        _register(word[:-1], cat_id)
-                    else:
-                        _register(word + "s", cat_id)
-
-        slug_words = slug.replace("-", " ")
-        if slug_words != name:
-            _register(slug_words, cat_id)
-
-        for original, variant in self._category_synonyms.items():
-            if original in name:
-                alt_name = name.replace(original, variant)
-                _register(alt_name, cat_id)
-
-        for suffix in self._store_generic_terms:
-            _register(f"{name} {suffix}", cat_id)
             if is_single_word_category:
                 for word in raw_words:
                     if len(word) > 2:
-                        _register(f"{word} {suffix}", cat_id)
+                        _register(word, cat_id)
+                        if word.endswith("s") and len(word) > 3:
+                            _register(word[:-1], cat_id)
+                        else:
+                            _register(word + "s", cat_id)
+
+            slug_words = slug.replace("-", " ")
+            if slug_words != name:
+                _register(slug_words, cat_id)
+
+            for original, variant in self._category_synonyms.items():
+                if original in name:
+                    alt_name = name.replace(original, variant)
+                    _register(alt_name, cat_id)
+
+            for suffix in self._store_generic_terms:
+                _register(f"{name} {suffix}", cat_id)
+                if is_single_word_category:
+                    for word in raw_words:
+                        if len(word) > 2:
+                            _register(f"{word} {suffix}", cat_id)
 
     # ─────────────────��───────────────────────────
     # QUERY METHODS
@@ -866,25 +744,48 @@ class StoreLoader:
 
     def get_product_for_text(self, text: str) -> Optional[Dict]:
         text_lower = text.lower()
-        best_match = None
-        best_match_len = 0
+        candidates = []
 
+        # 1. Exact matches
         for name_lower, entry in self.product_by_name_lower.items():
-            if name_lower in text_lower and len(name_lower) > best_match_len:
-                best_match = entry
-                best_match_len = len(name_lower)
+            if re.search(rf'\b{re.escape(name_lower)}\b', text_lower):
+                candidates.append(entry)
 
-        if best_match:
-            return best_match
+        if not candidates:
+            # 2. Token matches
+            for token, entry in self.product_name_tokens:
+                if re.search(rf'\b{re.escape(token)}\b', text_lower):
+                    candidates.append(entry)
 
-        for token, entry in self.product_name_tokens:
-            if (re.search(rf'\b{re.escape(token)}\b', text_lower)
-                    and len(token) > best_match_len):
-                best_match = entry
-                best_match_len = len(token)
+        # ── THE ULTIMATE DIAGNOSTIC ──
+        if not candidates:
+            logger.debug(f"StoreLoader: No matches for '{text_lower}'")
+            # If this prints, it will list EVERY product it actually loaded.
+            # If "ansel" is missing from this list, it means the product-list.json 
+            # in your data folder doesn't actually contain it!
+            logger.debug(f"StoreLoader: Currently loaded product keys: {list(self.product_by_name_lower.keys())}")
+            return None
 
-        return best_match
+        # 3. Stop words
+        stop_words = self._store_generic_terms.copy()
+        stop_words.update({"sample", "samples", "tile", "tiles", "mosaic", "mosaics", "product", "item", "size", "sizes"})
+        
+        for attr in self.attribute_by_slug.values():
+            attr_name = attr.get("name", "").lower().strip()
+            stop_words.add(attr_name)
+            stop_words.update(attr_name.split())
 
+        specific_matches = [c for c in candidates if c["name"].lower().strip() not in stop_words]
+        generic_matches = [c for c in candidates if c["name"].lower().strip() in stop_words]
+
+        if specific_matches:
+            return max(specific_matches, key=lambda x: len(x["name"]))
+
+        if generic_matches:
+            return max(generic_matches, key=lambda x: len(x["name"]))
+
+        return None
+            
     # ─────────────────────────────────────────────
     # ATTRIBUTE & TAG LOOKUPS
     # ─────────────────────────────────────────────
@@ -929,10 +830,18 @@ class StoreLoader:
 
             if term_clean == needle or term_slug == needle:
                 exact.append(term["id"])
-            elif needle in term_clean or term_clean in needle:
-                partial.append(term["id"])
-            elif re.sub(r'[^\dx]', '', needle) and re.sub(r'[^\dx]', '', needle) in re.sub(r'[^\dx]', '', term_clean):
-                partial.append(term["id"])
+            else:
+                needle_clean = re.sub(r'[^\dxX]', '', needle).lower()
+                term_clean_raw = re.sub(r'[^\dxX]', '', term_name).lower()
+                
+                # STRICT MATCH FOR DIMENSIONS: Prevents "3x3" from matching "13x36"
+                if needle_clean and term_clean_raw:
+                    if re.search(rf'(?<!\d){re.escape(needle_clean)}(?!\d)', term_clean_raw):
+                        partial.append(term["id"])
+                # STANDARD MATCH FOR TEXT: e.g., "matte" matches "matte white"
+                else:
+                    if needle in term_clean or term_clean in needle:
+                        partial.append(term["id"])
 
         return exact if exact else partial
 
@@ -953,12 +862,19 @@ class StoreLoader:
             if term_clean == needle or term_slug == needle:
                 exact_slug = term.get("slug", "")
                 break
-            if not partial_slug and (
-                needle in term_clean or term_clean in needle
-                or (re.sub(r'[^\dx]', '', needle) and
-                    re.sub(r'[^\dx]', '', needle) in re.sub(r'[^\dx]', '', term_clean))
-            ):
-                partial_slug = term.get("slug", "")
+                
+            if not partial_slug:
+                needle_clean = re.sub(r'[^\dxX]', '', needle).lower()
+                term_clean_raw = re.sub(r'[^\dxX]', '', term_name).lower()
+
+                if needle_clean and term_clean_raw:
+                    # STRICT MATCH FOR DIMENSIONS
+                    if re.search(rf'(?<!\d){re.escape(needle_clean)}(?!\d)', term_clean_raw):
+                        partial_slug = term.get("slug", "")
+                else:
+                    # STANDARD MATCH FOR TEXT
+                    if needle in term_clean or term_clean in needle:
+                        partial_slug = term.get("slug", "")
 
         return exact_slug or partial_slug
 

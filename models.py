@@ -127,6 +127,7 @@ class ExtractedEntities:
     # Exclusion filters — populate when user says "no marble", "without X", etc.
     excluded_tags: List[str] = field(default_factory=list)
     excluded_categories: List[str] = field(default_factory=list)
+    excluded_attributes: Dict[str, List[str]] = field(default_factory=dict)  # ← ADDED HERE
 
     # Multi-category AND-filter: primary category is category_id/category_name;
     # additional categories go here so api_builder can AND them together.

@@ -96,7 +96,6 @@ def _format_attributes(attrs: list, include_hidden: bool = False) -> list:
             })
     return result
 
-
 def format_custom_product(raw: dict) -> dict:
     """Convert raw custom API product to clean response format."""
     image_urls = raw.get("images", [])
@@ -112,10 +111,14 @@ def format_custom_product(raw: dict) -> dict:
     attributes_dict = raw.get("attributes", {})
     attributes = []
     for slug, attr_data in attributes_dict.items():
-        if isinstance(attr_data, dict):
-            options = attr_data.get("options", []) if attr_data else []
-            name = slug.replace("pa_", "").replace("-", " ").title()
-            attributes.append({"name": name, "options": options})
+        options = []
+        if isinstance(attr_data, list):
+            options = attr_data  # Custom API format: ["Matte", "Polished"]
+        elif isinstance(attr_data, dict):
+            options = attr_data.get("options", [])
+            
+        name = slug.replace("pa_", "").replace("-", " ").title()
+        attributes.append({"name": name, "options": options})
 
     return {
         "id":            raw.get("id"),
@@ -135,7 +138,6 @@ def format_custom_product(raw: dict) -> dict:
         "variations":    raw.get("variations", []),
     }
 
-
 def format_variation(raw: dict, parent: dict = None) -> dict:
     """Convert a raw WooCommerce variation to clean response format."""
     price = _safe_float(raw.get("price", ""))
@@ -147,9 +149,17 @@ def format_variation(raw: dict, parent: dict = None) -> dict:
     # Custom API returns attributes as a flat dict {pa_finish: "matte"};
     # standard WC API returns a list [{name, option}]. Normalise to list.
     if isinstance(attrs_raw, dict):
-        attrs = [{"name": k, "option": v} for k, v in attrs_raw.items() if v]
+        attrs = []
+        for k, v in attrs_raw.items():
+            if v:
+                # Convert "pa_colors" -> "Colors"
+                clean_name = k.replace("pa_", "").replace("-", " ").title()
+                # Convert "ansel-warm-white" -> "Ansel Warm White"
+                clean_option = v.replace("-", " ").title()
+                attrs.append({"name": clean_name, "option": clean_option})
     else:
         attrs = attrs_raw
+        
     attr_label = " / ".join(
         a.get("option", "") for a in attrs if a.get("option")
     )
