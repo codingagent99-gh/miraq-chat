@@ -1,13 +1,9 @@
 """
 Store Loader — Fetches categories, tags, and attributes from WooCommerce.
 
-Auth method: Browser User-Agent + Query-string auth
-(Test 3 confirmed this bypasses ModSecurity 406 on wgc.net.in)
-
-Dev mode: Set DEV_CACHE=true in .env to cache all store data to a local
-JSON file. On subsequent restarts, data loads from disk in ~50ms instead
-of fetching from WooCommerce (~15-30s). Run with DEV_CACHE_BUST=true
-(or delete .dev_cache/store_data.json) to force a fresh fetch.
+Dev mode: Set DEV_CACHE=true in .env to load all store data from local
+JSON files in the `data/` folder. When false, fetches live from WooCommerce
+and the new Custom API for attributes.
 """
 
 import os
@@ -27,6 +23,7 @@ load_dotenv()
 logger = get_logger("miraq_chat")
 
 WOO_BASE_URL = os.getenv("WOO_BASE_URL", "https://wgc.net.in/hn/wp-json/wc/v3")
+CUSTOM_API_BASE_URL = os.getenv("CUSTOM_API_BASE_URL", WOO_BASE_URL.replace("/wc/v3", "/custom-api/v1"))
 WOO_CONSUMER_KEY = os.getenv("WOO_CONSUMER_KEY", "")
 WOO_CONSUMER_SECRET = os.getenv("WOO_CONSUMER_SECRET", "")
 REQUEST_TIMEOUT = 30
@@ -34,8 +31,6 @@ REQUEST_TIMEOUT = 30
 # Dev cache settings
 DEV_CACHE_ENABLED = os.getenv("DEV_CACHE", "false").lower() == "true"
 DEV_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dev_cache")
-DEV_CACHE_FILE = os.path.join(DEV_CACHE_DIR, "store_data.json")
-DEV_CACHE_BUST = os.getenv("DEV_CACHE_BUST", "false").lower() == "true"
 
 # Path configuration based on your folder structure
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -45,6 +40,7 @@ FILE_MAP = {
     "categories": "product-category.json",
     "products":   "product-list.json"
 }
+
 BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -71,18 +67,10 @@ class BoundedVariationCache:
     When full, the least-recently-accessed entry is evicted.
     When accessed, expired entries return None (cache miss → re-fetch from API).
     """
-
     def __init__(self, max_size: int = 200, ttl: int = 3600):
         self._cache: OrderedDict = OrderedDict()
         self.max_size = max_size
         self.ttl = ttl
-        self.all_attributes_raw = []
-        self.categories = []
-        self.tags = []
-        self.products = []
-        self.attribute_terms = {}
-        self._lock = threading.Lock()
-        self._last_loaded = None
 
     def get(self, product_id: int):
         """Get cached variations. Returns None on miss or expiry."""
@@ -148,6 +136,7 @@ class StoreLoader:
 
     def __init__(self):
         self.base = WOO_BASE_URL
+        self.custom_api_base = CUSTOM_API_BASE_URL
         self.consumer_key = WOO_CONSUMER_KEY
         self.consumer_secret = WOO_CONSUMER_SECRET
         self.timeout = REQUEST_TIMEOUT
@@ -186,79 +175,164 @@ class StoreLoader:
         self._lock = threading.Lock()
         self._last_loaded: Optional[float] = None
         self._refresh_interval: int = 6 * 3600
-        self._retry_interval: int = 2 * 60   # 2 min retry when degraded
+        self._retry_interval: int = 2 * 60   
         self._refresh_thread: Optional[threading.Thread] = None
-        self._degraded: bool = False          # True when critical data failed to load
-        self._degraded_reasons: list = []     # Human-readable list of what's missing
+        self._degraded: bool = False          
+        self._degraded_reasons: list = []     
         self._expected_product_count: Optional[int] = None
-        self._loaded_from_cache: bool = False  # True when data came from dev cache
+        self._loaded_from_cache: bool = False  
 
-    # ───────────────────��─────────────────────────
-    # DEV CACHE — save/load store data to disk
+    # ─────────────────────────────────────────────
+    # LOADING & FETCHING LOGIC
     # ─────────────────────────────────────────────
 
-    def _save_dev_cache(self, data: dict):
-        """Save fetched store data to .dev_cache/store_data.json for fast restarts."""
+    def load_all(self):
+        """Loads store data (from local files in dev mode, or live API in prod)."""
         try:
-            os.makedirs(DEV_CACHE_DIR, exist_ok=True)
-            data["_cache_meta"] = {
-                "saved_at": time.time(),
-                "saved_at_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "base_url": self.base,
-            }
-            with open(DEV_CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            size_kb = os.path.getsize(DEV_CACHE_FILE) / 1024
-            logger.info(f"StoreLoader: 💾 Dev cache saved → {DEV_CACHE_FILE} ({size_kb:.0f} KB)")
+            with self._lock:
+                if DEV_CACHE_ENABLED:
+                    self._load_from_local_files()
+                    self._loaded_from_cache = True
+                else:
+                    self._load_from_live_api()
+                    self._loaded_from_cache = False
+
+                # Populate the internal lookup dictionaries for classification
+                self._build_lookups()
+                self._validate_load()
+                self._last_loaded = time.time()
+                
+                if DEV_CACHE_ENABLED:
+                    self._dump_lookups_for_debugging()
+                    
+                self._log_load_summary()
+
         except Exception as e:
-            logger.warning(f"StoreLoader: Could not save dev cache | error={e}")
+            self._degraded = True
+            self._degraded_reasons = [str(e)]
+            logger.error(f"StoreLoader: ❌ Failed to load store data: {e}", exc_info=True)
 
-    def _load_dev_cache(self) -> Optional[dict]:
-        """Load store data from .dev_cache/store_data.json if it exists.
-        Returns the data dict, or None if cache doesn't exist / is invalid.
-        """
-        if DEV_CACHE_BUST:
-            logger.info("StoreLoader: 🔄 DEV_CACHE_BUST=true — forcing fresh fetch")
-            return None
-
-        if not os.path.exists(DEV_CACHE_FILE):
-            return None
-
-        try:
-            with open(DEV_CACHE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            # Validate it has the expected keys
-            required = {"categories", "tags", "attributes", "attribute_terms", "products"}
-            if not required.issubset(data.keys()):
-                logger.warning("StoreLoader: Dev cache file is missing required keys — ignoring")
-                return None
-
-            # Check if the cache was for the same base URL
-            meta = data.get("_cache_meta", {})
-            cached_url = meta.get("base_url", "")
-            if cached_url and cached_url != self.base:
-                logger.warning(
-                    f"StoreLoader: Dev cache is for {cached_url} but current base is {self.base} — ignoring"
-                )
-                return None
-
-            saved_at = meta.get("saved_at_iso", "unknown")
-            size_kb = os.path.getsize(DEV_CACHE_FILE) / 1024
-            logger.info(f"StoreLoader: 📦 Dev cache found ({size_kb:.0f} KB, saved {saved_at})")
-            return data
-
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning(f"StoreLoader: Dev cache file is corrupt — ignoring | error={e}")
-            return None
+    def _log_load_summary(self):
+        """Prints a clean summary of what was loaded into memory."""
+        mode = "Local Dev Cache" if DEV_CACHE_ENABLED else "Live WooCommerce API"
+        status = "⚠️ DEGRADED" if self._degraded else "✅ HEALTHY"
         
+        term_count = sum(len(terms) for terms in self.attribute_terms.values())
+        
+        summary = [
+            f"StoreLoader: Initialization Complete [{status}]",
+            f"  ├─ Mode:       {mode}",
+            f"  ├─ Currency:   {self.currency_symbol}",
+            f"  ├─ Products:   {len(self.products)}",
+            f"  ├─ Categories: {len(self.categories)}",
+            f"  ├─ Tags:       {len(self.tags)}",
+            f"  ├─ Attributes: {len(self.attribute_by_slug)} (with {term_count} terms)",
+            f"  └─ Keywords:   {len(self.category_keywords)} (generated for search index)"
+        ]
+        
+        if self._degraded:
+            summary.append("  ❌ Degraded Reasons:")
+            for reason in self._degraded_reasons:
+                summary.append(f"     - {reason}")
+                
+        logger.info("\n" + "\n".join(summary) + "\n")
+
+    def _load_from_local_files(self):
+        """Loads taxonomies and products from the local data/ JSON files."""
+        logger.info(f"StoreLoader: 📁 Loading local data from {DATA_DIR}")
+        
+        self.currency_symbol = "₹" # Force local testing to INR
+        
+        self.categories = self._read_json(FILE_MAP["categories"]) or []
+        self.tags = self._read_json(FILE_MAP["tags"]) or []
+        self.products = self._read_json(FILE_MAP["products"]) or []
+        self.all_attributes_raw = self._read_json(FILE_MAP["attributes"]) or []
+
+        self.attribute_terms = {
+            int(attr["attribute_id"]): attr.get("terms", [])
+            for attr in self.all_attributes_raw 
+            if attr.get("attribute_id")
+        }
+
+    def _load_from_live_api(self):
+        """Fetches taxonomies and products from the live WooCommerce API."""
+        logger.info("StoreLoader: 🌐 Fetching data from live WooCommerce API...")
+        
+        self.currency_symbol = self._fetch_currency_symbol()
+        
+        # 1. Custom API for Attributes & Terms
+        custom_attr_url = f"{self.custom_api_base}/all-attributes"
+        logger.info(f"StoreLoader: Fetching attributes from {custom_attr_url}")
+        
+        try:
+            resp = self.session.get(custom_attr_url, timeout=self.timeout)
+            resp.raise_for_status()
+            self.all_attributes_raw = resp.json()
+            
+            self.attribute_terms = {
+                int(attr["attribute_id"]): attr.get("terms", [])
+                for attr in self.all_attributes_raw 
+                if attr.get("attribute_id")
+            }
+        except Exception as e:
+            logger.error(f"StoreLoader: Failed to fetch attributes: {e}")
+            self.all_attributes_raw = []
+
+        # 2. Categories
+        logger.info("StoreLoader: Fetching categories...")
+        self.categories = self._fetch_all_pages(f"{self.base}/products/categories", {"hide_empty": True})
+        
+        # 3. Tags
+        logger.info("StoreLoader: Fetching tags...")
+        self.tags = self._fetch_all_pages(f"{self.base}/products/tags", {"hide_empty": True})
+        
+        # 4. Products (Parent products only to build search index)
+        logger.info("StoreLoader: Fetching products...")
+        self.products, self._expected_product_count = self._fetch_all_pages_with_total(
+            f"{self.base}/products", 
+            {"status": "publish", "per_page": 100}
+        )
+
+    def _fetch_currency_symbol(self) -> str:
+        """Fetches the active currency symbol from WooCommerce."""
+        logger.info("StoreLoader: Fetching store currency...")
+        try:
+            url = f"{self.base}/data/currencies/current"
+            resp = self.session.get(
+                url, 
+                params={"consumer_key": self.consumer_key, "consumer_secret": self.consumer_secret},
+                timeout=self.timeout
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            
+            symbol = data.get("symbol")
+            if symbol:
+                return symbol
+                
+            code = data.get("code", "USD")
+            return self._CURRENCY_MAP.get(code.upper(), "$")
+            
+        except Exception as e:
+            logger.warning(f"StoreLoader: Failed to fetch currency symbol, defaulting to $. Error: {e}")
+            return "$"
+
+    @staticmethod
+    def _currency_code_to_symbol(code: str) -> str:
+        """Map ISO 4217 currency code to its symbol."""
+        return StoreLoader._CURRENCY_MAP.get(code.upper(), code)
+
+    def _read_json(self, filename: str) -> Optional[List]:
+        path = os.path.join(DATA_DIR, filename)
+        if not os.path.exists(path):
+            logger.warning(f"StoreLoader: File not found: {filename}")
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
 
     def _dump_lookups_for_debugging(self):
         """Dump the processed lookup dictionaries to a file in dev mode for inspection."""
-        if not DEV_CACHE_ENABLED:
-            return
-
-        dump_path = os.path.join(".dev_cache", "lookups_debug.json")
+        dump_path = os.path.join(DEV_CACHE_DIR, "lookups_debug.json")
         try:
             dump_data = {
                 "store_generic_terms": list(self._store_generic_terms) if self._store_generic_terms else [],
@@ -274,68 +348,14 @@ class StoreLoader:
                 "product_by_name_lower": self.product_by_name_lower,
                 "product_name_tokens": self.product_name_tokens,
             }
-            
-            # Ensure the .dev_cache directory exists
-            os.makedirs(".dev_cache", exist_ok=True)
-            
+            os.makedirs(DEV_CACHE_DIR, exist_ok=True)
             with open(dump_path, "w", encoding="utf-8") as f:
                 json.dump(dump_data, f, indent=2)
             logger.info(f"StoreLoader: Dumped lookup dictionaries to {dump_path} for debugging")
         except Exception as e:
             logger.error(f"StoreLoader: Failed to dump lookups: {e}")
 
-            
-    def load_all(self):
-        """Loads data from local JSON files to bypass the offline WP API."""
-        logger.info(f"StoreLoader: 📁 Loading local data from {DATA_DIR}")
-        
-        try:
-            with self._lock:
-                # Load the four files
-                self.categories = self._read_json(FILE_MAP["categories"]) or []
-                self.tags = self._read_json(FILE_MAP["tags"]) or []
-                self.products = self._read_json(FILE_MAP["products"]) or []
-                self.all_attributes_raw = self._read_json(FILE_MAP["attributes"]) or []
-
-                # Map attributes and terms for dynamic resolution
-                self.attribute_terms = {
-                    int(attr["attribute_id"]): attr.get("terms", [])
-                    for attr in self.all_attributes_raw 
-                    if attr.get("attribute_id")
-                }
-
-                # Populate the internal lookup dictionaries for classification
-                self._build_lookups()
-                self._last_loaded = time.time()
-                
-                # 👇 ADD THIS LINE to generate the debug file
-                self._dump_lookups_for_debugging()
-                
-            logger.info(f"StoreLoader: ✅ Local load complete. Products: {len(self.products)}")
-        except Exception as e:
-            logger.error(f"StoreLoader: ❌ Failed to load local files: {e}")
-
-    def _read_json(self, filename: str) -> Optional[List]:
-        path = os.path.join(DATA_DIR, filename)
-        if not os.path.exists(path):
-            logger.warning(f"StoreLoader: File not found: {filename}")
-            return None
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-    def _load_json_file(self, filename: str) -> Optional[List]:
-        """Helper to read individual JSON files."""
-        path = os.path.join(DATA_DIR, filename)
-        if not os.path.exists(path):
-            logger.warning(f"StoreLoader: Missing file {filename}")
-            return None
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-
     def _validate_load(self):
-        """
-        Check whether critical data loaded successfully.
-        """
         reasons = []
         if len(self.categories) == 0:
             reasons.append("0 categories (likely 503/maintenance during fetch)")
@@ -354,43 +374,9 @@ class StoreLoader:
         self._degraded = len(reasons) > 0
         self._degraded_reasons = reasons
 
-    def _fetch_currency_symbol(self) -> Optional[str]:
-        """Fetch the store's currency symbol from WooCommerce settings API."""
-        try:
-            url = f"{self.base}/settings/general/woocommerce_currency"
-            params = {
-                "consumer_key": self.consumer_key,
-                "consumer_secret": self.consumer_secret,
-            }
-            resp = self.session.get(url, params=params, timeout=self.timeout)
-            resp.raise_for_status()
-            data = resp.json()
-            currency_code = data.get("value", "")
-            if currency_code:
-                return self._currency_code_to_symbol(currency_code)
-        except Exception as e:
-            logger.warning(f"StoreLoader: Could not fetch currency setting | error={e}")
-        return None
-
-    @staticmethod
-    def _currency_code_to_symbol(code: str) -> str:
-        """Map ISO 4217 currency code to its symbol."""
-        return StoreLoader._CURRENCY_MAP.get(code.upper(), code)
-
     def start_background_refresh(self):
-        """
-        Start a background thread that keeps store data fresh.
-
-        Normal mode:  refreshes every 6 hours.
-        Degraded mode: retries every 2 minutes until data loads fully,
-                       then switches to the normal 6-hour cadence.
-
-        In dev mode: background refresh is disabled — you're restarting
-        the server manually anyway. Use DEV_CACHE_BUST=true or delete
-        .dev_cache/ to force fresh data.
-        """
         if DEV_CACHE_ENABLED:
-            logger.info("StoreLoader: 🛑 Background refresh DISABLED in dev mode (DEV_CACHE=true)")
+            logger.info("StoreLoader: 🛑 Background refresh DISABLED in dev mode")
             return
 
         if self._refresh_thread and self._refresh_thread.is_alive():
@@ -398,33 +384,24 @@ class StoreLoader:
 
         def _refresh_loop():
             while True:
-                if self._degraded:
-                    interval = self._retry_interval
-                    logger.warning(f"StoreLoader: DEGRADED ({', '.join(self._degraded_reasons)}) — retrying in {interval // 60}min")
-                else:
-                    interval = self._refresh_interval
+                interval = self._retry_interval if self._degraded else self._refresh_interval
                 time.sleep(interval)
-
                 label = "🔁 Degraded load retry" if self._degraded else "🔄 Background refresh"
                 logger.info(f"StoreLoader: {label} — reloading store data...")
                 try:
                     self.load_all()
-                    if not self._degraded:
-                        logger.info(f"StoreLoader: {label} complete ✅")
-                    else:
-                        logger.warning(f"StoreLoader: {label} still degraded — {', '.join(self._degraded_reasons)}")
                 except Exception as e:
                     logger.error(f"StoreLoader: {label} failed | error={e}", exc_info=True)
 
         self._refresh_thread = threading.Thread(target=_refresh_loop, daemon=True)
         self._refresh_thread.start()
-        if self._degraded:
-            logger.warning(f"StoreLoader: Starting in DEGRADED mode — auto-retry every {self._retry_interval // 60}min")
-        else:
-            logger.info(f"StoreLoader: Background refresh scheduled every {self._refresh_interval // 3600}h")
+        logger.info(f"StoreLoader: Background refresh scheduled every {self._refresh_interval // 3600}h")
+
+    # ─────────────────────────────────────────────
+    # API PAGINATION HANDLERS
+    # ─────────────────────────────────────────────
 
     def _fetch_all_pages(self, url: str, extra_params: Dict = None, max_retries: int = 3) -> List[Dict]:
-        """Fetch all pages using browser UA + query-string auth with retry."""
         all_items = []
         page = 1
         per_page = 100
@@ -436,8 +413,7 @@ class StoreLoader:
                 "consumer_key": self.consumer_key,
                 "consumer_secret": self.consumer_secret,
             }
-            if extra_params:
-                params.update(extra_params)
+            if extra_params: params.update(extra_params)
 
             data = None
             resp = None
@@ -447,48 +423,26 @@ class StoreLoader:
                     resp.raise_for_status()
                     data = resp.json()
                     break
-                except (requests.exceptions.HTTPError,
-                        requests.exceptions.ConnectionError,
-                        requests.exceptions.Timeout) as e:
-                    if attempt < max_retries - 1:
-                        wait = 2 ** attempt
-                        status_code = getattr(getattr(e, 'response', None), 'status_code', '?')
-                        logger.warning(
-                            f"StoreLoader: Retry {attempt + 1}/{max_retries} for {url} "
-                            f"page {page} in {wait}s | HTTP {status_code} | {e}"
-                        )
-                        time.sleep(wait)
-                    else:
-                        status_code = getattr(getattr(e, 'response', None), 'status_code', '?')
-                        body = getattr(getattr(e, 'response', None), 'text', 'N/A')
-                        body = body[:300] if body else 'N/A'
-                        logger.error(
-                            f"StoreLoader: All {max_retries} retries failed for {url} "
-                            f"page {page} | HTTP {status_code} | body={body}"
-                        )
-                        return all_items
                 except Exception as e:
-                    logger.warning(f"StoreLoader: Unexpected error fetching {url} page {page} | error={e}")
-                    return all_items
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                    else:
+                        logger.error(f"StoreLoader: All retries failed for {url} page {page}")
+                        return all_items
 
-            if data is None or not data:
-                break
-
+            if not data: break
             all_items.extend(data)
-
             total_pages = int(resp.headers.get("X-WP-TotalPages", 1)) if resp else 1
-            if page >= total_pages:
-                break
+            if page >= total_pages: break
             page += 1
 
         return all_items
 
     def _fetch_all_pages_with_total(self, url: str, extra_params: Dict = None, max_retries: int = 3) -> Tuple[List[Dict], Optional[int]]:
-        """Like _fetch_all_pages but also returns the X-WP-Total header value."""
         all_items = []
         page = 1
         per_page = 100
-        expected_total: Optional[int] = None
+        expected_total = None
 
         while True:
             params = {
@@ -497,8 +451,7 @@ class StoreLoader:
                 "consumer_key": self.consumer_key,
                 "consumer_secret": self.consumer_secret,
             }
-            if extra_params:
-                params.update(extra_params)
+            if extra_params: params.update(extra_params)
 
             data = None
             resp = None
@@ -508,39 +461,21 @@ class StoreLoader:
                     resp.raise_for_status()
                     data = resp.json()
                     break
-                except (requests.exceptions.HTTPError,
-                        requests.exceptions.ConnectionError,
-                        requests.exceptions.Timeout) as e:
-                    if attempt < max_retries - 1:
-                        wait = 2 ** attempt
-                        logger.warning(
-                            f"StoreLoader: Retry {attempt + 1}/{max_retries} for {url} "
-                            f"page {page} in {wait}s | {e}"
-                        )
-                        time.sleep(wait)
-                    else:
-                        logger.error(
-                            f"StoreLoader: All {max_retries} retries failed for {url} page {page}"
-                        )
-                        return all_items, expected_total
                 except Exception as e:
-                    logger.warning(f"StoreLoader: Unexpected error fetching {url} page {page} | error={e}")
-                    return all_items, expected_total
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                    else:
+                        return all_items, expected_total
 
-            if data is None or not data:
-                break
-
+            if not data: break
             all_items.extend(data)
-
+            
             if resp:
                 if expected_total is None:
-                    try:
-                        expected_total = int(resp.headers.get("X-WP-Total", 0))
-                    except (ValueError, TypeError):
-                        pass
+                    try: expected_total = int(resp.headers.get("X-WP-Total", 0))
+                    except: pass
                 total_pages = int(resp.headers.get("X-WP-TotalPages", 1))
-                if page >= total_pages:
-                    break
+                if page >= total_pages: break
             else:
                 break
             page += 1
@@ -558,16 +493,13 @@ class StoreLoader:
             synonyms = json.loads(raw)
             if isinstance(synonyms, dict):
                 return {k.lower(): v.lower() for k, v in synonyms.items()}
-        except Exception:
-            pass
+        except: pass
         return {}
 
     def _build_store_generic_terms(self) -> set:
-        """Derive generic/filler terms from the store's own category names."""
         from collections import Counter
         word_counts = Counter()
         valid_cats = [c for c in self.categories if c.get("slug") != "uncategorized" and c.get("count", 0) > 0]
-        total = len(valid_cats) or 1
         for cat in valid_cats:
             for word in re.split(r"[\s\-_/&]+", cat.get("name", "").lower()):
                 word = word.strip()
@@ -576,19 +508,14 @@ class StoreLoader:
         generic = set()
         for word, count in word_counts.items():
             if count >= 2:
-                solo_count = sum(
-                    1 for c in valid_cats
-                    if c.get("name", "").lower().strip() == word
-                )
-                compound_count = count - solo_count
-                if compound_count > solo_count:
+                solo_count = sum(1 for c in valid_cats if c.get("name", "").lower().strip() == word)
+                if (count - solo_count) > solo_count:
                     generic.add(word)
         return generic
 
     def _build_lookups(self):
         self._store_generic_terms = self._build_store_generic_terms()
 
-        # 1. ALWAYS Reset/Initialize lookups
         self.attribute_by_slug = {}
         self.attribute_by_id = {}
         self.category_by_slug = {}
@@ -598,8 +525,9 @@ class StoreLoader:
         self.tag_by_id = {}
         self.tag_by_name_lower = {}
         self.product_by_name_lower = {}
+        self.product_name_tokens = []
 
-        # 2. Process Attributes (Custom or Standard)
+        # Process Attributes (Custom API guarantees this is populated)
         if self.all_attributes_raw:
             for attr in self.all_attributes_raw:
                 if not attr.get("visible", True): continue
@@ -609,14 +537,7 @@ class StoreLoader:
                 self.attribute_by_slug[taxonomy_slug] = entry
                 self.attribute_by_id[attr_id] = entry
                 self.attribute_terms[attr_id] = attr.get("terms", [])
-        else:
-            # Standard WC logic for attributes if raw is missing
-            for attr in self.attributes:
-                entry = {"id": attr["id"], "name": attr.get("name", ""), "slug": attr.get("slug", "")}
-                self.attribute_by_slug[attr.get("slug", "")] = entry
-                self.attribute_by_id[attr["id"]] = entry
 
-        # 3. MOVE THIS OUTSIDE THE ELSE: Process Categories
         for cat in self.categories:
             cat_id = cat["id"]
             name_lower = cat.get("name", "").lower()
@@ -627,7 +548,6 @@ class StoreLoader:
             if entry["slug"] != "uncategorized" and entry["count"] > 0:
                 self._generate_category_keywords(entry)
 
-        # 4. Process Tags
         for tag in self.tags:
             name_lower = tag.get("name", "").lower()
             entry = {"id": tag["id"], "name": tag["name"], "slug": tag["slug"], "count": tag.get("count", 0)}
@@ -635,27 +555,21 @@ class StoreLoader:
             self.tag_by_slug[tag["slug"]] = entry
             self.tag_by_name_lower[name_lower] = entry
 
-         # 5. Process Products (Ensure Ansel is indexed)
         for product in self.products:
             name = product.get("name", "").strip()
             if not name: continue
             
             name_lower = name.lower()
             entry = {"id": product.get("id"), "name": name, "slug": product.get("slug", "")}
-            
-            # 1. Exact match dictionary
             self.product_by_name_lower[name_lower] = entry
             
-            # 2. Token match list (ADD THIS LOGIC)
-            # Split the name by spaces, hyphens, or underscores
+            # Token match list (ADD THIS LOGIC from original)
             words = re.split(r'[\s\-_]+', name_lower)
             for word in words:
-                # Only save tokens that are more than 2 letters and aren't generic words like "tile"
                 if len(word) > 2 and word not in self._store_generic_terms:
                     self.product_name_tokens.append((word, entry))
-    
+
     def _generate_category_keywords(self, cat_entry: Dict):
-        """Auto-generate NLP keywords from category name/slug."""
         cat_id = cat_entry["id"]
         name = cat_entry["name"].lower().strip()
         slug = cat_entry["slug"]
@@ -672,10 +586,6 @@ class StoreLoader:
 
         _register(name, cat_id)
 
-        stop_words = {
-            "the", "a", "an", "and", "or", "of", "for",
-            "in", "on", "to", "is", "all", "our", "new",
-        } | self._store_generic_terms
         words = re.split(r'[\s\-_/&]+', name)
         raw_words = [w for w in words if w.strip()]
         is_single_word_category = len(raw_words) <= 1
@@ -705,12 +615,11 @@ class StoreLoader:
                     if len(word) > 2:
                         _register(f"{word} {suffix}", cat_id)
 
-    # ─────────────────��───────────────────────────
+    # ─────────────────────────────────────────────
     # QUERY METHODS
     # ─────────────────────────────────────────────
 
     def get_category_id(self, keyword: str) -> Optional[int]:
-        """Look up category ID by keyword, name, or slug."""
         keyword = keyword.lower().strip()
 
         if keyword in self.category_by_name_lower:
@@ -767,27 +676,21 @@ class StoreLoader:
         text_lower = text.lower()
         candidates = []
 
-        # 1. Exact matches
         for name_lower, entry in self.product_by_name_lower.items():
             if re.search(rf'\b{re.escape(name_lower)}\b', text_lower):
                 candidates.append(entry)
 
         if not candidates:
-            # 2. Token matches
             for token, entry in self.product_name_tokens:
                 if re.search(rf'\b{re.escape(token)}\b', text_lower):
                     candidates.append(entry)
 
-        # ── THE ULTIMATE DIAGNOSTIC ──
+        # ── THE ULTIMATE DIAGNOSTIC (Restored) ──
         if not candidates:
             logger.debug(f"StoreLoader: No matches for '{text_lower}'")
-            # If this prints, it will list EVERY product it actually loaded.
-            # If "ansel" is missing from this list, it means the product-list.json 
-            # in your data folder doesn't actually contain it!
             logger.debug(f"StoreLoader: Currently loaded product keys: {list(self.product_by_name_lower.keys())}")
             return None
 
-        # 3. Stop words
         stop_words = self._store_generic_terms.copy()
         stop_words.update({"sample", "samples", "tile", "tiles", "mosaic", "mosaics", "product", "item", "size", "sizes"})
         
@@ -855,11 +758,11 @@ class StoreLoader:
                 needle_clean = re.sub(r'[^\dxX]', '', needle).lower()
                 term_clean_raw = re.sub(r'[^\dxX]', '', term_name).lower()
                 
-                # STRICT MATCH FOR DIMENSIONS: Prevents "3x3" from matching "13x36"
+                # STRICT MATCH FOR DIMENSIONS (Restored)
                 if needle_clean and term_clean_raw:
                     if re.search(rf'(?<!\d){re.escape(needle_clean)}(?!\d)', term_clean_raw):
                         partial.append(term["id"])
-                # STANDARD MATCH FOR TEXT: e.g., "matte" matches "matte white"
+                # STANDARD MATCH FOR TEXT
                 else:
                     if needle in term_clean or term_clean in needle:
                         partial.append(term["id"])
@@ -888,12 +791,11 @@ class StoreLoader:
                 needle_clean = re.sub(r'[^\dxX]', '', needle).lower()
                 term_clean_raw = re.sub(r'[^\dxX]', '', term_name).lower()
 
+                # STRICT MATCH FOR DIMENSIONS (Restored)
                 if needle_clean and term_clean_raw:
-                    # STRICT MATCH FOR DIMENSIONS
                     if re.search(rf'(?<!\d){re.escape(needle_clean)}(?!\d)', term_clean_raw):
                         partial_slug = term.get("slug", "")
                 else:
-                    # STANDARD MATCH FOR TEXT
                     if needle in term_clean or term_clean in needle:
                         partial_slug = term.get("slug", "")
 

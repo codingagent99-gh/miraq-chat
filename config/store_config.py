@@ -107,3 +107,24 @@ def _load_product_type_terms() -> list:
     return list(_DEFAULT_PRODUCT_TYPE_TERMS)
 
 PRODUCT_TYPE_TERMS: list = _load_product_type_terms()
+
+# ═══════════════════════════════════════════════════════════════
+# GENERIC NOISE WORDS (Stop-Word Hijacking Prevention)
+# Words stripped from extraction text to prevent category/tag hijacking.
+# Override via env var GENERIC_NOISE_WORDS_JSON (JSON array).
+# ═══════════════════════════════════════════════════════════════
+
+_DEFAULT_GENERIC_NOISE_WORDS = ["tile", "tiles"]
+
+def _load_generic_noise_words() -> list:
+    raw = os.getenv("GENERIC_NOISE_WORDS_JSON", "")
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+    return list(_DEFAULT_GENERIC_NOISE_WORDS)
+
+GENERIC_NOISE_WORDS: list = _load_generic_noise_words()

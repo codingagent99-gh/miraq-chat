@@ -163,10 +163,18 @@ def _build_advanced_filter_call(
     # ── Tags (include) ──
     _or_pair_tag_slugs = {p.get("tag_slug") for p in (or_pairs or [])}
     _uncovered_tags = [t for t in (tags or []) if t not in _or_pair_tag_slugs]
+    
     if _uncovered_tags:
-        op = "AND" if (tag_operator == "AND" and len(_uncovered_tags) > 1) else "IN"
-        conditions.append(_make_condition("product_tag", _uncovered_tags, op))
-
+        if tag_operator == "AND" and len(_uncovered_tags) > 1:
+            # 🚨 WP tax_query bug workaround 🚨
+            # Split multiple AND tags into separate IN conditions. 
+            # Because the root API relation is AND, this forces strict intersection.
+            for tag_slug in _uncovered_tags:
+                conditions.append(_make_condition("product_tag", [tag_slug], "IN"))
+        else:
+            # Single tag or standard OR logic
+            conditions.append(_make_condition("product_tag", _uncovered_tags, "IN"))
+                    
     # ── Tags (exclude) ──
     if excluded_tags:
         conditions.append(_make_condition("product_tag", list(excluded_tags), "NOT IN"))
@@ -430,15 +438,17 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             cat_id = loader.get_category_id(e.category_name)
         categories_list = loader.get_all_slugs_for_category(cat_id) if (cat_id and loader) else []
 
+        active_or_pairs = list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else []
+
         calls.append(_build_advanced_filter_call(
             tags=list(e.tag_slugs) if e.tag_slugs else None,
             categories=categories_list if categories_list else None,
-            attributes=attr_filters if attr_filters else None,
+            attributes=attr_filters,
+            or_pairs=active_or_pairs,
             excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
             excluded_categories=list(e.excluded_categories) if e.excluded_categories else None,
             excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None,
             tag_operator=e.tag_operator,
-            or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
             page=page,
             description=f"Advanced product search: '{e.product_name or e.search_term}'",
             min_price=e.min_price,
@@ -446,7 +456,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             search_term=e.product_name or e.search_term,
             product_id=e.product_id
         ))
-
+        
     elif intent == Intent.PRODUCT_DETAIL:
         calls.append(_build_advanced_filter_call(
             product_id=e.product_id,
