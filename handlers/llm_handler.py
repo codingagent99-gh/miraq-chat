@@ -238,7 +238,7 @@ def _should_trigger_llm(intent, confidence, entities, order_create_intents, user
         return True
     if should_disambiguate(intent.value, confidence):
         return True
-    if intent == Intent.PRODUCT_SEARCH and entities.product_name is None and entities.category_id is None:
+    if intent == Intent.PRODUCT_SEARCH and entities.product_name is None and not getattr(entities, 'target_category_slugs', None) and not entities.attr_tag_or_pairs:
         return True
     if intent in order_create_intents and entities.order_item_name is None and entities.product_name is None:
         last_product_ctx_check = user_context.get("last_product")

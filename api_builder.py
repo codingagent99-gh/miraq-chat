@@ -139,8 +139,7 @@ def _make_or_group(conditions: list) -> dict:
 
 def _build_advanced_filter_call(
     tags: List[str] = None,
-    categories: List[str] = None,
-    extra_categories: List[List[str]] = None, 
+    categories: set = None,
     attributes: dict = None,
     excluded_tags: List[str] = None,
     excluded_categories: List[str] = None,
@@ -180,15 +179,11 @@ def _build_advanced_filter_call(
         conditions.append(_make_condition("product_tag", list(excluded_tags), "NOT IN"))
 
     # ── Categories (include) ──
+    # The classifier already bundled parent/child and duplicates into a perfect set.
+    # We just drop it straight into the payload as a JSON array!
     if categories:
         conditions.append(_make_condition("product_cat", list(categories), "IN"))
-
-    # ── Extra Categories (AND logic) ── 
-    if extra_categories:
-        for extra_slug_list in extra_categories:
-            if extra_slug_list:
-                conditions.append(_make_condition("product_cat", extra_slug_list, "IN"))
-
+        
     # ── Categories (exclude) ──
     if excluded_categories:
         conditions.append(_make_condition("product_cat", list(excluded_categories), "NOT IN"))
@@ -226,21 +221,31 @@ def _build_advanced_filter_call(
                 conditions.append(or_conditions[0])
             elif len(or_conditions) > 1:
                 conditions.append(_make_or_group(or_conditions))
-                              
+       
     # ── Ambiguous tag+attribute OR pairs ──
     if or_pairs:
         for pair in or_pairs:
+            cat_slugs     = pair.get("cat_slugs", []) 
             tag_slug      = pair.get("tag_slug", "")
             attr_taxonomy = pair.get("attr_taxonomy", "")
             raw_attr_term = pair.get("attr_term", "")
-            if tag_slug and attr_taxonomy and raw_attr_term:
-                term_slug = l.get_attribute_term_slug(attr_taxonomy, raw_attr_term) if l else None
-                if not term_slug:
-                     term_slug = raw_attr_term.lower().replace(" ", "-")
-                conditions.append(_make_or_group([
-                    _make_condition("product_tag", [tag_slug], "IN"),
-                    _make_condition(attr_taxonomy, [term_slug], "IN"),
-                ]))
+            
+            term_slug = raw_attr_term.lower().replace(" ", "-") if raw_attr_term else ""
+            if attr_taxonomy and raw_attr_term and l:
+                fetched_slug = l.get_attribute_term_slug(attr_taxonomy, raw_attr_term)
+                if fetched_slug: 
+                    term_slug = fetched_slug
+                    
+            or_conditions = []
+            if tag_slug:
+                or_conditions.append(_make_condition("product_tag", [tag_slug], "IN"))
+            if cat_slugs:
+                or_conditions.append(_make_condition("product_cat", cat_slugs, "IN"))
+            if attr_taxonomy and term_slug:
+                or_conditions.append(_make_condition(attr_taxonomy, [term_slug], "IN"))
+                
+            if len(or_conditions) >= 2:
+                conditions.append(_make_or_group(or_conditions))                       
 
     body = _serialize_query(conditions, page, per_page, min_price=min_price, max_price=max_price)
 
@@ -363,15 +368,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
     # ═══════════════════════════════════════════
 
     elif intent == Intent.CATEGORY_BROWSE:
-        loader = get_store_loader()
-        cat_id = e.category_id
-
-        if not cat_id and e.category_name and loader:
-            cat_id = loader.get_category_id(e.category_name)
-            if cat_id:
-                e.category_id = cat_id
-
-        if not cat_id:
+        if not e.target_category_slugs:
             calls.append(WooAPICall(
                 method="GET",
                 endpoint=f"{BASE}/products/categories",
@@ -379,7 +376,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
                 description="List all product categories (no category specified)",
             ))
         else:
-            categories_list = loader.get_all_slugs_for_category(cat_id) if loader else ([_category_slug(cat_id)] if _category_slug(cat_id) else [])
+            loader = get_store_loader()
             attr_filters = {}
             if e.attribute_slug and e.attributes and loader and loader.all_attributes_raw:
                 for attr in loader.all_attributes_raw:
@@ -392,7 +389,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
 
             calls.append(_build_advanced_filter_call(
                 tags=list(e.tag_slugs) if e.tag_slugs else None,
-                categories=categories_list if categories_list else None,
+                categories=e.target_category_slugs,
                 attributes=attr_filters if attr_filters else None,
                 page=page,
                 excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
@@ -400,7 +397,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
                 excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None,
                 tag_operator=e.tag_operator,
                 or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
-                description=f"Browse category '{e.category_name}' (id={e.category_id})",
+                description=f"Browse category '{e.category_name}'",
                 min_price=e.min_price,
                 max_price=e.max_price,
             ))
@@ -432,17 +429,11 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             if slug and value:
                 attr_filters[slug] = value
 
-        loader = get_store_loader()
-        cat_id = e.category_id
-        if not cat_id and e.category_name and loader:
-            cat_id = loader.get_category_id(e.category_name)
-        categories_list = loader.get_all_slugs_for_category(cat_id) if (cat_id and loader) else []
-
         active_or_pairs = list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else []
 
         calls.append(_build_advanced_filter_call(
             tags=list(e.tag_slugs) if e.tag_slugs else None,
-            categories=categories_list if categories_list else None,
+            categories=e.target_category_slugs,
             attributes=attr_filters,
             or_pairs=active_or_pairs,
             excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
@@ -513,6 +504,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
                 })
         calls.append(_build_advanced_filter_call(
             tags=None if origin_or_pairs else (list(e.tag_slugs) if e.tag_slugs else None),
+            categories=e.target_category_slugs,
             attributes=None if origin_or_pairs else ({attr_slug: origin} if (attr_slug and origin) else None),
             or_pairs=origin_or_pairs or (list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None),
             excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
@@ -582,19 +574,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             if slug and value:
                 attr_filters[slug] = value
 
-        cat_id = e.category_id
-        loader = get_store_loader()
-        if not cat_id and e.category_name and loader:
-            cat_id = loader.get_category_id(e.category_name)
-        categories_list = loader.get_all_slugs_for_category(cat_id) if (cat_id and loader) else []
-
-        extra_conditions_categories = []
-        for extra_cid in (e.extra_category_ids or []):
-            if loader:
-                extra_slugs = loader.get_all_slugs_for_category(extra_cid)
-                if extra_slugs:
-                    extra_conditions_categories.append(extra_slugs)
-
         attr_value_tokens = set()
         for v in e.attributes.values():
             attr_value_tokens |= {
@@ -618,8 +597,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             page=page,
             min_price=e.min_price,
             max_price=e.max_price,
-            categories=categories_list if categories_list else None,
-            extra_categories=extra_conditions_categories if extra_conditions_categories else None,
+            categories=e.target_category_slugs,
             excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None,
             description=f"Filter by {attr_label}: {attr_value}",
             search_term=e.product_name,
@@ -636,19 +614,13 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
                 {"tag": list(e.tag_slugs)[0]},
             ]
 
-        cat_id = e.category_id
-        loader = get_store_loader()
-        if not cat_id and e.category_name and loader:
-            cat_id = loader.get_category_id(e.category_name)
-        categories_list = loader.get_all_slugs_for_category(cat_id) if (cat_id and loader) else []
-
         attr_filters = {}
         if finish_slug and finish_value:
             attr_filters[finish_slug] = finish_value
 
         calls.append(_build_advanced_filter_call(
             tags=list(e.tag_slugs) if e.tag_slugs else None,
-            categories=categories_list if categories_list else None,
+            categories=e.target_category_slugs,
             attributes=attr_filters if attr_filters else None,
             page=page,
             excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
@@ -657,39 +629,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             tag_operator=e.tag_operator,
             or_pairs=finish_or_pairs if finish_or_pairs else None,
             description=f"Filter by finish: {finish_value}",
-            min_price=e.min_price,
-            max_price=e.max_price,
-            search_term=e.product_name,
-            product_id=e.product_id
-        ))
-
-    elif intent == Intent.FILTER_BY_ORIGIN:
-        cat_id = e.category_id
-        loader = get_store_loader()
-        if not cat_id and e.category_name and loader:
-            cat_id = loader.get_category_id(e.category_name)
-        categories_list = loader.get_all_slugs_for_category(cat_id) if (cat_id and loader) else []
-
-        origin = e.attributes.get("origin", "")
-        origin_or_pairs = []
-        if e.attribute_slug and origin and e.tag_slugs:
-            for tag_slug in e.tag_slugs:
-                origin_or_pairs.append({
-                    "tag_slug":      tag_slug,
-                    "attr_taxonomy": e.attribute_slug,
-                    "attr_term":     origin,
-                })
-        calls.append(_build_advanced_filter_call(
-            tags=None if origin_or_pairs else (list(e.tag_slugs) if e.tag_slugs else None),
-            categories=categories_list if categories_list else None,
-            attributes=None if origin_or_pairs else ({e.attribute_slug: origin} if (e.attribute_slug and origin) else None),
-            or_pairs=origin_or_pairs if origin_or_pairs else (list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None),
-            excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
-            excluded_categories=list(e.excluded_categories) if e.excluded_categories else None, 
-            excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None, 
-            tag_operator=e.tag_operator,
-            page=page,
-            description=f"Filter by origin: {origin}",
             min_price=e.min_price,
             max_price=e.max_price,
             search_term=e.product_name,

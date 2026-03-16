@@ -232,22 +232,25 @@ def _filter_variations_by_entities(
 def _entities_to_dict(entities: ExtractedEntities) -> dict:
     """Convert entities to a dict for logging/metadata."""
     d = {}
-    if entities.product_name:    d["product_name"] = entities.product_name
-    if entities.product_id:      d["product_id"] = entities.product_id
-    if entities.category_name:   d["category_name"] = entities.category_name
-    if entities.category_id:     d["category_id"] = entities.category_id
-    if entities.attributes:      d["attributes"] = entities.attributes
-    if entities.search_term:     d["search_term"] = entities.search_term
-    if entities.order_id:        d["order_id"] = entities.order_id
-    if entities.order_item_name: d["order_item_name"] = entities.order_item_name
-    if entities.order_count:     d["order_count"] = entities.order_count
-    if entities.quantity:        d["quantity"] = entities.quantity
-    if entities.variation_id:    d["variation_id"] = entities.variation_id
-    if entities.tag_ids:         d["tag_ids"] = entities.tag_ids
-    if entities.collection_year: d["collection_year"] = entities.collection_year
-    if entities.on_sale:         d["on_sale"] = entities.on_sale
+    if getattr(entities, 'product_name', None):    d["product_name"] = entities.product_name
+    if getattr(entities, 'product_id', None):      d["product_id"] = entities.product_id
+    if getattr(entities, 'category_name', None):   d["category_name"] = entities.category_name
+    
+    # NEW: Safely handle the category slugs set by converting it to a list for JSON
+    if getattr(entities, 'target_category_slugs', None): 
+        d["target_category_slugs"] = list(entities.target_category_slugs)
+        
+    if getattr(entities, 'attributes', None):      d["attributes"] = entities.attributes
+    if getattr(entities, 'search_term', None):     d["search_term"] = entities.search_term
+    if getattr(entities, 'order_id', None):        d["order_id"] = entities.order_id
+    if getattr(entities, 'order_item_name', None): d["order_item_name"] = entities.order_item_name
+    if getattr(entities, 'order_count', None):     d["order_count"] = entities.order_count
+    if getattr(entities, 'quantity', None):        d["quantity"] = entities.quantity
+    if getattr(entities, 'variation_id', None):    d["variation_id"] = entities.variation_id
+    if getattr(entities, 'tag_ids', None):         d["tag_ids"] = entities.tag_ids
+    if getattr(entities, 'collection_year', None): d["collection_year"] = entities.collection_year
+    if getattr(entities, 'on_sale', None):         d["on_sale"] = entities.on_sale
     return d
-
 
 def _safe_float(val) -> float:
     """Safely convert to float."""

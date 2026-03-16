@@ -100,9 +100,8 @@ class ExtractedEntities:
     product_slug: Optional[str] = None
 
     # ──── Category fields ────
-    category_id: Optional[int] = None
-    category_name: Optional[str] = None
-    category_slug: Optional[str] = None
+    category_name: Optional[str] = None  # Kept ONLY for UI bot responses and text-masking
+    target_category_slugs: set = field(default_factory=set)
 
     # ──── Dynamic attribute matches ────
     # Keyed by attribute_label.lower() from the store's live attribute list.
@@ -128,10 +127,6 @@ class ExtractedEntities:
     excluded_tags: List[str] = field(default_factory=list)
     excluded_categories: List[str] = field(default_factory=list)
     excluded_attributes: Dict[str, List[str]] = field(default_factory=dict)  # ← ADDED HERE
-
-    # Multi-category AND-filter: primary category is category_id/category_name;
-    # additional categories go here so api_builder can AND them together.
-    extra_category_ids: List[int] = field(default_factory=list)
 
     # Attribute term resolution (for WooCommerce attribute=&attribute_term= filtering)
     attribute_slug: Optional[str] = None          # e.g. "pa_tile-size"
@@ -189,7 +184,10 @@ class ExtractedEntities:
     shipping_updates: Dict[str, str] = field(default_factory=dict)
     customer_fields_requested: List[str] = field(default_factory=list)  # e.g. ["first_name", "phone"]
 
-
+    # ──── Logical Chunking ────
+    # Stores isolated entity groups when a user uses "OR" (e.g. Titan OR Ansel)
+    logical_chunks: List[dict] = field(default_factory=list)
+    
 @dataclass
 class WooAPICall:
     method: str

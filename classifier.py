@@ -28,18 +28,6 @@ class IntentEvaluator(ABC):
         """Returns (Intent, confidence) if a match is found, else (None, 0.0)."""
         pass
 
-
-# class GreetingEvaluator(IntentEvaluator):
-#     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
-#         if re.search(r"^\s*(hi|hello|hey|hiya|howdy|yo|sup)\s*[!.]?\s*$", text) or \
-#            re.search(r"^\s*good\s+(morning|afternoon|evening|day)\s*[!.]?\s*$", text) or \
-#            re.search(r"^\s*(how\s+are\s+you|how'?s\s+it\s+going|what'?s\s+up)\s*[?!.]?\s*$", text) or \
-#            re.search(r"^\s*hi\s+there\s*[!.]?\s*$", text) or \
-#            re.search(r"^\s*hey\s+there\s*[!.]?\s*$", text):
-#             return Intent.GREETING, 0.99
-#         return None, 0.0
-
-
 class OrderActionEvaluator(IntentEvaluator):
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
         if re.search(r"\b(repeat|reorder|re-order|order\s*again)\b", text):
@@ -194,7 +182,8 @@ class CatalogSearchEvaluator(IntentEvaluator):
         if entities.product_id and entities.attributes:
             return Intent.PRODUCT_SEARCH, 0.93
         
-        if entities.category_id is not None:
+        # Use the new target_category_slugs set
+        if getattr(entities, 'target_category_slugs', set()):
             if entities.product_name:
                 if re.search(r"\b(tell|about|detail|info|specs?|specification|price|cost|how\s+much)\b", text):
                     return Intent.PRODUCT_DETAIL, 0.91
@@ -271,10 +260,8 @@ class ClassifierPipeline:
                 )
                 return intent, confidence
             else:
-                # Log that this evaluator didn't match and passed it down the chain
                 logger.debug(f"ClassifierPipeline: ⏭️ {evaluator_name} passed.")
                 
-        # If it gets through the whole chain without hitting the FallbackEvaluator
         logger.warning(
             f"ClassifierPipeline: ⚠️ Chain exhausted with no match. "
             f"Defaulting to UNKNOWN for text={text!r}"
@@ -302,27 +289,15 @@ def classify(utterance: str) -> ClassifiedResult:
     # ═════════════════════════════════════════════════════════
     # 1.5 NOISE REDUCTION (Generic Word Masking)
     # ═════════════════════════════════════════════════════════
-    # We remove words like "tiles" from the extraction text so they don't 
-    # accidentally trigger generic Categories (like ID 3109) or Tags.
-    # We leave the original 'text' variable intact so the Intent Pipeline 
-    # still understands the natural language context.
     entity_text = text
-    
-    # --- FIX: Use dynamically loaded config instead of hardcoded array ---
     for gw in GENERIC_NOISE_WORDS:
         entity_text = re.sub(rf'\b{re.escape(gw)}\b', ' ', entity_text, flags=re.IGNORECASE)
 
     # ─── 2. PRE-EXTRACT COMMON ENTITIES ───
-    # We pass the cleaned 'entity_text' to prevent category hijacking
     _extract_product_name(entity_text, entities)
     _extract_category(entity_text, entities)
 
     attr_text = entity_text
-    if entities.category_name:
-        _cat_base = entities.category_name.lower()
-        if _cat_base.endswith("s") and len(_cat_base) > 3:
-            _cat_base = _cat_base[:-1]
-        attr_text = re.sub(rf'\b{re.escape(_cat_base)}s?\b', ' ', attr_text).strip()
 
     _loader = get_store_loader()
     _type_mask_terms = set(pt.lower() for pt in PRODUCT_TYPE_TERMS)
@@ -336,8 +311,6 @@ def classify(utterance: str) -> ClassifiedResult:
     _extract_tag(attr_text, entities)               
     
     # --- 4. SECONDARY EXTRACTIONS ---
-    # These look for specific patterns (dates, numbers, order IDs), 
-    # so they safely use the original 'text' variable.
     _extract_collection_year(text, entities)
     _extract_order_id(text, entities)
     _extract_time_range(text, entities)
@@ -351,7 +324,6 @@ def classify(utterance: str) -> ClassifiedResult:
 
     # ─── 5. EXECUTE INTENT PIPELINE ───
     pipeline = ClassifierPipeline([
-        # GreetingEvaluator(),
         OrderActionEvaluator(),
         DiscountEvaluator(),
         ProductDetailEvaluator(),
@@ -369,22 +341,18 @@ def classify(utterance: str) -> ClassifiedResult:
         Intent.PLACE_ORDER, Intent.ORDER_ITEM, Intent.SAMPLE_REQUEST
     }
     
-    if entities.category_id is not None and entities.product_id is not None:
+    if getattr(entities, 'target_category_slugs', set()) and entities.product_id is not None:
         if intent in PRODUCT_SPECIFIC_INTENTS:
-            entities.category_id = None
+            entities.target_category_slugs.clear()
             entities.category_name = None
-            entities.category_slug = None
         else:
             entities.product_id = None
     
     if entities.tag_ids and entities.product_id:
         is_series = any("series" in slug or "collection" in slug for slug in entities.tag_slugs)
-        
         if is_series:
             logger.info(f"Conflict detected: Series tag found. Dropping product_id {entities.product_id}")
-            
-            # Re-extract category if it was hijacked by the product name
-            if not entities.category_id:
+            if not getattr(entities, 'target_category_slugs', set()):
                 _extract_category(text, entities)
                 if entities.category_name:
                     logger.info(f"Restored category '{entities.category_name}' after product drop.")
@@ -392,10 +360,10 @@ def classify(utterance: str) -> ClassifiedResult:
             entities.product_id = None
             entities.product_name = None
             entities.product_slug = None
-
-    # ═════════════════════════════════════════════════════════
+            
+    # ══════════════════════════════════════════════════════════════════
     # 7. ENTITY CONSOLIDATION (The "OR" Enabler)
-    # ═════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════
     if entities.attr_tag_or_pairs:
         loader = get_store_loader()
         
@@ -405,53 +373,134 @@ def classify(utterance: str) -> ClassifiedResult:
             entities.tag_slugs = [slug for slug in entities.tag_slugs if slug not in handled_tags]
             entities.tag_ids = [tid for tid in entities.tag_ids if loader and loader.tag_by_id.get(tid, {}).get("slug") not in handled_tags]
 
-        # Deduplicate Categories 
+        # Deduplicate Categories
         handled_cats = {pair.get("attr_term") for pair in entities.attr_tag_or_pairs if pair.get("attr_taxonomy") == "product_cat"}
-        if entities.category_slug and entities.category_slug in handled_cats:
-            entities.category_id = None
+        if handled_cats and getattr(entities, 'target_category_slugs', set()).intersection(handled_cats):
+            entities.target_category_slugs.clear()
             entities.category_name = None
-            entities.category_slug = None
             
     # Check for Category vs Attribute overlaps explicitly
-    if entities.category_slug and entities.attributes:
+    if getattr(entities, 'target_category_slugs', set()) and entities.attributes:
+        loader = get_store_loader()
         for attr_label, attr_slug in list(entities.attributes.items()):
-            if attr_slug == entities.category_slug or attr_slug == (entities.category_name or "").lower():
-                # Bundle them into an OR pair!
-                entities.attr_tag_or_pairs.append({
-                    "tag_slug": None,
-                    "attr_taxonomy": "product_cat",
-                    "attr_term": entities.category_slug
-                })
-                entities.attr_tag_or_pairs.append({
-                    "tag_slug": None,
-                    "attr_taxonomy": entities.attribute_slug,
-                    "attr_term": attr_slug
-                })
-                # Clear them from the strict AND lists
-                entities.category_id = None
-                entities.category_name = None
-                entities.category_slug = None
-                del entities.attributes[attr_label]
+            # Did the attribute specifically overlap with one of our category slugs?
+            if attr_slug in entities.target_category_slugs or attr_slug == (entities.category_name or "").lower():
+                
+                # Resolve the correct taxonomy for this attribute
+                actual_tax = ""
+                if loader and loader.all_attributes_raw:
+                    for a in loader.all_attributes_raw:
+                        if a.get("attribute_label", "").lower().strip() == attr_label:
+                            actual_tax = a.get("taxonomy", "")
+                            break
+                            
+                if actual_tax:
+                    # Bundle ONLY the overlapping slug into an OR pair!
+                    entities.attr_tag_or_pairs.append({
+                        "cat_slugs": [attr_slug],  # Just the overlapping word!
+                        "attr_taxonomy": actual_tax,
+                        "attr_term": attr_slug
+                    })
+                    
+                    # Remove ONLY the overlapping slug from the strict category set
+                    if attr_slug in entities.target_category_slugs:
+                        entities.target_category_slugs.remove(attr_slug)
+                        
+                    # If that was the only category, clear the UI name
+                    if not entities.target_category_slugs:
+                        entities.category_name = None
+                        
+                    del entities.attributes[attr_label]
+
+    # ─── NEW: ECLIPSED ENTITY CLEANUP ───
+    # If we extracted an exact tag (like "gray-tones"), we must delete any smaller 
+    # OR pairs or attributes (like "gray") that are fully eclipsed by it.
+    if entities.tag_slugs:
+        loader = get_store_loader()
+        exact_tag_tokens = []
+        if loader:
+            for tslug in entities.tag_slugs:
+                tag_obj = loader.tag_by_slug.get(tslug)
+                if tag_obj:
+                    exact_tag_tokens.append(_normalize_for_tag_compare(tag_obj.get("name", "")))
+        
+        if exact_tag_tokens:
+            # 1. Clean eclipsed OR pairs (e.g. "gray-look")
+            if entities.attr_tag_or_pairs:
+                valid_pairs = []
+                for pair in entities.attr_tag_or_pairs:
+                    attr_term_tokens = _normalize_for_tag_compare(pair.get("attr_term", "").replace("-", " "))
+                    # If the term (e.g. {"gray"}) is a subset of the exact tag (e.g. {"gray", "tones"}), drop it!
+                    if not any(attr_term_tokens <= exact_tokens for exact_tokens in exact_tag_tokens):
+                        valid_pairs.append(pair)
+                entities.attr_tag_or_pairs = valid_pairs
+                
+            # 2. Clean eclipsed standard attributes (e.g. "gray")
+            if entities.attributes:
+                for attr_label, attr_slug in list(entities.attributes.items()):
+                    attr_term_tokens = _normalize_for_tag_compare(attr_slug.replace("-", " "))
+                    if any(attr_term_tokens <= exact_tokens for exact_tokens in exact_tag_tokens):
+                        del entities.attributes[attr_label]
 
     return ClassifiedResult(intent=intent, entities=entities, confidence=confidence)
-                       
+
 # ─────────────────────────────────────────────
-# ENTITY EXTRACTION HELPERS (Keep Existing)
+# ENTITY EXTRACTION HELPERS 
 # ─────────────────────────────────────────────
-# [All your `_extract_*` functions remain here unchanged]
-def _extract_category(text: str, entities: ExtractedEntities):
+def _extract_category(text: str, entities: ExtractedEntities) -> str:
     loader = get_store_loader()
-    if not loader: return
-    matches = loader.get_all_categories_for_text(text)
-    if not matches: return
-    matched_ids = {m["id"] for m in matches}
-    child_parent_ids = {loader.category_by_id.get(m["id"], {}).get("parent", 0) for m in matches}
-    pruned = [m for m in matches if m["id"] not in (child_parent_ids & matched_ids)]
-    if not pruned: pruned = matches
-    entities.category_id   = pruned[0]["id"]
-    entities.category_name = pruned[0]["name"]
-    entities.category_slug = pruned[0].get("slug", "")
-    entities.extra_category_ids = [m["id"] for m in pruned[1:]]
+    if not loader or not loader.category_by_slug: 
+        return text
+
+    extracted_cats = []
+    longest_match = ""
+
+    # 1. Scan for all matching category names
+    for slug, cat in loader.category_by_slug.items():
+        name_lower = cat.get("name", "").lower().strip()
+        if len(name_lower) < 3: 
+            continue
+
+        pattern = rf'\b{re.escape(name_lower)}\b'
+        try:
+            if re.search(pattern, text, re.IGNORECASE):
+                # Keep track of the longest match strictly for the UI bot message
+                if len(name_lower) > len(longest_match):
+                    longest_match = name_lower
+                    entities.category_name = cat.get("name")
+                    
+                extracted_cats.append(cat)
+        except re.error: 
+            pass
+
+    if not extracted_cats:
+        return text
+
+    # ══════════════════════════════════════════════════════════════
+    # 2. HIERARCHY RESOLUTION (The Category Graph)
+    # ══════════════════════════════════════════════════════════════
+    extracted_ids = {c.get("id") for c in extracted_cats}
+    linked_children = []
+
+    # Check if any extracted category is a direct child of another extracted category
+    for cat in extracted_cats:
+        if cat.get("parent") in extracted_ids:
+            linked_children.append(cat)
+
+    if not hasattr(entities, 'target_category_slugs'):
+        entities.target_category_slugs = set()
+
+    if linked_children:
+        # SCENARIO A: User typed "Exterior Floor". We drop the broad Parent 
+        # and the orphan Floors, keeping ONLY the specific child branch!
+        for child in linked_children:
+            entities.target_category_slugs.add(child.get("slug"))
+    else:
+        # SCENARIO B: User typed "Floor". Bundle ALL duplicate slugs together.
+        for cat in extracted_cats:
+            entities.target_category_slugs.add(cat.get("slug"))
+
+    return text
 
 def _extract_product_name(text: str, entities: ExtractedEntities):
     loader = get_store_loader()
@@ -731,10 +780,15 @@ def _extract_tag(text: str, entities: ExtractedEntities) -> str:
     
     _cat_base_words = set()
     _all_cat_names = []
-    if entities.category_name: _all_cat_names.append(entities.category_name.lower())
-    for _cid in entities.extra_category_ids:
-        _cat = loader.category_by_id.get(_cid)
-        if _cat: _all_cat_names.append(_cat["name"].lower())
+    if entities.category_name: 
+        _all_cat_names.append(entities.category_name.lower())
+        
+    if hasattr(entities, 'target_category_slugs'):
+        for slug in entities.target_category_slugs:
+            _cat = loader.category_by_slug.get(slug)
+            if _cat and _cat.get("name"): 
+                _all_cat_names.append(_cat["name"].lower())
+                
     for _cname in _all_cat_names:
         _cat_base_words.add(_cname)
         if _cname.endswith("s") and len(_cname) > 3: _cat_base_words.add(_cname[:-1])
@@ -782,7 +836,6 @@ def _extract_tag(text: str, entities: ExtractedEntities) -> str:
         if not (all_token_sets[i] and any(all_token_sets[i] < other for j, other in enumerate(all_token_sets) if j != i)):
             entities.tag_ids.append(tag["id"])
             entities.tag_slugs.append(tag["slug"])
-            # POSITIONAL MASKING: Erase the tag from the text
 
     return masked_text
 
@@ -823,10 +876,6 @@ def _detect_tag_operator(text: str, entities: ExtractedEntities):
 _NEGATION_PATTERNS = [r'\bwithout\s+(.+?)(?:\s+(?:tiles?|products?|ones?)|$)', r'\bno\s+(.+?)(?:\s+(?:tiles?|products?|ones?)|$)', r'\bnot\s+(.+?)(?:\s+(?:tiles?|products?|ones?)|$)', r'\bexclude\s+(.+?)(?:\s+(?:tiles?|products?|ones?)|$)', r'\bavoid\s+(.+?)(?:\s+(?:tiles?|products?|ones?)|$)', r'\bdon\'?t\s+(?:want|include|show)\s+(.+?)(?:\s+(?:tiles?|products?|ones?)|$)']
 
 def _extract_exclusions(text: str, entities: ExtractedEntities) -> str:
-    """
-    Extracts negative entities (e.g. "not white tones") and returns a masked 
-    string so positive extractors do not double-dip on the negated words.
-    """
     loader = get_store_loader()
     if not loader: 
         return text
@@ -834,10 +883,9 @@ def _extract_exclusions(text: str, entities: ExtractedEntities) -> str:
     masked_text = text
     
     for pattern in _NEGATION_PATTERNS:
-        # Iterate over the text to find negations
         for match in re.finditer(pattern, masked_text, re.IGNORECASE):
             phrase = match.group(1).strip().lower()
-            full_match = match.group(0) # e.g., "not white tones"
+            full_match = match.group(0)
             
             if not phrase or len(phrase) < 2: 
                 continue
@@ -876,8 +924,6 @@ def _extract_exclusions(text: str, entities: ExtractedEntities) -> str:
                             break
                     if _resolved: break
             
-            # --- POSITIONAL MASKING ---
-            # If we successfully identified the negated phrase, erase it from the text.
             if _resolved:
                 masked_text = masked_text.replace(full_match, " ")
                 
