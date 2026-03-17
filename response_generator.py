@@ -259,6 +259,15 @@ def generate_bot_message(
     
     # ── No products found ──
     if page_count == 0:
+        # If they asked for a specific product AND specific attributes (e.g. Ansel in Charcoal)
+        if entities.product_name and entities.attributes:
+            attr_desc = " / ".join(filter(None, entities.attributes.values())).title()
+            return (
+                f"I couldn't find **{entities.product_name}** matching **{attr_desc}**. 😕\n\n"
+                f"Try asking: *'What variations does {entities.product_name} come in?'* to see all available options."
+            )
+            
+        # Standard fallback for general generic searches
         search = (
             entities.product_name or entities.category_name
             or next(iter(entities.attributes.values()), None)
