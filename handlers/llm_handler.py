@@ -21,50 +21,6 @@ from handlers.chat_utils import default_pagination
 
 logger = get_logger("miraq_chat")
 
-# Maps LLM-returned intent strings to Intent enum values when the string
-# doesn't directly match an Intent value.
-_INTENT_MAPPING = {
-    "search":            Intent.PRODUCT_SEARCH,
-    "product_search":    Intent.PRODUCT_SEARCH,
-    "browse":            Intent.CATEGORY_BROWSE,
-    "category_browse":   Intent.CATEGORY_BROWSE,
-    "filter":            Intent.PRODUCT_LIST,
-    "filter_by_finish":  Intent.FILTER_BY_FINISH,
-    "filter_by_color":   Intent.FILTER_BY_COLOR,
-    "filter_by_size":    Intent.FILTER_BY_SIZE,
-    "filter_by_application": Intent.FILTER_BY_APPLICATION,
-    "filter_by_material": Intent.FILTER_BY_MATERIAL,
-    "general_question":  Intent.PRODUCT_LIST,
-    "order_inquiry":     Intent.ORDER_HISTORY,
-    "order_history":     Intent.ORDER_HISTORY,
-    "check_orders":      Intent.ORDER_HISTORY,
-    "my_orders":         Intent.ORDER_HISTORY,
-    "order_status":      Intent.ORDER_STATUS,
-    "order_tracking":    Intent.ORDER_TRACKING,
-    "last_order":        Intent.LAST_ORDER,
-    "reorder":           Intent.REORDER,
-    "order":             Intent.QUICK_ORDER,
-    "place_order":       Intent.PLACE_ORDER,
-    "quick_order":       Intent.QUICK_ORDER,
-    "order_item":        Intent.ORDER_ITEM,
-    "discount_inquiry":  Intent.DISCOUNT_INQUIRY,
-    "promotions":        Intent.PROMOTIONS,
-    "clearance":         Intent.CLEARANCE_PRODUCTS,
-    "greeting":          Intent.GREETING,
-    "product_attribute_info": Intent.PRODUCT_ATTRIBUTE_INFO,
-    # Origin intents — LLM may return these for "products from Italy / made in X" queries
-    "product_by_origin": Intent.PRODUCT_BY_ORIGIN,
-    "filter_by_origin":  Intent.PRODUCT_BY_ORIGIN,
-    "origin":            Intent.PRODUCT_BY_ORIGIN,
-    # Attribute / tag filter intents added to match updated system prompt
-    "filter_by_attribute": Intent.FILTER_BY_ATTRIBUTE,
-    "product_by_tag":    Intent.PRODUCT_BY_TAG,
-    "product_by_collection": Intent.PRODUCT_BY_COLLECTION,
-    "category_list":     Intent.CATEGORY_LIST,
-    "general_question":  Intent.PRODUCT_LIST,
-}
-
-
 def run_llm_fallback(
     message: str,
     intent: Intent,
@@ -262,40 +218,21 @@ def _merge_llm_entities(llm_result, original_entities, fallback_type, store_load
     The LLM performs intent-only classification — it does not return entities.
     Original entities from the local classifier are preserved unchanged.
     """
-    # Keep the classifier's entities as-is; the LLM only resolves intent
     new_entities = original_entities
 
-    # Resolve intent string
-    llm_intent_str = llm_result.get("intent", "unknown")
+    # Safely extract and normalize the intent string from the LLM
+    llm_intent_str = llm_result.get("intent", "unknown").lower().strip()
+    
     try:
+        # Single Source of Truth: Cast string directly to the Intent enum
         new_intent = Intent(llm_intent_str)
     except ValueError:
-        new_intent = _INTENT_MAPPING.get(llm_intent_str, Intent.PRODUCT_LIST)
-        if llm_intent_str not in _INTENT_MAPPING:
-            log.warning(
-                f"Step 1.5: Unmapped LLM intent '{llm_intent_str}' — "
-                f"falling back to PRODUCT_LIST. Consider adding it to _INTENT_MAPPING."
-            )
-
-    # ── Remap attribute-filter intents to PRODUCT_ATTRIBUTE_INFO ──
-    # When the user asks "what finish on Ansel?" the LLM resolves to
-    # FILTER_BY_FINISH, but the user wants the finish *options* for a specific
-    # product — not a catalog-wide filter. Remap to PRODUCT_ATTRIBUTE_INFO
-    # so the api_builder fetches the product + variations and the response
-    # generator lists the attribute options.
-    _ATTR_FILTER_TO_TARGET = {
-        Intent.FILTER_BY_FINISH:  "finish",
-        Intent.FILTER_BY_COLOR:   "colors",
-        Intent.FILTER_BY_SIZE:    "tile size",
-    }
-    if new_intent in _ATTR_FILTER_TO_TARGET and new_entities.product_name:
-        target = _ATTR_FILTER_TO_TARGET[new_intent]
-        log.info(
-            f"Step 1.5: Remapping {new_intent.value} → product_attribute_info | "
-            f"product_name={new_entities.product_name!r} | target_attribute={target}"
+        # If the LLM hallucinates a fake intent, catch it safely
+        log.warning(
+            f"Step 1.5: LLM hallucinated invalid intent '{llm_intent_str}' — "
+            f"falling back to PRODUCT_SEARCH."
         )
-        new_intent = Intent.PRODUCT_ATTRIBUTE_INFO
-        new_entities.target_attribute = target
+        new_intent = Intent.PRODUCT_SEARCH
 
     new_confidence = llm_result.get("confidence", 0.70)
     return new_intent, new_entities, new_confidence

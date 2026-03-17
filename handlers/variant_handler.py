@@ -17,7 +17,7 @@ from config.settings import DEFAULT_PER_PAGE
 from models import Intent, WooAPICall
 from woo_client import woo_client
 from formatters import format_product, format_variation, _filter_variations_by_entities
-from response_generator import generate_bot_message, generate_suggestions, INTENT_LABELS
+from response_generator import generate_bot_message, generate_suggestions
 from conversation_flow import FlowState
 from chat_logger import get_logger, sanitize_log_string
 from formatters import _entities_to_dict
@@ -54,13 +54,22 @@ def handle_variant_selection(
     Step 3.55: Resolve variant selection from user response.
     Returns Flask response or None.
     """
-    # Abandon variant flow if user sent a new search/browse intent
+    
+    # --- HELPER: Safely extract options whether from Custom API (dict) or Standard WC (list) ---
+    def _get_safe_options(attrs):
+        if isinstance(attrs, dict):
+            return {k.replace("pa_", "").replace("-", " ").title(): str(v).replace("-", " ").title() for k, v in attrs.items() if v}
+        elif isinstance(attrs, list):
+            return {a.get("name", ""): a.get("option", "") for a in attrs if isinstance(a, dict) and a.get("name") and a.get("option")}
+        return {}
+    # -----------------------------------------------------------------------------------------
+
     _ABANDON_INTENTS = {
         Intent.PRODUCT_SEARCH, Intent.PRODUCT_LIST, Intent.CATEGORY_BROWSE,
-        Intent.CATEGORY_LIST, Intent.FILTER_BY_FINISH, Intent.FILTER_BY_SIZE,
-        Intent.FILTER_BY_COLOR, Intent.FILTER_BY_APPLICATION, Intent.PRODUCT_BY_VISUAL,
-        Intent.PRODUCT_BY_ORIGIN, Intent.PRODUCT_QUICK_SHIP, Intent.GREETING,
+        Intent.CATEGORY_LIST, Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_QUICK_SHIP, 
+        Intent.GREETING,
     }
+    
     if current_flow_state == FlowState.AWAITING_VARIANT_SELECTION and intent in _ABANDON_INTENTS:
         logger.info(
             f"Step 3.55: Abandoning variant flow — new intent={intent.value} detected | "
@@ -110,49 +119,31 @@ def handle_variant_selection(
     # ── Pre-filter using resolved attributes from prior turns ──
     prev_resolved = user_context.get("resolved_attributes", {})
     if prev_resolved:
-        # Refine prev_resolved if user specified a more specific value this turn
         user_msg_lower = message.lower()
         user_msg_clean = _STRIP_QUOTES_RE.sub('', user_msg_lower)
         refined_resolved = dict(prev_resolved)
         for attr_name, attr_val in prev_resolved.items():
             candidate_options = set()
             for var in all_variations:
-                for a in var.get("attributes", []):
-                    if a.get("name", "").lower() == attr_name.lower():
-                        opt = a.get("option", "")
-                        if opt:
-                            candidate_options.add(opt)
+                opts = _get_safe_options(var.get("attributes", []))
+                for name, opt in opts.items():
+                    if name.lower() == attr_name.lower():
+                        candidate_options.add(opt)
             current_val_lower = attr_val.lower()
             for opt in candidate_options:
                 opt_lower = opt.lower()
                 opt_clean = _STRIP_QUOTES_RE.sub('', opt_lower)
-                if (
-                    current_val_lower in opt_lower
-                    and opt_lower != current_val_lower
-                    and opt_clean in user_msg_clean
-                ):
+                if (current_val_lower in opt_lower and opt_lower != current_val_lower and opt_clean in user_msg_clean):
                     refined_resolved[attr_name] = opt
-                    logger.info(
-                        f"Step 3.55: Refined resolved attribute "
-                        f"{attr_name}: '{attr_val}' → '{opt}' based on current message"
-                    )
                     break
         prev_resolved = refined_resolved
 
-        # Apply pre-filter
         pre_filtered = []
         for var in all_variations:
-            var_attrs = {
-                a.get("name", "").lower(): a.get("option", "").lower()
-                for a in var.get("attributes", [])
-            }
-            if all(
-                prev_resolved[attr_name].lower() in var_attrs.get(attr_name.lower(), "")
-                for attr_name in prev_resolved
-            ):
+            var_attrs = {k.lower(): v.lower() for k, v in _get_safe_options(var.get("attributes", [])).items()}
+            if all(prev_resolved[attr_name].lower() in var_attrs.get(attr_name.lower(), "") for attr_name in prev_resolved):
                 pre_filtered.append(var)
         if pre_filtered:
-            logger.info(f"Step 3.55: Pre-filtered {len(all_variations)} → {len(pre_filtered)} using resolved_attributes={prev_resolved}")
             all_variations = pre_filtered
 
     # ── Score/match variations against user message ──
@@ -175,9 +166,8 @@ def handle_variant_selection(
             text_matched = [
                 var for var in candidates
                 if var.get("attributes") and all(
-                    a.get("option", "").lower() in user_text_lower
-                    for a in var.get("attributes", [])
-                    if a.get("option")
+                    opt.lower() in user_text_lower
+                    for opt in _get_safe_options(var.get("attributes", [])).values()
                 )
             ]
             if text_matched and len(text_matched) < len(candidates):
@@ -189,9 +179,29 @@ def handle_variant_selection(
         _resolved_variation_id = _resolved_variation["id"]
         logger.info(f"Step 3.55: Resolved to variation_id={_resolved_variation_id}")
 
-        _variant_label = " / ".join(
-            a.get("option", "") for a in _resolved_variation.get("attributes", []) if a.get("option")
-        )
+        if _resolved_variation.get("stock_status") == "outofstock" or _resolved_variation.get("in_stock") is False:
+            elapsed = time.time() - start_time
+            return jsonify({
+                "success": True,
+                "bot_message": f"I'm sorry, but that specific variant is currently out of stock! 😔\n\nWould you like to choose a different finish or size?",
+                "intent": "guided_flow",
+                "products": [],
+                "suggestions": ["Show me other options", "Cancel"],
+                "session_id": session_id,
+                "metadata": {
+                    "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
+                    "pending_product_id": _var_product_id,
+                    "pending_product_name": _var_product_name,
+                    "pending_quantity": _var_quantity,
+                    "response_time_ms": round(elapsed * 1000),
+                },
+                "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
+                "pagination": default_pagination(page),
+            }), 200
+
+        # Safe label extraction using our helper!
+        _variant_label = " / ".join(_get_safe_options(_resolved_variation.get("attributes", [])).values())
+        
         _variant_price = (
             _resolved_variation.get("sale_price")
             or _resolved_variation.get("price")
@@ -200,7 +210,6 @@ def handle_variant_selection(
         )
 
         if not _var_quantity:
-            logger.info(f"Step 3.55: Variant resolved, asking for quantity | price={_variant_price}")
             _price_line = f"\n**Unit Price:** {get_currency_symbol()}{_variant_price}" if _variant_price else ""
             elapsed = time.time() - start_time
             return jsonify({
@@ -228,7 +237,6 @@ def handle_variant_selection(
             }), 200
 
         # Quantity known — proceed to shipping
-        logger.info(f"Step 3.55: Variant resolved with quantity={_var_quantity}, proceeding to shipping")
         shipping_address = fetch_shipping_address(customer_id, "Step 3.55")
         has_address = bool(shipping_address and (shipping_address.get("address_1") or shipping_address.get("city")))
 
@@ -277,39 +285,31 @@ def handle_variant_selection(
             }), 200
 
     # ── Multiple or no match — ask user to narrow down ──
-    logger.info(f"Step 3.55: Could not resolve to single variation | matched={len(matched)} of {len(all_variations)}")
     resolved_attributes = {}
-        # Calculate resolved attributes when matched > 1 (regardless of whether it equals all_variations)
     if len(matched) > 1:
         attr_values = {}
         for v in matched:
-            for a in v.get("attributes", []):
-                name = a.get("name", "")
-                opt = a.get("option", "")
+            for name, opt in _get_safe_options(v.get("attributes", [])).items():
                 if name and opt:
                     attr_values.setdefault(name, set()).add(opt)
         for attr_name, options in attr_values.items():
             if len(options) == 1:
                 resolved_attributes[attr_name] = list(options)[0]
-        logger.info(f"Step 3.55: Resolved attributes so far: {resolved_attributes}")
         
     if prev_resolved:
         for k, v in prev_resolved.items():
             if k not in resolved_attributes:
                 resolved_attributes[k] = v
-        logger.info(f"Step 3.55: Merged with previous resolved_attributes: {resolved_attributes}")
 
-    # Load parent product for re-prompt (from cache or API)
     _session_parent = sessions.get(session_id, {}).get("variation_cache", {}).get(str(_var_product_id), {}).get("parent_raw")
     if _session_parent:
         parent_raw = _session_parent
-        logger.info("Step 3.55: Using session-cached parent_raw — skipping parent product API call")
     else:
         parent_call = WooAPICall(
             method="GET",
             endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}",
             params={},
-            description=f"Fetch parent product '{_var_product_name}' for variant re-prompt",
+            description=f"Fetch parent product '{_var_product_name}'",
         )
         parent_resp = woo_client.execute(parent_call)
         parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
@@ -317,17 +317,17 @@ def handle_variant_selection(
     if len(matched) > 1:
         attr_values_all = {}
         for v in matched:
-            for a in v.get("attributes", []):
-                name = a.get("name", "")
-                opt = a.get("option", "")
+            for name, opt in _get_safe_options(v.get("attributes", [])).items():
                 if name and opt:
                     attr_values_all.setdefault(name, set()).add(opt)
+        
         _already_resolved = {k.lower() for k in resolved_attributes}
         ambiguous = {
             k: sorted(v)
             for k, v in attr_values_all.items()
             if len(v) > 1 and k.lower() not in _already_resolved
         }
+        
         if ambiguous:
             lines = [f"Great, I found **{_var_product_name}** in your selected options! I just need a bit more info:\n"]
             for attr_name, options in ambiguous.items():
@@ -336,7 +336,7 @@ def handle_variant_selection(
             prompt_msg = "\n".join(lines)
         else:
             variation_labels = [
-                " / ".join(a.get("option", "") for a in v.get("attributes", []) if a.get("option"))
+                " / ".join(_get_safe_options(v.get("attributes", [])).values())
                 for v in matched
             ]
             prompt_msg = (
@@ -345,7 +345,7 @@ def handle_variant_selection(
                 + "\n\nWhich one would you like?"
             )
     else:
-        prompt_msg = build_variant_prompt(parent_raw, _var_product_name)
+        prompt_msg = build_variant_prompt(parent_raw, _var_product_name, resolved_attributes)
         if len(all_variations) > 0:
             prompt_msg = "Sorry, I couldn't find that exact variant. " + prompt_msg
 
@@ -368,7 +368,6 @@ def handle_variant_selection(
         "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
         "pagination": default_pagination(page),
     }), 200
-
 
 def handle_variation_product(
     intent,
@@ -516,11 +515,10 @@ def handle_variation_product(
     else:
         pagination = build_pagination(page, api_responses, api_calls_to_execute)
 
-    from response_generator import INTENT_LABELS as _IL
     return jsonify({
         "success": True,
         "bot_message": bot_message,
-        "intent": _IL.get(intent, "unknown"),
+        "intent": intent.value,
         "products": products,
         "suggestions": suggestions,
         "session_id": session_id,
@@ -561,13 +559,31 @@ def handle_quantity_and_variant_check(
         return None
 
     product = products_formatted[0]
+    
+    # ── OUT OF STOCK INTERCEPT ──
+    if product.get("stock_status") == "outofstock":
+        elapsed = time.time() - start_time
+        return jsonify({
+            "success": True,
+            "bot_message": f"I'm so sorry, but **{product['name']}** is currently out of stock!",
+            "intent": intent.value,
+            "products": products_formatted[:1],
+            "suggestions": ["Show similar products", "Browse categories"],
+            "session_id": session_id,
+            "metadata": {
+                "flow_state": FlowState.IDLE.value,
+                "response_time_ms": round(elapsed * 1000),
+            },
+            "flow_state": FlowState.IDLE.value,
+            "pagination": default_pagination(page),
+        }), 200
 
     # No quantity yet
     if not entities.quantity:
         if product.get("type") == "variable":
             _raw_for_prompt = next((p for p in all_products_raw if not p.get("parent_id")), {})
-            _variations_for_cache = [p for p in all_products_raw if p.get("parent_id") == product.get("id")]
-            prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"])
+            _variations_for_cache = _raw_for_prompt.get("variations", [])
+            prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}))
             if session_id and session_id in sessions:
                 _pid = str(product.get("id"))
                 sessions[session_id].setdefault("variation_cache", {})[_pid] = {
@@ -579,7 +595,7 @@ def handle_quantity_and_variant_check(
             return jsonify({
                 "success": True,
                 "bot_message": prompt_msg,
-                "intent": INTENT_LABELS.get(intent, "order"),
+                "intent": intent.value,
                 "products": products_formatted[:1],
                 "suggestions": [],
                 "session_id": session_id,
@@ -597,7 +613,7 @@ def handle_quantity_and_variant_check(
         return jsonify({
             "success": True,
             "bot_message": f"Sure, I can order **{product['name']}** for you! How many do you need? 🛒",
-            "intent": INTENT_LABELS.get(intent, "order"),
+            "intent": intent.value,
             "products": products_formatted[:1],
             "suggestions": ["1", "5", "10", "25"],
             "session_id": session_id,
@@ -614,8 +630,8 @@ def handle_quantity_and_variant_check(
     # Quantity known but variable product not yet resolved
     if entities.quantity and not order_data and product.get("type") == "variable":
         _raw_for_prompt = next((p for p in all_products_raw if not p.get("parent_id")), {})
-        _variations_for_cache = [p for p in all_products_raw if p.get("parent_id") == product.get("id")]
-        prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"])
+        _variations_for_cache = _raw_for_prompt.get("variations", [])
+        prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}))
         if session_id and session_id in sessions:
             _pid = str(product.get("id"))
             sessions[session_id].setdefault("variation_cache", {})[_pid] = {
@@ -627,7 +643,7 @@ def handle_quantity_and_variant_check(
         return jsonify({
             "success": True,
             "bot_message": prompt_msg,
-            "intent": INTENT_LABELS.get(intent, "order"),
+            "intent": intent.value,
             "products": products_formatted[:1],
             "suggestions": [],
             "session_id": session_id,

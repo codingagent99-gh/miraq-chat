@@ -259,6 +259,18 @@ def generate_bot_message(
     
     # ── No products found ──
     if page_count == 0:
+        if intent == Intent.RELATED_PRODUCTS:
+            target = entities.product_name or "that"
+            if not entities.product_name:
+                return (
+                    "I'd love to show you similar items! 🔍\n\n"
+                    "Which specific product would you like to find alternatives for?"
+                )
+            return (
+                f"I couldn't find any direct alternatives for **{target}**. 😕\n\n"
+                "Try browsing its category to see all our other options!"
+            )
+
         # If they asked for a specific product AND specific attributes (e.g. Ansel in Charcoal)
         if entities.product_name and entities.attributes:
             attr_desc = " / ".join(filter(None, entities.attributes.values())).title()
@@ -434,18 +446,42 @@ def generate_bot_message(
         else:
             msg += f"Here are **{count}** products in the **{entities.category_name}** category! 📂\n\n"
     
-    elif intent == Intent.PRODUCT_BY_VISUAL:
-        msg += f"Found **{count}** products with **{entities.attributes.get('visual', '')}** look! 🎨\n\n"
-    elif intent == Intent.FILTER_BY_FINISH:
-        msg += f"Here are **{count}** products with **{entities.attributes.get('finish', '')}** finish! ✨\n\n"
-    elif intent == Intent.FILTER_BY_COLOR:
-        msg += f"Found **{count}** products in **{entities.attributes.get('colors', '')}** tones! 🎨\n\n"
     elif intent == Intent.FILTER_BY_ATTRIBUTE:
         attr_desc = " · ".join(
             f"**{v}** {k}" for k, v in entities.attributes.items() if v
         )
         category_desc = f" in **{entities.category_name}**" if entities.category_name else ""
         msg += f"Found **{count}** products{category_desc} matching {attr_desc}! 🔍\n\n"
+    elif intent == Intent.PRODUCT_SEARCH:
+        msg += f"Found **{count}** products matching your search! 🔍\n\n"
+        
+    # NEW SUCCESS HEADER: Related Products
+    elif intent == Intent.RELATED_PRODUCTS:
+        p_name = entities.product_name or "this item"
+        msg += f"Here are some products similar to **{p_name}** that you might like! ✨\n\n"
+        
+    elif intent == Intent.CATEGORY_LIST:
+        msg += f"Here are our product categories! 📂\n\n"
+        
+    elif intent == Intent.FILTER_BY_ATTRIBUTE:
+        if entities.attributes:
+            attr_parts = []
+            for attr_name, attr_val in entities.attributes.items():
+                if not attr_val: continue
+                # Clean up ugly taxonomy names dynamically (e.g. "pa_fabric-type" -> "Fabric Type")
+                clean_name = attr_name.replace(" 2", "").replace("-", " ").replace("pa_", "").title()
+                clean_val = str(attr_val).replace("-", " ").title()
+                
+                attr_parts.append(f"**{clean_val}** {clean_name}")
+            
+            attr_desc = " · ".join(attr_parts)
+            category_desc = f" in **{entities.category_name}**" if entities.category_name else ""
+            
+            msg += f"Found **{count}** products{category_desc} matching {attr_desc}! ✨\n\n"
+        else:
+            category_desc = f" in **{entities.category_name}**" if entities.category_name else ""
+            msg += f"Found **{count}** products{category_desc}! 🛍️\n\n"
+        
     elif intent == Intent.PRODUCT_SEARCH:
         msg += f"Found **{count}** products matching your search! 🔍\n\n"
     elif intent == Intent.CATEGORY_LIST:
@@ -511,9 +547,10 @@ def generate_suggestions(
                 suggestions.append(f"Order {p_name}")
                 suggestions.append(f"Show all {p_name} products")
         suggestions.append("What categories do you have?")
-    elif intent in (Intent.FILTER_BY_FINISH, Intent.FILTER_BY_COLOR, Intent.FILTER_BY_SIZE):
+    
+    elif intent == Intent.FILTER_BY_ATTRIBUTE:
         suggestions.append("Show me all products")
-        suggestions.append("What finishes are available?")
+        suggestions.append("What categories do you have?")
         
     elif intent == Intent.SAMPLE_REQUEST:
         if products:
@@ -533,54 +570,6 @@ def generate_suggestions(
                 suggestions.append(f"Show me {cat['name']}")
 
     return suggestions
-
-# ── Label mapping for API response ──
-INTENT_LABELS = {
-    Intent.PRODUCT_SEARCH: "search",
-    Intent.PRODUCT_LIST: "browse",
-    Intent.PRODUCT_DETAIL: "detail",
-    Intent.PRODUCT_ATTRIBUTE_INFO: "attribute_info",
-    Intent.CATEGORY_BROWSE: "category",
-    Intent.CATEGORY_LIST: "categories",
-    Intent.PRODUCT_BY_COLLECTION: "collection",
-    Intent.PRODUCT_BY_TAG: "tag",
-    Intent.PRODUCT_QUICK_SHIP: "quick_ship",
-    Intent.PRODUCT_BY_VISUAL: "visual",
-    Intent.FILTER_BY_FINISH: "filter",
-    Intent.FILTER_BY_SIZE: "filter",
-    Intent.FILTER_BY_COLOR: "filter",
-    Intent.FILTER_BY_APPLICATION: "filter",
-    Intent.FILTER_BY_MATERIAL: "filter",
-    Intent.FILTER_BY_ORIGIN: "filter",
-    Intent.FILTER_BY_ATTRIBUTE: "filter",
-    Intent.SIZE_LIST: "sizes",
-    Intent.PRODUCT_TYPES: "types",
-    Intent.PRODUCT_CATALOG: "catalog",
-    Intent.RELATED_PRODUCTS: "related",
-    # Intent.MOSAIC_PRODUCTS: "mosaic",
-    # Intent.TRIM_PRODUCTS: "trim",
-    # Intent.CHIP_CARD: "chip_card",
-    Intent.SAMPLE_REQUEST: "sample",
-    Intent.PRODUCT_VARIATIONS: "variations",
-    Intent.PRODUCT_BY_ORIGIN: "origin",
-    Intent.LAST_ORDER: "order",
-    Intent.ORDER_HISTORY: "order_history",
-    Intent.REORDER: "reorder",
-    Intent.ORDER_ITEM: "order",
-    Intent.QUICK_ORDER: "order",
-    Intent.PLACE_ORDER: "order",
-    Intent.ORDER_TRACKING: "order",
-    Intent.ORDER_STATUS: "order",
-    Intent.DISCOUNT_INQUIRY: "discount",
-    Intent.CLEARANCE_PRODUCTS: "clearance",
-    Intent.BULK_DISCOUNT: "bulk",
-    Intent.PROMOTIONS: "promotions",
-    Intent.COUPON_INQUIRY: "coupon",
-    Intent.SAVE_FOR_LATER: "wishlist",
-    Intent.GREETING: "greeting",
-    Intent.UPDATE_CUSTOMER: "update_customer",
-}
-
 
 def _resolve_user_placeholders(api_calls: List[WooAPICall], customer_id: int):
     """Replace CURRENT_USER_ID / CURRENT_USER placeholders."""

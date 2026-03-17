@@ -16,7 +16,7 @@ from app_config import (
 )
 from woo_client import woo_client
 from formatters import format_product, format_custom_product, format_category, _entities_to_dict
-from response_generator import generate_bot_message, generate_suggestions, _resolve_user_placeholders, INTENT_LABELS
+from response_generator import generate_bot_message, generate_suggestions, _resolve_user_placeholders
 from session_store import sessions, touch_session
 from models import Intent, WooAPICall
 from classifier import classify
@@ -487,7 +487,7 @@ def chat():
         return jsonify({
             "success":     update_success,
             "bot_message": bot_message,
-            "intent":      INTENT_LABELS.get(intent, "update_customer"),
+            "intent":      intent.value,
             "products":    [],
             "suggestions": suggestions,
             "session_id":  session_id,
@@ -631,7 +631,7 @@ def chat():
     response = {
         "success": True,
         "bot_message": bot_message,
-        "intent": INTENT_LABELS.get(intent, "unknown"),
+        "intent": intent.value,
         "products": products,
         "suggestions": suggestions,
         "session_id": session_id,
@@ -652,7 +652,7 @@ def chat():
     )
 
     logger.info(
-        f"Step 10: Response sent | intent={INTENT_LABELS.get(intent, 'unknown')} | "
+        f"Step 10: Response sent | intent={intent.value} | "
         f"products_count={len(products)} | response_time_ms={metadata['response_time_ms']} | "
         f"flow_state={response['flow_state']}"
     )

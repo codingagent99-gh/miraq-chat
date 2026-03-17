@@ -20,7 +20,7 @@ from app_config import (
 from models import Intent, WooAPICall
 from woo_client import woo_client
 from formatters import format_product
-from response_generator import INTENT_LABELS, format_order_detail
+from response_generator import format_order_detail
 from conversation_flow import FlowState
 from chat_logger import get_logger, sanitize_log_string
 from handlers.chat_utils import (
@@ -176,6 +176,27 @@ def handle_quick_order(
     if not _order_product_id:
         logger.warning("Step 3.6: Skipped order creation (no product_id resolved)")
         return None
+    
+    # ── OUT OF STOCK INTERCEPT ──
+    if _order_product_raw and _order_product_raw.get("stock_status") == "outofstock":
+        elapsed = time.time() - start_time
+        from formatters import format_product
+        return jsonify({
+            "success": True,
+            "bot_message": f"I'm so sorry, but **{_order_product_name}** is currently out of stock!",
+            "intent": intent.value,
+            "products": [format_product(_order_product_raw)],
+            "suggestions": ["Show similar products", "Browse categories"],
+            "session_id": session_id,
+            "metadata": {
+                "flow_state": FlowState.IDLE.value,
+                "response_time_ms": round(elapsed * 1000),
+            },
+            "flow_state": FlowState.IDLE.value,
+            "pagination": default_pagination(page),
+        }), 200
+
+    _order_variation_id = entities.variation_id
 
     _order_variation_id = entities.variation_id
     _product_type = (_order_product_raw or {}).get("type", "simple")
@@ -185,7 +206,7 @@ def handle_quick_order(
 
         if not _order_variation_id and not has_attrs:
             logger.info(f"Step 3.6: Variable product with no variant info | product_id={_order_product_id}")
-            prompt_msg = build_variant_prompt(_order_product_raw or {}, _order_product_name)
+            prompt_msg = build_variant_prompt(_order_product_raw or {}, _order_product_name, getattr(entities, 'attributes', {}))
 
             if session_id and session_id in sessions:
                 _pfv = _prefetched_variations or []
@@ -199,7 +220,7 @@ def handle_quick_order(
             return jsonify({
                 "success": True,
                 "bot_message": prompt_msg,
-                "intent": INTENT_LABELS.get(intent, "order"),
+                "intent": intent.value,
                 "products": [format_product(_order_product_raw)] if _order_product_raw else [],
                 "suggestions": [],
                 "session_id": session_id,
@@ -249,12 +270,12 @@ def handle_quick_order(
                             + "\n\nWhich one would you like?"
                         )
                     else:
-                        prompt_msg = build_variant_prompt(_order_product_raw or {}, _order_product_name)
+                        prompt_msg = build_variant_prompt(_order_product_raw or {}, _order_product_name, getattr(entities, 'attributes', {}))
                     elapsed = time.time() - start_time
                     return jsonify({
                         "success": True,
                         "bot_message": prompt_msg,
-                        "intent": INTENT_LABELS.get(intent, "order"),
+                        "intent": intent.value,
                         "products": [format_product(_order_product_raw)] if _order_product_raw else [],
                         "suggestions": [],
                         "session_id": session_id,

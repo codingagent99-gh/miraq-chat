@@ -26,7 +26,6 @@ from chat_logger import get_logger
 from formatters import _entities_to_dict
 from handlers.chat_utils import default_pagination
 from handlers.suggestion_builder import build_suggestions
-from response_generator import INTENT_LABELS
 
 logger = get_logger("miraq_chat")
 
@@ -36,8 +35,6 @@ _SEARCH_FILTER_INTENTS = {
     Intent.CATEGORY_BROWSE,
     Intent.FILTER_BY_ATTRIBUTE,
     Intent.PRODUCT_BY_TAG,
-    Intent.PRODUCT_BY_ORIGIN,
-    Intent.PRODUCT_BY_COLLECTION,
 }
 
 
@@ -115,7 +112,7 @@ def handle_empty_results(
         return all_products_raw, (jsonify({
             "success": True,
             "bot_message": _no_results_msg,
-            "intent": INTENT_LABELS.get(intent, "unknown"),
+            "intent": intent.value,
             "products": [],
             "suggestions": [
                 f"Show all {_cat}",
@@ -223,7 +220,7 @@ def handle_empty_results(
         return all_products_raw, (jsonify({
             "success": True,
             "bot_message": suggestion_msg,
-            "intent": INTENT_LABELS.get(intent, "unknown"),
+            "intent": intent.value,
             "products": [],
             "suggestions": [
                 f"Show all {_cat}",

@@ -337,7 +337,7 @@ def classify(utterance: str) -> ClassifiedResult:
     # ─── 6. HIJACK PREVENTION ───
     PRODUCT_SPECIFIC_INTENTS = {
         Intent.PRODUCT_VARIATIONS, Intent.PRODUCT_DETAIL, Intent.PRODUCT_SEARCH,
-        Intent.SIZE_LIST, Intent.PRODUCT_ATTRIBUTE_INFO, Intent.QUICK_ORDER,
+        Intent.PRODUCT_ATTRIBUTE_INFO, Intent.QUICK_ORDER,
         Intent.PLACE_ORDER, Intent.ORDER_ITEM, Intent.SAMPLE_REQUEST
     }
     

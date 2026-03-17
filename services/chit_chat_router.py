@@ -1,5 +1,6 @@
 import time
 import logging
+import re
 from typing import Dict, Any
 
 # Import the existing LLMClient from your project!
@@ -75,6 +76,10 @@ def route_query(message: str) -> Dict[str, Any]:
     Returns {"handled": True, ...} if it intercepts the message.
     """
     start_time = time.time()
+
+    if re.search(r"\b(order|buy|purchase|checkout|cart|shopping)\b", message, re.IGNORECASE):
+        logger.info("Step 0.8: Commerce Fast-Pass triggered. Bypassing Out-Of-Scope router.")
+        return {"handled": False}
     
     # Run the 3-layer check
     result = router.route(message)

@@ -6,37 +6,25 @@ from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
 
-
 class Intent(Enum):
     # Product Discovery
     PRODUCT_LIST           = "product_list"
     PRODUCT_SEARCH         = "product_search"
-    PRODUCT_BY_VISUAL      = "product_by_visual"
     PRODUCT_BY_TAG         = "product_by_tag"
     PRODUCT_CATALOG        = "product_catalog"
     PRODUCT_TYPES          = "product_types"
     PRODUCT_BY_COLLECTION  = "product_by_collection"
-    PRODUCT_BY_ORIGIN      = "product_by_origin"
     PRODUCT_QUICK_SHIP     = "product_quick_ship"
     PRODUCT_DETAIL         = "product_detail"
-    PRODUCT_ATTRIBUTE_INFO = "product_attribute_info"  # "what sizes does X come in?"
+    PRODUCT_ATTRIBUTE_INFO = "product_attribute_info"  # generic: "what [attr] does X come in?"
     RELATED_PRODUCTS       = "related_products"
 
     # ──── Category-Based Browsing ────
     CATEGORY_BROWSE        = "category_browse"
     CATEGORY_LIST          = "category_list"
 
-    # Attribute Filtering
-    FILTER_BY_FINISH       = "filter_by_finish"
+    # ──── Attribute Filtering (THE GENERIC ENGINE) ────
     FILTER_BY_ATTRIBUTE    = "filter_by_attribute"   # generic: any store attribute
-    FILTER_BY_SIZE         = "filter_by_size"
-    FILTER_BY_COLOR        = "filter_by_color"
-    FILTER_BY_THICKNESS    = "filter_by_thickness"
-    FILTER_BY_EDGE         = "filter_by_edge"
-    FILTER_BY_APPLICATION  = "filter_by_application"
-    FILTER_BY_MATERIAL     = "filter_by_material"
-    FILTER_BY_ORIGIN       = "filter_by_origin"
-    SIZE_LIST              = "size_list"
 
     # Discounts & Promotions
     DISCOUNT_INQUIRY       = "discount_inquiry"
@@ -64,13 +52,12 @@ class Intent(Enum):
     QUICK_ORDER            = "quick_order"
 
     # ──── Chit-Chat ────
-    UPDATE_CUSTOMER        = "update_customer"   # update profile fields (no role/email/create)
+    UPDATE_CUSTOMER        = "update_customer"   # update profile fields
     FETCH_CUSTOMER         = "fetch_customer"
     GREETING               = "greeting"
 
     UNKNOWN                = "unknown"
 
-@dataclass
 class AmbiguousFilter:
     """
     Represents a filter term that exists in BOTH a tag and an attribute,

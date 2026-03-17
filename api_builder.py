@@ -284,16 +284,32 @@ def match_variation_to_entities(variations: list, entities) -> Optional[dict]:
 
     for variation in variations:
         score = 0
-        for attr in variation.get("attributes", []):
-            attr_label = attr.get("name", "").lower().strip()
-            attr_option = attr.get("option", "").lower().strip()
-            for ent_label, ent_value in entities.attributes.items():
-                if ent_label.lower().strip() == attr_label:
-                    ent_clean = re.sub(r'[\"\'`]', '', ent_value).strip().lower()
-                    opt_clean = re.sub(r'[\"\'`]', '', attr_option).strip().lower()
-                    if ent_clean == opt_clean or ent_clean in opt_clean or opt_clean in ent_clean:
+        
+        # Normalize attributes into a clean flat dictionary regardless of API source
+        var_attrs_norm = {}
+        raw_attrs = variation.get("attributes", {})
+        if isinstance(raw_attrs, dict):
+            for k, v in raw_attrs.items():
+                clean_k = k.replace("attribute_", "").replace("pa_", "").replace("-", " ").strip().lower()
+                clean_v = str(v).replace("-", " ").strip().lower()
+                var_attrs_norm[clean_k] = clean_v
+        elif isinstance(raw_attrs, list):
+            for a in raw_attrs:
+                clean_k = a.get("name", "").replace("-", " ").strip().lower()
+                clean_v = a.get("option", "").replace("-", " ").strip().lower()
+                var_attrs_norm[clean_k] = clean_v
+                
+        # Compare with requested entities
+        for ent_label, ent_value in entities.attributes.items():
+            ent_k = ent_label.replace("-", " ").strip().lower()
+            ent_v = re.sub(r'[\"\'`]', '', ent_value).strip().lower().replace("-", " ")
+            
+            for v_k, v_v in var_attrs_norm.items():
+                if ent_k in v_k or v_k in ent_k:
+                    if ent_v == v_v or ent_v in v_v or v_v in ent_v:
                         score += 1
                         break
+                        
         if score > best_score:
             best_score = score
             best_variation = variation
@@ -352,21 +368,41 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
 
     elif intent == Intent.ORDER_ITEM:
         product_name = e.order_item_name or e.product_name or ""
-        calls.append(_build_advanced_filter_call(
-            product_id=e.product_id,
-            search_term=product_name if not e.product_id else None,
-            description=f"Find product '{product_name}' for ordering",
-            requires_resolution=[] if e.product_id else ["order_item_step2"]
-        ))
+        
+        attr_filters = {}
+        for label, value in e.attributes.items():
+            slug = _attr_slug_for_label(label)
+            if slug and value:
+                attr_filters[slug] = value
+                
+        if e.product_id or product_name:
+            calls.append(_build_advanced_filter_call(
+                product_id=e.product_id,
+                search_term=product_name if not e.product_id else None,
+                attributes=attr_filters if attr_filters else None,
+                or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
+                description=f"Find product '{product_name}' for ordering",
+                requires_resolution=[] if e.product_id else ["order_item_step2"]
+            ))
 
     elif intent == Intent.QUICK_ORDER:
         search_term = e.order_item_name or e.product_name or ""
-        calls.append(_build_advanced_filter_call(
-            product_id=e.product_id,
-            search_term=search_term if not e.product_id else None,
-            description=f"Find product '{search_term}' for quick order",
-            requires_resolution=[] if e.product_id else ["create_order_from_product"]
-        ))
+        
+        attr_filters = {}
+        for label, value in e.attributes.items():
+            slug = _attr_slug_for_label(label)
+            if slug and value:
+                attr_filters[slug] = value
+                
+        if e.product_id or search_term:
+            calls.append(_build_advanced_filter_call(
+                product_id=e.product_id,
+                search_term=search_term if not e.product_id else None,
+                attributes=attr_filters if attr_filters else None,
+                or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
+                description=f"Find product '{search_term}' for quick order",
+                requires_resolution=[] if e.product_id else ["create_order_from_product"]
+            ))
 
     # ═══════════════════════════════════════════
     # CATEGORY-BASED BROWSING
@@ -764,12 +800,22 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
 
     elif intent == Intent.PLACE_ORDER:
         search_term = e.product_name or e.order_item_name
-        calls.append(_build_advanced_filter_call(
-            product_id=e.product_id,
-            search_term=search_term if not e.product_id else None,
-            page=1,
-            description=f"Find product '{search_term}' for order placement"
-        ))
+        
+        attr_filters = {}
+        for label, value in e.attributes.items():
+            slug = _attr_slug_for_label(label)
+            if slug and value:
+                attr_filters[slug] = value
+                
+        if e.product_id or search_term:
+            calls.append(_build_advanced_filter_call(
+                product_id=e.product_id,
+                search_term=search_term if not e.product_id else None,
+                attributes=attr_filters if attr_filters else None,
+                or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
+                page=1,
+                description=f"Find product '{search_term}' for order placement"
+            ))
 
     # ─── UPDATE_CUSTOMER ─────────────────────────────────────────────────────
     elif intent == Intent.UPDATE_CUSTOMER:

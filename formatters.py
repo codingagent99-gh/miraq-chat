@@ -63,10 +63,17 @@ def format_product(raw: dict) -> dict:
     regular_price = _safe_float(raw.get("regular_price", ""))
     sale_price_raw = raw.get("sale_price", "")
     sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
+    raw_status = raw.get("stock_status", "instock")
+    is_in_stock = (raw_status != "outofstock")
+    if raw.get("type") == "variable" and not is_in_stock:
+        if raw.get("variations"):
+            is_in_stock = True
 
     return {
-        "id":            raw.get("id"),
-        "name":          raw.get("name", ""),
+        "id": raw.get("id"),
+        "name": raw.get("name"),
+        "in_stock": is_in_stock, 
+        "stock_status": raw_status,
         "slug":          raw.get("slug", ""),
         "sku":           raw.get("sku", ""),
         "permalink":     raw.get("permalink", ""),
@@ -75,7 +82,6 @@ def format_product(raw: dict) -> dict:
         "regular_price": regular_price,
         "sale_price":    sale_price,
         "on_sale":       raw.get("on_sale", False),
-        "in_stock":      raw.get("stock_status") == "instock",
         "categories":    cat_names,
         "tags":          tag_names,
         "images":        image_urls,
@@ -93,6 +99,7 @@ def _format_attributes(attrs: list, include_hidden: bool = False) -> list:
             result.append({
                 "name":    attr.get("name", ""),
                 "options": attr.get("options", []),
+                "is_variation": attr.get("variation", False)
             })
     return result
 
@@ -192,14 +199,13 @@ def _filter_variations_by_entities(
 ) -> List[dict]:
     """
     Filter variation list by the attributes the user specified.
-    Each variation has attributes like:
-      [{"name": "Finish", "option": "Matte"}, {"name": "Tile Size", "option": '24"x48"'}]
+    Handles both Native WC arrays and Custom API flat dicts.
     """
     filters: List[tuple] = []
     FINISH_SYNONYMS = {"matt": "matte", "glossy": "polished", "gloss": "polished"}
 
     for attr_label, attr_value in entities.attributes.items():
-        val_lower = attr_value.lower()
+        val_lower = attr_value.lower().replace("-", " ")
         filters.append((attr_label, val_lower))
         if attr_label == "finish":
             normalized = FINISH_SYNONYMS.get(val_lower, val_lower)
@@ -213,12 +219,24 @@ def _filter_variations_by_entities(
 
     matched = []
     for var in variations:
-        if not var.get("attributes"):
+        raw_attrs = var.get("attributes")
+        if not raw_attrs:
             continue
-        var_attrs = {
-            a.get("name", "").lower(): a.get("option", "").lower()
-            for a in var.get("attributes", [])
-        }
+            
+        # Normalize attributes into a clean flat dictionary regardless of API source
+        var_attrs = {}
+        if isinstance(raw_attrs, dict):
+            for k, v in raw_attrs.items():
+                clean_k = k.replace("attribute_", "").replace("pa_", "").replace("-", " ").strip().lower()
+                clean_v = str(v).replace("-", " ").strip().lower()
+                var_attrs[clean_k] = clean_v
+        elif isinstance(raw_attrs, list):
+            for a in raw_attrs:
+                clean_k = a.get("name", "").replace("-", " ").strip().lower()
+                clean_v = a.get("option", "").replace("-", " ").strip().lower()
+                var_attrs[clean_k] = clean_v
+
+        # Check if it matches the user's requested filters
         if all(
             any(f_val in var_attrs.get(f_name, "") for f_name in var_attrs if f_name == attr_name or f_name.startswith(attr_name))
             or any(f_val in opt for opt in var_attrs.values())
@@ -227,7 +245,6 @@ def _filter_variations_by_entities(
             matched.append(var)
 
     return matched if matched else variations
-
 
 def _entities_to_dict(entities: ExtractedEntities) -> dict:
     """Convert entities to a dict for logging/metadata."""
