@@ -458,6 +458,29 @@ def classify(utterance: str) -> ClassifiedResult:
                     if any(attr_term_tokens <= exact_tokens for exact_tokens in exact_tag_tokens):
                         del entities.attributes[attr_label]
 
+    # ─── ATTRIBUTE-VS-ATTRIBUTE ECLIPSED CLEANUP ───
+    # If we extracted a specific attribute (like "ansel-charcoal"), drop any generic attributes (like "charcoal") that are fully eclipsed by it.
+    if entities.attributes and len(entities.attributes) > 1:
+        attr_items = list(entities.attributes.items())
+        to_delete = set()
+        for i, (label1, slug1) in enumerate(attr_items):
+            tokens1 = _normalize_for_tag_compare(slug1.replace("-", " "))
+            for j, (label2, slug2) in enumerate(attr_items):
+                if i == j: continue
+                tokens2 = _normalize_for_tag_compare(slug2.replace("-", " "))
+                
+                # If tokens2 is a strict subset of tokens1, drop label2
+                if tokens2 < tokens1:
+                    to_delete.add(label2)
+                # If they are exact duplicates, prefer the one without numbers in its label (e.g. keep "Colors", drop "Colors 2")
+                elif tokens2 == tokens1:
+                    if re.search(r'\d', label2) and not re.search(r'\d', label1):
+                        to_delete.add(label2)
+                        
+        for label in to_delete:
+            if label in entities.attributes:
+                del entities.attributes[label]
+
     return ClassifiedResult(intent=intent, entities=entities, confidence=confidence)
 
 # ─────────────────────────────────────────────
