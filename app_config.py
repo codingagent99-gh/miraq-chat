@@ -5,6 +5,8 @@ Named app_config to avoid conflict with the existing config/ directory.
 """
 
 import os
+import re
+import logging
 from dotenv import load_dotenv
 from models import Intent
 
@@ -118,8 +120,63 @@ DEFAULT_PAYMENT_METHOD_TITLE = "Cash on Delivery"
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "mistral")  # mistral, copilot, openai, anthropic, azure_openai
 LLM_MODEL = os.getenv("LLM_MODEL", "mistral-large-latest")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-LLM_API_BASE_URL = os.getenv("LLM_API_BASE_URL", "")
 COPILOT_API_TOKEN = os.getenv("COPILOT_API_TOKEN", "")
+
+# Per-provider canonical base URLs used when LLM_API_BASE_URL is not set in .env.
+# azure_openai has no universal endpoint — it must always be supplied explicitly.
+_LLM_PROVIDER_DEFAULT_URLS: dict = {
+    "mistral":      "https://api.mistral.ai/v1/chat/completions",
+    "openai":       "https://api.openai.com/v1/chat/completions",
+    "anthropic":    "https://api.anthropic.com/v1/messages",
+    "copilot":      "https://api.githubcopilot.com/chat/completions",
+    "azure_openai": "",
+}
+
+# Matches accidental markdown link formatting: [https://...](https://...)
+_MARKDOWN_LINK_RE = re.compile(r'^\[.*?\]\((https?://[^)]+)\)$')
+
+
+def _resolve_llm_api_base_url() -> str:
+    """
+    Resolve the LLM API base URL with two layers of protection:
+
+    1. Provider-aware default — if LLM_API_BASE_URL is absent from .env the
+       correct canonical URL for the configured provider is used automatically,
+       so the LLM works out of the box without any .env entry for this field.
+
+    2. Markdown-strip guard — if the value was accidentally copied from rendered
+       documentation as [https://...](https://...), the bare URL is extracted
+       and a startup warning is emitted so the misconfiguration is visible in
+       logs immediately rather than surfacing as a cryptic requests error.
+    """
+    raw = os.getenv("LLM_API_BASE_URL", "").strip()
+
+    if not raw:
+        # Nothing in .env — fall back to the provider-specific canonical URL.
+        url = _LLM_PROVIDER_DEFAULT_URLS.get(LLM_PROVIDER.lower(), "")
+        if url:
+            logging.getLogger("miraq_chat").debug(
+                f"app_config: LLM_API_BASE_URL not set — using provider default "
+                f"for '{LLM_PROVIDER}': {url}"
+            )
+        return url
+
+    # Strip accidental markdown link formatting, e.g.:
+    #   [https://api.mistral.ai/...](https://api.mistral.ai/...)
+    #   → https://api.mistral.ai/...
+    m = _MARKDOWN_LINK_RE.match(raw)
+    if m:
+        cleaned = m.group(1)
+        logging.getLogger("miraq_chat").warning(
+            f"app_config: LLM_API_BASE_URL contains markdown link formatting — "
+            f"auto-corrected | raw={raw!r} -> cleaned={cleaned!r}"
+        )
+        return cleaned
+
+    return raw
+
+
+LLM_API_BASE_URL: str = _resolve_llm_api_base_url()
 
 # LLM behavior settings
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))

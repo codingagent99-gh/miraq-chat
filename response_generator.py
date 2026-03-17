@@ -312,25 +312,77 @@ def generate_bot_message(
     # ── Variation results ──
     if intent in (Intent.PRODUCT_SEARCH, Intent.PRODUCT_DETAIL, Intent.PRODUCT_VARIATIONS) and entities.product_id and page_count > 0:
         parent = products[0]
+        
+        # 1. Extract nested variations from the Custom API if present
         variations = [p for p in products[1:] if p.get("type") == "variation"]
+        if not variations and parent.get("variations"):
+            variations = parent.get("variations", [])
+            
         has_attributes = bool(entities.attributes)
 
-        if intent == Intent.PRODUCT_VARIATIONS or (not has_attributes):
+        def _get_var_label(v):
+            """Safely build a variation label from either standard or custom API formats."""
+            label = v.get("variation_label") or v.get("name", "")
+            if not label and v.get("attributes"):
+                if isinstance(v["attributes"], dict):
+                    label = " / ".join(str(val) for val in v["attributes"].values() if val)
+                elif isinstance(v["attributes"], list):
+                    label = " / ".join(str(a.get("option", "")) for a in v["attributes"] if a.get("option"))
+            return label.strip().title() or f"Variation #{v.get('id', '')}"
+
+        # If we have specific attributes, show the FILTERED specific view!
+        if has_attributes:
+            attr_desc = " / ".join(filter(None, entities.attributes.values())).title()
+            
+            if not variations:
+                return (
+                    f"I found **{parent['name']}** but couldn't find variations matching "
+                    f"**{attr_desc}**. 😕\n\n"
+                    f"Try asking: *'What variations does {parent['name']} come in?'*"
+                )
+                
+            msg = f"🎯 **{parent['name']}** — {attr_desc}\n\n"
+            msg += f"Found **{len(variations)}** matching variation(s):\n\n"
+            
+            for v in variations[:10]:
+                label = _get_var_label(v)
+                price_val = float(v.get("price") or 0)
+                price_str = f"{CS}{price_val:.2f}" if price_val > 0 else ""
+                
+                # Custom API doesn't always send in_stock for nested variations, default to True if returned
+                stock = "✅ In stock" if v.get("in_stock", True) else "❌ Out of stock"
+                
+                line = f"• **{label}**"
+                if price_str:
+                    line += f" — {price_str}"
+                line += f" — {stock}"
+                msg += line + "\n"
+                
+            if len(variations) > 10:
+                msg += f"\n...and {len(variations) - 10} more."
+            return msg
+
+        # Otherwise, generic product variation dump
+        else:
             msg = f"🎯 **{parent['name']}**\n"
             if parent.get("price", 0) > 0:
                 msg += f"💰 Starting from {CS}{parent['price']:.2f}\n"
             if parent.get("short_description"):
                 msg += f"\n{parent['short_description']}\n"
+                
             if variations:
                 msg += f"\n**Available variations ({len(variations)}):**\n"
                 for v in variations[:10]:
-                    label = v.get("variation_label") or v.get("name", "")
-                    price_str = f"{CS}{v['price']:.2f}" if v.get("price", 0) > 0 else ""
-                    stock = "✅" if v.get("in_stock") else "❌"
+                    label = _get_var_label(v)
+                    price_val = float(v.get("price") or 0)
+                    price_str = f"{CS}{price_val:.2f}" if price_val > 0 else ""
+                    stock = "✅" if v.get("in_stock", True) else "❌"
+                    
                     line = f"  {stock} {label}"
                     if price_str:
                         line += f" — {price_str}"
                     msg += line + "\n"
+                    
                 if len(variations) > 10:
                     msg += f"  ...and {len(variations) - 10} more variations.\n"
             elif parent.get("attributes"):
@@ -338,28 +390,6 @@ def generate_bot_message(
                 for attr in parent["attributes"][:4]:
                     opts = ", ".join(attr["options"][:6])
                     msg += f"  • **{attr['name']}:** {opts}\n"
-            return msg
-
-        else:
-            attr_desc = " / ".join(filter(None, entities.attributes.values()))
-            if not variations:
-                return (
-                    f"I found **{parent['name']}** but couldn't find variations matching "
-                    f"**{attr_desc}**. 😕\n\n"
-                    f"Try asking: *'What variations does {parent['name']} come in?'*"
-                )
-            msg = f"🎯 **{parent['name']}** — {attr_desc}\n\n"
-            msg += f"Found **{len(variations)}** matching variation(s):\n\n"
-            for v in variations[:10]:
-                label = v.get("variation_label") or v.get("name", "")
-                price_str = f"{CS}{v['price']:.2f}" if v.get("price", 0) > 0 else ""
-                stock = "✅ In stock" if v.get("in_stock") else "❌ Out of stock"
-                line = f"• **{label}** — {stock}"
-                if price_str:
-                    line = f"• **{label}** — {price_str} — {stock}"
-                msg += line + "\n"
-            if len(variations) > 10:
-                msg += f"\n...and {len(variations) - 10} more."
             return msg
 
     # ── Single product ──

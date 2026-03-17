@@ -64,19 +64,19 @@ def _sanitize_for_llm(text: str) -> str:
     
     # Remove email addresses
     text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', '[EMAIL]', text)
-    
+
     # Remove phone numbers - use most specific pattern first to avoid overlaps
     # International format with country code
     text = re.sub(r'\b\+?\d{1,3}[-.\s]?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,9}\b', '[PHONE]', text)
     # Standard US format
     text = re.sub(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', '[PHONE]', text)
-    
+
     # Remove credit card numbers (basic pattern)
     text = re.sub(r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b', '[CARD]', text)
-    
+
     # Remove SSN-like patterns
     text = re.sub(r'\b\d{3}-\d{2}-\d{4}\b', '[SSN]', text)
-    
+
     return text
 
 
@@ -189,22 +189,33 @@ class LLMClient:
         self.max_tokens = LLM_MAX_TOKENS
         self.timeout = LLM_TIMEOUT_SECONDS
         
+        # ─── URL CLEANER ───
+        # Clean up the base URL right away in case .env has markdown links like [url](url)
+        clean_base_url = LLM_API_BASE_URL
+        if clean_base_url and isinstance(clean_base_url, str):
+            # Extracts just the http://... part out of [text](http://...)
+            match = re.search(r'\]\((https?://.*?)\)', clean_base_url)
+            if match:
+                clean_base_url = match.group(1)
+            # Strips out any stray angle brackets < > or spaces
+            clean_base_url = clean_base_url.strip('<> ')
+        
         # Initialize provider-specific settings
         if self.provider == "copilot":
             self.api_token = COPILOT_API_TOKEN
-            self.api_url = LLM_API_BASE_URL or "https://api.githubcopilot.com/chat/completions"
+            self.api_url = clean_base_url or "https://api.githubcopilot.com/chat/completions"
         elif self.provider == "openai":
             self.api_key = LLM_API_KEY
-            self.api_url = LLM_API_BASE_URL or "https://api.openai.com/v1/chat/completions"
+            self.api_url = clean_base_url or "https://api.openai.com/v1/chat/completions"
         elif self.provider == "anthropic":
             self.api_key = LLM_API_KEY
-            self.api_url = LLM_API_BASE_URL or "https://api.anthropic.com/v1/messages"
+            self.api_url = clean_base_url or "https://api.anthropic.com/v1/messages"
         elif self.provider == "azure_openai":
             self.api_key = LLM_API_KEY
-            self.api_url = LLM_API_BASE_URL  # Must be provided for Azure
+            self.api_url = clean_base_url  # Must be provided for Azure
         elif self.provider == "mistral":
             self.api_key = LLM_API_KEY
-            self.api_url = LLM_API_BASE_URL or "https://api.mistral.ai/v1/chat/completions"
+            self.api_url = clean_base_url or "https://api.mistral.ai/v1/chat/completions"
         else:
             raise ValueError(f"Unsupported LLM provider: {self.provider}")
     

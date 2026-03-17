@@ -178,10 +178,10 @@ class ProductDetailEvaluator(IntentEvaluator):
 
 class CatalogSearchEvaluator(IntentEvaluator):
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
-        # If we have a product AND an attribute (like 'Ansel' + '3x3'), it's a specific product search
+        # If we have a product AND an attribute (like 'Ansel' + '3x3'), it's a specific variation search
         if entities.product_id and entities.attributes:
-            return Intent.PRODUCT_SEARCH, 0.93
-        
+            return Intent.PRODUCT_VARIATIONS, 0.93
+                
         # Use the new target_category_slugs set
         if getattr(entities, 'target_category_slugs', set()):
             if entities.product_name:
@@ -382,9 +382,25 @@ def classify(utterance: str) -> ClassifiedResult:
     # Check for Category vs Attribute overlaps explicitly
     if getattr(entities, 'target_category_slugs', set()) and entities.attributes:
         loader = get_store_loader()
+        
+        # Build a set of normalized tokens for all extracted categories to allow fuzzy matching
+        cat_tokens_map = {}
+        for cat_slug in list(entities.target_category_slugs):
+            cat_obj = loader.category_by_slug.get(cat_slug) if loader else None
+            cat_name = cat_obj.get("name", "").lower() if cat_obj else cat_slug.replace("-", " ")
+            cat_tokens_map[cat_slug] = _normalize_for_tag_compare(cat_name)
+
         for attr_label, attr_slug in list(entities.attributes.items()):
-            # Did the attribute specifically overlap with one of our category slugs?
-            if attr_slug in entities.target_category_slugs or attr_slug == (entities.category_name or "").lower():
+            attr_tokens = _normalize_for_tag_compare(attr_slug.replace("-", " "))
+            
+            # Check if this attribute overlaps with ANY extracted category (handles plurals)
+            overlapping_cat_slug = None
+            for cat_slug, c_tokens in cat_tokens_map.items():
+                if attr_tokens <= c_tokens or c_tokens <= attr_tokens or attr_slug == cat_slug:
+                    overlapping_cat_slug = cat_slug
+                    break
+                    
+            if overlapping_cat_slug:
                 
                 # Resolve the correct taxonomy for this attribute
                 actual_tax = ""
@@ -397,14 +413,14 @@ def classify(utterance: str) -> ClassifiedResult:
                 if actual_tax:
                     # Bundle ONLY the overlapping slug into an OR pair!
                     entities.attr_tag_or_pairs.append({
-                        "cat_slugs": [attr_slug],  # Just the overlapping word!
+                        "cat_slugs": [overlapping_cat_slug],
                         "attr_taxonomy": actual_tax,
                         "attr_term": attr_slug
                     })
                     
                     # Remove ONLY the overlapping slug from the strict category set
-                    if attr_slug in entities.target_category_slugs:
-                        entities.target_category_slugs.remove(attr_slug)
+                    if overlapping_cat_slug in entities.target_category_slugs:
+                        entities.target_category_slugs.remove(overlapping_cat_slug)
                         
                     # If that was the only category, clear the UI name
                     if not entities.target_category_slugs:
@@ -461,7 +477,8 @@ def _extract_category(text: str, entities: ExtractedEntities) -> str:
         if len(name_lower) < 3: 
             continue
 
-        pattern = rf'\b{re.escape(name_lower)}\b'
+        # Use flexible matching to catch singular/plural differences
+        pattern = _create_flexible_pattern(name_lower)
         try:
             if re.search(pattern, text, re.IGNORECASE):
                 # Keep track of the longest match strictly for the UI bot message
@@ -582,9 +599,24 @@ def _extract_attributes(text: str, entities: ExtractedEntities) -> str:
                             
                         # Look for the raw number, optionally followed by any unit type
                         dim_pattern = rf"(?<!\d){escaped_dim}\s*(?:\"|'|mm|cm|inch(?:es)?|in\.?|thick|lbs?|oz|kg|g)?(?!\d)"
-                        if re.search(dim_pattern, masked_text, re.IGNORECASE):
-                            matched_pattern = dim_pattern
-
+                        
+                        match = re.search(dim_pattern, masked_text, re.IGNORECASE)
+                        if match:
+                            # PREVENT OVERLAP: Don't extract a 1D thickness (e.g. 3) from inside a 2D size (e.g. 3x3)
+                            if 'x' not in term_dim:
+                                start, end = match.span()
+                                ctx_before = masked_text[max(0, start-8):start]
+                                ctx_after  = masked_text[end:min(len(masked_text), end+8)]
+                                
+                                # Check if the match is immediately preceded or followed by an 'x' and a digit
+                                if re.search(r'\d\s*(?:\"|\')?\s*(?:x|X|by|×)\s*$', ctx_before) or \
+                                   re.search(r'^\s*(?:\"|\')?\s*(?:x|X|by|×)\s*\d', ctx_after):
+                                    pass # Reject this match, it belongs to a 2D size!
+                                else:
+                                    matched_pattern = dim_pattern
+                            else:
+                                matched_pattern = dim_pattern
+                                
                 # --- 2. STANDARD WORD MATCHER ---
                 if not matched_pattern:
                     if re.search(rf"\b{re.escape(term_name_lower)}\b", masked_text):

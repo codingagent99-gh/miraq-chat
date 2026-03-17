@@ -255,6 +255,11 @@ def _build_advanced_filter_call(
     elif search_term:
         body["search"] = search_term
 
+    import json as built_in_json
+    logger.debug(
+        f"api_builder: Executing advanced filter with body: {built_in_json.dumps(body)}"
+    )
+
     return WooAPICall(
         method="POST",
         endpoint=f"{CUSTOM_API_BASE}/products-advanced-new",
@@ -664,11 +669,22 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
     # ═══════════════════════════════════════════
 
     elif intent == Intent.PRODUCT_VARIATIONS:
+        
+        # 1. Safely build the attribute filters
+        attr_filters = {}
+        for label, value in e.attributes.items():
+            slug = _attr_slug_for_label(label)
+            if slug and value:
+                attr_filters[slug] = value
+                
+        # 2. Pass them into the API call
         calls.append(_build_advanced_filter_call(
             product_id=e.product_id,
             search_term=e.product_name if not e.product_id else None,
+            attributes=attr_filters if attr_filters else None,
+            or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
             page=page,
-            description=f"Get all variations for '{e.product_name}'"
+            description=f"Get specific variations for '{e.product_name}'"
         ))
 
     elif intent == Intent.SAMPLE_REQUEST:
