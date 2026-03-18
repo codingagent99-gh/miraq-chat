@@ -510,6 +510,26 @@ def _extract_category(text: str, entities: ExtractedEntities) -> str:
     if not extracted_cats:
         return text
 
+    # ─── NEW: ECLIPSED CATEGORY CLEANUP ───
+    # If we matched both "Wall/Floor" and "Wall", drop the generic "Wall"
+    # because "Wall/Floor" is more specific and fully eclipses it.
+    cat_tokens_list = [_normalize_for_tag_compare(c.get("name", "")) for c in extracted_cats]
+    survivors = []
+    for i, cat1 in enumerate(extracted_cats):
+        t1 = cat_tokens_list[i]
+        is_eclipsed = False
+        for j, cat2 in enumerate(extracted_cats):
+            if i == j: continue
+            t2 = cat_tokens_list[j]
+            # If cat1's name tokens are a strict subset of cat2's, it's eclipsed!
+            if t1 < t2:  
+                is_eclipsed = True
+                break
+        if not is_eclipsed:
+            survivors.append(cat1)
+            
+    extracted_cats = survivors
+
     # ══════════════════════════════════════════════════════════════
     # 2. HIERARCHY RESOLUTION (The Category Graph)
     # ══════════════════════════════════════════════════════════════

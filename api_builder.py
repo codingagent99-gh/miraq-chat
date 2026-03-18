@@ -179,11 +179,17 @@ def _build_advanced_filter_call(
         conditions.append(_make_condition("product_tag", list(excluded_tags), "NOT IN"))
 
     # ── Categories (include) ──
-    # The classifier already bundled parent/child and duplicates into a perfect set.
-    # We just drop it straight into the payload as a JSON array!
     if categories:
-        conditions.append(_make_condition("product_cat", list(categories), "IN"))
-        
+        if len(categories) > 1:
+            # 🚨 WP tax_query bug workaround 🚨
+            # Force a strict intersection (AND) by splitting multiple categories 
+            # into separate IN conditions, exactly like we do for tags.
+            for cat_slug in categories:
+                conditions.append(_make_condition("product_cat", [cat_slug], "IN"))
+        else:
+            # Single category
+            conditions.append(_make_condition("product_cat", list(categories), "IN"))
+            
     # ── Categories (exclude) ──
     if excluded_categories:
         conditions.append(_make_condition("product_cat", list(excluded_categories), "NOT IN"))
@@ -633,14 +639,20 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             if slug and value:
                 attr_filters[slug] = value
                 
-        # 2. Pass them into the API call
+        # 2. Pass EVERYTHING into the API call so series tags aren't dropped
         calls.append(_build_advanced_filter_call(
             product_id=e.product_id,
             search_term=e.product_name if not e.product_id else None,
             attributes=attr_filters if attr_filters else None,
             or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
+            tags=list(e.tag_slugs) if e.tag_slugs else None,
+            categories=e.target_category_slugs,
+            excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
+            excluded_categories=list(e.excluded_categories) if e.excluded_categories else None,
+            excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None,
+            tag_operator=e.tag_operator,
             page=page,
-            description=f"Get specific variations for '{e.product_name}'"
+            description=f"Get specific variations for '{e.product_name or 'Series'}'"
         ))
 
     elif intent == Intent.SAMPLE_REQUEST:
