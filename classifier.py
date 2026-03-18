@@ -197,14 +197,9 @@ class CatalogSearchEvaluator(IntentEvaluator):
         if re.search(r"\b(what|list|show|all)\b.*\bcategor(y|ies)\b", text):
             return Intent.CATEGORY_LIST, 0.91
 
-        if entities.attributes.get("origin") and not entities.product_name:
-            return Intent.PRODUCT_BY_ORIGIN, 0.88
-
+        # Fallthrough to the generic Attribute Filter engine!
         if entities.attributes and not entities.product_name:
             return Intent.FILTER_BY_ATTRIBUTE, 0.89
-
-        if re.search(r"\b(what|which)\b.*\bsizes?\b", text):
-            return Intent.SIZE_LIST, 0.88
 
         if entities.collection_year:
             return Intent.PRODUCT_BY_COLLECTION, 0.89
@@ -216,7 +211,6 @@ class CatalogSearchEvaluator(IntentEvaluator):
             return Intent.PRODUCT_LIST, 0.87
 
         return None, 0.0
-
 
 class GeneralFallbackEvaluator(IntentEvaluator):
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:

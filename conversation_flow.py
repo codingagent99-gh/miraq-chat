@@ -86,7 +86,6 @@ def get_disambiguation_message() -> dict:
         "flow_state": FlowState.AWAITING_INTENT_CHOICE.value,
     }
 
-
 def handle_flow_state(
     state: FlowState,
     message: str,
@@ -99,6 +98,21 @@ def handle_flow_state(
     to normal classifier pipeline.
     """
     text = message.lower().strip()
+
+    # ══════════════════════════════════════════════════════════
+    # ── GLOBAL ESCAPE HATCH: Allow users to exit ANY flow ──
+    # ══════════════════════════════════════════════════════════
+    if state not in (FlowState.IDLE, FlowState.AWAITING_ANYTHING_ELSE):
+        # Exact matches or starts-with to prevent accidental triggers 
+        # (e.g., we want to catch "cancel order" but not "I want to order cancela tiles")
+        exit_phrases = ["cancel", "exit", "stop", "quit", "nevermind", "never mind", "abort", "start over"]
+        if text in exit_phrases or any(text.startswith(p + " ") for p in exit_phrases):
+            return {
+                "bot_message": "No problem! I've cancelled that. Is there anything else I can help with? 😊",
+                "suggestions": ["Show me products", "Browse categories", "No, thank you"],
+                "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
+                "pass_through": False,
+            }
 
     # ── State: User is picking intent from menu ──
     if state == FlowState.AWAITING_INTENT_CHOICE:

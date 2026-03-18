@@ -532,31 +532,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             max_price=e.max_price,
         ))
 
-    elif intent == Intent.PRODUCT_BY_ORIGIN:
-        origin = e.attributes.get("origin", "")
-        attr_slug = _attr_slug_for_label("origin") or e.attribute_slug
-        origin_or_pairs = []
-        if attr_slug and origin and e.tag_slugs:
-            for tag_slug in e.tag_slugs:
-                origin_or_pairs.append({
-                    "tag_slug":      tag_slug,
-                    "attr_taxonomy": attr_slug,
-                    "attr_term":     origin,
-                })
-        calls.append(_build_advanced_filter_call(
-            tags=None if origin_or_pairs else (list(e.tag_slugs) if e.tag_slugs else None),
-            categories=e.target_category_slugs,
-            attributes=None if origin_or_pairs else ({attr_slug: origin} if (attr_slug and origin) else None),
-            or_pairs=origin_or_pairs or (list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None),
-            excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
-            excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None,
-            tag_operator=e.tag_operator,
-            page=page,
-            description=f"Products from {origin}",
-            min_price=e.min_price,
-            max_price=e.max_price,
-        ))
-
     elif intent == Intent.PRODUCT_QUICK_SHIP:
         calls.append(_build_advanced_filter_call(
             tags=[TAG_SLUG_QUICK_SHIP],
@@ -644,61 +619,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             search_term=e.product_name,
             product_id=e.product_id
         ))        
-
-    elif intent == Intent.FILTER_BY_FINISH:
-        finish_value = e.attributes.get("finish", "")
-        finish_slug = _attr_slug_for_label("finish") or e.attribute_slug
-        finish_or_pairs = []
-        if finish_slug and finish_value and e.tag_slugs:
-            finish_or_pairs = [
-                {"attribute": finish_slug, "value": finish_value},
-                {"tag": list(e.tag_slugs)[0]},
-            ]
-
-        attr_filters = {}
-        if finish_slug and finish_value:
-            attr_filters[finish_slug] = finish_value
-
-        calls.append(_build_advanced_filter_call(
-            tags=list(e.tag_slugs) if e.tag_slugs else None,
-            categories=e.target_category_slugs,
-            attributes=attr_filters if attr_filters else None,
-            page=page,
-            excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
-            excluded_categories=list(e.excluded_categories) if e.excluded_categories else None,
-            excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None,
-            tag_operator=e.tag_operator,
-            or_pairs=finish_or_pairs if finish_or_pairs else None,
-            description=f"Filter by finish: {finish_value}",
-            min_price=e.min_price,
-            max_price=e.max_price,
-            search_term=e.product_name,
-            product_id=e.product_id
-        ))
-
-    elif intent == Intent.SIZE_LIST:
-        if e.product_id or e.product_name:
-            calls.append(_build_advanced_filter_call(
-                product_id=e.product_id,
-                search_term=e.product_name if not e.product_id else None,
-                page=page,
-                description=f"Get product '{e.product_name}' to extract sizes"
-            ))
-        else:
-            l = _loader()
-            if l and l.all_attributes_raw:
-                for attr in l.all_attributes_raw:
-                    if "size" in attr.get("attribute_label", "").lower():
-                        size_slug = attr.get("taxonomy")
-                        attr_id = _attr_id(size_slug) if size_slug else None
-                        if attr_id:
-                            calls.append(WooAPICall(
-                                method="GET",
-                                endpoint=f"{BASE}/products/attributes/{attr_id}/terms",
-                                params={"per_page": 100},
-                                description="List all available sizes",
-                            ))
-                        break
 
     # ═══════════════════════════════════════════
     # VARIATIONS

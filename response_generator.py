@@ -492,14 +492,12 @@ def generate_suggestions(
     if intent == Intent.GREETING:
         suggestions = [
             "Show me all products",
-            "What categories do you have?",
-            "Show me what's on sale",
+            "View my orders",
         ]
     elif intent in (Intent.PRODUCT_SEARCH, Intent.PRODUCT_LIST, Intent.CATEGORY_BROWSE):
         if products:
-            suggestions.append("Show me what's on sale")
-            suggestions.append("Show me quick ship products")
-            suggestions.append("What categories do you have?")
+            suggestions.append("Show me all products")
+            suggestions.append("View my orders")
     elif intent == Intent.PRODUCT_DETAIL:
         if products:
             suggestions.append(f"Order {products[0]['name']}")
@@ -510,11 +508,11 @@ def generate_suggestions(
             if p_name:
                 suggestions.append(f"Order {p_name}")
                 suggestions.append(f"Show all {p_name} products")
-        suggestions.append("What categories do you have?")
+        suggestions.append("Show me all products")
     
     elif intent == Intent.FILTER_BY_ATTRIBUTE:
         suggestions.append("Show me all products")
-        suggestions.append("What categories do you have?")
+        suggestions.append("View my orders")
         
     elif intent == Intent.SAMPLE_REQUEST:
         if products:
@@ -524,24 +522,16 @@ def generate_suggestions(
                 suggestions.append(f"What sizes does {p_name} come in?")
         suggestions.append("Show me all products")
     elif intent == Intent.UPDATE_CUSTOMER:
-        return ["Show me products on sale", "What categories do you have?", "Show me new releases"]
+        return ["Show me all products", "View my orders"]
     elif intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY):
         suggestions.append("Reorder my last order")
-        suggestions.append("Show me products")
+        suggestions.append("Show me all products")
     elif intent == Intent.CATEGORY_LIST:
         if products:
             for cat in products[:3]:
                 suggestions.append(f"Show me {cat['name']}")
 
     return suggestions
-
-def _resolve_user_placeholders(api_calls: List[WooAPICall], customer_id: int):
-    """Replace CURRENT_USER_ID / CURRENT_USER placeholders."""
-    for call in api_calls:
-        for key, val in list(call.params.items()):
-            if isinstance(val, str) and val in USER_PLACEHOLDERS:
-                call.params[key] = str(customer_id)
-
 
 def _format_order_date(date_created: str) -> str:
     """Format an ISO date string to a readable format."""
