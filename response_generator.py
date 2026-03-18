@@ -533,6 +533,14 @@ def generate_suggestions(
 
     return suggestions
 
+def _resolve_user_placeholders(api_calls: List[WooAPICall], customer_id: int):
+    """Replace CURRENT_USER_ID / CURRENT_USER placeholders."""
+    for call in api_calls:
+        for key, val in list(call.params.items()):
+            if isinstance(val, str) and val in USER_PLACEHOLDERS:
+                call.params[key] = str(customer_id)
+
+
 def _format_order_date(date_created: str) -> str:
     """Format an ISO date string to a readable format."""
     if not date_created:

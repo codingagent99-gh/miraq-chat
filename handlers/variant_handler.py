@@ -54,15 +54,12 @@ def handle_variant_selection(
     Step 3.55: Resolve variant selection from user response.
     Returns Flask response or None.
     """
-    
-    # --- HELPER: Safely extract options whether from Custom API (dict) or Standard WC (list) ---
     def _get_safe_options(attrs):
         if isinstance(attrs, dict):
             return {k.replace("pa_", "").replace("-", " ").title(): str(v).replace("-", " ").title() for k, v in attrs.items() if v}
         elif isinstance(attrs, list):
             return {a.get("name", ""): a.get("option", "") for a in attrs if isinstance(a, dict) and a.get("name") and a.get("option")}
         return {}
-    # -----------------------------------------------------------------------------------------
 
     _ABANDON_INTENTS = {
         Intent.PRODUCT_SEARCH, Intent.PRODUCT_LIST, Intent.CATEGORY_BROWSE,
@@ -81,7 +78,7 @@ def handle_variant_selection(
             sessions[session_id]["user_context"].pop("pending_product_name", None)
             sessions[session_id]["user_context"].pop("pending_quantity", None)
             sessions[session_id]["user_context"].pop("resolved_attributes", None)
-        return None  # fall through with IDLE flow state
+        return None
 
     if not (current_flow_state == FlowState.AWAITING_VARIANT_SELECTION and customer_id):
         return None
@@ -94,7 +91,6 @@ def handle_variant_selection(
     if not _var_product_id:
         return None
 
-    # ── Load variations (session cache or API) ──
     _session_data = sessions.get(session_id, {})
     _var_cache = _session_data.get("variation_cache", {}).get(str(_var_product_id))
     if _var_cache:
@@ -116,7 +112,6 @@ def handle_variant_selection(
     if not _variations_loaded:
         return None
 
-    # ── Pre-filter using resolved attributes from prior turns ──
     prev_resolved = user_context.get("resolved_attributes", {})
     if prev_resolved:
         user_msg_lower = message.lower()
@@ -146,7 +141,6 @@ def handle_variant_selection(
         if pre_filtered:
             all_variations = pre_filtered
 
-    # ── Score/match variations against user message ──
     if _resolve_variant:
         user_text_lower = message.lower()
         user_text_clean = _STRIP_QUOTES_RE.sub('', user_text_lower)
@@ -173,7 +167,6 @@ def handle_variant_selection(
             if text_matched and len(text_matched) < len(candidates):
                 matched = text_matched
 
-    # ── Single match — enter confirmation flow ──
     if len(matched) == 1:
         _resolved_variation = matched[0]
         _resolved_variation_id = _resolved_variation["id"]
@@ -186,7 +179,7 @@ def handle_variant_selection(
                 "bot_message": f"I'm sorry, but that specific variant is currently out of stock! 😔\n\nWould you like to choose a different finish or size?",
                 "intent": "guided_flow",
                 "products": [],
-                "suggestions": ["Show me other options", "Cancel"],
+                "suggestions": ["Show me other options", "Cancel Order"],
                 "session_id": session_id,
                 "metadata": {
                     "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
@@ -199,7 +192,6 @@ def handle_variant_selection(
                 "pagination": default_pagination(page),
             }), 200
 
-        # Safe label extraction using our helper!
         _variant_label = " / ".join(_get_safe_options(_resolved_variation.get("attributes", [])).values())
         
         _variant_price = (
@@ -219,11 +211,11 @@ def handle_variant_selection(
                     f"**Product:** {_var_product_name}\n"
                     f"**Variant:** {_variant_label}"
                     f"{_price_line}\n\n"
-                    f"How many would you like to order? 🛒"
+                    f"How many would you like to order? You can tap an option below or type any exact number in the chat. 🛒"
                 ),
                 "intent": "guided_flow",
                 "products": [],
-                "suggestions": ["1", "5", "10", "25"],
+                "suggestions": ["1", "5", "10", "25", "Cancel Order"],
                 "session_id": session_id,
                 "metadata": {
                     "flow_state": FlowState.AWAITING_QUANTITY.value,
@@ -236,7 +228,6 @@ def handle_variant_selection(
                 "pagination": default_pagination(page),
             }), 200
 
-        # Quantity known — proceed to shipping
         shipping_address = fetch_shipping_address(customer_id, "Step 3.55")
         has_address = bool(shipping_address and (shipping_address.get("address_1") or shipping_address.get("city")))
 
@@ -264,7 +255,7 @@ def handle_variant_selection(
                 ),
                 "intent": "guided_flow",
                 "products": [],
-                "suggestions": ["Yes, use this address", "Change address", "Cancel"],
+                "suggestions": ["Yes, use this address", "Change address", "Cancel Order"],
                 "session_id": session_id,
                 "metadata": {**base_meta, "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value},
                 "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value,
@@ -277,14 +268,13 @@ def handle_variant_selection(
                 "bot_message": "No shipping address is on file. Please type your shipping address (street, city, state, zip code):",
                 "intent": "guided_flow",
                 "products": [],
-                "suggestions": [],
+                "suggestions": ["Cancel Order"],
                 "session_id": session_id,
                 "metadata": {**base_meta, "flow_state": FlowState.AWAITING_NEW_ADDRESS.value},
                 "flow_state": FlowState.AWAITING_NEW_ADDRESS.value,
                 "pagination": default_pagination(page),
             }), 200
 
-    # ── Multiple or no match — ask user to narrow down ──
     resolved_attributes = {}
     if len(matched) > 1:
         attr_values = {}
@@ -355,7 +345,7 @@ def handle_variant_selection(
         "bot_message": prompt_msg,
         "intent": "guided_flow",
         "products": [],
-        "suggestions": [],
+        "suggestions": ["Cancel Order"],
         "session_id": session_id,
         "metadata": {
             "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
@@ -368,6 +358,7 @@ def handle_variant_selection(
         "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
         "pagination": default_pagination(page),
     }), 200
+
 
 def handle_variation_product(
     intent,
@@ -526,7 +517,6 @@ def handle_variation_product(
         "pagination": pagination,
     }), 200
 
-
 def handle_quantity_and_variant_check(
     intent,
     entities,
@@ -563,6 +553,7 @@ def handle_quantity_and_variant_check(
     # ── OUT OF STOCK INTERCEPT ──
     if product.get("stock_status") == "outofstock":
         elapsed = time.time() - start_time
+        from conversation_flow import FlowState
         return jsonify({
             "success": True,
             "bot_message": f"I'm so sorry, but **{product['name']}** is currently out of stock!",
@@ -583,6 +574,7 @@ def handle_quantity_and_variant_check(
         if product.get("type") == "variable":
             _raw_for_prompt = next((p for p in all_products_raw if not p.get("parent_id")), {})
             _variations_for_cache = _raw_for_prompt.get("variations", [])
+            from handlers.chat_utils import build_variant_prompt
             prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}))
             if session_id and session_id in sessions:
                 _pid = str(product.get("id"))
@@ -592,12 +584,14 @@ def handle_quantity_and_variant_check(
                 }
                 logger.info(f"Step 5.5: Cached {len(_variations_for_cache)} variations for product_id={_pid} in session")
             elapsed = time.time() - start_time
+            from conversation_flow import FlowState
             return jsonify({
                 "success": True,
                 "bot_message": prompt_msg,
                 "intent": intent.value,
                 "products": products_formatted[:1],
-                "suggestions": [],
+                # 👇 Fixed: Now shows the Cancel Order suggestion!
+                "suggestions": ["Cancel Order"], 
                 "session_id": session_id,
                 "metadata": {
                     "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
@@ -610,12 +604,13 @@ def handle_quantity_and_variant_check(
             }), 200
 
         elapsed = time.time() - start_time
+        from conversation_flow import FlowState
         return jsonify({
             "success": True,
-            "bot_message": f"Sure, I can order **{product['name']}** for you! How many do you need? 🛒",
+            "bot_message": f"Sure, I can order **{product['name']}** for you! How many do you need? You can tap an option below or type any exact number in the chat. 🛒",
             "intent": intent.value,
             "products": products_formatted[:1],
-            "suggestions": ["1", "5", "10", "25"],
+            "suggestions": ["1", "5", "10", "25", "Cancel Order"],
             "session_id": session_id,
             "metadata": {
                 "flow_state": FlowState.AWAITING_QUANTITY.value,
@@ -631,6 +626,7 @@ def handle_quantity_and_variant_check(
     if entities.quantity and not order_data and product.get("type") == "variable":
         _raw_for_prompt = next((p for p in all_products_raw if not p.get("parent_id")), {})
         _variations_for_cache = _raw_for_prompt.get("variations", [])
+        from handlers.chat_utils import build_variant_prompt
         prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}))
         if session_id and session_id in sessions:
             _pid = str(product.get("id"))
@@ -640,12 +636,14 @@ def handle_quantity_and_variant_check(
             }
             logger.info(f"Step 5.5: Cached {len(_variations_for_cache)} variations for product_id={_pid} in session")
         elapsed = time.time() - start_time
+        from conversation_flow import FlowState
         return jsonify({
             "success": True,
             "bot_message": prompt_msg,
             "intent": intent.value,
             "products": products_formatted[:1],
-            "suggestions": [],
+            # 👇 Fixed: Now shows the Cancel Order suggestion!
+            "suggestions": ["Cancel Order"],
             "session_id": session_id,
             "metadata": {
                 "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
