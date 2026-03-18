@@ -294,42 +294,6 @@ def generate_bot_message(
             "• Specific finishes or colors"
         )
 
-    # ── Size list for a specific product ──
-    if intent == Intent.SIZE_LIST and entities.product_id:
-        product_name = entities.product_name or "this product"
-        if page_count == 0:
-            return (
-                f"I couldn't find any size information for **{product_name}**. "
-                f"Try asking: *'Show me {product_name} products'*"
-            )
-        size_map = {}
-        for p in products[1:]:
-            for attr in p.get("attributes", []):
-                attr_name = attr.get("name", "")
-                if "size" in attr_name.lower():
-                    option = attr.get("option") or attr.get("value", "")
-                    if option:
-                        size_map.setdefault(attr_name, set()).add(option)
-
-        if not size_map:
-            parent = products[0]
-            for attr in parent.get("attributes", []):
-                attr_name = attr.get("name", "")
-                if "size" in attr_name.lower():
-                    for opt in attr.get("options", []):
-                        size_map.setdefault(attr_name, set()).add(opt)
-
-        if size_map:
-            msg = f"📐 **{product_name}** is available in the following sizes:\n\n"
-            for attr_name, options in size_map.items():
-                sorted_opts = sorted(options)
-                msg += f"**{attr_name}:**\n"
-                for opt in sorted_opts:
-                    msg += f"  • {opt}\n"
-            return msg
-
-        return f"I couldn't find specific size options for **{product_name}**."
-
     # ── Variation results ──
     if intent in (Intent.PRODUCT_SEARCH, Intent.PRODUCT_DETAIL, Intent.PRODUCT_VARIATIONS) and entities.product_id and page_count > 0:
         parent = products[0]

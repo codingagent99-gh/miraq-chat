@@ -63,11 +63,21 @@ def format_product(raw: dict) -> dict:
     regular_price = _safe_float(raw.get("regular_price", ""))
     sale_price_raw = raw.get("sale_price", "")
     sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
+    
+    # ── SMART STOCK CHECK ──
     raw_status = raw.get("stock_status", "instock")
     is_in_stock = (raw_status != "outofstock")
+    
     if raw.get("type") == "variable" and not is_in_stock:
-        if raw.get("variations"):
-            is_in_stock = True
+        variations = raw.get("variations", [])
+        if variations:
+            is_in_stock = any(
+                v.get("stock_status") == "instock" or v.get("in_stock") is True 
+                for v in variations
+            )
+
+    # ── HONEST DATA: Pass exactly what the API reports ──
+    is_on_sale = raw.get("on_sale", False)
 
     return {
         "id": raw.get("id"),
@@ -81,7 +91,7 @@ def format_product(raw: dict) -> dict:
         "price":         price,
         "regular_price": regular_price,
         "sale_price":    sale_price,
-        "on_sale":       raw.get("on_sale", False),
+        "on_sale":       is_on_sale,
         "categories":    cat_names,
         "tags":          tag_names,
         "images":        image_urls,
@@ -89,7 +99,6 @@ def format_product(raw: dict) -> dict:
         "raw_attributes": _format_attributes(raw.get("attributes", []), include_hidden=True),
         "variations":    raw.get("variations", []),
     }
-
 
 def _format_attributes(attrs: list, include_hidden: bool = False) -> list:
     """Format product attributes for response."""
@@ -112,7 +121,10 @@ def format_custom_product(raw: dict) -> dict:
     regular_price = _safe_float(raw.get("regular_price") or raw.get("regular", ""))
     sale_price_raw = raw.get("sale_price", "") or raw.get("sale", "")
     sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
-    on_sale = bool(sale_price_raw and sale_price_raw != "")
+    
+    # ── HONEST DATA ──
+    is_in_stock = raw.get("stock_status") == "instock"
+    is_on_sale = bool(sale_price_raw and sale_price_raw != "")
 
     # Attributes come as {slug: {...}} — convert to [{name, options}]
     attributes_dict = raw.get("attributes", {})
@@ -137,8 +149,8 @@ def format_custom_product(raw: dict) -> dict:
         "price":         price,
         "regular_price": regular_price,
         "sale_price":    sale_price,
-        "on_sale":       on_sale,
-        "in_stock":      raw.get("stock_status") == "instock",
+        "on_sale":       is_on_sale,
+        "in_stock":      is_in_stock,
         "categories":    cat_names,
         "images":        image_urls,
         "attributes":    attributes,
@@ -151,6 +163,10 @@ def format_variation(raw: dict, parent: dict = None) -> dict:
     regular_price = _safe_float(raw.get("regular_price", ""))
     sale_price_raw = raw.get("sale_price", "")
     sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
+
+    # ── HONEST DATA ──
+    is_in_stock = raw.get("stock_status") == "instock"
+    is_on_sale = raw.get("on_sale", False)
 
     attrs_raw = raw.get("attributes", [])
     # Custom API returns attributes as a flat dict {pa_finish: "matte"};
@@ -186,13 +202,12 @@ def format_variation(raw: dict, parent: dict = None) -> dict:
         "price":           price,
         "regular_price":   regular_price,
         "sale_price":      sale_price,
-        "on_sale":         raw.get("on_sale", False),
-        "in_stock":        raw.get("stock_status") == "instock",
+        "on_sale":         is_on_sale,
+        "in_stock":        is_in_stock,
         "images":          [image_url] if image_url else (parent.get("images", []) if parent else []),
         "attributes":      attrs,
         "variation_label": attr_label,
     }
-
 
 def _filter_variations_by_entities(
     variations: List[dict], entities: ExtractedEntities
