@@ -597,7 +597,7 @@ def chat():
     # ─── Step 5.5: Quantity / variant still needed? ───
     resp = handle_quantity_and_variant_check(
         intent, entities, all_products_raw, order_data,
-        ORDER_CREATE_INTENTS, session_id, page, start_time, sessions,
+        ORDER_CREATE_INTENTS, session_id, page, start_time, sessions, customer_id=customer_id
     )
     if resp:
         return resp

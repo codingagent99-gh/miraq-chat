@@ -297,6 +297,7 @@ def generate_bot_message(
     # ── Variation results ──
     if intent in (Intent.PRODUCT_SEARCH, Intent.PRODUCT_DETAIL, Intent.PRODUCT_VARIATIONS) and entities.product_id and page_count > 0:
         parent = products[0]
+        print("products", products)
         
         # 1. Extract nested variations from the Custom API if present
         variations = [p for p in products[1:] if p.get("type") == "variation"]
@@ -304,7 +305,6 @@ def generate_bot_message(
             variations = parent.get("variations", [])
             
         has_attributes = bool(entities.attributes)
-
         def _get_var_label(v):
             """Safely build a variation label from either standard or custom API formats."""
             label = v.get("variation_label") or v.get("name", "")

@@ -715,13 +715,13 @@ def _extract_attributes(text: str, entities: ExtractedEntities) -> str:
                                     break
                                         
                     # --- THE OVERRIDE LOGIC ---
-                    if exact_tag_matched:
+                    if exact_tag_matched and not entities.product_name:
                         # User typed the EXACT tag. Add to strict Tag list and DO NOT assign an attribute!
                         if covering_tag_id not in entities.tag_ids:
                             entities.tag_ids.append(covering_tag_id)
                             entities.tag_slugs.append(covering_tag_slug)
                             
-                    elif covered_by_tag:
+                    elif covered_by_tag and not entities.product_name:
                         # User was generic. Build the broad OR pair.
                         entities.attr_tag_or_pairs.append({
                             "tag_slug": covering_tag_slug, 
@@ -730,7 +730,7 @@ def _extract_attributes(text: str, entities: ExtractedEntities) -> str:
                         })
                         
                     else:
-                        # Standard attribute assignment
+                        # Standard attribute assignment (Forced for specific products)
                         term_slug = term.get("slug", term_name)
                         entities.attributes[label] = term_slug
                         entities.attribute_slug = taxonomy
