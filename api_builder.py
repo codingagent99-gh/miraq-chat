@@ -154,6 +154,7 @@ def _build_advanced_filter_call(
     search_term: str = None,
     product_id: int = None,
     requires_resolution: List[str] = None,
+    in_stock: Optional[bool] = None,
 ) -> WooAPICall:
     
     conditions = []
@@ -251,16 +252,19 @@ def _build_advanced_filter_call(
                 or_conditions.append(_make_condition(attr_taxonomy, [term_slug], "IN"))
                 
             if len(or_conditions) >= 2:
-                conditions.append(_make_or_group(or_conditions))                       
+                conditions.append(_make_or_group(or_conditions))
+                      
 
     body = _serialize_query(conditions, page, per_page, min_price=min_price, max_price=max_price)
 
+    if in_stock:
+        body["stock_status"] = "instock"
     # Apply the top-level parameters defined in the updated custom API spec
     if product_id:
         body["ids"] = [product_id]
     elif search_term:
         body["search"] = search_term
-
+        
     import json as built_in_json
     logger.debug(
         f"api_builder: Executing advanced filter with body: {built_in_json.dumps(body)}"
@@ -617,6 +621,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             excluded_categories=list(e.excluded_categories) if e.excluded_categories else None,
             tag_operator=e.tag_operator,
             page=page,
+            in_stock=e.in_stock,
             min_price=e.min_price,
             max_price=e.max_price,
             categories=e.target_category_slugs,

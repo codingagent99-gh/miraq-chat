@@ -169,7 +169,7 @@ class ProductDetailEvaluator(IntentEvaluator):
             return Intent.RELATED_PRODUCTS, 0.88
             
         # QUICK SHIP
-        if re.search(r"\bquick\s*ship\b|\bin\s*stock\b|\bavailable\s*now\b|\bimmediate\b", text):
+        if re.search(r"\bquick\s*ship\b|\bavailable\s*now\b|\bimmediate\b", text):
             entities.quick_ship = True
             return Intent.PRODUCT_QUICK_SHIP, 0.91
             
@@ -229,6 +229,9 @@ class GeneralFallbackEvaluator(IntentEvaluator):
 
         if entities.order_item_name:
             return Intent.QUICK_ORDER, 0.90
+        
+        if (entities.attributes or entities.in_stock) and not entities.product_name:
+            return Intent.FILTER_BY_ATTRIBUTE, 0.89
 
         return Intent.UNKNOWN, 0.0
 
@@ -315,6 +318,7 @@ def classify(utterance: str) -> ClassifiedResult:
     _extract_customer_updates(text, entities)  
     _detect_tag_operator(text, entities)       
     _extract_customer_fetch(text, entities)
+    _extract_stock_status(text, entities)
 
     # ─── 5. EXECUTE INTENT PIPELINE ───
     pipeline = ClassifierPipeline([
@@ -480,6 +484,11 @@ def classify(utterance: str) -> ClassifiedResult:
 # ─────────────────────────────────────────────
 # ENTITY EXTRACTION HELPERS 
 # ─────────────────────────────────────────────
+
+def _extract_stock_status(text: str, entities: ExtractedEntities):
+    if re.search(r"\bin[- ]*stock\b", text):
+        entities.in_stock = True
+        
 def _extract_category(text: str, entities: ExtractedEntities) -> str:
     loader = get_store_loader()
     if not loader or not loader.category_by_slug: 
