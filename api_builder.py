@@ -178,19 +178,23 @@ def _build_advanced_filter_call(
     # ── Tags (exclude) ──
     if excluded_tags:
         conditions.append(_make_condition("product_tag", list(excluded_tags), "NOT IN"))
-
+        
     # ── Categories (include) ──
     if categories:
-        if len(categories) > 1:
-            # 🚨 WP tax_query bug workaround 🚨
-            # Force a strict intersection (AND) by splitting multiple categories 
-            # into separate IN conditions, exactly like we do for tags.
-            for cat_slug in categories:
-                conditions.append(_make_condition("product_cat", [cat_slug], "IN"))
-        else:
-            # Single category
-            conditions.append(_make_condition("product_cat", list(categories), "IN"))
+        # Group categories by their base prefix to solve the AND vs OR dilemma!
+        grouped_cats = {}
+        for cat_slug in categories:
+            # E.g., 'floor-2' -> 'floor', 'floor-exterior' -> 'floor'
+            base_slug = cat_slug.split('-')[0] 
+            if base_slug not in grouped_cats:
+                grouped_cats[base_slug] = []
+            grouped_cats[base_slug].append(cat_slug)
             
+        for base_slug, slugs in grouped_cats.items():
+            # Distinct terms ("exterior", "pavers") become separate AND conditions.
+            # Duplicate terms ("floor", "floor-2", "floor-exterior") get bundled into a single OR array!
+            conditions.append(_make_condition("product_cat", slugs, "IN"))
+
     # ── Categories (exclude) ──
     if excluded_categories:
         conditions.append(_make_condition("product_cat", list(excluded_categories), "NOT IN"))
