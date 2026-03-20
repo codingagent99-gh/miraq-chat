@@ -354,9 +354,9 @@ def generate_bot_message(
                 msg += f"💰 Starting from {CS}{parent['price']:.2f}\n"
             if parent.get("short_description"):
                 msg += f"\n{parent['short_description']}\n"
-                
+               
             if variations:
-                msg += f"\n**Available variations ({len(variations)}):**\n"
+                msg += f"\n**Available variations ({len(variations)}):** *(✅ In Stock | ❌ Out of Stock)*\n"
                 for v in variations[:10]:
                     label = _get_var_label(v)
                     price_val = float(v.get("price") or 0)
