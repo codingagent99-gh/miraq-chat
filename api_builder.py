@@ -664,25 +664,6 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             description=f"Get specific variations for '{e.product_name or 'Series'}'"
         ))
 
-    elif intent == Intent.SAMPLE_REQUEST:
-        if e.product_id or e.product_name:
-            calls.append(_build_advanced_filter_call(
-                product_id=e.product_id,
-                search_term=e.product_name if not e.product_id else None,
-                page=page,
-                description=f"Get product '{e.product_name}' for sample size check"
-            ))
-        else:
-            sample_slug = _attr_slug_for_label("sample size")
-            attr_id = _attr_id(sample_slug) if sample_slug else None
-            if attr_id:
-                calls.append(WooAPICall(
-                    method="GET",
-                    endpoint=f"{BASE}/products/attributes/{attr_id}/terms",
-                    params={"per_page": 100},
-                    description="List available sample sizes",
-                ))                
-
     # ═══════════════════════════════════════════
     # DISCOUNTS & SALES
     # ═══════════════════════════════════════════

@@ -117,13 +117,6 @@ class DiscountEvaluator(IntentEvaluator):
 
 class ProductDetailEvaluator(IntentEvaluator):
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
-        if re.search(r"\bsamples?\b", text) and (entities.product_name or re.search(r"\bsample\s+size\b", text) or re.search(r'\d+\s*"?\s*(?:x|by|×)\s*\d+', text)):
-            return Intent.SAMPLE_REQUEST, 0.93
-            
-        if entities.product_name and re.search(r"\bsamples?\b", text):
-            entities.target_attribute = "sample size"
-            return Intent.PRODUCT_ATTRIBUTE_INFO, 0.93
-
         # PRODUCT ATTRIBUTE INFO
         if entities.product_name and re.search(r"\b(what|which)\b.*\b(available|come|have|does|do|offer)\b", text):
             _loader_ref = get_store_loader()
@@ -336,7 +329,7 @@ def classify(utterance: str) -> ClassifiedResult:
     PRODUCT_SPECIFIC_INTENTS = {
         Intent.PRODUCT_VARIATIONS, Intent.PRODUCT_DETAIL, Intent.PRODUCT_SEARCH,
         Intent.PRODUCT_ATTRIBUTE_INFO, Intent.QUICK_ORDER,
-        Intent.PLACE_ORDER, Intent.ORDER_ITEM, Intent.SAMPLE_REQUEST
+        Intent.PLACE_ORDER, Intent.ORDER_ITEM
     }
     
     if getattr(entities, 'target_category_slugs', set()) and entities.product_id is not None:

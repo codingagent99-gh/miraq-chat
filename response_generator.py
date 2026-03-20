@@ -186,77 +186,6 @@ def generate_bot_message(
             f"Try searching for it by name, or ask: *'Show me {product_name} products'*"
         )
 
-    # ── Sample request ──
-    if intent == Intent.SAMPLE_REQUEST:
-        product_name = entities.product_name or "that product"
-
-        # Extract requested sample size from entities (e.g. "3x3" from user text)
-        requested_size = entities.attributes.get("sample size", "")
-
-        if page_count == 0:
-            return (
-                f"I couldn't find **{product_name}** in our catalog. 😕\n\n"
-                "Try searching for it by name, or browse our product categories."
-            )
-
-        # Read the pa_sample-size attribute from the product(s)
-        available_sample_sizes = []
-        target_product = None
-        for p in products:
-            for attr in p.get("attributes", []):
-                if "sample" in attr.get("name", "").lower() and "size" in attr.get("name", "").lower():
-                    opts = attr.get("options", [])
-                    if opts:
-                        available_sample_sizes = opts
-                        target_product = p
-                        break
-            if available_sample_sizes:
-                break
-
-        if not available_sample_sizes:
-            return (
-                f"I found **{products[0].get('name', product_name)}**, but it doesn't appear "
-                f"to have sample sizes listed. 😕\n\n"
-                f"You can ask: *'What sizes does {products[0].get('name', product_name)} come in?'*"
-            )
-
-        p_name = target_product.get("name", product_name) if target_product else product_name
-
-        # If user asked about a specific size, check if it's available
-        if requested_size:
-            # Normalize for comparison: strip quotes, spaces
-            import re as _re
-            req_clean = _re.sub(r'["\'\s]', '', requested_size).lower()
-            match_found = any(
-                _re.sub(r'["\'\s]', '', s).lower() == req_clean
-                for s in available_sample_sizes
-            )
-            if match_found:
-                # Format the requested size nicely from the matched option
-                matched_display = next(
-                    (s for s in available_sample_sizes
-                     if _re.sub(r'["\'\s]', '', s).lower() == req_clean),
-                    requested_size
-                )
-                msg = f"✅ Yes! **{p_name}** is available in a **{matched_display}** sample size.\n\n"
-                msg += f"**All available sample sizes:**\n"
-                for s in available_sample_sizes:
-                    marker = " ✅" if _re.sub(r'["\'\s]', '', s).lower() == req_clean else ""
-                    msg += f"  • {s}{marker}\n"
-                return msg
-            else:
-                msg = f"❌ Sorry, **{p_name}** does not come in a **{requested_size}** sample size.\n\n"
-                msg += f"**Available sample sizes:**\n"
-                for s in available_sample_sizes:
-                    msg += f"  • {s}\n"
-                return msg
-
-        # No specific size requested — list all available sample sizes
-        msg = f"📐 **{p_name}** is available in the following sample sizes:\n\n"
-        for s in available_sample_sizes:
-            msg += f"  • {s}\n"
-        return msg
-    
     # ── No products found ──
     if page_count == 0:
         if intent == Intent.RELATED_PRODUCTS:
@@ -514,13 +443,6 @@ def generate_suggestions(
         suggestions.append("Show me all products")
         suggestions.append("View my orders")
         
-    elif intent == Intent.SAMPLE_REQUEST:
-        if products:
-            p_name = products[0].get('name', '')
-            if p_name:
-                suggestions.append(f"Order {p_name}")
-                suggestions.append(f"What sizes does {p_name} come in?")
-        suggestions.append("Show me all products")
     elif intent == Intent.UPDATE_CUSTOMER:
         return ["Show me all products", "View my orders"]
     elif intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY):

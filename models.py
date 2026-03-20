@@ -42,7 +42,6 @@ class Intent(Enum):
 
     # Variations
     PRODUCT_VARIATIONS     = "product_variations"
-    SAMPLE_REQUEST         = "sample_request"
 
     # ──── Order History & Reorder ────
     ORDER_HISTORY          = "order_history"

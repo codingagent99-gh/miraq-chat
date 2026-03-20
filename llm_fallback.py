@@ -137,7 +137,6 @@ Do NOT extract entities — that is already handled by the local classifier.
 **Important disambiguation rules:**
 - If the user asks to check if a specific product comes in a certain attribute (e.g., "Do you have 3x3 for Ansel?", "Does the subway tile come in matte?"), use "product_search".
 - If the user asks for a general list of options without specifying what they want (e.g., "What sizes does Ansel come in?", "Show me the colors for this tile"), use "product_attribute_info".
-- If the user asks for generic samples without a specific product, use "sample_request".
 
 **Classifier context** (what the local classifier already resolved):
 - Intent: {classifier_intent} (confidence: {classifier_confidence:.2f})
