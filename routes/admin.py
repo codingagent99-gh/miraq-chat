@@ -3,7 +3,7 @@ from store_registry import get_store_loader
 from chat_logger import get_logger
 
 logger = get_logger("miraq_admin")
-admin_bp = Blueprint("admin", __name__, url_prefix="/api/admin")
+admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
 
 @admin_bp.route("/taxonomies", methods=["GET"])
 def get_taxonomies():
