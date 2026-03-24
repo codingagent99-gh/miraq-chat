@@ -24,10 +24,6 @@ def get_taxonomies():
         for prod in loader.product_by_name_lower.values():
             products.append({"id": prod["id"], "name": prod["name"], "slug": prod.get("slug", "")})
 
-    # ✅ FIX: Run simulate_single_term() on every saved query to build
-    # test_results in the correct LiveTestResult shape the frontend expects.
-    # Previously this returned loader.conflicts which is a raw internal list
-    # and doesn't contain term/intent/confidence/entities/api_endpoint/api_body.
     saved_queries = get_saved_queries()
     test_results = []
     for query in saved_queries:

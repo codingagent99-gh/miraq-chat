@@ -3,6 +3,7 @@ import json
 from collections import defaultdict
 from chat_logger import get_logger
 from classifier import classify, _normalize_for_tag_compare
+from api_builder import build_api_calls
 
 logger = get_logger("miraq_admin")
 TEST_FILE_PATH = os.path.join(os.path.dirname(__file__), "test_queries.txt")
@@ -30,7 +31,7 @@ def simulate_single_term(term: str) -> dict:
     
     groups = defaultdict(set)
     all_locations = set()
-    auto_resolved_locations = set() # 🚀 NEW: Dedicated bucket for resolved items
+    auto_resolved_locations = set()
 
     def add_loc(raw_text, loc_string, base_type):
         if not raw_text: return
@@ -74,15 +75,31 @@ def simulate_single_term(term: str) -> dict:
             is_conflict = True
             break
 
+    real_endpoint = "None"
+    real_body = {}
+    
+    try:
+        # Pass our simulated AI result into your actual API builder
+        api_calls = build_api_calls(result, page=1)
+        if api_calls:
+            # Grab the details of the first API call it generated
+            call = api_calls[0]
+            real_endpoint = f"{call.method} {call.endpoint}"
+            # GET requests use params, POST requests use body
+            real_body = call.params if call.method == "GET" else call.body
+    except Exception as e:
+        logger.error(f"Failed to build debug API call: {e}")
+        real_body = {"error": str(e)}
+
     return {
         "locations": sorted(list(all_locations)),
-        "auto_resolved": sorted(list(auto_resolved_locations)), # 🚀 NEW: Send to API
+        "auto_resolved": sorted(list(auto_resolved_locations)),
         "is_conflict": is_conflict,
         "intent": intent.value if intent else "UNKNOWN",
         "confidence": round(result.confidence, 2),
         "entities": _serialize_entities(entities),
-        "api_endpoint": "POST /wp-json/wc/v3/products", 
-        "api_body": {"status": "pending"} 
+        "api_endpoint": real_endpoint,
+        "api_body": real_body
     }
 
 def run_conflict_simulation(loader) -> list:
