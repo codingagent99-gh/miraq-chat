@@ -181,10 +181,19 @@ class StoreLoader:
         self._degraded_reasons: list = []     
         self._expected_product_count: Optional[int] = None
         self._loaded_from_cache: bool = False  
+        self.conflicts: List[Dict] = []
 
     # ─────────────────────────────────────────────
     # LOADING & FETCHING LOGIC
     # ─────────────────────────────────────────────
+
+    def _run_scanner_async(self):
+        """Runs the heavy NLP scanner in the background so it doesn't freeze the server."""
+        try:
+            from conflict_scanner import run_conflict_simulation
+            self.conflicts = run_conflict_simulation(self)
+        except Exception as e:
+            logger.error(f"StoreLoader: Conflict scanner failed: {e}", exc_info=True)
 
     def load_all(self):
         """Loads store data (from local files in dev mode, or live API in prod)."""
@@ -197,7 +206,6 @@ class StoreLoader:
                     self._load_from_live_api()
                     self._loaded_from_cache = False
 
-                # Populate the internal lookup dictionaries for classification
                 self._build_lookups()
                 self._validate_load()
                 self._last_loaded = time.time()
@@ -207,11 +215,14 @@ class StoreLoader:
                     
                 self._log_load_summary()
 
+            # 🚀 THE FIX: Run the scanner OUTSIDE the lock in a detached thread!
+            import threading
+            threading.Thread(target=self._run_scanner_async, daemon=True).start()
+
         except Exception as e:
             self._degraded = True
             self._degraded_reasons = [str(e)]
             logger.error(f"StoreLoader: ❌ Failed to load store data: {e}", exc_info=True)
-
     def _log_load_summary(self):
         """Prints a clean summary of what was loaded into memory."""
         mode = "Local Dev Cache" if DEV_CACHE_ENABLED else "Live WooCommerce API"

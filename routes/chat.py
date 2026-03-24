@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timezone
 import os
 from flask import Blueprint, request, jsonify
+from models import ExtractedEntities, ClassifiedResult
 
 from app_config import (
     ORDER_INTENTS,
@@ -35,6 +36,79 @@ from handlers.search_handler import log_matched_products, handle_empty_results
 logger = get_logger("miraq_chat")
 chat_bp = Blueprint("chat", __name__)
 
+def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
+    """Intercepts comma-separated values and maps them directly to WooCommerce IDs/Slugs."""
+    if "," not in msg:
+        return None
+        
+    terms = [t.strip().lower() for t in msg.split(",") if t.strip()]
+    if not terms:
+        return None
+        
+    entities = ExtractedEntities()
+    
+    # Initialize the set exactly how the rest of your app expects it
+    if not hasattr(entities, 'target_category_slugs'):
+        entities.target_category_slugs = set()
+        
+    matched = False
+    
+    for term in terms:
+        # 1. Product Check
+        if loader and hasattr(loader, 'product_by_name_lower') and term in loader.product_by_name_lower:
+            prod = loader.product_by_name_lower[term]
+            entities.product_name = prod.get("name")
+            entities.product_slug = prod.get("slug", "")
+            entities.product_id = prod.get("id")
+            matched = True
+            continue
+
+        # 2. Category Check
+        if loader and term in getattr(loader, 'category_by_name_lower', {}):
+            cat = loader.category_by_name_lower[term]
+            entities.target_category_slugs.add(cat.get("slug"))
+            if not getattr(entities, 'category_name', None):
+                entities.category_name = cat.get("name")
+            matched = True
+            continue
+            
+        # 3. Tag Check
+        if loader and term in getattr(loader, 'tag_by_name_lower', {}):
+            tag = loader.tag_by_name_lower[term]
+            entities.tag_slugs.append(tag.get("slug"))
+            entities.tag_ids.append(tag.get("id"))
+            matched = True
+            continue
+            
+        # 4. Attribute Check
+        if loader and hasattr(loader, 'all_attributes_raw'):
+            for attr in loader.all_attributes_raw:
+                label = attr.get("attribute_label", "").lower().strip()
+                
+                for attr_val in attr.get("terms", []):
+                    if term == attr_val.get("name", "").lower():
+                        term_slug = attr_val.get("slug")
+                        
+                        # Use the label as the dictionary key!
+                        if label not in entities.attributes:
+                            entities.attributes[label] = term_slug
+                        else:
+                            entities.attributes[label] += f",{term_slug}"
+                            
+                        matched = True
+                        break
+
+    if matched:
+        # Dynamically assign intent based on what was found
+        resolved_intent = Intent.PRODUCT_SEARCH if entities.product_id else Intent.FILTER_BY_ATTRIBUTE
+        
+        return ClassifiedResult(
+            intent=resolved_intent, 
+            entities=entities, 
+            confidence=1.0
+        )
+        
+    return None
 
 @chat_bp.route("/chat", methods=["POST"])
 def chat():
@@ -105,7 +179,6 @@ def chat():
     # ExtractedEntities directly from the suggestion, then jump to Step 2.
     _suggestion_retry = body.get("suggestion_retry")
     if _suggestion_retry:
-        from models import ExtractedEntities, ClassifiedResult
         from store_registry import get_store_loader as _get_loader
 
         _sr_label = _suggestion_retry.get("label", "suggestion retry")
@@ -303,9 +376,16 @@ def chat():
         last_product_ctx = None
         logger.info("Steps 1-3: Skipped (variant resolution mode — Step 3.55 will handle)")
     else:
-           
-        # ─── Step 1: Classify intent ───
-        result = classify(message)
+        
+        # ─── Step 1: Classify intent (or Parse CSV) ───
+        store_loader = get_store_loader()
+        result = parse_csv_message(message, store_loader)
+        
+        if result:
+            logger.info("Step 1: Message parsed as exact-match CSV.")
+        else:
+            result = classify(message)
+
         intent = result.intent
         entities = result.entities
         confidence = result.confidence
@@ -318,7 +398,7 @@ def chat():
                 "order_item_name": entities.order_item_name,
                 "quantity": entities.quantity,
                 "attributes": entities.attributes or None,
-                "tag_slugs": entities.tag_slugs or None,  # ← ADD THIS
+                "tag_slugs": entities.tag_slugs or None,
             }.items() if v is not None
         }
         logger.info(f"Step 1: Classified intent={intent.value} | confidence={confidence:.2f} | entities={entity_summary}")
