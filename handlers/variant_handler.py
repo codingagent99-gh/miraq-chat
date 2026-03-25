@@ -142,18 +142,36 @@ def handle_variant_selection(
             all_variations = pre_filtered
 
     if _resolve_variant:
+        import re
         user_text_lower = message.lower()
         user_text_clean = _STRIP_QUOTES_RE.sub('', user_text_lower)
         user_tokens = set(_TOKENIZE_RE.findall(user_text_clean))
-        scores = [
-            (var, score_variation_against_text(var, user_text_clean, user_tokens))
-            for var in all_variations
-            if var.get("attributes")
-        ]
+        
+        # Create a heavily stripped version for exact matching (removes commas, hyphens, etc.)
+        text_for_exact = re.sub(r'[^\w\s]', ' ', user_text_clean)
+        
+        scores = []
+        for var in all_variations:
+            if not var.get("attributes"):
+                continue
+                
+            base_score = score_variation_against_text(var, user_text_clean, user_tokens)
+            
+            # 🚀 FIX: Manually strip quotes and punctuation from DB options to catch dimensions
+            opts = _get_safe_options(var.get("attributes", []))
+            for opt_val in opts.values():
+                clean_opt = _STRIP_QUOTES_RE.sub('', opt_val.lower()).strip()
+                opt_for_exact = re.sub(r'[^\w\s]', ' ', clean_opt)
+                
+                # Pad with spaces to ensure word boundaries (so "12x12" doesn't falsely match "12x120")
+                if opt_for_exact and f" {opt_for_exact} " in f" {text_for_exact} ":
+                    base_score += 100
+                    
+            scores.append((var, base_score))
+
         max_score = max((s for _, s in scores), default=0)
         matched = [var for var, s in scores if s == max_score] if max_score > 0 else all_variations
         
-        # 👇 ADD THESE THREE LINES 👇
         logger.debug(f"Step 3.55 Scoring: user_text_clean='{user_text_clean}'")
         logger.debug(f"Step 3.55 Scoring: max_score={max_score} | variations_tied_for_max={len(matched)}")
         if len(matched) < 5:
