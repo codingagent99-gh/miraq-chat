@@ -37,7 +37,7 @@ logger = get_logger("miraq_chat")
 chat_bp = Blueprint("chat", __name__)
 
 def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
-    """Intercepts comma-separated values and maps them directly to WooCommerce IDs/Slugs."""
+    """Hybrid Parser: Secures exact matches first, uses NLP ONLY on the leftovers."""
     if "," not in msg:
         return None
         
@@ -46,69 +46,105 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
         return None
         
     entities = ExtractedEntities()
-    
-    # Initialize the set exactly how the rest of your app expects it
     if not hasattr(entities, 'target_category_slugs'):
         entities.target_category_slugs = set()
         
-    matched = False
+    unmatched_terms = []
     
+    # --- PHASE 1: EXACT MATCH SECURE ---
     for term in terms:
+        term_matched = False
+        
         # 1. Product Check
         if loader and hasattr(loader, 'product_by_name_lower') and term in loader.product_by_name_lower:
             prod = loader.product_by_name_lower[term]
             entities.product_name = prod.get("name")
             entities.product_slug = prod.get("slug", "")
             entities.product_id = prod.get("id")
-            matched = True
-            continue
+            term_matched = True
 
         # 2. Category Check
-        if loader and term in getattr(loader, 'category_by_name_lower', {}):
+        elif loader and term in getattr(loader, 'category_by_name_lower', {}):
             cat = loader.category_by_name_lower[term]
             entities.target_category_slugs.add(cat.get("slug"))
             if not getattr(entities, 'category_name', None):
                 entities.category_name = cat.get("name")
-            matched = True
-            continue
+            term_matched = True
             
         # 3. Tag Check
-        if loader and term in getattr(loader, 'tag_by_name_lower', {}):
+        elif loader and term in getattr(loader, 'tag_by_name_lower', {}):
             tag = loader.tag_by_name_lower[term]
             entities.tag_slugs.append(tag.get("slug"))
             entities.tag_ids.append(tag.get("id"))
-            matched = True
-            continue
+            term_matched = True
             
         # 4. Attribute Check
-        if loader and hasattr(loader, 'all_attributes_raw'):
+        elif loader and hasattr(loader, 'all_attributes_raw'):
             for attr in loader.all_attributes_raw:
                 label = attr.get("attribute_label", "").lower().strip()
-                
                 for attr_val in attr.get("terms", []):
                     if term == attr_val.get("name", "").lower():
                         term_slug = attr_val.get("slug")
-                        
-                        # Use the label as the dictionary key!
                         if label not in entities.attributes:
                             entities.attributes[label] = term_slug
                         else:
                             entities.attributes[label] += f",{term_slug}"
-                            
-                        matched = True
+                        term_matched = True
                         break
+                if term_matched:
+                    break
+        
+        # If the term failed, save it for the AI!
+        if not term_matched:
+            unmatched_terms.append(term)
 
-    if matched:
-        # Dynamically assign intent based on what was found
+    # If EVERYTHING matched perfectly, exit early
+    if not unmatched_terms:
         resolved_intent = Intent.PRODUCT_SEARCH if entities.product_id else Intent.FILTER_BY_ATTRIBUTE
+        return ClassifiedResult(intent=resolved_intent, entities=entities, confidence=1.0)
         
-        return ClassifiedResult(
-            intent=resolved_intent, 
-            entities=entities, 
-            confidence=1.0
-        )
+    # --- PHASE 2: NLP AI FALLBACK MERGE ---
+    # We have some perfect matches, but some failed. Send ONLY the failed ones to old fallback.
+    from classifier import classify 
+    
+    fallback_text = " ".join(unmatched_terms)
+    nlp_result = classify(fallback_text)
+    nlp_entities = nlp_result.entities
+    
+    # MERGE PRODUCT
+    if nlp_entities.product_id and not entities.product_id:
+        entities.product_name = nlp_entities.product_name
+        entities.product_slug = nlp_entities.product_slug
+        entities.product_id = nlp_entities.product_id
         
-    return None
+    # MERGE CATEGORIES
+    if hasattr(nlp_entities, 'target_category_slugs') and nlp_entities.target_category_slugs:
+        entities.target_category_slugs.update(nlp_entities.target_category_slugs)
+        if not getattr(entities, 'category_name', None):
+            entities.category_name = nlp_entities.category_name
+            
+    # MERGE TAGS
+    for tid, tslug in zip(nlp_entities.tag_ids, nlp_entities.tag_slugs):
+        if tid not in entities.tag_ids:
+            entities.tag_ids.append(tid)
+            entities.tag_slugs.append(tslug)
+            
+    # MERGE ATTRIBUTES
+    if nlp_entities.attributes:
+        for k, v in nlp_entities.attributes.items():
+            if k not in entities.attributes:
+                entities.attributes[k] = v
+            else:
+                if v not in entities.attributes[k]:
+                    entities.attributes[k] += f",{v}"
+                    
+    # Resolve final intent
+    resolved_intent = Intent.PRODUCT_SEARCH if entities.product_id else Intent.FILTER_BY_ATTRIBUTE
+    
+    # We boost the confidence back up because we know our exact matches were solid
+    final_confidence = max(nlp_result.confidence, 0.95)
+    
+    return ClassifiedResult(intent=resolved_intent, entities=entities, confidence=final_confidence)
 
 @chat_bp.route("/chat", methods=["POST"])
 def chat():
