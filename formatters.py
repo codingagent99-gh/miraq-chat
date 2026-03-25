@@ -154,7 +154,7 @@ def format_custom_product(raw: dict) -> dict:
         "slug":          raw.get("slug", ""),
         "sku":           raw.get("sku", ""),
         "permalink":     raw.get("permalink", ""),
-        "type":          "simple",
+        "type":          "variable" if raw.get("variations") else raw.get("type", "simple"),
         "price":         price,
         "regular_price": regular_price,
         "sale_price":    sale_price,

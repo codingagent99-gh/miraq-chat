@@ -286,8 +286,16 @@ def classify(utterance: str) -> ClassifiedResult:
     # ─── 2. PRE-EXTRACT COMMON ENTITIES ───
     _extract_product_name(entity_text, entities)
     _extract_category(entity_text, entities)
+    _extract_quantity(text, entities)
 
     attr_text = entity_text
+    # Mask out the product name so numbers inside it (like 2.0) don't trigger attributes
+    if entities.product_name:
+        attr_text = attr_text.replace(entities.product_name.lower(), " ")
+        
+    # Mask out the extracted quantity so bare numbers don't falsely trigger attributes
+    if entities.quantity:
+        attr_text = re.sub(rf'(?<![\dxX\-])\b{entities.quantity}\b(?![\dxX\-])', ' ', attr_text, count=1)
 
     _loader = get_store_loader()
     _type_mask_terms = set(pt.lower() for pt in PRODUCT_TYPE_TERMS)
@@ -304,7 +312,6 @@ def classify(utterance: str) -> ClassifiedResult:
     _extract_collection_year(text, entities)
     _extract_order_id(text, entities)
     _extract_time_range(text, entities)
-    _extract_quantity(text, entities)
     _extract_order_item(text, entities)
     _extract_unresolved_descriptors(text, entities)
     _extract_price_range(text, entities)       

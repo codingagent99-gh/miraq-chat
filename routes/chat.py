@@ -535,14 +535,23 @@ def chat():
 
         api_responses = woo_client.execute_all(api_calls_to_execute)
 
+        # Helper to ensure custom API products have a 'type' field for the order handler
+        def _enrich_raw_products(prod_list):
+            for p in prod_list:
+                if "type" not in p:
+                    p["type"] = "variable" if p.get("variations") else "simple"
+
         for resp in api_responses:
             if resp.get("success"):
                 data = resp.get("data")
                 if isinstance(data, dict) and "products" in data:
+                    _enrich_raw_products(data["products"])
                     (order_data if intent in ORDER_INTENTS else all_products_raw).extend(data["products"])
                 elif isinstance(data, list):
+                    _enrich_raw_products(data)
                     (order_data if intent in ORDER_INTENTS else all_products_raw).extend(data)
                 elif isinstance(data, dict):
+                    _enrich_raw_products([data])
                     (order_data if intent in ORDER_INTENTS else all_products_raw).append(data)
             else:
                 error_msg = sanitize_log_string(str(resp.get('error', 'Unknown')))
@@ -630,6 +639,13 @@ def chat():
     resp = handle_variant_selection(
         current_flow_state, intent, entities, message, customer_id,
         session_id, page, start_time, sessions, user_context, _resolve_variant,
+    )
+    if resp:
+        return resp
+    
+    resp = handle_quantity_and_variant_check(
+        intent, entities, all_products_raw, order_data,
+        ORDER_CREATE_INTENTS, session_id, page, start_time, sessions, customer_id=customer_id
     )
     if resp:
         return resp
@@ -723,14 +739,6 @@ def chat():
             logger.warning("Step 5: Used fallback 'your item' - no product name available")
         if total == 0.0:
             logger.warning(f"Step 5: Order total is {get_currency_symbol()}0.00 - possible pricing issue")
-
-    # ─── Step 5.5: Quantity / variant still needed? ───
-    resp = handle_quantity_and_variant_check(
-        intent, entities, all_products_raw, order_data,
-        ORDER_CREATE_INTENTS, session_id, page, start_time, sessions, customer_id=customer_id
-    )
-    if resp:
-        return resp
 
     # ─── Step 6: Generate suggestions ───
     suggestions = generate_suggestions(intent, entities, products)

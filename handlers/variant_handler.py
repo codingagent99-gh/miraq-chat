@@ -558,6 +558,12 @@ def handle_quantity_and_variant_check(
 
     product = products_formatted[0]
     
+    logger.info(
+        f"🛑 DEBUG STEP 5.5 | Product: {product.get('name')} | "
+        f"Type: {product.get('type')} | "
+        f"Variations Count: {len(product.get('variations', []))}"
+    )
+    
     # ── OUT OF STOCK INTERCEPT ──
     if product.get("stock_status") == "outofstock":
         elapsed = time.time() - start_time
@@ -579,7 +585,7 @@ def handle_quantity_and_variant_check(
 
     # No quantity yet
     if not entities.quantity:
-        if product.get("type") == "variable":
+        if product.get("type") == "variable" or product.get("variations"):
             _raw_for_prompt = next((p for p in all_products_raw if not p.get("parent_id")), {})
             _variations_for_cache = _raw_for_prompt.get("variations", [])
             
@@ -683,7 +689,7 @@ def handle_quantity_and_variant_check(
         }), 200
 
     # Quantity known but variable product not yet resolved
-    if entities.quantity and not order_data and product.get("type") == "variable":
+    if entities.quantity and not order_data and (product.get("type") == "variable" or product.get("variations")):
         _raw_for_prompt = next((p for p in all_products_raw if not p.get("parent_id")), {})
         _variations_for_cache = _raw_for_prompt.get("variations", [])
         
