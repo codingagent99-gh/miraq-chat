@@ -380,27 +380,6 @@ def chat():
 
     # Capture resolve_variant flag
     _resolve_variant = bool(flow_result and flow_result.get("resolve_variant"))
-    
-    if "tile" not in message and not _resolve_variant and current_flow_state == FlowState.IDLE:
-        from services.chit_chat_router import route_query
-        
-        router_result = route_query(message)
-        if router_result.get("handled"):
-            elapsed = time.time() - start_time
-            return jsonify({
-                "success": True,
-                "bot_message": router_result["response"],
-                "intent": router_result["intent"],
-                "products": [],
-                "suggestions": ["Show me tiles", "View my orders"],
-                "session_id": session_id,
-                "metadata": {
-                    "response_time_ms": round(elapsed * 1000),
-                    "layer_used": router_result["metadata"].get("layer_used")
-                },
-                "pagination": default_pagination(page),
-                "flow_state": FlowState.IDLE.value,
-            }), 200
 
     # ─── Steps 1–3: Classify + API execution (skipped in variant resolution mode) ───
     if _resolve_variant:

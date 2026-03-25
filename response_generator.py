@@ -8,6 +8,31 @@ from datetime import datetime
 from models import Intent, ExtractedEntities, WooAPICall
 from app_config import MAX_DISPLAYED_ITEMS, USER_PLACEHOLDERS, DEFAULT_PAYMENT_METHOD_TITLE, get_currency_symbol
 
+def _build_search_context_string(entities: ExtractedEntities) -> str:
+    """Builds a human-readable string of the exact entities the bot searched for."""
+    desc_parts = []
+    
+    if getattr(entities, 'product_name', None):
+        desc_parts.append(f"Product: **{entities.product_name}**")
+    elif getattr(entities, 'search_term', None):
+        desc_parts.append(f"Search: **{entities.search_term}**")
+        
+    if getattr(entities, 'category_name', None):
+        desc_parts.append(f"Category: **{entities.category_name}**")
+        
+    if getattr(entities, 'attributes', None):
+        for attr_name, attr_val in entities.attributes.items():
+            if not attr_val: continue
+            clean_name = attr_name.replace(" 2", "").replace("-", " ").replace("pa_", "").title()
+            clean_val = str(attr_val).replace("-", " ").title()
+            desc_parts.append(f"{clean_name}: **{clean_val}**")
+            
+    if getattr(entities, 'tag_slugs', None):
+        for tag in entities.tag_slugs:
+            clean_tag = tag.replace("-", " ").title()
+            desc_parts.append(f"Tag: **{clean_tag}**")
+            
+    return " · ".join(desc_parts)
 
 def generate_bot_message(
     intent: Intent,
@@ -311,23 +336,9 @@ def generate_bot_message(
     if page_count == 1:
         p = products[0]
         
-        # 1. Build the specific announcement if it's a filter
-        match_intro = "I found the perfect match! 🎯"
-        if intent == Intent.FILTER_BY_ATTRIBUTE:
-            desc_parts = []
-            if entities.attributes:
-                for attr_name, attr_val in entities.attributes.items():
-                    if not attr_val: continue
-                    clean_name = attr_name.replace(" 2", "").replace("-", " ").replace("pa_", "").title()
-                    clean_val = str(attr_val).replace("-", " ").title()
-                    desc_parts.append(f"**{clean_val}** {clean_name}")
-            if entities.tag_slugs:
-                for tag in entities.tag_slugs:
-                    desc_parts.append(f"**{tag.replace('-', ' ').title()}**")
-            
-            if desc_parts:
-                combined_desc = " · ".join(desc_parts)
-                match_intro = f"I found the perfect match for {combined_desc}! 🎯"
+        # 🚀 FIX: Use the new context builder to explicitly announce tags/categories/attributes
+        search_context = _build_search_context_string(entities)
+        match_intro = f"I found the perfect match for {search_context}! 🎯" if search_context else "I found the perfect match! 🎯"
 
         msg = f"{match_intro}\n\n**{p['name']}**\n"
         
@@ -337,14 +348,17 @@ def generate_bot_message(
             msg += f"🏷️ Sale Price: {CS}{p['sale_price']:.2f}\n"
         if p.get("short_description"):
             msg += f"\n{p['short_description']}\n"
+            
+        # 🚀 FIX: Display more attributes to match the rich visual requested
         if p.get("attributes"):
-            for attr in p["attributes"][:3]:
-                opts = ", ".join(attr["options"][:5])
+            for attr in p["attributes"][:8]:  # Show up to 8 attributes instead of just 3
+                opts = ", ".join(attr["options"][:10])
                 msg += f"• **{attr['name']}:** {opts}\n"
         return msg
 
     # ── Multiple products ──
     msg = ""
+    search_context = _build_search_context_string(entities)
 
     if intent == Intent.CATEGORY_BROWSE:
         qualifier = _get_unresolved_category_qualifier(entities)
@@ -353,40 +367,17 @@ def generate_bot_message(
         elif qualifier:
             msg += (
                 f"We don't have a specific **{qualifier} {entities.category_name}** "
-                f"sub-category, but here are all **{count}** products in "
-                f"**{entities.category_name}** — many of these work great for "
+                f"sub-category, but here are all **{count}** products for {search_context} — many of these work great for "
                 f"**{qualifier.lower()}** use! 📂\n\n"
             )
         else:
-            msg += f"Here are **{count}** products in the **{entities.category_name}** category! 📂\n\n"
+            msg += f"Here are **{count}** products for {search_context}! 📂\n\n"
             
-    elif intent == Intent.FILTER_BY_ATTRIBUTE:
-        desc_parts = []
-        
-        # 1. Format Attributes
-        if entities.attributes:
-            for attr_name, attr_val in entities.attributes.items():
-                if not attr_val: continue
-                clean_name = attr_name.replace(" 2", "").replace("-", " ").replace("pa_", "").title()
-                clean_val = str(attr_val).replace("-", " ").title()
-                desc_parts.append(f"**{clean_val}** {clean_name}")
-                
-        # 2. Format Tags (🚀 FIX: Now it will announce tags like "Minimalistic Look"!)
-        if entities.tag_slugs:
-            for tag in entities.tag_slugs:
-                clean_tag = tag.replace("-", " ").title()
-                desc_parts.append(f"**{clean_tag}**")
-
-        category_desc = f" in **{entities.category_name}**" if entities.category_name else ""
-        
-        if desc_parts:
-            combined_desc = " · ".join(desc_parts)
-            msg += f"Found **{count}** products{category_desc} matching {combined_desc}! ✨\n\n"
+    elif intent in (Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_SEARCH):
+        if search_context:
+            msg += f"Found **{count}** products for {search_context}! ✨\n\n"
         else:
-            msg += f"Found **{count}** products{category_desc}! 🛍️\n\n"
-
-    elif intent == Intent.PRODUCT_SEARCH:
-        msg += f"Found **{count}** products matching your search! 🔍\n\n"
+            msg += f"Found **{count}** products! 🛍️\n\n"
 
     elif intent == Intent.RELATED_PRODUCTS:
         p_name = entities.product_name or "this item"
