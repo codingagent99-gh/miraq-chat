@@ -114,11 +114,11 @@ class DiscountEvaluator(IntentEvaluator):
             return Intent.DISCOUNT_INQUIRY, 0.91
         return None, 0.0
 
-
 class ProductDetailEvaluator(IntentEvaluator):
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
         # PRODUCT ATTRIBUTE INFO
-        if entities.product_name and re.search(r"\b(what|which)\b.*\b(available|come|have|does|do|offer)\b", text):
+        if entities.product_name and re.search(r"\b(what|which|how|tell|about)\b", text):
+        # if entities.product_name and re.search(r"\b(what|which)\b.*\b(available|come|have|does|do|offer)\b", text):
             _loader_ref = get_store_loader()
             if _loader_ref and _loader_ref.all_attributes_raw:
                 _matched_label = None
