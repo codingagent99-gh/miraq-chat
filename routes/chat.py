@@ -639,12 +639,20 @@ def chat():
     
     products = [p for p in products if p.get("name")]
     logger.info(f"Step 4: Formatted {len(products)} products")
-
+    
+    
     # ─── Step 5: Generate bot message ───
     _pagination_data = build_pagination(page, api_responses, api_calls_to_execute)
     _total_items_for_msg = _pagination_data.get("total_items")
-    bot_message = generate_bot_message(intent, entities, products, confidence, order_data, total_items=_total_items_for_msg)
-
+    bot_message = generate_bot_message(
+        intent, 
+        entities, 
+        products, 
+        confidence, 
+        order_data, 
+        total_items=_total_items_for_msg,
+        page=page 
+    )
     if intent in ORDER_CREATE_INTENTS and order_data:
         placed_order = order_data[-1]
         used_product_name = (

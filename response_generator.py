@@ -16,6 +16,7 @@ def generate_bot_message(
     confidence: float,
     order_data: List[dict] = None,
     total_items: Optional[int] = None,
+    page: int = 1
 ) -> str:
     """Generate a natural language bot response.
 
@@ -309,7 +310,27 @@ def generate_bot_message(
     # ── Single product ──
     if page_count == 1:
         p = products[0]
-        msg = f"I found the perfect match! 🎯\n\n**{p['name']}**\n"
+        
+        # 1. Build the specific announcement if it's a filter
+        match_intro = "I found the perfect match! 🎯"
+        if intent == Intent.FILTER_BY_ATTRIBUTE:
+            desc_parts = []
+            if entities.attributes:
+                for attr_name, attr_val in entities.attributes.items():
+                    if not attr_val: continue
+                    clean_name = attr_name.replace(" 2", "").replace("-", " ").replace("pa_", "").title()
+                    clean_val = str(attr_val).replace("-", " ").title()
+                    desc_parts.append(f"**{clean_val}** {clean_name}")
+            if entities.tag_slugs:
+                for tag in entities.tag_slugs:
+                    desc_parts.append(f"**{tag.replace('-', ' ').title()}**")
+            
+            if desc_parts:
+                combined_desc = " · ".join(desc_parts)
+                match_intro = f"I found the perfect match for {combined_desc}! 🎯"
+
+        msg = f"{match_intro}\n\n**{p['name']}**\n"
+        
         if p.get("price", 0) > 0:
             msg += f"💰 Price: {CS}{p['price']:.2f}\n"
         if p.get("on_sale") and p.get("sale_price") and float(p.get("sale_price", 0)) > 0:
@@ -338,45 +359,39 @@ def generate_bot_message(
             )
         else:
             msg += f"Here are **{count}** products in the **{entities.category_name}** category! 📂\n\n"
-    
+            
     elif intent == Intent.FILTER_BY_ATTRIBUTE:
-        attr_desc = " · ".join(
-            f"**{v}** {k}" for k, v in entities.attributes.items() if v
-        )
+        desc_parts = []
+        
+        # 1. Format Attributes
+        if entities.attributes:
+            for attr_name, attr_val in entities.attributes.items():
+                if not attr_val: continue
+                clean_name = attr_name.replace(" 2", "").replace("-", " ").replace("pa_", "").title()
+                clean_val = str(attr_val).replace("-", " ").title()
+                desc_parts.append(f"**{clean_val}** {clean_name}")
+                
+        # 2. Format Tags (🚀 FIX: Now it will announce tags like "Minimalistic Look"!)
+        if entities.tag_slugs:
+            for tag in entities.tag_slugs:
+                clean_tag = tag.replace("-", " ").title()
+                desc_parts.append(f"**{clean_tag}**")
+
         category_desc = f" in **{entities.category_name}**" if entities.category_name else ""
-        msg += f"Found **{count}** products{category_desc} matching {attr_desc}! 🔍\n\n"
+        
+        if desc_parts:
+            combined_desc = " · ".join(desc_parts)
+            msg += f"Found **{count}** products{category_desc} matching {combined_desc}! ✨\n\n"
+        else:
+            msg += f"Found **{count}** products{category_desc}! 🛍️\n\n"
+
     elif intent == Intent.PRODUCT_SEARCH:
         msg += f"Found **{count}** products matching your search! 🔍\n\n"
-        
-    # NEW SUCCESS HEADER: Related Products
+
     elif intent == Intent.RELATED_PRODUCTS:
         p_name = entities.product_name or "this item"
         msg += f"Here are some products similar to **{p_name}** that you might like! ✨\n\n"
-        
-    elif intent == Intent.CATEGORY_LIST:
-        msg += f"Here are our product categories! 📂\n\n"
-        
-    elif intent == Intent.FILTER_BY_ATTRIBUTE:
-        if entities.attributes:
-            attr_parts = []
-            for attr_name, attr_val in entities.attributes.items():
-                if not attr_val: continue
-                # Clean up ugly taxonomy names dynamically (e.g. "pa_fabric-type" -> "Fabric Type")
-                clean_name = attr_name.replace(" 2", "").replace("-", " ").replace("pa_", "").title()
-                clean_val = str(attr_val).replace("-", " ").title()
-                
-                attr_parts.append(f"**{clean_val}** {clean_name}")
-            
-            attr_desc = " · ".join(attr_parts)
-            category_desc = f" in **{entities.category_name}**" if entities.category_name else ""
-            
-            msg += f"Found **{count}** products{category_desc} matching {attr_desc}! ✨\n\n"
-        else:
-            category_desc = f" in **{entities.category_name}**" if entities.category_name else ""
-            msg += f"Found **{count}** products{category_desc}! 🛍️\n\n"
-        
-    elif intent == Intent.PRODUCT_SEARCH:
-        msg += f"Found **{count}** products matching your search! 🔍\n\n"
+
     elif intent == Intent.CATEGORY_LIST:
         msg += f"Here are our product categories! 📂\n\n"
         for p in products[:MAX_DISPLAYED_ITEMS]:
@@ -386,17 +401,29 @@ def generate_bot_message(
         if len(products) > MAX_DISPLAYED_ITEMS:
             msg += f"\n...and {len(products) - MAX_DISPLAYED_ITEMS} more categories."
         return msg
+
     else:
         msg += f"Here are **{count}** products I found! 🛍️\n\n"
 
-    for p in products[:5]:
+    # 1. Determine exactly how many items are on this specific page
+    displayed_count = len(products)
+
+    # 2. Render those specific items
+    for p in products:
         if p.get("price", 0) > 0:
             msg += f"• **{p['name']}** — {CS}{p['price']:.2f}\n"
         else:
             msg += f"• **{p['name']}**\n"
 
-    if count > 5:
-        msg += f"\n...and {count - 5} more products."
+    # 3. Calculate the exact remainder using the CURRENT page offset!
+    if total_items is not None:
+        # Since your API requests 4 items per page, we multiply past pages by 4
+        items_shown_so_far = ((page - 1) * 4) + displayed_count
+        remaining = total_items - items_shown_so_far
+        
+        if remaining > 0:
+            plural = "s" if remaining > 1 else ""
+            msg += f"\n...and {remaining} more product{plural}."
 
     return msg
 
