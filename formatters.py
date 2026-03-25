@@ -116,7 +116,16 @@ def format_custom_product(raw: dict) -> dict:
     """Convert raw custom API product to clean response format."""
     image_urls = raw.get("images", [])
     cat_names  = raw.get("categories", [])
-
+    tags = raw.get("tags", [])
+    
+    tag_names = []
+    for t in tags:
+        if isinstance(t, dict):
+            name = t.get("name", "")
+            if name:
+                tag_names.append(name)
+        elif isinstance(t, str) and t:
+            tag_names.append(t)
     price = _safe_float(raw.get("price", ""))
     regular_price = _safe_float(raw.get("regular_price") or raw.get("regular", ""))
     sale_price_raw = raw.get("sale_price", "") or raw.get("sale", "")
@@ -152,6 +161,7 @@ def format_custom_product(raw: dict) -> dict:
         "on_sale":       is_on_sale,
         "in_stock":      is_in_stock,
         "categories":    cat_names,
+        "tags":          tag_names,
         "images":        image_urls,
         "attributes":    attributes,
         "variations":    raw.get("variations", []),

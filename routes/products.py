@@ -14,18 +14,18 @@ logger = logging.getLogger("miraq_chat")
 
 products_bp = Blueprint("products", __name__)
 
-
 @products_bp.route("/products/<int:product_id>", methods=["GET"])
 def get_product(product_id: int):
     """
     Fetch a single product by ID from WooCommerce and return it
     in the same clean format used by the chat endpoint.
     """
-    BASE = WOO_BASE_URL.rstrip("/") + "/wp-json/wc/v3"
+
+    base_url = WOO_BASE_URL.rstrip("/")
 
     api_call = WooAPICall(
         method="GET",
-        endpoint=f"{BASE}/products/{product_id}",
+        endpoint=f"{base_url}/products/{product_id}",
         params={},
         description=f"REST: Fetch product id={product_id}",
     )

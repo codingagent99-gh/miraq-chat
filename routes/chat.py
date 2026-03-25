@@ -38,9 +38,7 @@ chat_bp = Blueprint("chat", __name__)
 
 def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
     """Hybrid Parser: Secures exact matches first, uses NLP ONLY on the leftovers."""
-    if "," not in msg:
-        return None
-        
+    
     terms = [t.strip().lower() for t in msg.split(",") if t.strip()]
     if not terms:
         return None
@@ -98,13 +96,16 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
         if not term_matched:
             unmatched_terms.append(term)
 
+    # 🚀 SAFETY LOCK 1: If NOTHING matched the dictionary, abort and let the normal AI handle it!
+    if len(unmatched_terms) == len(terms):
+        return None
+
     # If EVERYTHING matched perfectly, exit early
     if not unmatched_terms:
         resolved_intent = Intent.PRODUCT_SEARCH if entities.product_id else Intent.FILTER_BY_ATTRIBUTE
         return ClassifiedResult(intent=resolved_intent, entities=entities, confidence=1.0)
         
     # --- PHASE 2: NLP AI FALLBACK MERGE ---
-    # We have some perfect matches, but some failed. Send ONLY the failed ones to old fallback.
     from classifier import classify 
     
     fallback_text = " ".join(unmatched_terms)
@@ -138,8 +139,13 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
                 if v not in entities.attributes[k]:
                     entities.attributes[k] += f",{v}"
                     
-    # Resolve final intent
-    resolved_intent = Intent.PRODUCT_SEARCH if entities.product_id else Intent.FILTER_BY_ATTRIBUTE
+    # 🚀 SAFETY LOCK 2: Preserve conversational AI intents (like Order Tracking)
+    CATALOG_INTENTS = {Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_SEARCH, Intent.PRODUCT_VARIATIONS, Intent.UNKNOWN}
+    
+    if nlp_result.intent in CATALOG_INTENTS:
+        resolved_intent = Intent.PRODUCT_SEARCH if entities.product_id else Intent.FILTER_BY_ATTRIBUTE
+    else:
+        resolved_intent = nlp_result.intent
     
     # We boost the confidence back up because we know our exact matches were solid
     final_confidence = max(nlp_result.confidence, 0.95)

@@ -23,7 +23,7 @@ from store_loader import StoreLoader, DEV_CACHE_ENABLED
 from session_store import sessions
 from routes.chat import chat_bp
 from routes.admin import admin_bp
-
+from routes.products import products_bp
 
 # ══════════════════════════════════════��════
 # FLASK APP
@@ -35,7 +35,7 @@ CORS(app)
 # Register blueprints
 app.register_blueprint(chat_bp)
 app.register_blueprint(admin_bp)
-
+app.register_blueprint(products_bp)
 # ═══════════════════════════════════════════
 # ADDITIONAL ROUTES
 # ═══════════════════════════════════════════
