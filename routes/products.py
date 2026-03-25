@@ -33,9 +33,14 @@ def get_product(product_id: int):
     result = woo_client.execute(api_call)
 
     if not result.get("success"):
+        real_error = result.get("error", "Unknown error from woo_client")
+        logger.error(f"WooCommerce API Failed for product {product_id}: {real_error}")
+        
         return jsonify({
             "success": False,
-            "error": result.get("error", "Failed to fetch product"),
+            "error": "WooCommerce API Request Failed",
+            "real_woo_error": str(real_error),
+            "debug_result": result
         }), 502
 
     raw = result.get("data")
