@@ -72,10 +72,9 @@ def format_product(raw: dict) -> dict:
         variations = raw.get("variations", [])
         if variations:
             is_in_stock = any(
-                v.get("stock_status") == "instock" or v.get("in_stock") is True 
+                isinstance(v, dict) and (v.get("stock_status") == "instock" or v.get("in_stock") is True) 
                 for v in variations
             )
-
     # ── HONEST DATA: Pass exactly what the API reports ──
     is_on_sale = raw.get("on_sale", False)
 

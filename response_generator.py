@@ -373,7 +373,7 @@ def generate_bot_message(
         else:
             msg += f"Here are **{count}** products for {search_context}! 📂\n\n"
             
-    elif intent in (Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_SEARCH):
+    elif intent in (Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_SEARCH, Intent.PRODUCT_BY_TAG, Intent.PRODUCT_BY_COLLECTION):
         if search_context:
             msg += f"Found **{count}** products for {search_context}! ✨\n\n"
         else:
