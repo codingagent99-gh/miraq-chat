@@ -13,6 +13,7 @@ Endpoint:
 import logging
 
 from datetime import datetime, timezone
+from chat_logger import get_logger
 
 from flask import Flask, jsonify
 from flask_cors import CORS
@@ -36,6 +37,31 @@ CORS(app)
 app.register_blueprint(chat_bp)
 app.register_blueprint(admin_bp)
 app.register_blueprint(products_bp)
+
+# ═══════════════════════════════════════════
+# GLOBAL ERROR HANDLER
+# ═══════════════════════════════════════════
+
+@app.errorhandler(Exception)
+def handle_global_exception(e):
+    """
+    Catches ALL unhandled exceptions across the entire Flask app.
+    Forces the full traceback into our daily chat.txt log file, 
+    and prevents the frontend chatbot from receiving a broken HTML 500 page.
+    """
+    logger = get_logger("miraq_chat")
+    
+    logger.critical(f"🔥 UNHANDLED CRASH: {str(e)}", exc_info=True)
+    
+    return jsonify({
+        "success": False,
+        "bot_message": "Oops! I encountered an unexpected Error.",
+        "intent": "error",
+        "products": [],
+        "suggestions": ["Start over", "Show me all products"],
+        "metadata": {"error": "Internal Server Error"}
+    }), 500
+    
 # ═══════════════════════════════════════════
 # ADDITIONAL ROUTES
 # ═══════════════════════════════════════════

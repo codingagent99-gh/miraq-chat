@@ -31,7 +31,126 @@ from handlers.chat_utils import (
 
 logger = get_logger("miraq_chat")
 
+def handle_historical_search(intent, entities, order_data, customer_id, session_id, page, start_time, sessions):
+    """Step 3.5c: Filter past orders by specific attributes or tags."""
+    if intent != Intent.HISTORICAL_SEARCH:
+        return None
 
+    if not customer_id:
+        elapsed = time.time() - start_time
+        return jsonify({
+            "success": True,
+            "bot_message": "I'd love to check your past orders! 🔍\n\nPlease log in to view your history.",
+            "intent": intent.value,
+            "products": [],
+            "suggestions": ["Show all products"],
+            "session_id": session_id,
+            "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": round(elapsed * 1000)},
+            "pagination": default_pagination(page),
+            "flow_state": FlowState.IDLE.value,
+        }), 200
+
+    past_product_ids = []
+    for o in order_data:
+        for item in o.get("line_items", []):
+            if item.get("product_id"):
+                past_product_ids.append(item["product_id"])
+
+    if not past_product_ids:
+        elapsed = time.time() - start_time
+        return jsonify({
+            "success": True,
+            "bot_message": "It looks like you don't have any past orders yet. Try searching for a specific style or color!",
+            "intent": intent.value,
+            "products": [],
+            "suggestions": ["Browse categories", "Show all products"],
+            "session_id": session_id,
+            "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": round(elapsed * 1000)},
+            "pagination": default_pagination(page),
+            "flow_state": FlowState.IDLE.value,
+        }), 200
+
+    from api_builder import _build_advanced_filter_call, _attr_slug_for_label
+    
+    # 1. Fetch ONLY the exact past purchases matching the criteria
+    attr_filters = {
+        _attr_slug_for_label(label): val 
+        for label, val in entities.attributes.items() 
+        if _attr_slug_for_label(label) and val
+    }
+
+    seed_call = _build_advanced_filter_call(
+        attributes=attr_filters if attr_filters else None,
+        tags=list(entities.tag_slugs) if entities.tag_slugs else None,
+        or_pairs=list(entities.attr_tag_or_pairs) if entities.attr_tag_or_pairs else None,
+        page=page, 
+        per_page=20,
+        description="Filter past orders"
+    )
+    seed_call.body["ids"] = list(set(past_product_ids))
+    seed_resp = woo_client.execute(seed_call)
+    
+    seed_products = []
+    _sd = {}
+    if seed_resp.get("success"):
+        _sd = seed_resp.get("data", {})
+        seed_products = _sd.get("products", []) if isinstance(_sd, dict) else (_sd if isinstance(_sd, list) else [])
+
+    if not seed_products:
+        filter_str = " ".join(entities.tag_slugs + list(entities.attributes.values())).replace("-", " ") or "that description"
+        elapsed = time.time() - start_time
+        return jsonify({
+            "success": True,
+            "bot_message": f"I couldn't find any past purchases matching **{filter_str}**. Try searching our full catalog!",
+            "intent": intent.value,
+            "products": [],
+            "suggestions": ["Show all products"],
+            "session_id": session_id,
+            "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": round(elapsed * 1000)},
+            "pagination": default_pagination(page),
+            "flow_state": FlowState.IDLE.value,
+        }), 200
+
+    from formatters import format_product, format_custom_product
+    formatted_products = []
+    for p in seed_products:
+        if "featured_image" in p:
+            formatted_products.append(format_custom_product(p))
+        else:
+            formatted_products.append(format_product(p))
+            
+    formatted_products = [p for p in formatted_products if p.get("name")]
+
+    filter_str = " ".join(entities.tag_slugs + list(entities.attributes.values())).replace("-", " ") or "that description"
+    bot_message = f"Here are your previous purchases matching **{filter_str}**! 🎯\n\n"
+
+    from response_generator import generate_suggestions
+    suggestions = generate_suggestions(intent, entities, formatted_products)
+
+    pagination = {
+        "page": page,
+        "per_page": 20,
+        "total_pages": _sd.get("pages", 1) if isinstance(_sd, dict) else 1,
+        "total_items": _sd.get("total", len(formatted_products)) if isinstance(_sd, dict) else len(formatted_products)
+    }
+
+    elapsed = time.time() - start_time
+    logger.info(f"Step 10: Response sent | intent={intent.value} | products_count={len(formatted_products)} | response_time_ms={round(elapsed * 1000)} | flow_state=idle")
+
+    return jsonify({
+        "success": True,
+        "bot_message": bot_message,
+        "intent": intent.value,
+        "products": formatted_products,
+        "suggestions": suggestions,
+        "session_id": session_id,
+        "metadata": {
+            "flow_state": FlowState.IDLE.value, 
+            "response_time_ms": round(elapsed * 1000)
+        },
+        "pagination": pagination,
+        "flow_state": FlowState.IDLE.value,
+    }), 200    
 def handle_reorder(intent, order_data, customer_id, session_id):
     """Step 3.5: Create a new order from the last order's line items."""
     if not (intent == Intent.REORDER and order_data):

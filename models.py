@@ -49,6 +49,7 @@ class Intent(Enum):
     REORDER                = "reorder"
     ORDER_ITEM             = "order_item"
     QUICK_ORDER            = "quick_order"
+    HISTORICAL_SEARCH = "HISTORICAL_SEARCH"
 
     # ──── Chit-Chat ────
     UPDATE_CUSTOMER        = "update_customer"   # update profile fields

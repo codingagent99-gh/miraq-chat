@@ -29,7 +29,7 @@ from store_registry import get_store_loader
 from handlers.chat_utils import default_pagination, build_pagination, format_order_for_frontend
 from handlers.flow_handler import handle_flow
 from handlers.llm_handler import run_llm_fallback
-from handlers.order_handler import handle_reorder, handle_order_detail, handle_quick_order
+from handlers.order_handler import handle_reorder, handle_order_detail, handle_quick_order, handle_historical_search
 from handlers.variant_handler import handle_variant_selection, handle_variation_product, handle_quantity_and_variant_check
 from handlers.search_handler import log_matched_products, handle_empty_results
 
@@ -613,6 +613,13 @@ def chat():
     resp = handle_order_detail(current_flow_state, customer_id, user_context, session_id, page, start_time)
     if resp:
         return resp
+    
+    # ─── Step 3.5c: Historical Recommendations ───
+    resp = handle_historical_search(
+        intent, entities, order_data, customer_id, session_id, page, start_time, sessions
+    )
+    if resp:
+        return resp
 
     # ─── Step 3.55: Variant selection ───
     resp = handle_variant_selection(
@@ -767,7 +774,7 @@ def chat():
         if intent in ORDER_CREATE_INTENTS and order_data
         else FlowState.IDLE.value
     )
-
+    
     logger.info(
         f"Step 10: Response sent | intent={intent.value} | "
         f"products_count={len(products)} | response_time_ms={metadata['response_time_ms']} | "

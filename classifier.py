@@ -157,8 +157,13 @@ class ProductDetailEvaluator(IntentEvaluator):
         if entities.product_name and re.search(r"\b(colors?|variants?|variations?|sizes)\b", text):
             return Intent.PRODUCT_VARIATIONS, 0.89
             
-        # RELATED / YMAL
-        if re.search(r"\b(goes?\s*with|pair|complement|match|similar|related|you may also like|ymal)\b", text):
+        # HISTORICAL RECOMMENDATION
+        if re.search(r"\b(match|similar|related|goes\s*with|pair|complement)\b", text) and \
+           re.search(r"\b(previous|past|last)\b.*\b(purchases?|orders?|bought|buy)\b", text):
+            return Intent.HISTORICAL_SEARCH, 0.95
+
+        # RELATED / YMAL (Must require a product name so it doesn't hijack generic searches)
+        if entities.product_name and re.search(r"\b(goes?\s*with|pair|complement|match|similar|related|you may also like|ymal)\b", text):
             return Intent.RELATED_PRODUCTS, 0.88
             
         # QUICK SHIP
@@ -951,7 +956,7 @@ def _detect_tag_operator(text: str, entities: ExtractedEntities):
     if sum(1 for words in slug_word_sets if words & text_words) >= 2:
         entities.tag_operator = "OR"
 
-_NEGATION_PATTERNS = [r'\bwithout\s+(.+?)(?:\s+(?:tiles?|products?|ones?)|$)', r'\bno\s+(.+?)(?:\s+(?:tiles?|products?|ones?)|$)', r'\bnot\s+(.+?)(?:\s+(?:tiles?|products?|ones?)|$)', r'\bexclude\s+(.+?)(?:\s+(?:tiles?|products?|ones?)|$)', r'\bavoid\s+(.+?)(?:\s+(?:tiles?|products?|ones?)|$)', r'\bdon\'?t\s+(?:want|include|show)\s+(.+?)(?:\s+(?:tiles?|products?|ones?)|$)']
+_NEGATION_PATTERNS = [r'\bwithout\s+(.+?)(?:\s+(?:items?|products?|ones?)|$)', r'\bno\s+(.+?)(?:\s+(?:items?|products?|ones?)|$)', r'\bnot\s+(.+?)(?:\s+(?:items?|products?|ones?)|$)', r'\bexclude\s+(.+?)(?:\s+(?:items?|products?|ones?)|$)', r'\bavoid\s+(.+?)(?:\s+(?:items?|products?|ones?)|$)', r'\bdon\'?t\s+(?:want|include|show)\s+(.+?)(?:\s+(?:items?|products?|ones?)|$)']
 
 def _extract_exclusions(text: str, entities: ExtractedEntities) -> str:
     loader = get_store_loader()

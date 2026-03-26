@@ -39,8 +39,8 @@ BOT_NAME = os.getenv("BOT_NAME", "MiraQ")
 
 # Singular and plural forms of the primary product type.
 # Used in classifier fallback regexes and user-facing copy.
-PRODUCT_TYPE_SINGULAR = os.getenv("PRODUCT_TYPE_SINGULAR", "tile")
-PRODUCT_TYPE_PLURAL   = os.getenv("PRODUCT_TYPE_PLURAL",   "tiles")
+PRODUCT_TYPE_SINGULAR = os.getenv("PRODUCT_TYPE_SINGULAR", "item")
+PRODUCT_TYPE_PLURAL   = os.getenv("PRODUCT_TYPE_PLURAL",   "items")
 
 # Short identifier string embedded in API response metadata.
 # Useful for distinguishing traffic in logs when hosting multiple stores.
@@ -89,6 +89,7 @@ ORDER_INTENTS = {
     Intent.REORDER,
     Intent.ORDER_TRACKING,
     Intent.ORDER_STATUS,
+    Intent.HISTORICAL_SEARCH,
 }
 
 ORDER_CREATE_INTENTS = {

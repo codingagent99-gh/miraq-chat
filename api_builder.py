@@ -379,6 +379,15 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             description="Fetch last order for reorder (step 1)",
             requires_resolution=["customer_id", "reorder_step2"],
         ))
+        
+    elif intent == Intent.HISTORICAL_SEARCH:
+        calls.append(WooAPICall(
+            method="GET",
+            endpoint=f"{BASE}/orders",
+            params={"customer": "CURRENT_USER_ID", "per_page": 20, "orderby": "date", "order": "desc"},
+            description="Fetch past orders to find a historical seed product",
+            requires_resolution=["customer_id"],
+        ))
 
     elif intent == Intent.ORDER_ITEM:
         product_name = e.order_item_name or e.product_name or ""

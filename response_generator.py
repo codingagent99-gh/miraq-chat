@@ -393,6 +393,10 @@ def generate_bot_message(
             msg += f"\n...and {len(products) - MAX_DISPLAYED_ITEMS} more categories."
         return msg
 
+    elif intent == Intent.HISTORICAL_SEARCH:
+        p_name = entities.product_name or "that item"
+        msg += f"I see you previously ordered **{p_name}**! Here are some options that pair with it:\n\n"
+        
     else:
         msg += f"Here are **{count}** products I found! 🛍️\n\n"
 

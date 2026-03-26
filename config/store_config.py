@@ -93,7 +93,7 @@ FALLBACK_SEARCH_TERM: str = os.getenv("FALLBACK_SEARCH_TERM", "products")
 # Override via env var PRODUCT_TYPE_TERMS_JSON (JSON array).
 # ═══════════════════════════════════════════════════════════════
 
-_DEFAULT_PRODUCT_TYPE_TERMS = ["tiles", "tile"]
+_DEFAULT_PRODUCT_TYPE_TERMS = ["items", "item", "products", "product"]
 
 def _load_product_type_terms() -> list:
     raw = os.getenv("PRODUCT_TYPE_TERMS_JSON", "")
@@ -114,7 +114,7 @@ PRODUCT_TYPE_TERMS: list = _load_product_type_terms()
 # Override via env var GENERIC_NOISE_WORDS_JSON (JSON array).
 # ═══════════════════════════════════════════════════════════════
 
-_DEFAULT_GENERIC_NOISE_WORDS = ["tile", "tiles"]
+_DEFAULT_GENERIC_NOISE_WORDS = ["item", "items", "product", "products"]
 
 def _load_generic_noise_words() -> list:
     raw = os.getenv("GENERIC_NOISE_WORDS_JSON", "")
