@@ -467,9 +467,9 @@ def generate_suggestions(
         
     elif intent == Intent.UPDATE_CUSTOMER:
         return ["Show me all products", "View my orders"]
-    elif intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY):
+    elif intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.ORDER_STATUS, Intent.ORDER_TRACKING):
         suggestions.append("Reorder my last order")
-        suggestions.append("Show me all products")
+        suggestions.append("Show me my recent orders")
     elif intent == Intent.CATEGORY_LIST:
         if products:
             for cat in products[:3]:

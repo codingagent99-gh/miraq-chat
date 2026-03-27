@@ -16,7 +16,9 @@ from app_config import (
     WOO_BASE_URL,
     DEFAULT_PAYMENT_METHOD,
     DEFAULT_PAYMENT_METHOD_TITLE,
+    CUSTOM_API_BASE_URL
 )
+
 # From your api_builder.py (Line 12)
 from config.settings import DEFAULT_PER_PAGE, DEFAULT_ORDER_PER_PAGE
 from datetime import datetime, timezone
@@ -78,10 +80,15 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
         order_data = order_data[:limit]
 
     past_product_ids = []
+    ordered_variations = {}
     for o in order_data:
         for item in o.get("line_items", []):
-            if item.get("product_id"):
-                past_product_ids.append(item["product_id"])
+            pid = item.get("product_id")
+            vid = item.get("variation_id")
+            if pid:
+                past_product_ids.append(pid)
+                if vid:
+                    ordered_variations[pid] = vid
 
     if not past_product_ids:
         elapsed = time.time() - start_time
@@ -137,23 +144,59 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
             "pagination": default_pagination(page),
             "flow_state": FlowState.IDLE.value,
         }), 200
-
+        
+    
     from formatters import format_product, format_custom_product
     formatted_products = []
+    
+    # 🚀 NEW: Create a list to hold the text descriptions of what they actually bought
+    purchased_items_text = []
+
     for p in seed_products:
         if "featured_image" in p:
-            formatted_products.append(format_custom_product(p))
+            fp = format_custom_product(p)
         else:
-            formatted_products.append(format_product(p))
+            fp = format_product(p)
             
+        pid = p.get("id")
+        ordered_vid = ordered_variations.get(pid)
+        
+        var_suffix = ""
+        if ordered_vid and p.get("variations"):
+            for var in p["variations"]:
+                if var.get("id") == ordered_vid:
+                    # Extract the variation attributes (e.g., "Charcoal / 12x24")
+                    var_attrs = var.get("attributes", {})
+                    if isinstance(var_attrs, dict):
+                        var_suffix = " / ".join(str(v) for v in var_attrs.values() if v)
+                    elif isinstance(var_attrs, list):
+                        var_suffix = " / ".join(str(a.get("option", "")) for a in var_attrs if isinstance(a, dict) and a.get("option"))
+                    break
+        
+        # 🚀 FIX: Add the specific variation to our text list, but leave the product card alone!
+        product_name = fp.get('name', 'Product')
+        if var_suffix:
+            purchased_items_text.append(f"• {product_name} ({var_suffix})")
+        else:
+            purchased_items_text.append(f"• {product_name}")
+            
+        formatted_products.append(fp)
+        
     formatted_products = [p for p in formatted_products if p.get("name")]
 
-    filter_str = " ".join(entities.tag_slugs + list(entities.attributes.values())).replace("-", " ") or "that description"
-    bot_message = f"Here are your previous purchases matching **{filter_str}**! 🎯\n\n"
+    # 🚀 FIX: Generate the bot message and append the list of specific variations!
+    if specific_order_id:
+        bot_message = f"Here are the products from order **#{specific_order_id}**! 📦\n\n"
+    else:
+        filter_str = " ".join(entities.tag_slugs + list(entities.attributes.values())).replace("-", " ") or "that description"
+        bot_message = f"Here are your previous purchases matching **{filter_str}**! 🎯\n\n"
+        
+    if purchased_items_text:
+        bot_message += "You specifically ordered:\n" + "\n".join(purchased_items_text) + "\n\n"
 
     from response_generator import generate_suggestions
     suggestions = generate_suggestions(intent, entities, formatted_products)
-
+    
     total_pages_calc = _sd.get("pages", 1) if isinstance(_sd, dict) else 1
     
     pagination = {
@@ -233,6 +276,59 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
     if not (source_line_items and customer_id):
         return None
 
+    # Check Stock Status Before Reordering!
+    product_ids = [item["product_id"] for item in source_line_items if item.get("product_id")]
+    
+    if product_ids:
+        stock_call = WooAPICall(
+            method="POST",
+            endpoint=f"{CUSTOM_API_BASE_URL}/products-advanced-new",
+            params={},
+            body={"ids": product_ids, "per_page": len(product_ids)},
+            description="Check stock status for reorder items"
+        )
+        stock_resp = woo_client.execute(stock_call)
+        
+        out_of_stock_items = []
+        if stock_resp.get("success"):
+            data = stock_resp.get("data", {})
+            current_products = data.get("products", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            
+            # Map product AND variation IDs to their current live stock status
+            stock_map = {}
+            for p in current_products:
+                stock_map[p["id"]] = p.get("stock_status", "instock")
+                for var in p.get("variations", []):
+                    stock_map[var["id"]] = var.get("stock_status", "instock")
+                    
+            # Check every item in the past order against the live stock map
+            for item in source_line_items:
+                check_id = item.get("variation_id") or item.get("product_id")
+                if stock_map.get(check_id) == "outofstock":
+                    out_of_stock_items.append(item.get("name", "An item"))
+                    
+        if out_of_stock_items:
+            if start_time is None: 
+                start_time = time.time()
+                
+            elapsed = time.time() - start_time
+            oos_names = ", ".join(out_of_stock_items)
+            
+            # Block the order and notify the user!
+            return jsonify({
+                "success": True,
+                "bot_message": f"I'm sorry, but I cannot duplicate this order because the following items are currently out of stock: **{oos_names}**.",
+                "intent": intent.value,
+                "products": [],
+                "suggestions": ["Show my orders", "Browse products", "Cancel"],
+                "session_id": session_id,
+                "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": round(elapsed * 1000)},
+                "flow_state": FlowState.IDLE.value,
+                "pagination": default_pagination(page)
+            }), 200
+
+
+    # ─── Standard Reorder Logic (Only executes if everything is in stock) ───
     new_line_items = [
         {
             "product_id": item["product_id"],

@@ -38,7 +38,11 @@ class OrderActionEvaluator(IntentEvaluator):
             return Intent.REORDER, 0.95
 
         has_filters = bool(entities.attributes or entities.tag_slugs or getattr(entities, 'target_category_slugs', set()) or entities.product_name)
-        is_past_order_query = re.search(r"\b(previous(?:ly)?|past|last|before)\b", text) and re.search(r"\b(purchases?|orders?|bought|buy|ordered)\b", text)
+        is_past_order_query = (
+            (re.search(r"\b(previous(?:ly)?|past|last|before)\b", text) and re.search(r"\b(purchases?|orders?|bought|buy|ordered)\b", text)) or
+            re.search(r"\b(?:from|in|of)\s+(?:my\s+)?orders?\b", text) or
+            (re.search(r"\bmy\s+orders?\b", text) and has_filters)
+        )
         is_match_query = re.search(r"\b(match|similar|related|goes\s*with|pair|complement)\b", text) and is_past_order_query
         asks_for_products = re.search(r"\b(what|which|show|list|tell)\b.*\b(products?|items?)\b", text)
         
