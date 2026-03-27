@@ -38,17 +38,27 @@ class OrderActionEvaluator(IntentEvaluator):
             return Intent.REORDER, 0.95
 
         has_filters = bool(entities.attributes or entities.tag_slugs or getattr(entities, 'target_category_slugs', set()) or entities.product_name)
-        is_past_order_query = re.search(r"\b(previous|past|last|before)\b", text) and re.search(r"\b(purchases?|orders?|bought|buy|ordered)\b", text)
+        is_past_order_query = re.search(r"\b(previous(?:ly)?|past|last|before)\b", text) and re.search(r"\b(purchases?|orders?|bought|buy|ordered)\b", text)
         is_match_query = re.search(r"\b(match|similar|related|goes\s*with|pair|complement)\b", text) and is_past_order_query
+        asks_for_products = re.search(r"\b(what|which|show|list|tell)\b.*\b(products?|items?)\b", text)
         
-        if is_match_query or (is_past_order_query and has_filters):
+        if is_match_query or (is_past_order_query and (has_filters or asks_for_products)):
+            # If they specifically asked for their *last* order's products, only fetch 1 order!
+            if re.search(r"\blast\b", text) and not re.search(r"past orders?", text):
+                entities.order_count = 1
             return Intent.HISTORICAL_SEARCH, 0.96
-
+        
         if re.search(r"\b(order|buy|purchase)\b|\bwant\s+to\s+(order|buy|purchase|get)\b|\bi'?d\s+like\s+to\s+(order|buy|purchase|get)\b", text) and entities.order_item_name and not re.search(r"\b(track|tracking|status|where|last|history|previous|past|look|show|search|browse|find|see|display)\b", text):
             return Intent.QUICK_ORDER, 0.93
 
-        if entities.order_id and re.search(r"\b(show|view|see|detail|details|info|about|check|open|what\s+is|tell\s+me)\b", text):
-            return Intent.ORDER_STATUS, 0.96
+        if entities.order_id:
+            # If they specifically ask for the products inside an order ID
+            if re.search(r"\b(what|which|show|list|tell)\b.*\b(products?|items?)\b", text):
+                return Intent.HISTORICAL_SEARCH, 0.97
+                
+            # Otherwise, show the standard text receipt
+            if re.search(r"\b(show|view|see|detail|details|info|about|check|open|what|which|tell)\b", text):
+                return Intent.ORDER_STATUS, 0.96
 
         if re.search(r"\b(track|tracking)\b.*\border\b|\border\b.*\btrack", text):
             return Intent.ORDER_TRACKING, 0.93

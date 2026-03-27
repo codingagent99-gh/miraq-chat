@@ -392,10 +392,19 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             ))
         
     elif intent == Intent.HISTORICAL_SEARCH:
+        params = {"customer": "CURRENT_USER_ID", "orderby": "date", "order": "desc"}
+        
+        if getattr(e, 'order_id', None):
+            params["include"] = [e.order_id]
+        elif getattr(e, 'order_count', None):
+            params["per_page"] = e.order_count
+        else:
+            params["per_page"] = 20
+            
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/orders",
-            params={"customer": "CURRENT_USER_ID", "per_page": 20, "orderby": "date", "order": "desc"},
+            params=params,
             description="Fetch past orders to find a historical seed product",
             requires_resolution=["customer_id"],
         ))

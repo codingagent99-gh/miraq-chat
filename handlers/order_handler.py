@@ -17,6 +17,8 @@ from app_config import (
     DEFAULT_PAYMENT_METHOD,
     DEFAULT_PAYMENT_METHOD_TITLE,
 )
+# From your api_builder.py (Line 12)
+from config.settings import DEFAULT_PER_PAGE, DEFAULT_ORDER_PER_PAGE
 from datetime import datetime, timezone
 from models import Intent, WooAPICall
 from woo_client import woo_client
@@ -50,6 +52,30 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
             "pagination": default_pagination(page),
             "flow_state": FlowState.IDLE.value,
         }), 200
+
+    # If they asked for a specific order ID, filter the order_data list!
+    specific_order_id = getattr(entities, 'order_id', None)
+    if specific_order_id:
+        order_data = [o for o in order_data if str(o.get('id')) == str(specific_order_id) or str(o.get('number')) == str(specific_order_id)]
+        
+        if not order_data:
+            elapsed = time.time() - start_time
+            return jsonify({
+                "success": True,
+                "bot_message": f"I couldn't find order #{specific_order_id} in your recent history. Please check the order number and try again!",
+                "intent": intent.value,
+                "products": [],
+                "suggestions": ["Show my orders", "Browse products"],
+                "session_id": session_id,
+                "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": round(elapsed * 1000)},
+                "pagination": default_pagination(page),
+                "flow_state": FlowState.IDLE.value,
+            }), 200
+
+    # Existing limit logic (only applies if they DIDN'T provide a specific order ID)
+    limit = getattr(entities, 'order_count', None)
+    if limit and not specific_order_id:
+        order_data = order_data[:limit]
 
     past_product_ids = []
     for o in order_data:
@@ -85,7 +111,7 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
         tags=list(entities.tag_slugs) if entities.tag_slugs else None,
         or_pairs=list(entities.attr_tag_or_pairs) if entities.attr_tag_or_pairs else None,
         page=page, 
-        per_page=20,
+        per_page=DEFAULT_PER_PAGE,
         description="Filter past orders"
     )
     seed_call.body["ids"] = list(set(past_product_ids))
@@ -128,11 +154,14 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
     from response_generator import generate_suggestions
     suggestions = generate_suggestions(intent, entities, formatted_products)
 
+    total_pages_calc = _sd.get("pages", 1) if isinstance(_sd, dict) else 1
+    
     pagination = {
         "page": page,
-        "per_page": 20,
-        "total_pages": _sd.get("pages", 1) if isinstance(_sd, dict) else 1,
-        "total_items": _sd.get("total", len(formatted_products)) if isinstance(_sd, dict) else len(formatted_products)
+        "per_page": DEFAULT_PER_PAGE,
+        "total_pages": total_pages_calc,
+        "total_items": _sd.get("total", len(formatted_products)) if isinstance(_sd, dict) else len(formatted_products),
+        "has_more": page < total_pages_calc
     }
 
     elapsed = time.time() - start_time
