@@ -220,13 +220,30 @@ class GeneralFallbackEvaluator(IntentEvaluator):
 
         for _pt in PRODUCT_TYPE_TERMS:
             _pt_esc = re.escape(_pt)
-            if re.search(rf"\b(show|list|all|sell|have|get|see)\b.*\b{_pt_esc}\b", text):
-                return Intent.PRODUCT_LIST, 0.85
-            elif re.search(rf"\b{_pt_esc}\b", text):
+            
+            if re.search(rf"\b{_pt_esc}s?\b", text):
+                # Check if we successfully extracted ANY known filters (tags, categories, attributes)
+                has_filters = any([
+                    entities.product_name, 
+                    getattr(entities, 'target_category_slugs', None), 
+                    entities.attributes, 
+                    entities.tag_slugs
+                ])
+                
+                if not has_filters:
+                    # Check if it's a purely generic request (e.g., "show all products") 
+                    # to safely dump the catalog without an error.
+                    is_pure_generic = bool(re.search(rf"^(show|list|all|sell|have|get|see|browse|what)\s+(me\s+)?(all\s+)?(your\s+)?(the\s+)?{_pt_esc}s?[.?!]*$", text.strip()))
+                    
+                    if is_pure_generic or re.search(rf"^{_pt_esc}s?(?:\s+please)?[.?!]*$", text.strip()):
+                        return Intent.PRODUCT_LIST, 0.85
+                    else:
+                        # The query contains unrecognized words (like "popular products").
+                        # Force a strict text search! This will return 0 results and trigger your LLM fallback perfectly.
+                        entities.search_term = text.replace("?", "").strip()
+                        return Intent.PRODUCT_SEARCH, 0.80
+                        
                 return Intent.PRODUCT_LIST, 0.75
-
-        if entities.order_item_name:
-            return Intent.QUICK_ORDER, 0.90
         
         if (entities.attributes or entities.in_stock) and not entities.product_name:
             return Intent.FILTER_BY_ATTRIBUTE, 0.89
