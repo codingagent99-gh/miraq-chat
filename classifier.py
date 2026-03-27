@@ -33,12 +33,18 @@ class OrderActionEvaluator(IntentEvaluator):
         if re.search(r"\b(repeat|reorder|re-order|order\s*again)\b", text):
             entities.reorder = True
             entities.order_count = 1
-            if re.search(r"\b(last|recent|previous)\b", text):
+            if re.search(r"\b(last|recent|previous)\b", text) and not re.search(r"past orders?", text):
                 entities.explicit_last_order = True
             return Intent.REORDER, 0.95
-            
-        if re.search(r"\b(order|buy|purchase)\b|\bwant\s+to\s+(order|buy|purchase|get)\b|\bi'?d\s+like\s+to\s+(order|buy|purchase|get)\b", text) and \
-           entities.order_item_name and not re.search(r"\b(track|tracking|status|where|last|history|previous|past|look|show|search|browse|find|see|display)\b", text):
+
+        has_filters = bool(entities.attributes or entities.tag_slugs or getattr(entities, 'target_category_slugs', set()) or entities.product_name)
+        is_past_order_query = re.search(r"\b(previous|past|last|before)\b", text) and re.search(r"\b(purchases?|orders?|bought|buy|ordered)\b", text)
+        is_match_query = re.search(r"\b(match|similar|related|goes\s*with|pair|complement)\b", text) and is_past_order_query
+        
+        if is_match_query or (is_past_order_query and has_filters):
+            return Intent.HISTORICAL_SEARCH, 0.96
+
+        if re.search(r"\b(order|buy|purchase)\b|\bwant\s+to\s+(order|buy|purchase|get)\b|\bi'?d\s+like\s+to\s+(order|buy|purchase|get)\b", text) and entities.order_item_name and not re.search(r"\b(track|tracking|status|where|last|history|previous|past|look|show|search|browse|find|see|display)\b", text):
             return Intent.QUICK_ORDER, 0.93
 
         if entities.order_id and re.search(r"\b(show|view|see|detail|details|info|about|check|open|what\s+is|tell\s+me)\b", text):
@@ -57,7 +63,8 @@ class OrderActionEvaluator(IntentEvaluator):
         if re.search(r"\border\b", text) and re.search(r"\b(last|past)\s+\d*\s*(day|week|month|year)s?\b", text):
             return Intent.ORDER_HISTORY, 0.93
 
-        if re.search(r"\b(order\s*history|past\s*orders?|previous\s*orders?)\b", text):
+        if re.search(r"\b(order\s*history|past\s*orders?|previous\s*orders?)\b", text) or \
+           (re.search(r"\bordered\b", text) and re.search(r"\b(in\s+the\s+past|previously|before)\b", text)):
             return Intent.ORDER_HISTORY, 0.92
 
         if re.search(r"\bwhat\b.*\bordered\b.*\bbefore\b", text):
@@ -159,11 +166,6 @@ class ProductDetailEvaluator(IntentEvaluator):
         if entities.product_name and re.search(r"\b(colors?|variants?|variations?|sizes)\b", text):
             return Intent.PRODUCT_VARIATIONS, 0.89
             
-        # HISTORICAL RECOMMENDATION
-        if re.search(r"\b(match|similar|related|goes\s*with|pair|complement)\b", text) and \
-           re.search(r"\b(previous|past|last)\b.*\b(purchases?|orders?|bought|buy)\b", text):
-            return Intent.HISTORICAL_SEARCH, 0.95
-
         # RELATED / YMAL (Must require a product name so it doesn't hijack generic searches)
         if entities.product_name and re.search(r"\b(goes?\s*with|pair|complement|match|similar|related|you may also like|ymal)\b", text):
             return Intent.RELATED_PRODUCTS, 0.88
