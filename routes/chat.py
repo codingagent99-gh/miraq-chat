@@ -607,7 +607,9 @@ def chat():
         }), 200
 
     # ─── Step 3.5: Reorder ───
-    handle_reorder(intent, order_data, customer_id, session_id)
+    resp = handle_reorder(intent, entities, order_data, customer_id, session_id, page, start_time, sessions)
+    if resp:
+        return resp
 
     # ─── Step 3.5b: Order detail ───
     resp = handle_order_detail(current_flow_state, customer_id, user_context, session_id, page, start_time)

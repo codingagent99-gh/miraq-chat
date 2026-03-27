@@ -134,6 +134,7 @@ class ExtractedEntities:
     reorder: Optional[bool] = None
     order_count: Optional[int] = None          # how many past orders to fetch
     order_item_name: Optional[str] = None      # product name for "order this item X"
+    explicit_last_order: bool = False
 
     # ──── Attribute info query ────
     target_attribute: Optional[str] = None     # attribute the user is asking about, e.g. "size", "finish"

@@ -17,6 +17,7 @@ from app_config import (
     DEFAULT_PAYMENT_METHOD,
     DEFAULT_PAYMENT_METHOD_TITLE,
 )
+from datetime import datetime, timezone
 from models import Intent, WooAPICall
 from woo_client import woo_client
 from formatters import format_product
@@ -150,18 +151,58 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
         },
         "pagination": pagination,
         "flow_state": FlowState.IDLE.value,
-    }), 200    
-def handle_reorder(intent, order_data, customer_id, session_id):
+    }), 200
+    
+def handle_reorder(intent, entities, order_data, customer_id, session_id, page, start_time, sessions):
     """Step 3.5: Create a new order from the last order's line items."""
-    if not (intent == Intent.REORDER and order_data):
-        return
+    if intent != Intent.REORDER:
+        return None
+
+    # 🚀 THE INTERCEPT: If they didn't provide an order ID and didn't explicitly say "last order"
+    if not entities.order_id and not getattr(entities, 'explicit_last_order', False):
+        elapsed = time.time() - start_time
+        bot_msg = "Which order would you like to reorder? 🔄\n\nPlease provide the order number (e.g., #12345), or simply say 'my last order'."
+        
+        if session_id and session_id in sessions:
+            sessions[session_id]["history"].append({
+                "role": "bot",
+                "message": bot_msg,
+                "intent": "guided_flow",
+                "products_count": 0,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            
+        return jsonify({
+            "success": True,
+            "bot_message": bot_msg,
+            "intent": "guided_flow",
+            "products": [],
+            "suggestions": ["My last order", "Cancel"],
+            "session_id": session_id,
+            "metadata": {
+                "flow_state": FlowState.AWAITING_REORDER_ID.value,
+                "response_time_ms": round(elapsed * 1000)
+            },
+            "flow_state": FlowState.AWAITING_REORDER_ID.value,
+            "pagination": default_pagination(page)
+        }), 200
+
+    # ─── Standard Reorder Logic ───
+    if not order_data:
+        return None
 
     source_order = order_data[0]
+    
+    # Security check to ensure they own the order they are trying to reorder!
+    if source_order.get("customer_id") != customer_id:
+        logger.warning(f"Step 3.5: Reorder failed | Unauthorized access attempt for order #{source_order.get('id')}")
+        return None
+
     source_line_items = source_order.get("line_items", [])
     logger.info(f"Step 3.5: Reorder attempt | source_order_id={source_order.get('id')} | line_items_count={len(source_line_items)}")
 
     if not (source_line_items and customer_id):
-        return
+        return None
 
     new_line_items = [
         {
@@ -172,8 +213,9 @@ def handle_reorder(intent, order_data, customer_id, session_id):
         for item in source_line_items
         if item.get("product_id")
     ]
+    
     if not new_line_items:
-        return
+        return None
 
     reorder_call = WooAPICall(
         method="POST",
@@ -187,9 +229,10 @@ def handle_reorder(intent, order_data, customer_id, session_id):
             "set_paid": False,
             "line_items": new_line_items,
         },
-        description="Create reorder from last order line items (COD, on-hold)",
+        description="Create reorder from last order line items",
     )
     reorder_resp = woo_client.execute(reorder_call)
+    
     if reorder_resp.get("success") and isinstance(reorder_resp.get("data"), dict):
         new_order = reorder_resp["data"]
         order_data.append(new_order)
@@ -197,7 +240,8 @@ def handle_reorder(intent, order_data, customer_id, session_id):
     else:
         error_msg = sanitize_log_string(str(reorder_resp.get('error', 'Unknown')))
         logger.warning(f"Step 3.5: Reorder failed | error={error_msg}")
-
+        
+    return None # Fall through so chat.py formats the success/failure message!
 
 def handle_order_detail(current_flow_state, customer_id, user_context, session_id, page, start_time):
     """Step 3.5b: Fetch and display a specific order's details."""

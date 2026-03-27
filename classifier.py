@@ -33,6 +33,8 @@ class OrderActionEvaluator(IntentEvaluator):
         if re.search(r"\b(repeat|reorder|re-order|order\s*again)\b", text):
             entities.reorder = True
             entities.order_count = 1
+            if re.search(r"\b(last|recent|previous)\b", text):
+                entities.explicit_last_order = True
             return Intent.REORDER, 0.95
             
         if re.search(r"\b(order|buy|purchase)\b|\bwant\s+to\s+(order|buy|purchase|get)\b|\bi'?d\s+like\s+to\s+(order|buy|purchase|get)\b", text) and \

@@ -372,13 +372,24 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
         ))
 
     elif intent == Intent.REORDER:
-        calls.append(WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/orders",
-            params={"customer": "CURRENT_USER_ID", "per_page": 1, "orderby": "date", "order": "desc"},
-            description="Fetch last order for reorder (step 1)",
-            requires_resolution=["customer_id", "reorder_step2"],
-        ))
+        if e.order_id:
+            # If the user specified an order number, fetch that exact order
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/orders/{e.order_id}",
+                params={},
+                description=f"Fetch order #{e.order_id} for reorder (step 1)",
+                requires_resolution=["reorder_step2"],
+            ))
+        else:
+            # If they just said "reorder", default to their most recent order
+            calls.append(WooAPICall(
+                method="GET",
+                endpoint=f"{BASE}/orders",
+                params={"customer": "CURRENT_USER_ID", "per_page": 1, "orderby": "date", "order": "desc"},
+                description="Fetch last order for reorder (step 1)",
+                requires_resolution=["customer_id", "reorder_step2"],
+            ))
         
     elif intent == Intent.HISTORICAL_SEARCH:
         calls.append(WooAPICall(

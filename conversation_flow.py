@@ -30,7 +30,7 @@ class FlowState(Enum):
     CLOSING = "closing"                     # User said no, chat closing
     AWAITING_VARIANT_SELECTION = "awaiting_variant_selection"  # MQ asked: which variant?
     AWAITING_ORDER_DETAIL = "awaiting_order_detail"            # User asked for order detail / clicked an order
-
+    AWAITING_REORDER_ID = "awaiting_reorder_id"
 
 @dataclass
 class ConversationContext:
@@ -158,6 +158,43 @@ def handle_flow_state(
             # No keyword matched — let the classifier pipeline handle it
             return None
 
+    # ── State: Awaiting specific order ID to reorder ──
+    if state == FlowState.AWAITING_REORDER_ID:
+        if any(kw in text for kw in ["cancel", "stop", "nevermind", "never mind", "quit", "exit"]):
+            return {
+                "bot_message": "No problem! Let me know if you need anything else.",
+                "suggestions": ["Show me products", "View my orders", "No, thank you"],
+                "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
+                "pass_through": False,
+            }
+
+        import re
+        # If they reply with "my last one", route it as an explicit last order
+        if re.search(r"\b(last|recent|previous)\b", text):
+            return {
+                "override_message": "reorder my last order",
+                "flow_state": FlowState.IDLE.value,
+                "pass_through": True
+            }
+
+        # Check if they provided a number (e.g. "12345" or "#12345")
+        match = re.search(r'#?\s*(\d+)', text)
+        if match:
+            order_num = match.group(1)
+            # Override their message to be perfectly parsable by the standard pipeline!
+            return {
+                "override_message": f"reorder order #{order_num}",
+                "flow_state": FlowState.IDLE.value,
+                "pass_through": True
+            }
+
+        # They typed something unrelated
+        return {
+            "bot_message": "I didn't catch an order number. Please provide the order number (e.g., #12345), or say 'my last order' to reorder your most recent purchase.",
+            "suggestions": ["My last order", "Cancel"],
+            "flow_state": FlowState.AWAITING_REORDER_ID.value,
+            "pass_through": False,
+        }
     # ── State: Awaiting quantity for an order ──
     # After user provides quantity → go straight to shipping (skip old order confirm)
     if state == FlowState.AWAITING_QUANTITY:
