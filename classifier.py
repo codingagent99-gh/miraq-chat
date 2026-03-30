@@ -13,6 +13,8 @@ from config.store_config import (
     ORIGIN_KEYWORDS,
     GENERIC_NOISE_WORDS
 )
+import os
+import difflib
 from chat_logger import get_logger
 
 logger = get_logger("miraq_chat")
@@ -304,6 +306,84 @@ def _normalize_dimension(val: str) -> str:
     clean = re.sub(r'(mm|cm|inch|inches|in\.?|thick|weight|lbs?|oz|kg|g)$', '', clean)
     return clean
 
+def _extract_fuzzy_near_misses(text: str, entities: ExtractedEntities):
+    loader = get_store_loader()
+    if not loader: 
+        return
+
+    # 1. Build a set of normalized tokens we ALREADY successfully extracted.
+    # We do this so we don't accidentally "fuzzy match" a word we already processed.
+    used_tokens = set()
+    if entities.product_name:
+        used_tokens.update(_normalize_for_tag_compare(entities.product_name))
+    for cat in getattr(entities, 'target_category_slugs', set()):
+        used_tokens.update(_normalize_for_tag_compare(cat.replace("-", " ")))
+    for slug in entities.tag_slugs:
+        used_tokens.update(_normalize_for_tag_compare(slug.replace("-", " ")))
+    for term in entities.attributes.values():
+        used_tokens.update(_normalize_for_tag_compare(term.replace("-", " ")))
+
+    # Add known store noise words to the ignore list so they don't corrupt the fuzzy match
+    used_tokens.update(set(kw.lower() for kw in GENERIC_NOISE_WORDS))
+    used_tokens.update(set(kw.lower() for kw in PRODUCT_TYPE_TERMS))
+    if hasattr(loader, '_store_generic_terms'):
+        used_tokens.update(loader._store_generic_terms)
+
+    # 2. Isolate the "Leftover Text"
+    # Mask out all the successfully used tokens with spaces
+    leftover_text = text.lower()
+    for token in used_tokens:
+        if len(token) > 2:  # Only mask meaningful words
+            leftover_text = re.sub(rf'\b{re.escape(token)}\b', ' ', leftover_text)
+
+    # Clean up the leftover string to see what phrase the user actually typed
+    leftover_phrase = re.sub(r'\s+', ' ', leftover_text).strip()
+
+    if not leftover_phrase or len(leftover_phrase) < 4:
+        return  # Nothing substantial left to fuzzy match!
+
+    # Pull the threshold from the environment, defaulting to 80% similarity
+    THRESHOLD = float(os.getenv("FUZZY_MATCH_THRESHOLD", "0.80"))
+    
+    best_match = None
+    best_score = 0
+    
+    # 3. Fuzzy match the leftover phrase against active Tags
+    for tag_name_lower, tag_entry in loader.tag_by_name_lower.items():
+        if tag_entry.get("count", 0) > 0:
+            score = difflib.SequenceMatcher(None, leftover_phrase, tag_name_lower).ratio()
+            if score >= THRESHOLD and score > best_score:
+                best_score = score
+                best_match = {
+                    "user_text": leftover_phrase,
+                    "suggested_name": tag_entry.get("name"),
+                    "type": "tag",
+                    "slug": tag_entry.get("slug")
+                }
+    
+    # 4. Fuzzy match against active Attributes
+    if loader.attribute_terms:
+        for attr_id, terms_list in loader.attribute_terms.items():
+            for term in terms_list:
+                if term.get("count", 0) > 0:
+                    term_name_lower = term.get("name", "").lower()
+                    score = difflib.SequenceMatcher(None, leftover_phrase, term_name_lower).ratio()
+                    if score >= THRESHOLD and score > best_score:
+                        taxonomy_slug = loader.get_attribute_slug(attr_id) or "attribute"
+                        best_score = score
+                        best_match = {
+                            "user_text": leftover_phrase,
+                            "suggested_name": term.get("name"),
+                            "type": "attribute",
+                            "slug": term.get("slug"),
+                            "taxonomy": taxonomy_slug
+                        }
+                        
+    # 5. If we found a strong near-miss, attach it!
+    if best_match:
+        entities.fuzzy_matches.append(best_match)
+        logger.info(f"Classifier: Fuzzy match found! '{leftover_phrase}' -> '{best_match['suggested_name']}' (Score: {best_score:.2f})")
+
 # ─────────────────────────────────────────────
 # MAIN CLASSIFY FUNCTION
 # ─────────────────────────────────────────────
@@ -359,6 +439,9 @@ def classify(utterance: str) -> ClassifiedResult:
     _detect_tag_operator(text, entities)       
     _extract_customer_fetch(text, entities)
     _extract_stock_status(text, entities)
+    
+    # ─── 4.5 FUZZY NEAR-MISS EXTRACTION ───
+    _extract_fuzzy_near_misses(text, entities)
 
     # ─── 5. EXECUTE INTENT PIPELINE ───
     pipeline = ClassifierPipeline([

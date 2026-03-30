@@ -37,7 +37,7 @@ logger = get_logger("miraq_chat")
 chat_bp = Blueprint("chat", __name__)
 
 def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
-    """Hybrid Parser: Secures exact matches first, uses NLP ONLY on the leftovers."""
+    """Hybrid Parser: Secures exact matches first, fuzzy matches near-misses, uses NLP ONLY on the leftovers."""
     
     terms = [t.strip().lower() for t in msg.split(",") if t.strip()]
     if not terms:
@@ -92,15 +92,65 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
                 if term_matched:
                     break
         
-        # If the term failed, save it for the AI!
+        # If the term failed exact match, save it for fuzzy matching!
         if not term_matched:
             unmatched_terms.append(term)
 
-    # 🚀 SAFETY LOCK 1: If NOTHING matched the dictionary, abort and let the normal AI handle it!
-    if len(unmatched_terms) == len(terms):
+    # --- PHASE 1.5: FUZZY MATCH UNMATCHED CSV TERMS ---
+    still_unmatched = []
+    if unmatched_terms and loader:
+        import difflib
+        import os
+        THRESHOLD = float(os.getenv("FUZZY_MATCH_THRESHOLD", "0.60"))
+        
+        for term in unmatched_terms:
+            best_match = None
+            best_score = 0
+            
+            # Fuzzy match against Tags
+            for tag_name_lower, tag_entry in loader.tag_by_name_lower.items():
+                if tag_entry.get("count", 0) > 0:
+                    score = difflib.SequenceMatcher(None, term, tag_name_lower).ratio()
+                    if score >= THRESHOLD and score > best_score:
+                        best_score = score
+                        best_match = {
+                            "user_text": term,
+                            "suggested_name": tag_entry.get("name"),
+                            "type": "tag",
+                            "slug": tag_entry.get("slug")
+                        }
+            
+            # Fuzzy match against Attributes
+            if loader.attribute_terms:
+                for attr_id, terms_list in loader.attribute_terms.items():
+                    for attr_term in terms_list:
+                        if attr_term.get("count", 0) > 0:
+                            term_name_lower = attr_term.get("name", "").lower()
+                            score = difflib.SequenceMatcher(None, term, term_name_lower).ratio()
+                            if score >= THRESHOLD and score > best_score:
+                                taxonomy_slug = loader.get_attribute_slug(attr_id) or "attribute"
+                                best_score = score
+                                best_match = {
+                                    "user_text": term,
+                                    "suggested_name": attr_term.get("name"),
+                                    "type": "attribute",
+                                    "slug": attr_term.get("slug"),
+                                    "taxonomy": taxonomy_slug
+                                }
+                                
+            if best_match:
+                entities.fuzzy_matches.append(best_match)
+                logger.info(f"Hybrid Parser: Fuzzy match found! '{term}' -> '{best_match['suggested_name']}' (Score: {best_score:.2f})")
+            else:
+                still_unmatched.append(term)
+                
+        unmatched_terms = still_unmatched
+
+    # 🚀 SAFETY LOCK 1: If NOTHING matched the dictionary (exact or fuzzy), abort and let normal AI handle it!
+    if len(unmatched_terms) == len(terms) and not entities.fuzzy_matches:
         return None
 
-    # If EVERYTHING matched perfectly, exit early
+    # If EVERYTHING matched perfectly (exact or fuzzy), exit early
     if not unmatched_terms:
         resolved_intent = Intent.PRODUCT_SEARCH if entities.product_id else Intent.FILTER_BY_ATTRIBUTE
         return ClassifiedResult(intent=resolved_intent, entities=entities, confidence=1.0)
@@ -139,7 +189,18 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
                 if v not in entities.attributes[k]:
                     entities.attributes[k] += f",{v}"
                     
-    # 🚀 SAFETY LOCK 2: Preserve conversational AI intents (like Order Tracking)
+    # MERGE SECONDARY FUZZY MATCHES (If NLP found any remaining)
+    if hasattr(nlp_entities, 'fuzzy_matches') and nlp_entities.fuzzy_matches:
+        entities.fuzzy_matches.extend(nlp_entities.fuzzy_matches)
+                    
+    # PRESERVE UNMATCHED TEXT AS SEARCH TERM
+    if getattr(nlp_entities, 'search_term', None):
+        entities.search_term = nlp_entities.search_term
+    elif fallback_text and not nlp_entities.product_id and not getattr(nlp_entities, 'target_category_slugs', None) and not nlp_entities.tag_slugs and not nlp_entities.attributes and not nlp_entities.fuzzy_matches:
+        # If the AI couldn't extract ANY structured filters from the fallback text, treat it as a raw search!
+        entities.search_term = fallback_text
+
+    # 🚀 SAFETY LOCK 2: Preserve conversational AI intents
     CATALOG_INTENTS = {Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_SEARCH, Intent.PRODUCT_VARIATIONS, Intent.UNKNOWN}
     
     if nlp_result.intent in CATALOG_INTENTS:
@@ -147,7 +208,6 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
     else:
         resolved_intent = nlp_result.intent
     
-    # We boost the confidence back up because we know our exact matches were solid
     final_confidence = max(nlp_result.confidence, 0.95)
     
     return ClassifiedResult(intent=resolved_intent, entities=entities, confidence=final_confidence)
@@ -453,7 +513,161 @@ def chat():
             # (intent, entities, confidence, result) tuple — updated classification
             if isinstance(llm_outcome, tuple) and len(llm_outcome) == 4:
                 intent, entities, confidence, result = llm_outcome
+        
+        # ─── PHASE 4: RESOLVE PENDING FUZZY MATCH ───
+        if flow_result and current_flow_state == FlowState.AWAITING_FILTER_CLARIFICATION:
+            pending_fuzzy = user_context.get("pending_fuzzy_match")
+            if pending_fuzzy:
+                if flow_result.get("apply_fuzzy_match"):
+                    logger.info(f"Step 1.8: User ACCEPTED fuzzy matches.")
+                    
+                    # 1. Did they click a Multi-Choice option? (Resolving a Tie)
+                    if "options" in pending_fuzzy:
+                        selected_name = flow_result.get("button_text", "").replace("Use ", "")
+                        selected_match = next((opt for opt in pending_fuzzy["options"] if opt["suggested_name"] == selected_name), pending_fuzzy["options"][0])
+                        
+                        if selected_match["type"] == "tag":
+                            entities.tag_slugs.append(selected_match["slug"])
+                        elif selected_match["type"] == "attribute":
+                            entities.attributes[selected_match["taxonomy"]] = selected_match["slug"]
+                    else:
+                        # Fallback for single acceptance
+                        if pending_fuzzy.get("type") == "tag":
+                            entities.tag_slugs.append(pending_fuzzy.get("slug"))
+                            
+                    # Inject any extra grouped fuzzies
+                    for extra in pending_fuzzy.get("extra_fuzzies", []):
+                        if extra["type"] == "tag":
+                            entities.tag_slugs.append(extra["slug"])
+                        elif extra["type"] == "attribute":
+                            taxonomy = extra["taxonomy"]
+                            if taxonomy not in entities.attributes:
+                                entities.attributes[taxonomy] = extra["slug"]
+                            else:
+                                if extra["slug"] not in entities.attributes[taxonomy].split(","):
+                                    entities.attributes[taxonomy] += f",{extra['slug']}"
 
+                elif flow_result.get("reject_fuzzy_match"):
+                    logger.info(f"Step 1.8: User REJECTED fuzzy matches.")
+                    # Let it pass through so they can continue searching without it
+
+                # 2. 👉 THE ONE-BY-ONE LOOP: Put any leftover questions back in the queue!
+                # (We do this even if they rejected the first one, so they still get asked about the rest)
+                leftovers = pending_fuzzy.get("pending_other_fuzzies", [])
+                if leftovers:
+                    entities.fuzzy_matches.extend(leftovers)
+
+                # 3. Unpack the backpack and restore the exact matches
+                if pending_fuzzy.get("carryover_search_term"):
+                    entities.search_term = pending_fuzzy["carryover_search_term"]
+                if pending_fuzzy.get("carryover_tags"):
+                    entities.tag_slugs.extend(pending_fuzzy["carryover_tags"])
+                if pending_fuzzy.get("carryover_categories") and hasattr(entities, 'target_category_slugs'):
+                    entities.target_category_slugs.update(pending_fuzzy["carryover_categories"])
+                if pending_fuzzy.get("carryover_category_name"):
+                    entities.category_name = pending_fuzzy["carryover_category_name"]
+                if pending_fuzzy.get("carryover_attributes"):
+                    for k, v in pending_fuzzy["carryover_attributes"].items():
+                        if k not in entities.attributes:
+                            entities.attributes[k] = v
+                        else:
+                            if v not in entities.attributes[k].split(","):
+                                entities.attributes[k] += f",{v}"
+        
+                elif flow_result.get("reject_fuzzy_match"):
+                    # User said NO: Force a raw text search for their original words
+                    logger.info(f"Fuzzy Match Rejected: Searching raw text '{pending_fuzzy['user_text']}'")
+                    entities.search_term = pending_fuzzy["user_text"]
+                    
+                    # Prevent the LLM from suggesting this rejected term later
+                    if "rejected_fuzzy_terms" not in user_context:
+                        user_context["rejected_fuzzy_terms"] = []
+                    user_context["rejected_fuzzy_terms"].append(pending_fuzzy["suggested_name"])
+
+
+        # ─── PHASE 3: INTERCEPT NEW FUZZY MATCHES ───
+        if entities.fuzzy_matches and current_flow_state != FlowState.AWAITING_FILTER_CLARIFICATION:
+            
+            rejected_list = user_context.get("rejected_fuzzy_terms", [])
+            valid_term_groups = []
+            
+            for candidate_list in entities.fuzzy_matches:
+                # Safety check: ensure it's a list (in case of legacy flat list formats)
+                if isinstance(candidate_list, dict):
+                    candidate_list = [candidate_list]
+                    
+                clean_list = [c for c in candidate_list if c["suggested_name"] not in rejected_list]
+                if clean_list:
+                    valid_term_groups.append(clean_list)
+                    
+            if valid_term_groups and not (flow_result and flow_result.get("reject_fuzzy_match")):
+                
+                has_ties = any(len(group) > 1 for group in valid_term_groups)
+                
+                # 👉 THE STASH: Always pack the exact matches into the backpack
+                stashed_fuzzy_data = {
+                    "carryover_search_term": entities.search_term,
+                    "carryover_tags": list(entities.tag_slugs),
+                    "carryover_attributes": entities.attributes
+                }
+                if hasattr(entities, 'target_category_slugs'):
+                    stashed_fuzzy_data["carryover_categories"] = list(entities.target_category_slugs)
+                    stashed_fuzzy_data["carryover_category_name"] = getattr(entities, 'category_name', None)
+
+                suggestion_buttons = []
+
+                if has_ties:
+                    # ── ROUTE 1: RESOLVE THE TIE (Sequential Resolution) ──
+                    active_group = valid_term_groups[0]
+                    user_original_term = active_group[0]["user_text"]
+                    
+                    stashed_fuzzy_data["options"] = active_group
+                    stashed_fuzzy_data["pending_other_fuzzies"] = valid_term_groups[1:] 
+                    
+                    bot_message = f"I found multiple matches for '{user_original_term}'. Which one did you mean?"
+                    for candidate in active_group:
+                        suggestion_buttons.append(f"Use {candidate['suggested_name']}")
+                    suggestion_buttons.append(f"No - search for '{user_original_term}'")
+                    
+                else:
+                    # ── ROUTE 2: NO TIES, GROUP THEM ALL ──
+                    primary_fuzzies = [group[0] for group in valid_term_groups]
+                    
+                    stashed_fuzzy_data["options"] = [primary_fuzzies[0]] 
+                    stashed_fuzzy_data["extra_fuzzies"] = primary_fuzzies[1:] 
+                    
+                    suggested_names = [f["suggested_name"] for f in primary_fuzzies]
+                    if len(suggested_names) == 1:
+                        bot_message = f"I don't have an exact match for '{primary_fuzzies[0]['user_text']}', but I do have **{suggested_names[0]}**. Would you like to use that filter?"
+                        suggestion_buttons.append(f"Yes - use {suggested_names[0]}")
+                        suggestion_buttons.append(f"No - search for '{primary_fuzzies[0]['user_text']}'")
+                    else:
+                        joined_names = " and ".join(suggested_names)
+                        bot_message = f"I don't have exact matches, but I found **{joined_names}**. Would you like to use these filters?"
+                        suggestion_buttons.append("Yes - use these filters")
+                        suggestion_buttons.append("No - use my original text")
+
+                suggestion_buttons.append("Cancel")
+                
+                elapsed = time.time() - start_time
+                logger.info(f"Step 1.9: Intercepting API Pipeline! Pausing to resolve fuzzy matches.")
+                
+                return jsonify({
+                    "success": True,
+                    "bot_message": bot_message,
+                    "intent": "guided_flow",
+                    "products": [],
+                    "suggestions": suggestion_buttons,
+                    "session_id": session_id,
+                    "metadata": {
+                        "flow_state": FlowState.AWAITING_FILTER_CLARIFICATION.value,
+                        "pending_fuzzy_match": stashed_fuzzy_data,
+                        "response_time_ms": round(elapsed * 1000),
+                    },
+                    "flow_state": FlowState.AWAITING_FILTER_CLARIFICATION.value,
+                    "pagination": default_pagination(page),
+                }), 200
+                       
         # ─── Step 2: Build API calls ───
         # Resolve customer_id before build so UPDATE_CUSTOMER gets the correct ID
         customer_id = user_context.get("customer_id")

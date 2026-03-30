@@ -176,6 +176,14 @@ class ExtractedEntities:
     # Stores isolated entity groups when a user uses "OR" (e.g. Titan OR Ansel)
     logical_chunks: List[dict] = field(default_factory=list)
     
+    # ──── Conversational Disambiguation ────
+    # Populated when a user types an unrecognized term that strongly resembles 
+    # an active tag or attribute (e.g. "minimalist design" -> "minimalistic look").
+    fuzzy_matches: List[dict] = field(default_factory=list)
+    
+    # ──── Logical Chunking ────
+    logical_chunks: List[dict] = field(default_factory=list)
+    
 @dataclass
 class WooAPICall:
     method: str

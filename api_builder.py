@@ -515,6 +515,10 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
 
         active_or_pairs = list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else []
 
+        actual_search = e.product_name or e.search_term
+        if not actual_search and not e.tag_slugs and not e.target_category_slugs and not attr_filters and not e.product_id and not active_or_pairs:
+            actual_search = user_message
+
         calls.append(_build_advanced_filter_call(
             tags=list(e.tag_slugs) if e.tag_slugs else None,
             categories=e.target_category_slugs,
@@ -525,10 +529,10 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None,
             tag_operator=e.tag_operator,
             page=page,
-            description=f"Advanced product search: '{e.product_name or e.search_term}'",
+            description=f"Advanced product search: '{actual_search}'",
             min_price=e.min_price,
             max_price=e.max_price,
-            search_term=e.product_name or e.search_term,
+            search_term=actual_search,
             product_id=e.product_id
         ))
         
@@ -645,7 +649,11 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
 
         attr_label = next(iter(e.attributes.keys()), "attribute")
         attr_value = next(iter(e.attributes.values()), "")
-        
+
+        actual_search = e.product_name or e.search_term
+        if not actual_search and not deduped_tag_slugs and not e.target_category_slugs and not attr_filters and not e.product_id and not e.attr_tag_or_pairs:
+            actual_search = user_message
+
         calls.append(_build_advanced_filter_call(
             tags=deduped_tag_slugs if deduped_tag_slugs else None,
             attributes=attr_filters if attr_filters else None,
@@ -660,9 +668,9 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             categories=e.target_category_slugs,
             excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None,
             description=f"Filter by {attr_label}: {attr_value}",
-            search_term=e.product_name,
+            search_term=actual_search,
             product_id=e.product_id
-        ))        
+        ))
 
     # ═══════════════════════════════════════════
     # VARIATIONS

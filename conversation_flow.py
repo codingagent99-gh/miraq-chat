@@ -31,6 +31,7 @@ class FlowState(Enum):
     AWAITING_VARIANT_SELECTION = "awaiting_variant_selection"  # MQ asked: which variant?
     AWAITING_ORDER_DETAIL = "awaiting_order_detail"            # User asked for order detail / clicked an order
     AWAITING_REORDER_ID = "awaiting_reorder_id"
+    AWAITING_FILTER_CLARIFICATION = "awaiting_filter_clarification"
 
 @dataclass
 class ConversationContext:
@@ -112,6 +113,31 @@ def handle_flow_state(
                 "suggestions": ["Show me products", "Browse categories", "No, thank you"],
                 "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
                 "pass_through": False,
+            }
+            
+    # ── State: Awaiting Filter Clarification ──
+    if state == FlowState.AWAITING_FILTER_CLARIFICATION:
+        # Check if they accepted the suggested filter
+        if any(kw in text for kw in ["yes", "yeah", "yep", "sure", "ok", "correct", "use", "mean"]):
+            return {
+                "flow_state": FlowState.IDLE.value,
+                "pass_through": True,
+                "apply_fuzzy_match": True  # Flag for chat.py
+            }
+        # Check if they explicitly rejected it
+        elif any(kw in text for kw in ["no", "nope", "don't", "original", "search for"]):
+            return {
+                "flow_state": FlowState.IDLE.value,
+                "pass_through": True,
+                "reject_fuzzy_match": True  # Flag for chat.py
+            }
+        else:
+            # Context Switch! The user ignored the question and typed a completely new search.
+            # We silently clear the fuzzy state and let the new query process normally.
+            return {
+                "flow_state": FlowState.IDLE.value,
+                "pass_through": True,
+                "clear_fuzzy_match": True
             }
 
     # ── State: User is picking intent from menu ──
