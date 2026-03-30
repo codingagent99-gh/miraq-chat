@@ -215,7 +215,7 @@ class StoreLoader:
                     
                 self._log_load_summary()
 
-            # 🚀 THE FIX: Run the scanner OUTSIDE the lock in a detached thread!
+            # Run the scanner OUTSIDE the lock in a detached thread!
             import threading
             threading.Thread(target=self._run_scanner_async, daemon=True).start()
 
@@ -696,14 +696,8 @@ class StoreLoader:
                 if re.search(rf'\b{re.escape(token)}\b', text_lower):
                     candidates.append(entry)
 
-        # ── THE ULTIMATE DIAGNOSTIC (Restored) ──
-        if not candidates:
-            logger.debug(f"StoreLoader: No matches for '{text_lower}'")
-            logger.debug(f"StoreLoader: Currently loaded product keys: {list(self.product_by_name_lower.keys())}")
-            return None
-
         stop_words = self._store_generic_terms.copy()
-        stop_words.update({"sample", "samples", "tile", "tiles", "mosaic", "mosaics", "product", "item", "size", "sizes"})
+        stop_words.update({"sample", "samples", "product", "item", "size", "sizes"})
         
         for attr in self.attribute_by_slug.values():
             attr_name = attr.get("name", "").lower().strip()
