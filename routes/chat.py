@@ -418,9 +418,15 @@ def chat():
             
             is_reject = (
                 msg_lower.startswith("no - ") or
-                msg_lower in ["no", "n", "nope", "cancel"]
+                msg_lower in ["no", "n", "nope"]
             )
+            
+            is_cancel = msg_lower in ["cancel", "exit", "stop", "nevermind", "never mind", "abort", "start over"]
 
+            if is_cancel:
+                logger.info("Step 0.8: User cancelled semantic match. Purging backpack and triggering escape hatch.")
+                user_context.pop("pending_semantic_match", None)
+                
             if is_accept or is_reject:
                 logger.info(f"Step 0.8: User responded to semantic match (Accept={is_accept}). Bypassing NLP.")
                 entities = ExtractedEntities()

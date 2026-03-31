@@ -31,6 +31,24 @@ def _build_search_context_string(entities: ExtractedEntities) -> str:
         for tag in entities.tag_slugs:
             clean_tag = tag.replace("-", " ").title()
             desc_parts.append(f"Tag: **{clean_tag}**")
+
+    # EXCLUSIONS
+    if getattr(entities, 'excluded_tags', None):
+        for tag in entities.excluded_tags:
+            clean_tag = tag.replace("-", " ").title()
+            desc_parts.append(f"Excluding Tag: **{clean_tag}**")
+            
+    if getattr(entities, 'excluded_categories', None):
+        for cat in entities.excluded_categories:
+            clean_cat = cat.replace("-", " ").title()
+            desc_parts.append(f"Excluding Category: **{clean_cat}**")
+            
+    if getattr(entities, 'excluded_attributes', None):
+        for attr_name, attr_vals in entities.excluded_attributes.items():
+            clean_name = attr_name.replace(" 2", "").replace("-", " ").replace("pa_", "").title()
+            for val in attr_vals:
+                clean_val = str(val).replace("-", " ").title()
+                desc_parts.append(f"Excluding {clean_name}: **{clean_val}**")
             
     return " · ".join(desc_parts)
 

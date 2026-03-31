@@ -291,10 +291,7 @@ def _normalize_dimension(val: str) -> str:
     return clean
 
 # ─────────────────────────────────────────────
-# NEW: LEFTOVER ISOLATOR FOR VECTOR AI
-# ─────────────────────────────────────────────
-# ─────────────────────────────────────────────
-# NEW: NEGATIVE-AWARE LEFTOVER ISOLATOR
+# NEGATIVE-AWARE LEFTOVER ISOLATOR
 # ─────────────────────────────────────────────
 def _isolate_unrecognized_terms(text: str, entities: ExtractedEntities):
     """Masks out successfully extracted entities and routes leftovers to positive/negative baskets."""
@@ -313,7 +310,7 @@ def _isolate_unrecognized_terms(text: str, entities: ExtractedEntities):
     for term in getattr(entities, 'attributes', {}).values():
         used_tokens.update(_normalize_for_tag_compare(term.replace("-", " ")))
 
-    # 2. Add conversational filler (NOTE: "without", "no", "not" have been REMOVED from this list!)
+    # 2. Add conversational filler (NOTE: "without", "no", "not" have been REMOVED from this list)
     CONVERSATIONAL_FILLER = {
         "do", "you", "have", "are", "there", "any", "what", "is", "the", 
         "show", "me", "find", "looking", "for", "i", "want", "to", "buy",
@@ -337,7 +334,7 @@ def _isolate_unrecognized_terms(text: str, entities: ExtractedEntities):
     leftover_phrase = re.sub(r'[^a-z0-9, ]', ' ', leftover_text)
     leftover_phrase = re.sub(r'\s+', ' ', leftover_phrase).strip()
 
-    # 5. THE TRAFFIC COP: Route positives and negatives
+    # 5. Route positives and negatives
     positive_leftovers = []
     negative_leftovers = []
 
