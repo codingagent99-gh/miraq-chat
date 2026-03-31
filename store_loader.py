@@ -17,6 +17,8 @@ from typing import List, Dict, Optional, Tuple
 from dotenv import load_dotenv
 from config.store_config import TAG_SLUG_QUICK_SHIP, TAG_SLUG_CHIP_CARD
 from chat_logger import get_logger
+import torch
+from sentence_transformers import SentenceTransformer, util
 
 load_dotenv()
 
@@ -143,6 +145,18 @@ class StoreLoader:
 
         self.session = requests.Session()
         self.session.headers.update(BROWSER_HEADERS)
+        
+        # ─── 1. INITIALIZE SEMANTIC VECTOR MODEL ───
+        logger.info("Loading Semantic Vector Model (all-MiniLM-L6-v2)...")
+        try:
+            self.vector_model = SentenceTransformer('all-MiniLM-L6-v2')
+        except Exception as e:
+            logger.error(f"Failed to load vector model. Fallback will not be available: {e}")
+            self.vector_model = None
+            
+        self.semantic_dictionary = {}
+        self.semantic_tensors = None
+        self.semantic_keys = []
 
         self.categories: List[Dict] = []
         self.tags: List[Dict] = []
@@ -210,6 +224,10 @@ class StoreLoader:
                 self._validate_load()
                 self._last_loaded = time.time()
                 
+                # ─── NEW: Build Semantic Vectors Instantly ───
+                if self.vector_model:
+                    self.build_semantic_vectors()
+                
                 if DEV_CACHE_ENABLED:
                     self._dump_lookups_for_debugging()
                     
@@ -223,12 +241,67 @@ class StoreLoader:
             self._degraded = True
             self._degraded_reasons = [str(e)]
             logger.error(f"StoreLoader: ❌ Failed to load store data: {e}", exc_info=True)
+
+    def build_semantic_vectors(self):
+        """Translates WooCommerce Tags and Attributes into Semantic Coordinates."""
+        logger.info("Building Semantic Vectors for Store Tags & Attributes...")
+        start_time = time.time()
+        
+        corpus_texts = []
+        self.semantic_keys = []
+        self.semantic_dictionary = {}
+        
+        # 1. Add Tags
+        for name_lower, tag in self.tag_by_name_lower.items():
+            if tag.get("count", 0) > 0:
+                clean_name = name_lower.replace("-", " ")
+                corpus_texts.append(clean_name)
+                self.semantic_keys.append(tag["slug"])
+                self.semantic_dictionary[tag["slug"]] = {
+                    "suggested_name": tag["name"],
+                    "type": "tag",
+                    "slug": tag["slug"]
+                }
+
+        # 2. Add Attributes
+        for attr in self.all_attributes_raw:
+            taxonomy = attr.get("attribute_name", "") or attr.get("taxonomy", "")
+            for term in attr.get("terms", []):
+                # Optional: Skip empty attributes to keep vectors lean
+                if term.get("count", 0) == 0: continue 
+                
+                clean_name = term.get("name", "").replace("-", " ").lower()
+                corpus_texts.append(clean_name)
+                self.semantic_keys.append(term["slug"])
+                self.semantic_dictionary[term["slug"]] = {
+                    "suggested_name": term.get("name"),
+                    "type": "attribute",
+                    "taxonomy": taxonomy,
+                    "slug": term["slug"]
+                }
+
+        # 3. Generate the Math Coordinates (Tensors)
+        if corpus_texts and self.vector_model:
+            self.semantic_tensors = self.vector_model.encode(corpus_texts, convert_to_tensor=True)
+            
+        logger.info(f"Generated {len(corpus_texts)} vectors in {round(time.time() - start_time, 2)}s")
+
+    def sync_from_webhook(self):
+        """The background function triggered by WordPress Action Webhooks to refresh the brain."""
+        logger.info("Webhook triggered! Refreshing WooCommerce data in background...")
+        try:
+            # load_all() naturally calls build_semantic_vectors() under the lock!
+            self.load_all()
+        except Exception as e:
+            logger.error(f"Webhook sync failed: {e}", exc_info=True)
+
     def _log_load_summary(self):
         """Prints a clean summary of what was loaded into memory."""
         mode = "Local Dev Cache" if DEV_CACHE_ENABLED else "Live WooCommerce API"
         status = "⚠️ DEGRADED" if self._degraded else "✅ HEALTHY"
         
         term_count = sum(len(terms) for terms in self.attribute_terms.values())
+        vector_count = len(self.semantic_keys) if self.semantic_keys else 0
         
         summary = [
             f"StoreLoader: Initialization Complete [{status}]",
@@ -238,7 +311,8 @@ class StoreLoader:
             f"  ├─ Categories: {len(self.categories)}",
             f"  ├─ Tags:       {len(self.tags)}",
             f"  ├─ Attributes: {len(self.attribute_by_slug)} (with {term_count} terms)",
-            f"  └─ Keywords:   {len(self.category_keywords)} (generated for search index)"
+            f"  ├─ Keywords:   {len(self.category_keywords)} (generated for search index)",
+            f"  └─ Vectors:    {vector_count} (for semantic fallback)"
         ]
         
         if self._degraded:
@@ -574,7 +648,7 @@ class StoreLoader:
             entry = {"id": product.get("id"), "name": name, "slug": product.get("slug", "")}
             self.product_by_name_lower[name_lower] = entry
             
-            # Token match list (ADD THIS LOGIC from original)
+            # Token match list
             words = re.split(r'[\s\-_]+', name_lower)
             for word in words:
                 if len(word) > 2 and word not in self._store_generic_terms:
@@ -763,7 +837,7 @@ class StoreLoader:
                 needle_clean = re.sub(r'[^\dxX]', '', needle).lower()
                 term_clean_raw = re.sub(r'[^\dxX]', '', term_name).lower()
                 
-                # STRICT MATCH FOR DIMENSIONS (Restored)
+                # STRICT MATCH FOR DIMENSIONS 
                 if needle_clean and term_clean_raw:
                     if re.search(rf'(?<!\d){re.escape(needle_clean)}(?!\d)', term_clean_raw):
                         partial.append(term["id"])
@@ -796,7 +870,7 @@ class StoreLoader:
                 needle_clean = re.sub(r'[^\dxX]', '', needle).lower()
                 term_clean_raw = re.sub(r'[^\dxX]', '', term_name).lower()
 
-                # STRICT MATCH FOR DIMENSIONS (Restored)
+                # STRICT MATCH FOR DIMENSIONS 
                 if needle_clean and term_clean_raw:
                     if re.search(rf'(?<!\d){re.escape(needle_clean)}(?!\d)', term_clean_raw):
                         partial_slug = term.get("slug", "")
@@ -956,6 +1030,7 @@ class StoreLoader:
                 "category_keywords": len(self.category_keywords),
                 "attribute_terms": sum(len(v) for v in self.attribute_terms.values()),
                 "variation_cache_size": len(self.variation_detail_cache),
+                "semantic_vectors": len(self.semantic_keys) if self.semantic_keys else 0
             },
         }
 
