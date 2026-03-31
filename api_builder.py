@@ -815,7 +815,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
         )
         
         if search:
-            # We have SOME text extracted, so we can attempt a fuzzy search
+            # We have SOME text extracted, so we can attempt a semantic fallback search
             logger.warning(
                 f"api_builder: No calls built for intent={intent.value} — using fallback search | "
                 f"search={search!r}"

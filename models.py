@@ -114,7 +114,8 @@ class ExtractedEntities:
     excluded_tags: List[str] = field(default_factory=list)
     excluded_categories: List[str] = field(default_factory=list)
     excluded_attributes: Dict[str, List[str]] = field(default_factory=dict)  # ← ADDED HERE
-
+    excluded_search_term: Optional[str] = None
+    
     # Attribute term resolution (for WooCommerce attribute=&attribute_term= filtering)
     attribute_slug: Optional[str] = None          # e.g. "pa_tile-size"
     attribute_term_ids: List[int] = field(default_factory=list)  # resolved term IDs
@@ -176,13 +177,10 @@ class ExtractedEntities:
     # Stores isolated entity groups when a user uses "OR" (e.g. Titan OR Ansel)
     logical_chunks: List[dict] = field(default_factory=list)
     
-    # ──── Conversational Disambiguation ────
-    # Populated when a user types an unrecognized term that strongly resembles 
-    # an active tag or attribute (e.g. "minimalist design" -> "minimalistic look").
-    fuzzy_matches: List[dict] = field(default_factory=list)
-    
-    # ──── Logical Chunking ────
-    logical_chunks: List[dict] = field(default_factory=list)
+    # ──── Semantic Resolution ────
+    # Holds multiple candidate matches from Vector AI or broad NLP sweeps
+    # to be resolved by the user via the Talk-Back interceptor.
+    semantic_matches: List = field(default_factory=list)
     
 @dataclass
 class WooAPICall:

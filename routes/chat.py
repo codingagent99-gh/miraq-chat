@@ -37,7 +37,7 @@ logger = get_logger("miraq_chat")
 chat_bp = Blueprint("chat", __name__)
 
 def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
-    """Hybrid Parser: Secures exact matches first, fuzzy matches near-misses, uses NLP ONLY on the leftovers."""
+    """Hybrid Parser: Secures exact matches first, uses NLP on leftovers, then Vector AI for synonyms."""
     
     terms = [t.strip().lower() for t in msg.split(",") if t.strip()]
     if not terms:
@@ -49,7 +49,7 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
         
     unmatched_terms = []
     
-    # --- PHASE 1: EXACT MATCH SECURE ---
+    # ─── PHASE 1: EXACT MATCH SECURE ───
     for term in terms:
         term_matched = False
         
@@ -92,73 +92,19 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
                 if term_matched:
                     break
         
-        # If the term failed exact match, save it for fuzzy matching!
+        # If the term failed, save it for the NLP AI!
         if not term_matched:
             unmatched_terms.append(term)
 
-    # --- PHASE 1.5: FUZZY MATCH UNMATCHED CSV TERMS ---
-    still_unmatched = []
-    if unmatched_terms and loader:
-        import difflib
-        import os
-        THRESHOLD = float(os.getenv("FUZZY_MATCH_THRESHOLD", "0.60"))
-        
-        for term in unmatched_terms:
-            best_match = None
-            best_score = 0
-            
-            # Fuzzy match against Tags
-            for tag_name_lower, tag_entry in loader.tag_by_name_lower.items():
-                if tag_entry.get("count", 0) > 0:
-                    score = difflib.SequenceMatcher(None, term, tag_name_lower).ratio()
-                    if score >= THRESHOLD and score > best_score:
-                        best_score = score
-                        best_match = {
-                            "user_text": term,
-                            "suggested_name": tag_entry.get("name"),
-                            "type": "tag",
-                            "slug": tag_entry.get("slug")
-                        }
-            
-            # Fuzzy match against Attributes
-            if loader.attribute_terms:
-                for attr_id, terms_list in loader.attribute_terms.items():
-                    for attr_term in terms_list:
-                        if attr_term.get("count", 0) > 0:
-                            term_name_lower = attr_term.get("name", "").lower()
-                            score = difflib.SequenceMatcher(None, term, term_name_lower).ratio()
-                            if score >= THRESHOLD and score > best_score:
-                                taxonomy_slug = loader.get_attribute_slug(attr_id) or "attribute"
-                                best_score = score
-                                best_match = {
-                                    "user_text": term,
-                                    "suggested_name": attr_term.get("name"),
-                                    "type": "attribute",
-                                    "slug": attr_term.get("slug"),
-                                    "taxonomy": taxonomy_slug
-                                }
-                                
-            if best_match:
-                entities.fuzzy_matches.append(best_match)
-                logger.info(f"Hybrid Parser: Fuzzy match found! '{term}' -> '{best_match['suggested_name']}' (Score: {best_score:.2f})")
-            else:
-                still_unmatched.append(term)
-                
-        unmatched_terms = still_unmatched
-
-    # 🚀 SAFETY LOCK 1: If NOTHING matched the dictionary (exact or fuzzy), abort and let normal AI handle it!
-    if len(unmatched_terms) == len(terms) and not entities.fuzzy_matches:
-        return None
-
-    # If EVERYTHING matched perfectly (exact or fuzzy), exit early
+    # SAFETY LOCK 1: If EVERYTHING matched perfectly, exit early
     if not unmatched_terms:
         resolved_intent = Intent.PRODUCT_SEARCH if entities.product_id else Intent.FILTER_BY_ATTRIBUTE
         return ClassifiedResult(intent=resolved_intent, entities=entities, confidence=1.0)
         
-    # --- PHASE 2: NLP AI FALLBACK MERGE ---
+    # ─── PHASE 2: REGEX NLP (Joined String) ───
     from classifier import classify 
     
-    fallback_text = " ".join(unmatched_terms)
+    fallback_text = ", ".join(unmatched_terms)
     nlp_result = classify(fallback_text)
     nlp_entities = nlp_result.entities
     
@@ -189,18 +135,81 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
                 if v not in entities.attributes[k]:
                     entities.attributes[k] += f",{v}"
                     
-    # MERGE SECONDARY FUZZY MATCHES (If NLP found any remaining)
-    if hasattr(nlp_entities, 'fuzzy_matches') and nlp_entities.fuzzy_matches:
-        entities.fuzzy_matches.extend(nlp_entities.fuzzy_matches)
+    # MERGE EXCLUSIONS
+    if getattr(nlp_entities, 'excluded_tags', None):
+        if not hasattr(entities, 'excluded_tags'): entities.excluded_tags = []
+        entities.excluded_tags.extend(nlp_entities.excluded_tags)
+        
+    if getattr(nlp_entities, 'excluded_categories', None):
+        if not hasattr(entities, 'excluded_categories'): entities.excluded_categories = []
+        entities.excluded_categories.extend(nlp_entities.excluded_categories)
+        
+    if getattr(nlp_entities, 'excluded_attributes', None):
+        if not hasattr(entities, 'excluded_attributes'): entities.excluded_attributes = {}
+        for k, v in nlp_entities.excluded_attributes.items():
+            if k not in entities.excluded_attributes: entities.excluded_attributes[k] = v
+            else: entities.excluded_attributes[k].extend(v)
+            
+    if getattr(nlp_entities, 'excluded_search_term', None):
+        entities.excluded_search_term = nlp_entities.excluded_search_term
+                
+    # MERGE SEMANTIC MATCHES
+    if nlp_entities.semantic_matches:
+        entities.semantic_matches.extend(nlp_entities.semantic_matches)
+                                   
+    # ─── PHASE 2.5: SEMANTIC VECTOR FALLBACK (True AI) ───
+    still_unmatched_pos = []
+    still_unmatched_neg = []
+    
+    has_leftovers = getattr(nlp_entities, 'search_term', None) or getattr(nlp_entities, 'excluded_search_term', None)
+    
+    if has_leftovers and loader:
+        import torch
+        from sentence_transformers import util
+        SEMANTIC_THRESHOLD = 0.55 
+        
+        if not hasattr(loader, 'semantic_tensors') or loader.semantic_tensors is None:
+            logger.warning("Phase 2.5: Vector AI skipped because semantic_tensors is None!")
+            if getattr(nlp_entities, 'search_term', None): still_unmatched_pos.extend(nlp_entities.search_term.split(","))
+            if getattr(nlp_entities, 'excluded_search_term', None): still_unmatched_neg.extend(nlp_entities.excluded_search_term.split(","))
+        else:
+            def _process_vectors(term_string, is_negative=False):
+                unmatched = []
+                chunks = [t.strip() for t in term_string.split(",") if t.strip()]
+                for term in chunks:
+                    user_vector = loader.vector_model.encode(term, convert_to_tensor=True)
+                    cosine_scores = util.cos_sim(user_vector, loader.semantic_tensors)[0]
+                    top_results = torch.topk(cosine_scores, k=3)
                     
-    # PRESERVE UNMATCHED TEXT AS SEARCH TERM
-    if getattr(nlp_entities, 'search_term', None):
-        entities.search_term = nlp_entities.search_term
-    elif fallback_text and not nlp_entities.product_id and not getattr(nlp_entities, 'target_category_slugs', None) and not nlp_entities.tag_slugs and not nlp_entities.attributes and not nlp_entities.fuzzy_matches:
-        # If the AI couldn't extract ANY structured filters from the fallback text, treat it as a raw search!
-        entities.search_term = fallback_text
+                    candidates = []
+                    for score, idx in zip(top_results[0], top_results[1]):
+                        if score.item() >= SEMANTIC_THRESHOLD:
+                            matched_slug = loader.semantic_keys[idx]
+                            candidate_data = loader.semantic_dictionary[matched_slug].copy()
+                            candidate_data["user_text"] = term
+                            candidate_data["score"] = score.item()
+                            candidate_data["is_negative"] = is_negative
+                            candidates.append(candidate_data)
+                    
+                    if candidates:
+                        entities.semantic_matches.append(candidates)
+                        logger.info(f"Vector Match: '{term}' mapped to '{candidates[0]['suggested_name']}' (Score: {candidates[0]['score']:.2f} | Negative: {is_negative})")
+                    else:
+                        unmatched.append(term)
+                return unmatched
 
-    # 🚀 SAFETY LOCK 2: Preserve conversational AI intents
+            if getattr(nlp_entities, 'search_term', None):
+                still_unmatched_pos = _process_vectors(nlp_entities.search_term, is_negative=False)
+            if getattr(nlp_entities, 'excluded_search_term', None):
+                still_unmatched_neg = _process_vectors(nlp_entities.excluded_search_term, is_negative=True)
+            
+    elif not has_leftovers and fallback_text and not nlp_entities.product_id and not getattr(nlp_entities, 'target_category_slugs', None) and not nlp_entities.tag_slugs and not nlp_entities.attributes and not nlp_entities.semantic_matches:
+        still_unmatched_pos = [fallback_text]
+
+    entities.search_term = ", ".join(still_unmatched_pos) if still_unmatched_pos else None
+    entities.excluded_search_term = ", ".join(still_unmatched_neg) if still_unmatched_neg else None
+
+    # SAFETY LOCK 2: Preserve conversational AI intents
     CATALOG_INTENTS = {Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_SEARCH, Intent.PRODUCT_VARIATIONS, Intent.UNKNOWN}
     
     if nlp_result.intent in CATALOG_INTENTS:
@@ -276,24 +285,18 @@ def chat():
         touch_session(session_id)
 
     # ─── Step 0.5: Suggestion retry intercept ───
-    # When the user taps a filter_suggestion chip, the frontend sends the suggestion
-    # params back as `suggestion_retry`. We bypass the classifier entirely and build
-    # ExtractedEntities directly from the suggestion, then jump to Step 2.
     _suggestion_retry = body.get("suggestion_retry")
     if _suggestion_retry:
         from store_registry import get_store_loader as _get_loader
 
         _sr_label = _suggestion_retry.get("label", "suggestion retry")
         logger.info(
-            f"Step 0.5: Suggestion retry | session={session_id} | label={_sr_label!r} | "
-            f"tag_slugs={_suggestion_retry.get('tag_slugs')} | "
-            f"category_slug={_suggestion_retry.get('category_slug')!r}"
+            f"Step 0.5: Suggestion retry | session={session_id} | label={_sr_label!r}"
         )
 
         _loader = _get_loader()
         _sr_entities = ExtractedEntities()
 
-        # Resolve category slug -> name + id
         _cat_slug = _suggestion_retry.get("category_slug", "")
         if _cat_slug and _loader:
             _cat_entry = _loader.category_by_slug.get(_cat_slug)
@@ -301,14 +304,12 @@ def chat():
                 _sr_entities.category_name = _cat_entry["name"]
                 _sr_entities.category_id = _cat_entry["id"]
 
-        # Resolve extra category slugs -> extra_category_ids
         for _extra_slug in (_suggestion_retry.get("extra_category_slugs") or []):
             if _loader:
                 _extra_entry = _loader.category_by_slug.get(_extra_slug)
                 if _extra_entry:
                     _sr_entities.extra_category_ids.append(_extra_entry["id"])
 
-        # Tag slugs -> tag_slugs + tag_ids
         for _tslug in (_suggestion_retry.get("tag_slugs") or []):
             _sr_entities.tag_slugs.append(_tslug)
             if _loader:
@@ -316,7 +317,6 @@ def chat():
                 if _tid:
                     _sr_entities.tag_ids.append(_tid)
 
-        # Attributes
         _sr_entities.attributes = dict(_suggestion_retry.get("attributes") or {})
 
         _sr_intent = Intent.FILTER_BY_ATTRIBUTE
@@ -327,14 +327,8 @@ def chat():
             confidence=_sr_confidence,
         )
 
-        # Jump straight to Step 2 - build API calls from suggestion entities
         _sr_customer_id = user_context.get("customer_id")
         _sr_api_calls = build_api_calls(_sr_result, page, user_message=message, session_id=session_id, customer_id=_sr_customer_id)
-        _sr_endpoint_summary = [f"{c.method} {c.endpoint.split('/')[-1]}" for c in _sr_api_calls]
-        logger.info(
-            f"Step 0.5: Built {len(_sr_api_calls)} API call(s) | "
-            f"endpoints={_sr_endpoint_summary}"
-        )
 
         if _sr_customer_id:
             _resolve_user_placeholders(_sr_api_calls, _sr_customer_id)
@@ -350,8 +344,6 @@ def chat():
                     _sr_products_raw.extend(_d)
                 elif isinstance(_d, dict):
                     _sr_products_raw.append(_d)
-
-        logger.info(f"Step 0.5: Suggestion retry returned {len(_sr_products_raw)} products")
 
         _sr_formatted = []
         for _p in _sr_products_raw:
@@ -393,7 +385,6 @@ def chat():
                 "provider": CLASSIFIER_PROVIDER_TAG,
                 "response_time_ms": round(elapsed * 1000),
                 "intent_raw": "suggestion_retry",
-                "suggestion_label": _sr_label,
             },
             "pagination": _sr_pagination,
             "flow_state": FlowState.IDLE.value,
@@ -406,6 +397,121 @@ def chat():
     except ValueError:
         current_flow_state = FlowState.IDLE
     logger.info(f"Step 0: Flow state={current_flow_state.value}")
+
+    # ══════════════════════════════════════════════════════════════
+    # ─── STEP 0.8: VECTOR MATCH RESOLUTION BYPASS ───
+    # ══════════════════════════════════════════════════════════════
+    _skip_classification = False
+    bypass_result = None
+
+    if current_flow_state == FlowState.AWAITING_FILTER_CLARIFICATION:
+        pending_semantic = user_context.get("pending_semantic_match")
+        if pending_semantic:
+            msg_lower = message.lower().strip()
+            
+            is_accept = (
+                msg_lower == "yes - use these filters" or
+                msg_lower.startswith("yes - use ") or
+                msg_lower.startswith("yes - exclude ") or
+                msg_lower in ["yes", "y", "yep", "sure", "ok"]
+            )
+            
+            is_reject = (
+                msg_lower.startswith("no - ") or
+                msg_lower in ["no", "n", "nope", "cancel"]
+            )
+
+            if is_accept or is_reject:
+                logger.info(f"Step 0.8: User responded to semantic match (Accept={is_accept}). Bypassing NLP.")
+                entities = ExtractedEntities()
+                entities.target_category_slugs = set()
+                
+                if is_accept:
+                    options_to_apply = []
+                    if "options" in pending_semantic:
+                        if len(pending_semantic["options"]) > 1 and ("use " in msg_lower or "exclude " in msg_lower):
+                            selected_name = message.replace("Yes - use ", "").replace("Yes - exclude ", "").replace("Use ", "").replace("Exclude ", "").strip()
+                            selected_match = next((opt for opt in pending_semantic["options"] if opt["suggested_name"].lower() == selected_name.lower()), pending_semantic["options"][0])
+                            options_to_apply.append(selected_match)
+                        else:
+                            options_to_apply.extend(pending_semantic["options"])
+                            
+                    options_to_apply.extend(pending_semantic.get("extra_semantics", []))
+                    
+                    for opt in options_to_apply:
+                        is_neg = opt.get("is_negative", False)
+                        if opt["type"] == "tag":
+                            if is_neg:
+                                if not hasattr(entities, 'excluded_tags'): entities.excluded_tags = []
+                                entities.excluded_tags.append(opt["slug"])
+                            else:
+                                entities.tag_slugs.append(opt["slug"])
+                        elif opt["type"] == "category":
+                            if is_neg:
+                                if not hasattr(entities, 'excluded_categories'): entities.excluded_categories = []
+                                entities.excluded_categories.append(opt["slug"])
+                            else:
+                                entities.target_category_slugs.add(opt["slug"])
+                                entities.category_name = opt["suggested_name"]
+                        elif opt["type"] == "attribute":
+                            taxonomy = opt["taxonomy"]
+                            if is_neg:
+                                if not hasattr(entities, 'excluded_attributes'): entities.excluded_attributes = {}
+                                if taxonomy not in entities.excluded_attributes: entities.excluded_attributes[taxonomy] = []
+                                entities.excluded_attributes[taxonomy].append(opt["slug"])
+                            else:
+                                if taxonomy not in entities.attributes:
+                                    entities.attributes[taxonomy] = opt["slug"]
+                                else:
+                                    if opt["slug"] not in entities.attributes[taxonomy].split(","):
+                                        entities.attributes[taxonomy] += f",{opt['slug']}"
+
+                elif is_reject:
+                    entities.search_term = pending_semantic.get("options", [{}])[0].get("user_text", "")
+                    if "rejected_semantic_terms" not in user_context:
+                        user_context["rejected_semantic_terms"] = []
+                    for opt in pending_semantic.get("options", []):
+                        user_context["rejected_semantic_terms"].append(opt["suggested_name"])
+
+
+                # Backpack Retrieval
+                leftovers = pending_semantic.get("pending_other_semantics", [])
+                if leftovers: entities.semantic_matches.extend(leftovers)
+
+                if pending_semantic.get("carryover_search_term"): entities.search_term = pending_semantic["carryover_search_term"]
+                if pending_semantic.get("carryover_tags"): entities.tag_slugs.extend(pending_semantic["carryover_tags"])
+                if pending_semantic.get("carryover_categories"):
+                    entities.target_category_slugs.update(pending_semantic["carryover_categories"])
+                if pending_semantic.get("carryover_category_name"): entities.category_name = pending_semantic["carryover_category_name"]
+                if pending_semantic.get("carryover_attributes"):
+                    for k, v in pending_semantic["carryover_attributes"].items():
+                        if k not in entities.attributes: entities.attributes[k] = v
+                        else:
+                            if v not in entities.attributes[k].split(","): entities.attributes[k] += f",{v}"
+                            
+                # Unpack the Exclusions
+                if pending_semantic.get("carryover_excluded_tags"):
+                    if not hasattr(entities, 'excluded_tags'): entities.excluded_tags = []
+                    entities.excluded_tags.extend(pending_semantic["carryover_excluded_tags"])
+                if pending_semantic.get("carryover_excluded_categories"):
+                    if not hasattr(entities, 'excluded_categories'): entities.excluded_categories = []
+                    entities.excluded_categories.extend(pending_semantic["carryover_excluded_categories"])
+                if pending_semantic.get("carryover_excluded_attributes"):
+                    if not hasattr(entities, 'excluded_attributes'): entities.excluded_attributes = {}
+                    for k, v in pending_semantic["carryover_excluded_attributes"].items():
+                        if k not in entities.excluded_attributes: entities.excluded_attributes[k] = v
+                        else: entities.excluded_attributes[k].extend(v)
+
+                # Reset the state so handle_flow_state ignores it, and flag the bypass
+                current_flow_state = FlowState.IDLE
+                user_context["flow_state"] = FlowState.IDLE.value
+                user_context.pop("pending_semantic_match", None)
+                
+                # Determine intent
+                bypass_intent = Intent.PRODUCT_SEARCH if getattr(entities, 'product_id', None) else Intent.FILTER_BY_ATTRIBUTE
+                bypass_result = ClassifiedResult(intent=bypass_intent, entities=entities, confidence=0.98)
+                _skip_classification = True
+
 
     flow_context = {
         "pending_product_name": user_context.get("pending_product_name"),
@@ -426,24 +532,18 @@ def chat():
         if flow_result and flow_result.get("override_message"):
             message = flow_result["override_message"]
 
-    # Delegate all flow-state branches to flow_handler
     if flow_result and not flow_result.get("pass_through") and not flow_result.get("override_message"):
         resp = handle_flow(flow_result, user_context, session_id, customer_id, page, start_time, sessions)
-        if resp:
-            return resp
+        if resp: return resp
 
-    # Check for flow-triggered actions (create_order, fetch_customer_address, fetch_price_summary)
     if flow_result:
         resp = handle_flow(flow_result, user_context, session_id, customer_id, page, start_time, sessions)
-        if resp:
-            return resp
+        if resp: return resp
 
-    # Capture resolve_variant flag
     _resolve_variant = bool(flow_result and flow_result.get("resolve_variant"))
 
-    # ─── Steps 1–3: Classify + API execution (skipped in variant resolution mode) ───
+    # ─── Steps 1–3: Pipeline Routing ───
     if _resolve_variant:
-        from models import ExtractedEntities
         intent = Intent.QUICK_ORDER
         entities = ExtractedEntities()
         confidence = 1.0
@@ -455,10 +555,18 @@ def chat():
         order_data = []
         customer_id = user_context.get("customer_id")
         last_product_ctx = None
-        logger.info("Steps 1-3: Skipped (variant resolution mode — Step 3.55 will handle)")
-    else:
+        logger.info("Steps 1-3: Skipped (variant resolution mode)")
         
-        # ─── Step 1: Classify intent (or Parse CSV) ───
+    elif _skip_classification:
+        # THE BYPASS
+        result = bypass_result
+        intent = result.intent
+        entities = result.entities
+        confidence = result.confidence
+        logger.info(f"Step 1: NLP Bypassed. Using semantic clarification intent={intent.value}")
+        
+    else:
+        # ─── NORMAL ROUTE ───
         store_loader = get_store_loader()
         result = parse_csv_message(message, store_loader)
         
@@ -484,10 +592,8 @@ def chat():
         }
         logger.info(f"Step 1: Classified intent={intent.value} | confidence={confidence:.2f} | entities={entity_summary}")
 
-        # ─── Step 1.5: LLM Fallback ───
-        store_loader = get_store_loader()
+        # LLM Fallback
         session_history = sessions.get(session_id, {}).get("history") if session_id else None
-
         llm_outcome = run_llm_fallback(
             message=message,
             intent=intent,
@@ -504,214 +610,121 @@ def chat():
         )
 
         if llm_outcome is not None:
-            # Flask response — return directly (conversational or disambiguation)
             if not isinstance(llm_outcome, tuple) or not isinstance(llm_outcome[0], tuple):
-                if hasattr(llm_outcome, 'get_data'):  # it's a Response object
+                if hasattr(llm_outcome, 'get_data'):  
                     return llm_outcome
                 if isinstance(llm_outcome, tuple) and len(llm_outcome) == 2 and isinstance(llm_outcome[1], int):
                     return llm_outcome
-            # (intent, entities, confidence, result) tuple — updated classification
             if isinstance(llm_outcome, tuple) and len(llm_outcome) == 4:
                 intent, entities, confidence, result = llm_outcome
+
+    # ─── PHASE 3: INTERCEPT NEW VECTOR/SEMANTIC MATCHES ───
+    if entities.semantic_matches and current_flow_state != FlowState.AWAITING_FILTER_CLARIFICATION:
+        rejected_list = user_context.get("rejected_semantic_terms", [])
+        valid_term_groups = []
         
-        # ─── PHASE 4: RESOLVE PENDING FUZZY MATCH ───
-        if flow_result and current_flow_state == FlowState.AWAITING_FILTER_CLARIFICATION:
-            pending_fuzzy = user_context.get("pending_fuzzy_match")
-            if pending_fuzzy:
-                if flow_result.get("apply_fuzzy_match"):
-                    logger.info(f"Step 1.8: User ACCEPTED fuzzy matches.")
-                    
-                    # 1. Did they click a Multi-Choice option? (Resolving a Tie)
-                    if "options" in pending_fuzzy:
-                        selected_name = flow_result.get("button_text", "").replace("Use ", "")
-                        selected_match = next((opt for opt in pending_fuzzy["options"] if opt["suggested_name"] == selected_name), pending_fuzzy["options"][0])
-                        
-                        if selected_match["type"] == "tag":
-                            entities.tag_slugs.append(selected_match["slug"])
-                        elif selected_match["type"] == "attribute":
-                            entities.attributes[selected_match["taxonomy"]] = selected_match["slug"]
+        for candidate_list in entities.semantic_matches:
+            if isinstance(candidate_list, dict): candidate_list = [candidate_list]
+            clean_list = [c for c in candidate_list if c["suggested_name"] not in rejected_list]
+            if clean_list: valid_term_groups.append(clean_list)
+                
+        # Support both new and old variable name from conversation_flow.py to avoid breaking
+        reject_flow = flow_result and flow_result.get("reject_semantic_match")
+        
+        if valid_term_groups and not reject_flow:
+            has_ties = any(len(group) > 1 for group in valid_term_groups)
+            
+            stashed_semantic_data = {
+                "carryover_search_term": entities.search_term,
+                "carryover_tags": list(entities.tag_slugs),
+                "carryover_attributes": entities.attributes,
+                "carryover_excluded_tags": getattr(entities, 'excluded_tags', []),
+                "carryover_excluded_categories": getattr(entities, 'excluded_categories', []),
+                "carryover_excluded_attributes": getattr(entities, 'excluded_attributes', {})
+            }
+            
+            if hasattr(entities, 'target_category_slugs'):
+                stashed_semantic_data["carryover_categories"] = list(entities.target_category_slugs)
+                stashed_semantic_data["carryover_category_name"] = getattr(entities, 'category_name', None)
+            
+            suggestion_buttons = []
+
+            if has_ties:
+                active_group = valid_term_groups[0]
+                user_original_term = active_group[0]["user_text"]
+                is_negative = active_group[0].get("is_negative", False)
+                
+                stashed_semantic_data["options"] = active_group
+                stashed_semantic_data["pending_other_semantics"] = valid_term_groups[1:] 
+                
+                action_word = "EXCLUDE" if is_negative else "USE"
+                bot_message = f"I found multiple matches for '{user_original_term}'. Which one did you mean to {action_word}?"
+                for candidate in active_group:
+                    verb = "Exclude" if candidate.get("is_negative") else "Use"
+                    suggestion_buttons.append(f"{verb} {candidate['suggested_name']}")
+                suggestion_buttons.append(f"No - search for '{user_original_term}'")
+                
+            else:
+                primary_semantics = [group[0] for group in valid_term_groups]
+                stashed_semantic_data["options"] = [primary_semantics[0]] 
+                stashed_semantic_data["extra_semantics"] = primary_semantics[1:] 
+                
+                suggested_names = [f["suggested_name"] for f in primary_semantics]
+                is_negative = primary_semantics[0].get("is_negative", False)
+                
+                if len(suggested_names) == 1:
+                    if is_negative:
+                        bot_message = f"I don't have an exact match for '{primary_semantics[0]['user_text']}'. Did you mean to **EXCLUDE** {suggested_names[0]}?"
+                        suggestion_buttons.append(f"Yes - exclude {suggested_names[0]}")
                     else:
-                        # Fallback for single acceptance
-                        if pending_fuzzy.get("type") == "tag":
-                            entities.tag_slugs.append(pending_fuzzy.get("slug"))
-                            
-                    # Inject any extra grouped fuzzies
-                    for extra in pending_fuzzy.get("extra_fuzzies", []):
-                        if extra["type"] == "tag":
-                            entities.tag_slugs.append(extra["slug"])
-                        elif extra["type"] == "attribute":
-                            taxonomy = extra["taxonomy"]
-                            if taxonomy not in entities.attributes:
-                                entities.attributes[taxonomy] = extra["slug"]
-                            else:
-                                if extra["slug"] not in entities.attributes[taxonomy].split(","):
-                                    entities.attributes[taxonomy] += f",{extra['slug']}"
-
-                elif flow_result.get("reject_fuzzy_match"):
-                    logger.info(f"Step 1.8: User REJECTED fuzzy matches.")
-                    # Let it pass through so they can continue searching without it
-
-                # 2. 👉 THE ONE-BY-ONE LOOP: Put any leftover questions back in the queue!
-                # (We do this even if they rejected the first one, so they still get asked about the rest)
-                leftovers = pending_fuzzy.get("pending_other_fuzzies", [])
-                if leftovers:
-                    entities.fuzzy_matches.extend(leftovers)
-
-                # 3. Unpack the backpack and restore the exact matches
-                if pending_fuzzy.get("carryover_search_term"):
-                    entities.search_term = pending_fuzzy["carryover_search_term"]
-                if pending_fuzzy.get("carryover_tags"):
-                    entities.tag_slugs.extend(pending_fuzzy["carryover_tags"])
-                if pending_fuzzy.get("carryover_categories") and hasattr(entities, 'target_category_slugs'):
-                    entities.target_category_slugs.update(pending_fuzzy["carryover_categories"])
-                if pending_fuzzy.get("carryover_category_name"):
-                    entities.category_name = pending_fuzzy["carryover_category_name"]
-                if pending_fuzzy.get("carryover_attributes"):
-                    for k, v in pending_fuzzy["carryover_attributes"].items():
-                        if k not in entities.attributes:
-                            entities.attributes[k] = v
-                        else:
-                            if v not in entities.attributes[k].split(","):
-                                entities.attributes[k] += f",{v}"
-        
-                elif flow_result.get("reject_fuzzy_match"):
-                    # User said NO: Force a raw text search for their original words
-                    logger.info(f"Fuzzy Match Rejected: Searching raw text '{pending_fuzzy['user_text']}'")
-                    entities.search_term = pending_fuzzy["user_text"]
-                    
-                    # Prevent the LLM from suggesting this rejected term later
-                    if "rejected_fuzzy_terms" not in user_context:
-                        user_context["rejected_fuzzy_terms"] = []
-                    user_context["rejected_fuzzy_terms"].append(pending_fuzzy["suggested_name"])
-
-
-        # ─── PHASE 3: INTERCEPT NEW FUZZY MATCHES ───
-        if entities.fuzzy_matches and current_flow_state != FlowState.AWAITING_FILTER_CLARIFICATION:
-            
-            rejected_list = user_context.get("rejected_fuzzy_terms", [])
-            valid_term_groups = []
-            
-            for candidate_list in entities.fuzzy_matches:
-                # Safety check: ensure it's a list (in case of legacy flat list formats)
-                if isinstance(candidate_list, dict):
-                    candidate_list = [candidate_list]
-                    
-                clean_list = [c for c in candidate_list if c["suggested_name"] not in rejected_list]
-                if clean_list:
-                    valid_term_groups.append(clean_list)
-                    
-            if valid_term_groups and not (flow_result and flow_result.get("reject_fuzzy_match")):
-                
-                has_ties = any(len(group) > 1 for group in valid_term_groups)
-                
-                # 👉 THE STASH: Always pack the exact matches into the backpack
-                stashed_fuzzy_data = {
-                    "carryover_search_term": entities.search_term,
-                    "carryover_tags": list(entities.tag_slugs),
-                    "carryover_attributes": entities.attributes
-                }
-                if hasattr(entities, 'target_category_slugs'):
-                    stashed_fuzzy_data["carryover_categories"] = list(entities.target_category_slugs)
-                    stashed_fuzzy_data["carryover_category_name"] = getattr(entities, 'category_name', None)
-
-                suggestion_buttons = []
-
-                if has_ties:
-                    # ── ROUTE 1: RESOLVE THE TIE (Sequential Resolution) ──
-                    active_group = valid_term_groups[0]
-                    user_original_term = active_group[0]["user_text"]
-                    
-                    stashed_fuzzy_data["options"] = active_group
-                    stashed_fuzzy_data["pending_other_fuzzies"] = valid_term_groups[1:] 
-                    
-                    bot_message = f"I found multiple matches for '{user_original_term}'. Which one did you mean?"
-                    for candidate in active_group:
-                        suggestion_buttons.append(f"Use {candidate['suggested_name']}")
-                    suggestion_buttons.append(f"No - search for '{user_original_term}'")
-                    
-                else:
-                    # ── ROUTE 2: NO TIES, GROUP THEM ALL ──
-                    primary_fuzzies = [group[0] for group in valid_term_groups]
-                    
-                    stashed_fuzzy_data["options"] = [primary_fuzzies[0]] 
-                    stashed_fuzzy_data["extra_fuzzies"] = primary_fuzzies[1:] 
-                    
-                    suggested_names = [f["suggested_name"] for f in primary_fuzzies]
-                    if len(suggested_names) == 1:
-                        bot_message = f"I don't have an exact match for '{primary_fuzzies[0]['user_text']}', but I do have **{suggested_names[0]}**. Would you like to use that filter?"
+                        bot_message = f"I don't have an exact match for '{primary_semantics[0]['user_text']}', but I do have **{suggested_names[0]}**. Would you like to use that filter?"
                         suggestion_buttons.append(f"Yes - use {suggested_names[0]}")
-                        suggestion_buttons.append(f"No - search for '{primary_fuzzies[0]['user_text']}'")
-                    else:
-                        joined_names = " and ".join(suggested_names)
-                        bot_message = f"I don't have exact matches, but I found **{joined_names}**. Would you like to use these filters?"
-                        suggestion_buttons.append("Yes - use these filters")
-                        suggestion_buttons.append("No - use my original text")
+                    suggestion_buttons.append(f"No - search for '{primary_semantics[0]['user_text']}'")
+                else:
+                    joined_names = " and ".join(suggested_names)
+                    bot_message = f"I don't have exact matches, but I found **{joined_names}**. Would you like to apply these filters?"
+                    suggestion_buttons.append("Yes - use these filters")
+                    suggestion_buttons.append("No - use my original text")
 
-                suggestion_buttons.append("Cancel")
-                
-                elapsed = time.time() - start_time
-                logger.info(f"Step 1.9: Intercepting API Pipeline! Pausing to resolve fuzzy matches.")
-                
-                return jsonify({
-                    "success": True,
-                    "bot_message": bot_message,
-                    "intent": "guided_flow",
-                    "products": [],
-                    "suggestions": suggestion_buttons,
-                    "session_id": session_id,
-                    "metadata": {
-                        "flow_state": FlowState.AWAITING_FILTER_CLARIFICATION.value,
-                        "pending_fuzzy_match": stashed_fuzzy_data,
-                        "response_time_ms": round(elapsed * 1000),
-                    },
-                    "flow_state": FlowState.AWAITING_FILTER_CLARIFICATION.value,
-                    "pagination": default_pagination(page),
-                }), 200
-                       
-        # ─── Step 2: Build API calls ───
-        # Resolve customer_id before build so UPDATE_CUSTOMER gets the correct ID
-        customer_id = user_context.get("customer_id")
-        api_calls = build_api_calls(result, page, user_message=message, session_id=session_id, customer_id=customer_id)
-        endpoint_summary = [f"{c.method} {c.endpoint.split('/')[-1]}" for c in api_calls]
-        logger.info(f"Step 2: Built {len(api_calls)} API call(s) | endpoints={endpoint_summary}")
-
-        if customer_id:
-            logger.info(f"Step 2.5: Resolved customer_id={customer_id}")
-            _resolve_user_placeholders(api_calls, customer_id)
-
-        last_product_ctx = user_context.get("last_product")
-        if last_product_ctx and last_product_ctx.get("id"):
-            logger.info(f"Step 2.6: last_product_ctx found: id={last_product_ctx.get('id')}, name=\"{sanitize_log_string(last_product_ctx.get('name', ''))}\"")
-        else:
-            logger.info("Step 2.6: No last_product_ctx")
+            suggestion_buttons.append("Cancel")
             
-        # ─── Step 2.7: OFFLINE / DRY RUN INTERCEPT ───
-        # Stop here and return the constructed parameters instead of calling WooCommerce
-        # if body.get("dry_run") or os.getenv("DRY_RUN", "false").lower() == "true":
-        #     elapsed = time.time() - start_time
-        #     logger.info(f"Step 2.7: Dry run return | intent={intent.value}")
-        #     return jsonify({
-        #         "success": True,
-        #         "bot_message": "Offline Mode: API calls built using local JSON data.",
-        #         "intent": intent.value,
-        #         "extracted_entities": _entities_to_dict(entities),
-        #         "constructed_api_calls": [
-        #             {
-        #                 "description": call.description,
-        #                 "method": call.method,
-        #                 "endpoint": call.endpoint.split('/')[-1], # Shortened for easy reading
-        #                 "params": call.params,
-        #                 "body": call.body
-        #             } for call in api_calls
-        #         ],
-        #         "metadata": {
-        #             "confidence": round(confidence, 2),
-        #             "response_time_ms": round(elapsed * 1000),
-        #             "data_source": "local_json_files"
-        #         }
-        #     }), 200
+            elapsed = time.time() - start_time
+            logger.info(f"Step 1.9: Intercepting API Pipeline! Pausing to resolve semantic match.")
+            
+            return jsonify({
+                "success": True,
+                "bot_message": bot_message,
+                "intent": "guided_flow",
+                "products": [],
+                "suggestions": suggestion_buttons,
+                "session_id": session_id,
+                "metadata": {
+                    "flow_state": FlowState.AWAITING_FILTER_CLARIFICATION.value,
+                    "pending_semantic_match": stashed_semantic_data,
+                    "response_time_ms": round(elapsed * 1000),
+                },
+                "flow_state": FlowState.AWAITING_FILTER_CLARIFICATION.value,
+                "pagination": default_pagination(page),
+            }), 200
 
-        # ─── Step 3: Execute API calls ───
+    # ─── Step 2: Build API calls ───
+    customer_id = user_context.get("customer_id")
+    api_calls = build_api_calls(result, page, user_message=message, session_id=session_id, customer_id=customer_id)
+    endpoint_summary = [f"{c.method} {c.endpoint.split('/')[-1]}" for c in api_calls]
+    logger.info(f"Step 2: Built {len(api_calls)} API call(s) | endpoints={endpoint_summary}")
+
+    if customer_id:
+        logger.info(f"Step 2.5: Resolved customer_id={customer_id}")
+        _resolve_user_placeholders(api_calls, customer_id)
+
+    last_product_ctx = user_context.get("last_product")
+    if last_product_ctx and last_product_ctx.get("id"):
+        logger.info(f"Step 2.6: last_product_ctx found: id={last_product_ctx.get('id')}, name=\"{sanitize_log_string(last_product_ctx.get('name', ''))}\"")
+    else:
+        logger.info("Step 2.6: No last_product_ctx")
+        
+    # ─── Step 3: Execute API calls ───
+    if not _resolve_variant:
         all_products_raw = []
         order_data = []
 
@@ -728,7 +741,6 @@ def chat():
 
         api_responses = woo_client.execute_all(api_calls_to_execute)
 
-        # Helper to ensure custom API products have a 'type' field for the order handler
         def _enrich_raw_products(prod_list):
             for p in prod_list:
                 if "type" not in p:
@@ -752,15 +764,12 @@ def chat():
 
         logger.info(f"Step 3: API execution complete | all_products_raw count={len(all_products_raw)} | order_data count={len(order_data)}")
 
-        # ─── Step 3.1: Debug — log matched product context ───
         log_matched_products(all_products_raw, api_calls_to_execute)
     
-    # After Step 3.1
     if intent == Intent.FETCH_CUSTOMER:
         elapsed = int((time.time() - start_time) * 1000)
         customer_raw = order_data[0] if order_data else {}
         
-        # Pull requested fields from the API response
         display = {}
         for field_key in entities.customer_fields_requested:
             if "." in field_key:
@@ -786,10 +795,8 @@ def chat():
             "flow_state": FlowState.IDLE.value,
         }), 200
 
-    # ─── Step 3.2: Customer update response ───
     if intent == Intent.UPDATE_CUSTOMER:
         elapsed = int((time.time() - start_time) * 1000)
-        # Find the PUT /customers response specifically — don't trust a fallback GET
         update_success = False
         for _api_call, _api_resp in zip(api_calls_to_execute, api_responses):
             if _api_call.method == "PUT" and "/customers/" in _api_call.endpoint:
@@ -820,64 +827,48 @@ def chat():
             "flow_state":  FlowState.IDLE.value,
         }), 200
 
-    # ─── Step 3.5: Reorder ───
     resp = handle_reorder(intent, entities, order_data, customer_id, session_id, page, start_time, sessions)
-    if resp:
-        return resp
+    if resp: return resp
 
-    # ─── Step 3.5b: Order detail ───
     resp = handle_order_detail(current_flow_state, customer_id, user_context, session_id, page, start_time)
-    if resp:
-        return resp
+    if resp: return resp
     
-    # ─── Step 3.5c: Historical Recommendations ───
     resp = handle_historical_search(
         intent, entities, order_data, customer_id, session_id, page, start_time, sessions
     )
-    if resp:
-        return resp
+    if resp: return resp
 
-    # ─── Step 3.55: Variant selection ───
     resp = handle_variant_selection(
         current_flow_state, intent, entities, message, customer_id,
         session_id, page, start_time, sessions, user_context, _resolve_variant,
     )
-    if resp:
-        return resp
+    if resp: return resp
     
     resp = handle_quantity_and_variant_check(
         intent, entities, all_products_raw, order_data,
         ORDER_CREATE_INTENTS, session_id, page, start_time, sessions, customer_id=customer_id
     )
-    if resp:
-        return resp
+    if resp: return resp
 
-    # ─── Step 3.6: Quick order ───
     resp = handle_quick_order(
         intent, entities, all_products_raw, last_product_ctx,
         customer_id, session_id, page, start_time, sessions, ORDER_CREATE_INTENTS,
     )
-    if resp:
-        return resp
+    if resp: return resp
 
-    # ─── Step 3.7: Variation product handling ───
     resp = handle_variation_product(
         intent, entities, api_responses, api_calls_to_execute,
         confidence, order_data, session_id, page, start_time, sessions,
     )
-    if resp:
-        return resp
+    if resp: return resp
 
-    # ─── Step 3.8: Empty result handling ───
     store_loader = get_store_loader()
     all_products_raw, resp = handle_empty_results(
         intent, entities, all_products_raw, message,
         session_id, page, start_time, confidence, sessions, store_loader,
     )
-    if resp:
-        return resp
+    if resp: return resp
 
-    # ─── Step 4: Format products ───
     products = []
     if intent == Intent.CATEGORY_LIST:
         seen_names = set()
@@ -890,8 +881,6 @@ def chat():
         for p in all_products_raw:
             if p.get("parent_id"):
                 continue
-            # Custom API returns attributes as a dict: {"pa_colors": [...]}
-            # Standard WC returns attributes as a list: [{"name": "Colors", "options": [...]}]
             if isinstance(p.get("attributes"), dict):
                 products.append(format_custom_product(p))
             else:
@@ -900,8 +889,6 @@ def chat():
     products = [p for p in products if p.get("name")]
     logger.info(f"Step 4: Formatted {len(products)} products")
     
-    
-    # ─── Step 5: Generate bot message ───
     _pagination_data = build_pagination(page, api_responses, api_calls_to_execute)
     _total_items_for_msg = _pagination_data.get("total_items")
     bot_message = generate_bot_message(
@@ -913,6 +900,7 @@ def chat():
         total_items=_total_items_for_msg,
         page=page 
     )
+    
     if intent in ORDER_CREATE_INTENTS and order_data:
         placed_order = order_data[-1]
         used_product_name = (
@@ -925,27 +913,17 @@ def chat():
             total = float(total_str) if total_str else 0.0
         except (ValueError, TypeError):
             total = 0.0
-            logger.warning(f"Step 5: Invalid total value '{total_str}', defaulting to 0.00")
 
         if total == 0.0 and placed_order.get("line_items"):
             try:
                 line_total = sum(float(item.get("total") or 0) for item in placed_order["line_items"])
                 if line_total > 0:
                     total = line_total
-                    logger.warning(f"Step 5: Order total was {get_currency_symbol()}0.00, used line_item total={get_currency_symbol()}{line_total:.2f} instead")
             except (ValueError, TypeError) as e:
-                logger.warning(f"Step 5: Error calculating line_item total: {e}")
+                pass
 
-        logger.info(f"Step 5: Bot message generated | product_name=\"{sanitize_log_string(used_product_name)}\" | total={get_currency_symbol()}{total:.2f}")
-        if used_product_name == "your item":
-            logger.warning("Step 5: Used fallback 'your item' - no product name available")
-        if total == 0.0:
-            logger.warning(f"Step 5: Order total is {get_currency_symbol()}0.00 - possible pricing issue")
-
-    # ─── Step 6: Generate suggestions ───
     suggestions = generate_suggestions(intent, entities, products)
 
-    # ─── Step 8: Build metadata ───
     elapsed = time.time() - start_time
     metadata = {
         "confidence": round(confidence, 2),
@@ -957,7 +935,6 @@ def chat():
         "entities": _entities_to_dict(entities),
     }
 
-    # ─── Step 9: Update session history ───
     if session_id and session_id in sessions:
         sessions[session_id]["history"].append({
             "role": "bot",
@@ -967,7 +944,6 @@ def chat():
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
-    # ─── Step 10: Build and return response ───
     response = {
         "success": True,
         "bot_message": bot_message,
@@ -979,12 +955,10 @@ def chat():
         "pagination": _pagination_data,
     }
 
-    # Attach structured order data and pagination for ORDER_HISTORY / LAST_ORDER
     if intent in (Intent.ORDER_HISTORY, Intent.LAST_ORDER) and order_data:
         response["orders"] = [format_order_for_frontend(o) for o in order_data]
         response["order_pagination"] = build_pagination(page, api_responses, api_calls_to_execute)
 
-    # Set flow state
     response["flow_state"] = (
         FlowState.AWAITING_ANYTHING_ELSE.value
         if intent in ORDER_CREATE_INTENTS and order_data

@@ -14,7 +14,6 @@ from config.store_config import (
     GENERIC_NOISE_WORDS
 )
 import os
-import difflib
 from chat_logger import get_logger
 
 logger = get_logger("miraq_chat")
@@ -49,7 +48,6 @@ class OrderActionEvaluator(IntentEvaluator):
         asks_for_products = re.search(r"\b(what|which|show|list|tell)\b.*\b(products?|items?)\b", text)
         
         if is_match_query or (is_past_order_query and (has_filters or asks_for_products)):
-            # If they specifically asked for their *last* order's products, only fetch 1 order!
             if re.search(r"\blast\b", text) and not re.search(r"past orders?", text):
                 entities.order_count = 1
             return Intent.HISTORICAL_SEARCH, 0.96
@@ -58,11 +56,9 @@ class OrderActionEvaluator(IntentEvaluator):
             return Intent.QUICK_ORDER, 0.93
 
         if entities.order_id:
-            # If they specifically ask for the products inside an order ID
             if re.search(r"\b(what|which|show|list|tell)\b.*\b(products?|items?)\b", text):
                 return Intent.HISTORICAL_SEARCH, 0.97
                 
-            # Otherwise, show the standard text receipt
             if re.search(r"\b(show|view|see|detail|details|info|about|check|open|what|which|tell)\b", text):
                 return Intent.ORDER_STATUS, 0.96
 
@@ -141,9 +137,7 @@ class DiscountEvaluator(IntentEvaluator):
 
 class ProductDetailEvaluator(IntentEvaluator):
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
-        # PRODUCT ATTRIBUTE INFO
         if entities.product_name and re.search(r"\b(what|which|how|tell|about)\b", text):
-        # if entities.product_name and re.search(r"\b(what|which)\b.*\b(available|come|have|does|do|offer)\b", text):
             _loader_ref = get_store_loader()
             if _loader_ref and _loader_ref.all_attributes_raw:
                 _matched_label = None
@@ -176,17 +170,14 @@ class ProductDetailEvaluator(IntentEvaluator):
                     entities.target_attribute = _matched_label
                     return Intent.PRODUCT_ATTRIBUTE_INFO, 0.91
 
-        # PRODUCT VARIATIONS
         if re.search(r"\b(colors?|variants?|variations?|options?|finishes|sizes)\b.*\b(come|available|does|do)\b", text):
             return Intent.PRODUCT_VARIATIONS, 0.89
         if entities.product_name and re.search(r"\b(colors?|variants?|variations?|sizes)\b", text):
             return Intent.PRODUCT_VARIATIONS, 0.89
             
-        # RELATED / YMAL (Must require a product name so it doesn't hijack generic searches)
         if entities.product_name and re.search(r"\b(goes?\s*with|pair|complement|match|similar|related|you may also like|ymal)\b", text):
             return Intent.RELATED_PRODUCTS, 0.88
             
-        # QUICK SHIP
         if re.search(r"\bquick\s*ship\b|\bavailable\s*now\b|\bimmediate\b", text):
             entities.quick_ship = True
             return Intent.PRODUCT_QUICK_SHIP, 0.91
@@ -196,11 +187,9 @@ class ProductDetailEvaluator(IntentEvaluator):
 
 class CatalogSearchEvaluator(IntentEvaluator):
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
-        # If we have a product AND an attribute (like 'Ansel' + '3x3'), it's a specific variation search
         if entities.product_id and entities.attributes:
             return Intent.PRODUCT_VARIATIONS, 0.93
                 
-        # Use the new target_category_slugs set
         if getattr(entities, 'target_category_slugs', set()):
             if entities.product_name:
                 if re.search(r"\b(tell|about|detail|info|specs?|specification|price|cost|how\s+much)\b", text):
@@ -215,7 +204,6 @@ class CatalogSearchEvaluator(IntentEvaluator):
         if re.search(r"\b(what|list|show|all)\b.*\bcategor(y|ies)\b", text):
             return Intent.CATEGORY_LIST, 0.91
 
-        # Fallthrough to the generic Attribute Filter engine!
         if entities.attributes and not entities.product_name:
             return Intent.FILTER_BY_ATTRIBUTE, 0.89
 
@@ -242,7 +230,6 @@ class GeneralFallbackEvaluator(IntentEvaluator):
             _pt_esc = re.escape(_pt)
             
             if re.search(rf"\b{_pt_esc}s?\b", text):
-                # Check if we successfully extracted ANY known filters (tags, categories, attributes)
                 has_filters = any([
                     entities.product_name, 
                     getattr(entities, 'target_category_slugs', None), 
@@ -251,16 +238,14 @@ class GeneralFallbackEvaluator(IntentEvaluator):
                 ])
                 
                 if not has_filters:
-                    # Check if it's a purely generic request (e.g., "show all products") 
-                    # to safely dump the catalog without an error.
                     is_pure_generic = bool(re.search(rf"^(show|list|all|sell|have|get|see|browse|what)\s+(me\s+)?(all\s+)?(your\s+)?(the\s+)?{_pt_esc}s?[.?!]*$", text.strip()))
                     
                     if is_pure_generic or re.search(rf"^{_pt_esc}s?(?:\s+please)?[.?!]*$", text.strip()):
                         return Intent.PRODUCT_LIST, 0.85
                     else:
-                        # The query contains unrecognized words (like "popular products").
-                        # Force a strict text search! This will return 0 results and trigger your LLM fallback perfectly.
-                        entities.search_term = text.replace("?", "").strip()
+                        # Only overwrite search_term if the Isolator didn't already find leftovers!
+                        if not entities.search_term:
+                            entities.search_term = text.replace("?", "").strip()
                         return Intent.PRODUCT_SEARCH, 0.80
                         
                 return Intent.PRODUCT_LIST, 0.75
@@ -282,7 +267,6 @@ class ClassifierPipeline:
         for evaluator in self.evaluators:
             evaluator_name = evaluator.__class__.__name__
             
-            # Evaluate the text
             intent, confidence = evaluator.evaluate(text, entities)
             
             if intent is not None:
@@ -306,84 +290,79 @@ def _normalize_dimension(val: str) -> str:
     clean = re.sub(r'(mm|cm|inch|inches|in\.?|thick|weight|lbs?|oz|kg|g)$', '', clean)
     return clean
 
-def _extract_fuzzy_near_misses(text: str, entities: ExtractedEntities):
+# ─────────────────────────────────────────────
+# NEW: LEFTOVER ISOLATOR FOR VECTOR AI
+# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# NEW: NEGATIVE-AWARE LEFTOVER ISOLATOR
+# ─────────────────────────────────────────────
+def _isolate_unrecognized_terms(text: str, entities: ExtractedEntities):
+    """Masks out successfully extracted entities and routes leftovers to positive/negative baskets."""
     loader = get_store_loader()
-    if not loader: 
-        return
-
-    # 1. Build a set of normalized tokens we ALREADY successfully extracted.
-    # We do this so we don't accidentally "fuzzy match" a word we already processed.
     used_tokens = set()
-    if entities.product_name:
+    
+    # 1. Collect all words we successfully matched
+    if getattr(entities, 'product_name', None):
         used_tokens.update(_normalize_for_tag_compare(entities.product_name))
+    if getattr(entities, 'category_name', None):
+        used_tokens.update(_normalize_for_tag_compare(entities.category_name))
     for cat in getattr(entities, 'target_category_slugs', set()):
         used_tokens.update(_normalize_for_tag_compare(cat.replace("-", " ")))
-    for slug in entities.tag_slugs:
+    for slug in getattr(entities, 'tag_slugs', []):
         used_tokens.update(_normalize_for_tag_compare(slug.replace("-", " ")))
-    for term in entities.attributes.values():
+    for term in getattr(entities, 'attributes', {}).values():
         used_tokens.update(_normalize_for_tag_compare(term.replace("-", " ")))
 
-    # Add known store noise words to the ignore list so they don't corrupt the fuzzy match
+    # 2. Add conversational filler (NOTE: "without", "no", "not" have been REMOVED from this list!)
+    CONVERSATIONAL_FILLER = {
+        "do", "you", "have", "are", "there", "any", "what", "is", "the", 
+        "show", "me", "find", "looking", "for", "i", "want", "to", "buy",
+        "get", "a", "an", "can", "could", "some", "like", "use", "using",
+        "please", "give", "would", "need", "has", "that"
+    }
+    used_tokens.update(CONVERSATIONAL_FILLER)
     used_tokens.update(set(kw.lower() for kw in GENERIC_NOISE_WORDS))
     used_tokens.update(set(kw.lower() for kw in PRODUCT_TYPE_TERMS))
-    if hasattr(loader, '_store_generic_terms'):
+    if loader and hasattr(loader, '_store_generic_terms'):
         used_tokens.update(loader._store_generic_terms)
 
-    # 2. Isolate the "Leftover Text"
-    # Mask out all the successfully used tokens with spaces
+    # 3. Mask out the used words from the text
     leftover_text = text.lower()
     for token in used_tokens:
-        if len(token) > 2:  # Only mask meaningful words
-            leftover_text = re.sub(rf'\b{re.escape(token)}\b', ' ', leftover_text)
+        if len(token) > 2 or token in CONVERSATIONAL_FILLER:  
+            pattern = _create_flexible_pattern(token)
+            leftover_text = re.sub(pattern, ' ', leftover_text, flags=re.IGNORECASE)
 
-    # Clean up the leftover string to see what phrase the user actually typed
-    leftover_phrase = re.sub(r'\s+', ' ', leftover_text).strip()
+    # 4. Clean up the leftover string
+    leftover_phrase = re.sub(r'[^a-z0-9, ]', ' ', leftover_text)
+    leftover_phrase = re.sub(r'\s+', ' ', leftover_phrase).strip()
 
-    if not leftover_phrase or len(leftover_phrase) < 4:
-        return  # Nothing substantial left to fuzzy match!
+    # 5. THE TRAFFIC COP: Route positives and negatives
+    positive_leftovers = []
+    negative_leftovers = []
 
-    # Pull the threshold from the environment, defaulting to 80% similarity
-    THRESHOLD = float(os.getenv("FUZZY_MATCH_THRESHOLD", "0.80"))
-    
-    best_match = None
-    best_score = 0
-    
-    # 3. Fuzzy match the leftover phrase against active Tags
-    for tag_name_lower, tag_entry in loader.tag_by_name_lower.items():
-        if tag_entry.get("count", 0) > 0:
-            score = difflib.SequenceMatcher(None, leftover_phrase, tag_name_lower).ratio()
-            if score >= THRESHOLD and score > best_score:
-                best_score = score
-                best_match = {
-                    "user_text": leftover_phrase,
-                    "suggested_name": tag_entry.get("name"),
-                    "type": "tag",
-                    "slug": tag_entry.get("slug")
-                }
-    
-    # 4. Fuzzy match against active Attributes
-    if loader.attribute_terms:
-        for attr_id, terms_list in loader.attribute_terms.items():
-            for term in terms_list:
-                if term.get("count", 0) > 0:
-                    term_name_lower = term.get("name", "").lower()
-                    score = difflib.SequenceMatcher(None, leftover_phrase, term_name_lower).ratio()
-                    if score >= THRESHOLD and score > best_score:
-                        taxonomy_slug = loader.get_attribute_slug(attr_id) or "attribute"
-                        best_score = score
-                        best_match = {
-                            "user_text": leftover_phrase,
-                            "suggested_name": term.get("name"),
-                            "type": "attribute",
-                            "slug": term.get("slug"),
-                            "taxonomy": taxonomy_slug
-                        }
-                        
-    # 5. If we found a strong near-miss, attach it!
-    if best_match:
-        entities.fuzzy_matches.append(best_match)
-        logger.info(f"Classifier: Fuzzy match found! '{leftover_phrase}' -> '{best_match['suggested_name']}' (Score: {best_score:.2f})")
+    for chunk in leftover_phrase.split(","):
+        chunk = chunk.strip()
+        if not chunk: continue
+        
+        # Check if this specific chunk starts with a negation word
+        negation_match = re.match(r'^(without|no|not|exclude|avoid)\s+(.+)$', chunk)
+        if negation_match:
+            clean_term = negation_match.group(2).strip()
+            if len(clean_term) >= 3:
+                negative_leftovers.append(clean_term)
+        else:
+            if len(chunk) >= 3:
+                positive_leftovers.append(chunk)
 
+    if positive_leftovers:
+        entities.search_term = ", ".join(positive_leftovers)
+    if negative_leftovers:
+        # Ensures safety if models.py wasn't updated yet
+        if not hasattr(entities, 'excluded_search_term'):
+            entities.excluded_search_term = None
+        entities.excluded_search_term = ", ".join(negative_leftovers)
+        
 # ─────────────────────────────────────────────
 # MAIN CLASSIFY FUNCTION
 # ─────────────────────────────────────────────
@@ -409,11 +388,9 @@ def classify(utterance: str) -> ClassifiedResult:
     _extract_quantity(text, entities)
 
     attr_text = entity_text
-    # Mask out the product name so numbers inside it (like 2.0) don't trigger attributes
     if entities.product_name:
         attr_text = attr_text.replace(entities.product_name.lower(), " ")
         
-    # Mask out the extracted quantity so bare numbers don't falsely trigger attributes
     if entities.quantity:
         attr_text = re.sub(rf'(?<![\dxX\-])\b{entities.quantity}\b(?![\dxX\-])', ' ', attr_text, count=1)
 
@@ -440,8 +417,8 @@ def classify(utterance: str) -> ClassifiedResult:
     _extract_customer_fetch(text, entities)
     _extract_stock_status(text, entities)
     
-    # ─── 4.5 FUZZY NEAR-MISS EXTRACTION ───
-    _extract_fuzzy_near_misses(text, entities)
+    # ─── 4.5 ISOLATE LEFTOVERS FOR VECTOR AI ───
+    _isolate_unrecognized_terms(text, entities)
 
     # ─── 5. EXECUTE INTENT PIPELINE ───
     pipeline = ClassifierPipeline([
@@ -504,7 +481,6 @@ def classify(utterance: str) -> ClassifiedResult:
     if getattr(entities, 'target_category_slugs', set()) and entities.attributes:
         loader = get_store_loader()
         
-        # Build a set of normalized tokens for all extracted categories to allow fuzzy matching
         cat_tokens_map = {}
         for cat_slug in list(entities.target_category_slugs):
             cat_obj = loader.category_by_slug.get(cat_slug) if loader else None
@@ -514,7 +490,6 @@ def classify(utterance: str) -> ClassifiedResult:
         for attr_label, attr_slug in list(entities.attributes.items()):
             attr_tokens = _normalize_for_tag_compare(attr_slug.replace("-", " "))
             
-            # Check if this attribute overlaps with ANY extracted category (handles plurals)
             overlapping_cat_slug = None
             for cat_slug, c_tokens in cat_tokens_map.items():
                 if attr_tokens <= c_tokens or c_tokens <= attr_tokens or attr_slug == cat_slug:
@@ -522,8 +497,6 @@ def classify(utterance: str) -> ClassifiedResult:
                     break
                     
             if overlapping_cat_slug:
-                
-                # Resolve the correct taxonomy for this attribute
                 actual_tax = ""
                 if loader and loader.all_attributes_raw:
                     for a in loader.all_attributes_raw:
@@ -532,26 +505,20 @@ def classify(utterance: str) -> ClassifiedResult:
                             break
                             
                 if actual_tax:
-                    # Bundle ONLY the overlapping slug into an OR pair!
                     entities.attr_tag_or_pairs.append({
                         "cat_slugs": [overlapping_cat_slug],
                         "attr_taxonomy": actual_tax,
                         "attr_term": attr_slug
                     })
                     
-                    # Remove ONLY the overlapping slug from the strict category set
                     if overlapping_cat_slug in entities.target_category_slugs:
                         entities.target_category_slugs.remove(overlapping_cat_slug)
                         
-                    # If that was the only category, clear the UI name
                     if not entities.target_category_slugs:
                         entities.category_name = None
                         
                     del entities.attributes[attr_label]
 
-    # ─── NEW: ECLIPSED ENTITY CLEANUP ───
-    # If we extracted an exact tag (like "gray-tones"), we must delete any smaller 
-    # OR pairs or attributes (like "gray") that are fully eclipsed by it.
     if entities.tag_slugs:
         loader = get_store_loader()
         exact_tag_tokens = []
@@ -562,25 +529,20 @@ def classify(utterance: str) -> ClassifiedResult:
                     exact_tag_tokens.append(_normalize_for_tag_compare(tag_obj.get("name", "")))
         
         if exact_tag_tokens:
-            # 1. Clean eclipsed OR pairs (e.g. "gray-look")
             if entities.attr_tag_or_pairs:
                 valid_pairs = []
                 for pair in entities.attr_tag_or_pairs:
                     attr_term_tokens = _normalize_for_tag_compare(pair.get("attr_term", "").replace("-", " "))
-                    # If the term (e.g. {"gray"}) is a subset of the exact tag (e.g. {"gray", "tones"}), drop it!
                     if not any(attr_term_tokens <= exact_tokens for exact_tokens in exact_tag_tokens):
                         valid_pairs.append(pair)
                 entities.attr_tag_or_pairs = valid_pairs
                 
-            # 2. Clean eclipsed standard attributes (e.g. "gray")
             if entities.attributes:
                 for attr_label, attr_slug in list(entities.attributes.items()):
                     attr_term_tokens = _normalize_for_tag_compare(attr_slug.replace("-", " "))
                     if any(attr_term_tokens <= exact_tokens for exact_tokens in exact_tag_tokens):
                         del entities.attributes[attr_label]
 
-    # ─── ATTRIBUTE-VS-ATTRIBUTE ECLIPSED CLEANUP ───
-    # If we extracted a specific attribute (like "ansel-charcoal"), drop any generic attributes (like "charcoal") that are fully eclipsed by it.
     if entities.attributes and len(entities.attributes) > 1:
         attr_items = list(entities.attributes.items())
         to_delete = set()
@@ -590,10 +552,8 @@ def classify(utterance: str) -> ClassifiedResult:
                 if i == j: continue
                 tokens2 = _normalize_for_tag_compare(slug2.replace("-", " "))
                 
-                # If tokens2 is a strict subset of tokens1, drop label2
                 if tokens2 < tokens1:
                     to_delete.add(label2)
-                # If they are exact duplicates, prefer the one without numbers in its label (e.g. keep "Colors", drop "Colors 2")
                 elif tokens2 == tokens1:
                     if re.search(r'\d', label2) and not re.search(r'\d', label1):
                         to_delete.add(label2)
@@ -620,17 +580,14 @@ def _extract_category(text: str, entities: ExtractedEntities) -> str:
     extracted_cats = []
     longest_match = ""
 
-    # 1. Scan for all matching category names
     for slug, cat in loader.category_by_slug.items():
         name_lower = cat.get("name", "").lower().strip()
         if len(name_lower) < 3: 
             continue
 
-        # Use flexible matching to catch singular/plural differences
         pattern = _create_flexible_pattern(name_lower)
         try:
             if re.search(pattern, text, re.IGNORECASE):
-                # Keep track of the longest match strictly for the UI bot message
                 if len(name_lower) > len(longest_match):
                     longest_match = name_lower
                     entities.category_name = cat.get("name")
@@ -642,9 +599,6 @@ def _extract_category(text: str, entities: ExtractedEntities) -> str:
     if not extracted_cats:
         return text
 
-    # ─── NEW: ECLIPSED CATEGORY CLEANUP ───
-    # If we matched both "Wall/Floor" and "Wall", drop the generic "Wall"
-    # because "Wall/Floor" is more specific and fully eclipses it.
     cat_tokens_list = [_normalize_for_tag_compare(c.get("name", "")) for c in extracted_cats]
     survivors = []
     for i, cat1 in enumerate(extracted_cats):
@@ -653,7 +607,6 @@ def _extract_category(text: str, entities: ExtractedEntities) -> str:
         for j, cat2 in enumerate(extracted_cats):
             if i == j: continue
             t2 = cat_tokens_list[j]
-            # If cat1's name tokens are a strict subset of cat2's, it's eclipsed!
             if t1 < t2:  
                 is_eclipsed = True
                 break
@@ -662,13 +615,9 @@ def _extract_category(text: str, entities: ExtractedEntities) -> str:
             
     extracted_cats = survivors
 
-    # ══════════════════════════════════════════════════════════════
-    # 2. HIERARCHY RESOLUTION (The Category Graph)
-    # ══════════════════════════════════════════════════════════════
     extracted_ids = {c.get("id") for c in extracted_cats}
     linked_children = []
 
-    # Check if any extracted category is a direct child of another extracted category
     for cat in extracted_cats:
         if cat.get("parent") in extracted_ids:
             linked_children.append(cat)
@@ -677,12 +626,9 @@ def _extract_category(text: str, entities: ExtractedEntities) -> str:
         entities.target_category_slugs = set()
 
     if linked_children:
-        # SCENARIO A: User typed "Exterior Floor". We drop the broad Parent 
-        # and the orphan Floors, keeping ONLY the specific child branch!
         for child in linked_children:
             entities.target_category_slugs.add(child.get("slug"))
     else:
-        # SCENARIO B: User typed "Floor". Bundle ALL duplicate slugs together.
         for cat in extracted_cats:
             entities.target_category_slugs.add(cat.get("slug"))
 
@@ -725,10 +671,8 @@ def _extract_attributes(text: str, entities: ExtractedEntities) -> str:
         terms = attr.get("terms", [])
         if not label or not taxonomy or not terms: continue
 
-        # Dynamically detect if this attribute is a measurement
         is_dimensional = any(kw in label for kw in ['size', 'thickness', 'weight', 'width', 'length', 'depth', 'dimension'])
 
-        # --- Origin Logic (Kept exactly as is) ---
         if "origin" in label:
             matched_origin = False
             for keyword, normalized in ORIGIN_KEYWORDS.items():
@@ -756,37 +700,30 @@ def _extract_attributes(text: str, entities: ExtractedEntities) -> str:
             try:
                 matched_pattern = None
                 
-                # --- 1. GENERIC DIMENSIONAL MATCHER ---
                 if is_dimensional:
                     term_dim = _normalize_dimension(term_name)
-                    # Make sure there is actually a number to match
                     if term_dim and re.search(r'\d', term_dim):
                         escaped_dim = re.escape(term_dim)
-                        # If it's a 2D size (e.g., 60x120), allow flexible separators like "by" or "X"
                         if 'x' in escaped_dim:
                             escaped_dim = escaped_dim.replace('x', r'\s*"?\s*(?:x|by|×)\s*')
                             
-                        # Look for the raw number, optionally followed by any unit type
                         dim_pattern = rf"(?<!\d){escaped_dim}\s*(?:\"|'|mm|cm|inch(?:es)?|in\.?|thick|lbs?|oz|kg|g)?(?!\d)"
                         
                         match = re.search(dim_pattern, masked_text, re.IGNORECASE)
                         if match:
-                            # PREVENT OVERLAP: Don't extract a 1D thickness (e.g. 3) from inside a 2D size (e.g. 3x3)
                             if 'x' not in term_dim:
                                 start, end = match.span()
                                 ctx_before = masked_text[max(0, start-8):start]
                                 ctx_after  = masked_text[end:min(len(masked_text), end+8)]
                                 
-                                # Check if the match is immediately preceded or followed by an 'x' and a digit
                                 if re.search(r'\d\s*(?:\"|\')?\s*(?:x|X|by|×)\s*$', ctx_before) or \
                                    re.search(r'^\s*(?:\"|\')?\s*(?:x|X|by|×)\s*\d', ctx_after):
-                                    pass # Reject this match, it belongs to a 2D size!
+                                    pass 
                                 else:
                                     matched_pattern = dim_pattern
                             else:
                                 matched_pattern = dim_pattern
                                 
-                # --- 2. STANDARD WORD MATCHER ---
                 if not matched_pattern:
                     if re.search(rf"\b{re.escape(term_name_lower)}\b", masked_text):
                         matched_pattern = rf"\b{re.escape(term_name_lower)}\b"
@@ -795,7 +732,6 @@ def _extract_attributes(text: str, entities: ExtractedEntities) -> str:
                     elif len(term_name_lower) > 4 and re.search(rf"\b{re.escape(term_name_lower[:-1])}\b", masked_text):
                         matched_pattern = rf"\b{re.escape(term_name_lower[:-1])}\b"
 
-                # --- 3. APPLY MATCH ---
                 if matched_pattern:
                     covered_by_tag = False
                     covering_tag_slug = None
@@ -804,13 +740,11 @@ def _extract_attributes(text: str, entities: ExtractedEntities) -> str:
                     
                     if loader:
                         import html
-                        # Clean the text of all messy punctuation (quotes, hyphens) for perfect matching
                         norm_text = re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9/.]', ' ', html.unescape(text))).strip()
                         
                         for tag_name_lower, tag_entry in loader.tag_by_name_lower.items():
                             if tag_entry.get("count", 0) == 0: continue
                             
-                            # If it's dimensional, check if the raw digits match
                             if is_dimensional:
                                 tag_digits = re.sub(r'[^0-9]', '', tag_entry.get("slug", ""))
                                 term_digits = re.sub(r'[^0-9]', '', term_name_lower)
@@ -819,16 +753,13 @@ def _extract_attributes(text: str, entities: ExtractedEntities) -> str:
                                     covering_tag_slug = tag_entry.get("slug", "")
                                     covering_tag_id = tag_entry.get("id")
                                     
-                                    # EXACT MATCH CHECK 1: Punctuation-stripped string (solves quotes/measurements)
                                     norm_tag = re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9/.]', ' ', html.unescape(tag_name_lower))).strip()
                                     if norm_tag and re.search(rf'\b{re.escape(norm_tag)}\b', norm_text):
                                         exact_tag_matched = True
-                                    # EXACT MATCH CHECK 2: Flexible regex (solves singular/plural like "tones")
                                     elif re.search(_create_flexible_pattern(tag_name_lower), text):
                                         exact_tag_matched = True
                                     break
                             else:
-                                # Standard overlap check: Is "black" a subset of "black tones"?
                                 term_tokens = _normalize_for_tag_compare(term_name_lower)
                                 tag_tokens = _normalize_for_tag_compare(tag_name_lower)
                                 
@@ -837,24 +768,19 @@ def _extract_attributes(text: str, entities: ExtractedEntities) -> str:
                                     covering_tag_slug = tag_entry.get("slug", "")
                                     covering_tag_id = tag_entry.get("id")
                                     
-                                    # EXACT MATCH CHECK 1: Punctuation-stripped string
                                     norm_tag = re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9/.]', ' ', html.unescape(tag_name_lower))).strip()
                                     if norm_tag and re.search(rf'\b{re.escape(norm_tag)}\b', norm_text):
                                         exact_tag_matched = True
-                                    # EXACT MATCH CHECK 2: Flexible regex
                                     elif re.search(_create_flexible_pattern(tag_name_lower), text):
                                         exact_tag_matched = True
                                     break
                                         
-                    # --- THE OVERRIDE LOGIC ---
                     if exact_tag_matched and not entities.product_name:
-                        # User typed the EXACT tag. Add to strict Tag list and DO NOT assign an attribute!
                         if covering_tag_id not in entities.tag_ids:
                             entities.tag_ids.append(covering_tag_id)
                             entities.tag_slugs.append(covering_tag_slug)
                             
                     elif covered_by_tag and not entities.product_name:
-                        # User was generic. Build the broad OR pair.
                         entities.attr_tag_or_pairs.append({
                             "tag_slug": covering_tag_slug, 
                             "attr_taxonomy": taxonomy, 
@@ -862,13 +788,12 @@ def _extract_attributes(text: str, entities: ExtractedEntities) -> str:
                         })
                         
                     else:
-                        # Standard attribute assignment (Forced for specific products)
                         term_slug = term.get("slug", term_name)
                         entities.attributes[label] = term_slug
                         entities.attribute_slug = taxonomy
                         entities.attribute_term_ids = [term["id"]]
                     
-                    break # Move to the next term
+                    break
                 
             except re.error: pass
             
@@ -1093,7 +1018,6 @@ def _extract_exclusions(text: str, entities: ExtractedEntities) -> str:
                 
             _resolved = False
             
-            # 1. Resolve Tags
             for candidate in [phrase] + phrase.split():
                 if len(candidate) < 3: continue
                 tag_entry = loader.tag_by_name_lower.get(candidate) or loader.tag_by_slug.get(candidate.replace(" ", "-"))
@@ -1104,7 +1028,6 @@ def _extract_exclusions(text: str, entities: ExtractedEntities) -> str:
                         _resolved = True
                     break
                     
-            # 2. Resolve Categories
             if not _resolved:
                 cat = loader.category_by_name_lower.get(phrase) or (loader.category_by_id.get(loader.get_category_id(phrase)) if loader.get_category_id(phrase) else None)
                 if cat and cat.get("slug") and cat["slug"] != "uncategorized":
@@ -1112,7 +1035,6 @@ def _extract_exclusions(text: str, entities: ExtractedEntities) -> str:
                         entities.excluded_categories.append(cat["slug"])
                         _resolved = True
                         
-            # 3. Resolve Attributes
             if not _resolved and loader.all_attributes_raw:
                 for attr in loader.all_attributes_raw:
                     for term in attr.get("terms", []):

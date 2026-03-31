@@ -122,22 +122,22 @@ def handle_flow_state(
             return {
                 "flow_state": FlowState.IDLE.value,
                 "pass_through": True,
-                "apply_fuzzy_match": True  # Flag for chat.py
+                "apply_semantic_match": True
             }
         # Check if they explicitly rejected it
         elif any(kw in text for kw in ["no", "nope", "don't", "original", "search for"]):
             return {
                 "flow_state": FlowState.IDLE.value,
                 "pass_through": True,
-                "reject_fuzzy_match": True  # Flag for chat.py
+                "reject_semantic_match": True
             }
         else:
             # Context Switch! The user ignored the question and typed a completely new search.
-            # We silently clear the fuzzy state and let the new query process normally.
+            # silently clear the semantic state and let the new query process normally.
             return {
                 "flow_state": FlowState.IDLE.value,
                 "pass_through": True,
-                "clear_fuzzy_match": True
+                "clear_semantic_match": True
             }
 
     # ── State: User is picking intent from menu ──
@@ -397,11 +397,3 @@ def handle_flow_state(
         ]
         if any(ph in text for ph in _topic_change_phrases) or text.strip() in ("hello", "hi"):
             return None
-        # Everything else is a variant selection response — handle self-contained in Step 3.55
-        return {
-            "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
-            "pass_through": True,
-            "resolve_variant": True,
-        }
-
-    return None  # Fall through to normal pipeline
