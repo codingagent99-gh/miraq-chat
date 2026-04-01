@@ -278,6 +278,8 @@ def generate_bot_message(
             variations = parent.get("variations", [])
             
         has_attributes = bool(entities.attributes)
+        has_stock_filter = getattr(entities, 'in_stock', None) is not None
+        
         def _get_var_label(v):
             """Safely build a variation label from either standard or custom API formats."""
             label = v.get("variation_label") or v.get("name", "")
@@ -288,9 +290,19 @@ def generate_bot_message(
                     label = " / ".join(str(a.get("option", "")) for a in v["attributes"] if a.get("option"))
             return label.strip().title() or f"Variation #{v.get('id', '')}"
 
-        # If we have specific attributes, show the FILTERED specific view!
-        if has_attributes:
+        # Filter variations natively if stock status was requested
+        if has_stock_filter:
+            variations = [
+                v for v in variations 
+                if v.get("in_stock", v.get("stock_status") == "instock") == entities.in_stock
+            ]
+
+        # If we have specific attributes or stock filters, show the FILTERED specific view!
+        if has_attributes or has_stock_filter:
             attr_desc = " / ".join(filter(None, entities.attributes.values())).title()
+            if has_stock_filter:
+                stock_desc = "In Stock" if entities.in_stock else "Out of Stock"
+                attr_desc = f"{attr_desc} ({stock_desc})" if attr_desc else stock_desc
             
             if not variations:
                 return (
@@ -307,8 +319,7 @@ def generate_bot_message(
                 price_val = float(v.get("price") or 0)
                 price_str = f"{CS}{price_val:.2f}" if price_val > 0 else ""
                 
-                # Custom API doesn't always send in_stock for nested variations, default to True if returned
-                stock = "✅ In stock" if v.get("in_stock", True) else "❌ Out of stock"
+                stock = "✅ In stock" if v.get("in_stock", v.get("stock_status") == "instock") else "❌ Out of stock"
                 
                 line = f"• **{label}**"
                 if price_str:

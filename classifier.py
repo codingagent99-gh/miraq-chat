@@ -14,6 +14,17 @@ from config.store_config import (
     GENERIC_NOISE_WORDS
 )
 import os
+import re
+import calendar
+from datetime import datetime, timezone, timedelta
+from dateutil.relativedelta import relativedelta
+
+try:
+    from dateparser.search import search_dates
+    DATEPARSER_AVAILABLE = True
+except ImportError:
+    DATEPARSER_AVAILABLE = False
+
 from chat_logger import get_logger
 
 logger = get_logger("miraq_chat")
@@ -98,6 +109,13 @@ class OrderActionEvaluator(IntentEvaluator):
             return Intent.LAST_ORDER, 0.94
 
         if re.search(r"\bwhat\b.*\b(did\s+i|have\s+i)\b.*\border", text):
+            # If a date/time context is present, this is ORDER_HISTORY not LAST_ORDER
+            has_date_context = bool(re.search(
+                r"\b(on|from|in|during|between|after|before)\b.{1,30}\b(\d{1,2}[\w]*|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)",
+                text, re.IGNORECASE
+            ))
+            if has_date_context:
+                return Intent.ORDER_HISTORY, 0.93
             entities.order_count = 1
             return Intent.LAST_ORDER, 0.93
 
@@ -188,6 +206,9 @@ class ProductDetailEvaluator(IntentEvaluator):
 class CatalogSearchEvaluator(IntentEvaluator):
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
         if entities.product_id and entities.attributes:
+            return Intent.PRODUCT_VARIATIONS, 0.93
+        
+        if entities.product_id and (entities.attributes or getattr(entities, 'in_stock', None) is not None):
             return Intent.PRODUCT_VARIATIONS, 0.93
                 
         if getattr(entities, 'target_category_slugs', set()):
@@ -310,12 +331,19 @@ def _isolate_unrecognized_terms(text: str, entities: ExtractedEntities):
     for term in getattr(entities, 'attributes', {}).values():
         used_tokens.update(_normalize_for_tag_compare(term.replace("-", " ")))
 
-    # 2. Add conversational filler (NOTE: "without", "no", "not" have been REMOVED from this list)
+    # Prevents stock status words from leaking into the search term
+    if getattr(entities, 'in_stock', None) is not None:
+        used_tokens.update(["out", "of", "stock", "in", "available", "unavailable"])
+        
+    # 2. Add conversational filler
     CONVERSATIONAL_FILLER = {
         "do", "you", "have", "are", "there", "any", "what", "is", "the", 
         "show", "me", "find", "looking", "for", "i", "want", "to", "buy",
         "get", "a", "an", "can", "could", "some", "like", "use", "using",
-        "please", "give", "would", "need", "has", "that"
+        "please", "give", "would", "need", "has", "that",
+        "all", "this", "these", "those", "it", "them", "my", "our", "their",
+        "only", "just", "very", "much", "many", 
+        "which", "who", "when", "where", "how", "whose", "whom"
     }
     used_tokens.update(CONVERSATIONAL_FILLER)
     used_tokens.update(set(kw.lower() for kw in GENERIC_NOISE_WORDS))
@@ -405,7 +433,9 @@ def classify(utterance: str) -> ClassifiedResult:
     # --- 4. SECONDARY EXTRACTIONS ---
     _extract_collection_year(text, entities)
     _extract_order_id(text, entities)
+    logger.debug(f"ClassifierPipeline: Calling _extract_time_range")
     _extract_time_range(text, entities)
+    logger.debug(f"ClassifierPipeline: After _extract_time_range | entities={entities}")
     _extract_order_item(text, entities)
     _extract_unresolved_descriptors(text, entities)
     _extract_price_range(text, entities)       
@@ -566,8 +596,19 @@ def classify(utterance: str) -> ClassifiedResult:
 # ─────────────────────────────────────────────
 
 def _extract_stock_status(text: str, entities: ExtractedEntities):
-    if re.search(r"\bin[- ]*stock\b", text):
+    """Isolates boolean flags for stock and sale status using regex."""
+    
+    # 1. Check for Out of Stock / Unavailable
+    if re.search(r"\b(?:out\s+of\s+stock|no\s+stock|unavailable)\b", text, re.IGNORECASE):
+        entities.in_stock = False
+        
+    # 2. Check for In Stock / Available
+    elif re.search(r"\b(?:in\s+stock|available)\b", text, re.IGNORECASE):
         entities.in_stock = True
+        
+    # 3. Check for Sale / Discount status
+    if re.search(r"\b(?:on\s+sale|discount(?:ed)?|clearance)\b", text, re.IGNORECASE):
+        entities.on_sale = True
         
 def _extract_category(text: str, entities: ExtractedEntities) -> str:
     loader = get_store_loader()
@@ -646,12 +687,30 @@ def _extract_product_name(text: str, entities: ExtractedEntities):
                 tag_names_lower = set(loader.tag_by_name_lower.keys())
                 tag_words = {t for tag_name in tag_names_lower for t in re.split(r'[\s\-_/]+', tag_name) if t and len(t) > 2}
                 if not overlapping_tokens or overlapping_tokens.issubset(tag_words): return  
+            
+            # 1. Set the base product first (e.g., "Ansel")
             entities.product_name = match["name"]
             entities.product_slug = match.get("slug", "")
             entities.product_id = match.get("id")
-            if "mosaic" in text: entities.product_slug = f"{match['slug']}-mosaic"
-            elif "chip card" in text: entities.product_slug = f"{match['slug']}-chip-card"
-            elif "ymal" in text: entities.product_slug = f"{match['slug']}-ymal"
+            
+            # 🚀 2. DYNAMIC VARIANT UPGRADE (No hardcoding!)
+            if hasattr(loader, 'product_by_name_lower'):
+                base_name_lower = match["name"].lower()
+                
+                # Scan the catalog for any product that starts with the base name
+                # e.g., it will find "ansel mosaic", "ansel chip card", "ansel sample"
+                for catalog_name, prod_data in loader.product_by_name_lower.items():
+                    if catalog_name != base_name_lower and catalog_name.startswith(base_name_lower + " "):
+                        
+                        # Extract just the suffix part (e.g., "mosaic", "chip card")
+                        suffix = catalog_name[len(base_name_lower):].strip()
+                        
+                        # If the user typed that exact suffix, seamlessly upgrade the product!
+                        if suffix and suffix in text:
+                            entities.product_name = prod_data.get("name")
+                            entities.product_slug = prod_data.get("slug", "")
+                            entities.product_id = prod_data.get("id")
+                            break # Stop looking once we upgrade
 
 def _normalize_for_tag_compare(s: str) -> set:
     return set(re.sub(r'[^a-z0-9 ]', ' ', s.lower()).split())
@@ -850,9 +909,10 @@ def _extract_order_id(text: str, entities: ExtractedEntities):
     if match: entities.order_id = int(match.group(1))
 
 def _extract_time_range(text: str, entities: ExtractedEntities):
-    from datetime import datetime, timezone, timedelta
-    from dateutil.relativedelta import relativedelta
+    logger.debug(f"_extract_time_range: ENTERED with text='{text}'")
     now = datetime.now(timezone.utc)
+
+    # 1. FAST REGEXES (Rolling Windows for explicit numbers)
     m = re.search(r'(?:last|past)\s+(\d+)\s+(day|week|month|year)s?', text)
     if m:
         n = int(m.group(1))
@@ -860,14 +920,109 @@ def _extract_time_range(text: str, entities: ExtractedEntities):
         if unit == 'day': entities.date_after = (now - timedelta(days=n)).strftime('%Y-%m-%dT00:00:00')
         elif unit == 'week': entities.date_after = (now - timedelta(weeks=n)).strftime('%Y-%m-%dT00:00:00')
         elif unit == 'month': entities.date_after = (now - relativedelta(months=n)).strftime('%Y-%m-%dT00:00:00')
-        elif unit == 'year': entities.date_after = (now - relativedelta(years=1)).strftime('%Y-%m-%dT00:00:00')
+        elif unit == 'year': entities.date_after = (now - relativedelta(years=n)).strftime('%Y-%m-%dT00:00:00')
+        logger.debug(f"_extract_time_range: EXIT | date_after={getattr(entities, 'date_after', None)} | date_before={getattr(entities, 'date_before', None)}")
         return
-    if re.search(r'(?:last|past)\s+month', text): entities.date_after = (now - relativedelta(months=1)).strftime('%Y-%m-%dT00:00:00'); return
-    if re.search(r'(?:last|past)\s+week', text): entities.date_after = (now - timedelta(weeks=1)).strftime('%Y-%m-%dT00:00:00'); return
-    if re.search(r'(?:last|past)\s+year', text): entities.date_after = (now - relativedelta(years=1)).strftime('%Y-%m-%dT00:00:00'); return
+
+    # 2. CALENDAR-ALIGNED REGEXES (For vague relative terms)
+    if re.search(r'(?:last|past)\s+week', text):
+        # e.g., Previous completed Monday-Sunday week
+        today = now.date()
+        last_monday = today - timedelta(days=today.weekday() + 7)
+        last_sunday = last_monday + timedelta(days=6)
+        entities.date_after = last_monday.strftime('%Y-%m-%dT00:00:00')
+        entities.date_before = last_sunday.strftime('%Y-%m-%dT23:59:59')
+        logger.debug(f"_extract_time_range: EXIT | date_after={getattr(entities, 'date_after', None)} | date_before={getattr(entities, 'date_before', None)}")
+        return
+
+    if re.search(r'(?:last|past)\s+month', text):
+        # e.g., If today is April 15, get March 1 to March 31
+        first_day_this_month = now.replace(day=1)
+        last_day_prev_month = first_day_this_month - timedelta(days=1)
+        entities.date_after = last_day_prev_month.replace(day=1).strftime('%Y-%m-%dT00:00:00')
+        entities.date_before = last_day_prev_month.strftime('%Y-%m-%dT23:59:59')
+        logger.debug(f"_extract_time_range: EXIT | date_after={getattr(entities, 'date_after', None)} | date_before={getattr(entities, 'date_before', None)}")
+        return
+
+    if re.search(r'(?:last|past)\s+year', text):
+        # e.g., If today is 2026, get Jan 1 2025 to Dec 31 2025
+        last_year = now.year - 1
+        entities.date_after = f"{last_year}-01-01T00:00:00"
+        entities.date_before = f"{last_year}-12-31T23:59:59"
+        logger.debug(f"_extract_time_range: EXIT | date_after={getattr(entities, 'date_after', None)} | date_before={getattr(entities, 'date_before', None)}")
+        return
+
     if re.search(r'this\s+month', text): entities.date_after = now.replace(day=1).strftime('%Y-%m-%dT00:00:00'); return
     if re.search(r'this\s+year', text): entities.date_after = now.replace(month=1, day=1).strftime('%Y-%m-%dT00:00:00'); return
 
+    # 3. DYNAMIC PARSING
+    if not DATEPARSER_AVAILABLE:
+        logger.debug(f"_extract_time_range: EXIT | date_after={getattr(entities, 'date_after', None)} | date_before={getattr(entities, 'date_before', None)}")
+        return
+
+    # Normalize fused date formats before parsing (e.g. "18mar" → "18 mar")
+    normalized_text = re.sub(r'(\d{1,2})(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)', r'\1 \2', text, flags=re.IGNORECASE)
+
+    # Detect open-ended range intent BEFORE parsing (only relevant for day-level branch)
+    is_open_range = bool(re.search(r'\b(from|since|after|starting)\b', text, re.IGNORECASE))
+
+    parsed_results = search_dates(
+        normalized_text,
+        settings={
+            'PREFER_DATES_FROM': 'past',
+            'RETURN_AS_TIMEZONE_AWARE': False
+        }
+    )
+
+    if not parsed_results:
+        # Failure to Parse: No recognizable date found. Defer to LLM fallback.
+        logger.debug(f"_extract_time_range: EXIT | date_after={getattr(entities, 'date_after', None)} | date_before={getattr(entities, 'date_before', None)}")
+        return
+
+    if len(parsed_results) >= 3:
+        # Complexity Bailout: Too many dates to safely assume a bounding box. Defer to LLM fallback.
+        logger.debug(f"_extract_time_range: EXIT | date_after={getattr(entities, 'date_after', None)} | date_before={getattr(entities, 'date_before', None)}")
+        return
+
+    # 4. EXACTLY 2 DATES (Range Logic)
+    if len(parsed_results) == 2:
+        dates = sorted([r[1] for r in parsed_results])
+        entities.date_after = dates[0].strftime('%Y-%m-%dT00:00:00')
+        entities.date_before = dates[1].strftime('%Y-%m-%dT23:59:59')
+        logger.debug(f"_extract_time_range: EXIT | date_after={getattr(entities, 'date_after', None)} | date_before={getattr(entities, 'date_before', None)}")
+        return
+
+    # 5. EXACTLY 1 DATE (Granularity-Aware Bounding Box)
+    matched_string, parsed_date = parsed_results[0]
+    matched_lower = matched_string.lower()
+
+    has_day_token = bool(re.search(r'\b\d{1,2}(?:st|nd|rd|th)?\b', matched_lower))
+    has_year_token = bool(re.search(r'\b\d{4}\b', matched_string))
+    has_month_token = bool(re.search(r'\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b', matched_lower))
+
+    if has_year_token and not has_month_token and not has_day_token and parsed_date.month == 1 and parsed_date.day == 1:
+        # Year-level: "orders from 2024" → full year bounding box regardless of open-range intent
+        entities.date_after = parsed_date.strftime('%Y-01-01T00:00:00')
+        entities.date_before = parsed_date.strftime('%Y-12-31T23:59:59')
+
+    elif parsed_date.day == 1 and not has_day_token:
+        # Month-level: "orders from March" → full month bounding box regardless of open-range intent
+        last_day = calendar.monthrange(parsed_date.year, parsed_date.month)[1]
+        entities.date_after = parsed_date.strftime('%Y-%m-%dT00:00:00')
+        entities.date_before = parsed_date.replace(day=last_day).strftime('%Y-%m-%dT23:59:59')
+
+    else:
+        # Day-level: apply open-range logic here
+        entities.date_after = parsed_date.strftime('%Y-%m-%dT00:00:00')
+        if is_open_range:
+            # "from/since feb 26" → start of that day until now, no upper bound
+            pass  # date_before intentionally left unset — WooCommerce defaults to now
+        else:
+            # "on feb 26" → strict 24-hour window
+            entities.date_before = parsed_date.strftime('%Y-%m-%dT23:59:59')
+
+    logger.debug(f"_extract_time_range: EXIT | date_after={getattr(entities, 'date_after', None)} | date_before={getattr(entities, 'date_before', None)}")
+       
 def _extract_quantity(text: str, entities: ExtractedEntities):
     match = re.search(r'(\d+)\s*(qty|quantity|pcs|pieces|units|boxes|sq\s*ft)', text)
     if match: entities.quantity = int(match.group(1)); return

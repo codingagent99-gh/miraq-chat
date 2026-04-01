@@ -261,14 +261,17 @@ def _build_advanced_filter_call(
 
     body = _serialize_query(conditions, page, per_page, min_price=min_price, max_price=max_price)
 
-    if in_stock:
+    if in_stock is True:
         body["stock_status"] = "instock"
+    elif in_stock is False:
+        body["stock_status"] = "outofstock"
     # Apply the top-level parameters defined in the updated custom API spec
     if product_id:
         body["ids"] = [product_id]
+        body.pop("stock_status", None)
     elif search_term:
         body["search"] = search_term
-        
+            
     import json as built_in_json
     logger.debug(
         f"api_builder: Executing advanced filter with body: {built_in_json.dumps(body)}"
@@ -363,6 +366,8 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
         _order_params = {"customer": "CURRENT_USER_ID", "per_page": count, "page": page, "orderby": "date", "order": "desc"}
         if getattr(e, "date_after", None):
             _order_params["after"] = e.date_after
+        if getattr(e, "date_before", None):
+            _order_params["before"] = e.date_before
         calls.append(WooAPICall(
             method="GET",
             endpoint=f"{BASE}/orders",
@@ -503,6 +508,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             product_id=e.product_id,
             search_term=e.product_name if not e.product_id else None,
             page=page,
+            in_stock=e.in_stock,
             description=f"List products (Product ID: {e.product_id}, Name: {e.product_name})"
         ))
 
@@ -532,6 +538,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             description=f"Advanced product search: '{actual_search}'",
             min_price=e.min_price,
             max_price=e.max_price,
+            in_stock=e.in_stock,
             search_term=actual_search,
             product_id=e.product_id
         ))
@@ -698,6 +705,7 @@ def build_api_calls(result: ClassifiedResult, page: int = 1, user_message: str =
             excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None,
             tag_operator=e.tag_operator,
             page=page,
+            in_stock=e.in_stock,
             description=f"Get specific variations for '{e.product_name or 'Series'}'"
         ))
 

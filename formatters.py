@@ -290,7 +290,11 @@ def _entities_to_dict(entities: ExtractedEntities) -> dict:
     if getattr(entities, 'variation_id', None):    d["variation_id"] = entities.variation_id
     if getattr(entities, 'tag_ids', None):         d["tag_ids"] = entities.tag_ids
     if getattr(entities, 'collection_year', None): d["collection_year"] = entities.collection_year
-    if getattr(entities, 'on_sale', None):         d["on_sale"] = entities.on_sale
+    if getattr(entities, 'on_sale', None) is not None:  
+        d["on_sale"] = entities.on_sale
+    if getattr(entities, 'in_stock', None) is not None: 
+        d["in_stock"] = entities.in_stock
+        
     return d
 
 def _safe_float(val) -> float:

@@ -81,6 +81,9 @@ class AmbiguousFilter:
 
 @dataclass
 class ExtractedEntities:
+    
+    date_after: Optional[str] = None
+    date_before: Optional[str] = None 
     # Product identification
     product_name: Optional[str] = None
     product_id: Optional[int] = None
@@ -115,7 +118,6 @@ class ExtractedEntities:
     excluded_categories: List[str] = field(default_factory=list)
     excluded_attributes: Dict[str, List[str]] = field(default_factory=dict)  # ← ADDED HERE
     excluded_search_term: Optional[str] = None
-    
     # Attribute term resolution (for WooCommerce attribute=&attribute_term= filtering)
     attribute_slug: Optional[str] = None          # e.g. "pa_tile-size"
     attribute_term_ids: List[int] = field(default_factory=list)  # resolved term IDs

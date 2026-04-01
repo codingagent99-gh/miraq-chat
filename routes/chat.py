@@ -152,7 +152,25 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
             
     if getattr(nlp_entities, 'excluded_search_term', None):
         entities.excluded_search_term = nlp_entities.excluded_search_term
-                
+        
+    # MERGE PRIMITIVES (Booleans & Numbers)
+    if getattr(nlp_entities, 'in_stock', None) is not None:
+        entities.in_stock = nlp_entities.in_stock
+    if getattr(nlp_entities, 'on_sale', None) is not None:
+        entities.on_sale = nlp_entities.on_sale
+    if getattr(nlp_entities, 'min_price', None) is not None:
+        entities.min_price = nlp_entities.min_price
+    if getattr(nlp_entities, 'max_price', None) is not None:
+        entities.max_price = nlp_entities.max_price
+    if getattr(nlp_entities, 'collection_year', None) is not None:
+        entities.collection_year = nlp_entities.collection_year
+    if getattr(nlp_entities, 'date_after', None) is not None:
+        entities.date_after = nlp_entities.date_after
+    if getattr(nlp_entities, 'date_before', None) is not None:
+        entities.date_before = nlp_entities.date_before
+    if getattr(nlp_entities, 'order_count', None) is not None:
+        entities.order_count = nlp_entities.order_count
+                    
     # MERGE SEMANTIC MATCHES
     if nlp_entities.semantic_matches:
         entities.semantic_matches.extend(nlp_entities.semantic_matches)
@@ -213,7 +231,11 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
     CATALOG_INTENTS = {Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_SEARCH, Intent.PRODUCT_VARIATIONS, Intent.UNKNOWN}
     
     if nlp_result.intent in CATALOG_INTENTS:
-        resolved_intent = Intent.PRODUCT_SEARCH if entities.product_id else Intent.FILTER_BY_ATTRIBUTE
+        # Do not overwrite PRODUCT_VARIATIONS
+        if nlp_result.intent == Intent.PRODUCT_VARIATIONS:
+            resolved_intent = Intent.PRODUCT_VARIATIONS
+        else:
+            resolved_intent = Intent.PRODUCT_SEARCH if entities.product_id else Intent.FILTER_BY_ATTRIBUTE
     else:
         resolved_intent = nlp_result.intent
     
@@ -489,6 +511,28 @@ def chat():
                 if pending_semantic.get("carryover_categories"):
                     entities.target_category_slugs.update(pending_semantic["carryover_categories"])
                 if pending_semantic.get("carryover_category_name"): entities.category_name = pending_semantic["carryover_category_name"]
+                
+                if pending_semantic.get("carryover_product_id"):
+                    entities.product_id = pending_semantic["carryover_product_id"]
+                if pending_semantic.get("carryover_product_name"):
+                    entities.product_name = pending_semantic["carryover_product_name"]
+                
+                if pending_semantic.get("carryover_quantity") is not None:
+                    entities.quantity = pending_semantic["carryover_quantity"]
+                if pending_semantic.get("carryover_order_id") is not None:
+                    entities.order_id = pending_semantic["carryover_order_id"]
+                if pending_semantic.get("carryover_collection_year") is not None:
+                    entities.collection_year = pending_semantic["carryover_collection_year"]
+                        
+                if pending_semantic.get("carryover_in_stock") is not None:
+                    entities.in_stock = pending_semantic["carryover_in_stock"]
+                if pending_semantic.get("carryover_on_sale") is not None:
+                    entities.on_sale = pending_semantic["carryover_on_sale"]
+                if pending_semantic.get("carryover_min_price") is not None:
+                    entities.min_price = pending_semantic["carryover_min_price"]
+                if pending_semantic.get("carryover_max_price") is not None:
+                    entities.max_price = pending_semantic["carryover_max_price"]
+                    
                 if pending_semantic.get("carryover_attributes"):
                     for k, v in pending_semantic["carryover_attributes"].items():
                         if k not in entities.attributes: entities.attributes[k] = v
@@ -594,6 +638,8 @@ def chat():
                 "quantity": entities.quantity,
                 "attributes": entities.attributes or None,
                 "tag_slugs": entities.tag_slugs or None,
+                "in_stock": getattr(entities, 'in_stock', None),
+                "on_sale": getattr(entities, 'on_sale', None),
             }.items() if v is not None
         }
         logger.info(f"Step 1: Classified intent={intent.value} | confidence={confidence:.2f} | entities={entity_summary}")
@@ -646,7 +692,16 @@ def chat():
                 "carryover_attributes": entities.attributes,
                 "carryover_excluded_tags": getattr(entities, 'excluded_tags', []),
                 "carryover_excluded_categories": getattr(entities, 'excluded_categories', []),
-                "carryover_excluded_attributes": getattr(entities, 'excluded_attributes', {})
+                "carryover_excluded_attributes": getattr(entities, 'excluded_attributes', {}),
+                "carryover_product_id": entities.product_id,
+                "carryover_product_name": entities.product_name,
+                "carryover_quantity": getattr(entities, 'quantity', None),
+                "carryover_order_id": getattr(entities, 'order_id', None),
+                "carryover_collection_year": getattr(entities, 'collection_year', None),
+                "carryover_in_stock": getattr(entities, 'in_stock', None),
+                "carryover_on_sale": getattr(entities, 'on_sale', None),
+                "carryover_min_price": getattr(entities, 'min_price', None),
+                "carryover_max_price": getattr(entities, 'max_price', None)
             }
             
             if hasattr(entities, 'target_category_slugs'):

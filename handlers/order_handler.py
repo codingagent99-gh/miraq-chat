@@ -114,6 +114,8 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
     }
 
     seed_call = _build_advanced_filter_call(
+        product_id=entities.product_id,
+        search_term=entities.product_name if not entities.product_id else None,
         attributes=attr_filters if attr_filters else None,
         tags=list(entities.tag_slugs) if entities.tag_slugs else None,
         or_pairs=list(entities.attr_tag_or_pairs) if entities.attr_tag_or_pairs else None,
@@ -121,7 +123,31 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
         per_page=DEFAULT_PER_PAGE,
         description="Filter past orders"
     )
-    seed_call.body["ids"] = list(set(past_product_ids))
+    
+    # Safely intersect IDs instead of overwriting!
+    existing_ids = seed_call.body.get("ids", [])
+    if existing_ids:
+        # User asked for a specific product ID
+        valid_ids = list(set(existing_ids) & set(past_product_ids))
+        if not valid_ids:
+            elapsed = time.time() - start_time
+            p_name = entities.product_name or "that product"
+            return jsonify({
+                "success": True,
+                "bot_message": f"No, I don't see **{p_name}** in your recent order history. 😕",
+                "intent": intent.value,
+                "products": [],
+                "suggestions": [f"Order {p_name}" if entities.product_name else "Browse products", "Show my orders"],
+                "session_id": session_id,
+                "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": round(elapsed * 1000)},
+                "pagination": default_pagination(page),
+                "flow_state": FlowState.IDLE.value,
+            }), 200
+        seed_call.body["ids"] = valid_ids
+    else:
+        # No specific product ID requested, search within all past purchases
+        seed_call.body["ids"] = list(set(past_product_ids))
+
     seed_resp = woo_client.execute(seed_call)
     
     seed_products = []
@@ -131,11 +157,17 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
         seed_products = _sd.get("products", []) if isinstance(_sd, dict) else (_sd if isinstance(_sd, list) else [])
 
     if not seed_products:
-        filter_str = " ".join(entities.tag_slugs + list(entities.attributes.values())).replace("-", " ") or "that description"
+        filter_parts = []
+        if entities.product_name: filter_parts.append(entities.product_name)
+        elif entities.search_term: filter_parts.append(entities.search_term)
+        filter_parts.extend(entities.tag_slugs)
+        filter_parts.extend(list(entities.attributes.values()))
+        filter_str = " ".join(filter_parts).replace("-", " ") or "that description"
+        
         elapsed = time.time() - start_time
         return jsonify({
             "success": True,
-            "bot_message": f"I couldn't find any past purchases matching **{filter_str}**. Try searching our full catalog!",
+            "bot_message": f"No, I don't see any past purchases matching **{filter_str}**. 😕\n\nTry searching our full catalog!",
             "intent": intent.value,
             "products": [],
             "suggestions": ["Show all products"],
@@ -145,11 +177,8 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
             "flow_state": FlowState.IDLE.value,
         }), 200
         
-    
     from formatters import format_product, format_custom_product
     formatted_products = []
-    
-    # 🚀 NEW: Create a list to hold the text descriptions of what they actually bought
     purchased_items_text = []
 
     for p in seed_products:
@@ -173,7 +202,6 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
                         var_suffix = " / ".join(str(a.get("option", "")) for a in var_attrs if isinstance(a, dict) and a.get("option"))
                     break
         
-        # 🚀 FIX: Add the specific variation to our text list, but leave the product card alone!
         product_name = fp.get('name', 'Product')
         if var_suffix:
             purchased_items_text.append(f"• {product_name} ({var_suffix})")
@@ -184,9 +212,12 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
         
     formatted_products = [p for p in formatted_products if p.get("name")]
 
-    # 🚀 FIX: Generate the bot message and append the list of specific variations!
+    # 🚀 FIX: Dynamic Yes/No conversational response
     if specific_order_id:
         bot_message = f"Here are the products from order **#{specific_order_id}**! 📦\n\n"
+    elif entities.product_id or entities.product_name or entities.search_term:
+        p_name = entities.product_name or entities.search_term or "that product"
+        bot_message = f"Yes, you have ordered **{p_name}** before! Here are the details of your past purchase(s): 🎯\n\n"
     else:
         filter_str = " ".join(entities.tag_slugs + list(entities.attributes.values())).replace("-", " ") or "that description"
         bot_message = f"Here are your previous purchases matching **{filter_str}**! 🎯\n\n"
@@ -517,6 +548,7 @@ def handle_quick_order(
                     "pending_product_id": _order_product_id,
                     "pending_product_name": _order_product_name,
                     "pending_quantity": entities.quantity,
+                    "resolved_attributes": getattr(entities, 'attributes', {}),
                     "response_time_ms": round(elapsed * 1000),
                 },
                 "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
@@ -572,6 +604,7 @@ def handle_quick_order(
                             "pending_product_id": _order_product_id,
                             "pending_product_name": _order_product_name,
                             "pending_quantity": entities.quantity,
+                            "resolved_attributes": getattr(entities, 'attributes', {}),
                             "response_time_ms": round(elapsed * 1000),
                         },
                         "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
