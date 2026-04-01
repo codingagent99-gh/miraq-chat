@@ -1,0 +1,44 @@
+# Database Migrations with Flask-Migrate
+
+All commands require `--app server` unless `FLASK_APP=server.py` is set in your environment.
+
+---
+
+## One-Time Setup
+
+```bash
+flask --app server db init
+flask --app server db migrate -m "initial schema"
+flask --app server db upgrade
+```
+
+---
+
+## Every Future Schema Change
+
+```bash
+flask --app server db migrate -m "describe what changed"
+flask --app server db upgrade
+```
+
+Always review the generated script in `migrations/versions/` before running `upgrade` on production.
+
+---
+
+## Command Reference
+
+| Command               | Purpose                                              |
+| --------------------- | ---------------------------------------------------- |
+| `db init`             | One-time setup — creates the `migrations/` folder    |
+| `db migrate -m "msg"` | Auto-generates a migration script from model changes |
+| `db upgrade`          | Applies all pending migrations                       |
+| `db downgrade`        | Rolls back the last migration                        |
+| `db history`          | Lists all migrations in order                        |
+| `db current`          | Shows which migration the database is currently on   |
+| `db stamp head`       | Marks DB as up-to-date without running migrations    |
+
+---
+
+## ⚠️ Column Renames — Do Manually
+
+Alembic cannot detect column renames. It will generate a `DROP + ADD` instead, which deletes your data. Always write the migration manually for renames using `op.alter_column()`.

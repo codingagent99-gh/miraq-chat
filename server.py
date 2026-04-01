@@ -10,8 +10,8 @@ Endpoint:
     Body: {"message": "...", "session_id": "...", "user_context": {...}}
 """
 
+import os
 import logging
-
 from datetime import datetime, timezone
 from chat_logger import get_logger
 
@@ -21,17 +21,83 @@ from flask_cors import CORS
 from app_config import PORT, DEBUG, STORE_NAME
 from store_registry import set_store_loader, get_store_loader
 from store_loader import StoreLoader, DEV_CACHE_ENABLED
-from session_store import sessions
+from models import db, Conversation
+
 from routes.chat import chat_bp
 from routes.admin import admin_bp
 from routes.products import products_bp
 
-# ══════════════════════════════════════��════
-# FLASK APP
+import urllib.parse
+import psycopg2
+from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+# ═══════════════════════════════════════════
+# FLASK APP & DATABASE
 # ═══════════════════════════════════════════
 
 app = Flask(__name__)
 CORS(app)
+from flask_migrate import Migrate
+migrate = Migrate(app, db)
+# Configure Database Connection
+# Defaults to localhost for dev, override with DATABASE_URL in production
+database_uri = os.getenv('DATABASE_URL', 'postgresql://postgres:admin@localhost:5432/miraq_chat')
+app.config['SQLALCHEMY_DATABASE_URI'] = database_uri
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+def ensure_database_exists(db_uri):
+    """
+    Connects to the default 'postgres' database to check if our target 
+    database exists. If not, it creates it.
+    """
+    # Parse the database URI (e.g., postgresql://user:pass@localhost:5432/miraq_chat)
+    result = urllib.parse.urlparse(db_uri)
+    username = result.username
+    password = result.password
+    hostname = result.hostname
+    port = result.port
+    database_name = result.path[1:] # Strip the leading slash
+
+    try:
+        # Connect to the default 'postgres' database to issue admin commands
+        conn = psycopg2.connect(
+            dbname='postgres', 
+            user=username, 
+            password=password, 
+            host=hostname, 
+            port=port
+        )
+        # PostgreSQL does not allow CREATE DATABASE inside a transaction block
+        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+        cursor = conn.cursor()
+
+        # Check if the database exists
+        cursor.execute(f"SELECT 1 FROM pg_catalog.pg_database WHERE datname = '{database_name}'")
+        exists = cursor.fetchone()
+
+        if not exists:
+            print(f"📦 Database '{database_name}' not found. Creating it now...")
+            cursor.execute(f"CREATE DATABASE {database_name}")
+            print(f"✅ Database '{database_name}' created successfully!")
+        
+        cursor.close()
+        conn.close()
+
+    except Exception as e:
+        print(f"⚠️ Could not verify or create database automatically: {e}")
+        print("Make sure your PostgreSQL server is running and the credentials are correct.")
+
+ensure_database_exists(database_uri)
+# Bind Database to App
+db.init_app(app)
+# Create Tables on Startup
+with app.app_context():
+    db.create_all()
+    # Tables are now safely created inside miraq_chat!
+# Create Tables on Startup
+with app.app_context():
+    db.create_all()
+    # Note: For production, you will eventually want to use Flask-Migrate (Alembic) 
+    # instead of create_all(), but this is perfect for getting started.
 
 # Register blueprints
 app.register_blueprint(chat_bp)
@@ -52,6 +118,14 @@ def handle_global_exception(e):
     logger = get_logger("miraq_chat")
     
     logger.critical(f"🔥 UNHANDLED CRASH: {str(e)}", exc_info=True)
+    
+    # Safety Rollback
+    # If a database transaction failed globally, we must roll it back 
+    # so the session doesn't get permanently stuck.
+    try:
+        db.session.rollback()
+    except Exception:
+        pass
     
     return jsonify({
         "success": False,
@@ -130,9 +204,30 @@ def list_categories():
 
 @app.route("/session/<session_id>", methods=["GET"])
 def get_session(session_id):
-    """Get session history."""
-    if session_id in sessions:
-        return jsonify({"session": sessions[session_id]})
+    """
+    Get session history.
+    🚀 UPDATED: Now queries the Postgres database instead of the in-memory dict.
+    Great for debugging.
+    """
+    import uuid
+    try:
+        session_uuid = uuid.UUID(session_id)
+        conversation = db.session.get(Conversation, session_uuid)
+        
+        if conversation:
+            return jsonify({
+                "session": {
+                    "id": str(conversation.id),
+                    "flow_state": conversation.flow_state,
+                    "context_data": conversation.context_data,
+                    "created_at": conversation.created_at.isoformat(),
+                    "updated_at": conversation.updated_at.isoformat(),
+                    "message_count": len(conversation.messages)
+                }
+            })
+    except ValueError:
+        pass # Invalid UUID format
+        
     return jsonify({"error": "Session not found"}), 404
 
 
@@ -154,7 +249,7 @@ def _print_dev_banner():
     print(f"{'━' * 60}{RESET}")
     print(f"{YELLOW}{BOLD}")
     print(f"  ██████╗ ███████╗██╗   ██╗")
-    print(f"  ██╔══██╗██╔═���══╝██║   ██║")
+    print(f"  ██╔══██╗██╔════╝██║   ██║")
     print(f"  ██║  ██║█████╗  ██║   ██║")
     print(f"  ██║  ██║██╔══╝  ╚██╗ ██╔╝")
     print(f"  ██████╔╝███████╗ ╚████╔╝ ")
@@ -190,6 +285,10 @@ def initialize_store():
     if DEV_CACHE_ENABLED and loader._loaded_from_cache:
         _print_dev_banner()
 
+import os
+import urllib.parse
+import psycopg2
+from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
 if __name__ == "__main__":
     print("=" * 60)
