@@ -108,20 +108,37 @@ def _finalize_turn(conversation, flask_response):
 
 @chat_bp.route('/chat/history', methods=['GET'])
 def get_chat_history():
-    """Fetches chat history for the frontend to hydrate the UI."""
+    """Fetches paginated chat history for the frontend to hydrate the UI."""
     miraq_session = request.headers.get('X-MiraQ-Session')
     if not miraq_session:
-        return jsonify({"messages": []}), 200
+        return jsonify({"messages": [], "has_more": False}), 200
 
     try:
         session_uuid = uuid.UUID(miraq_session)
         conversation = Conversation.query.get(session_uuid)
         
         if not conversation:
-            return jsonify({"messages": []}), 200
+            return jsonify({"messages": [], "has_more": False}), 200
+
+        # Pagination parameters
+        page = int(request.args.get('page', 1))
+        limit = int(request.args.get('limit', 20)) # Load 20 messages at a time
+        offset = (page - 1) * limit
+
+        # Fetch messages descending (newest first) so page 1 is the most recent
+        messages_query = Message.query.filter_by(conversation_id=session_uuid)\
+            .order_by(Message.created_at.desc())\
+            .limit(limit).offset(offset).all()
+
+        # Count total to determine if there's more history
+        total_messages = Message.query.filter_by(conversation_id=session_uuid).count()
+        has_more = (offset + limit) < total_messages
+
+        # Reverse the chunk so they display in chronological order (top to bottom)
+        messages_query.reverse()
 
         history = []
-        for msg in conversation.messages:
+        for msg in messages_query:
             history.append({
                 "role": msg.role,
                 "message": msg.content,
@@ -129,10 +146,14 @@ def get_chat_history():
                 "timestamp": msg.created_at.isoformat()
             })
 
-        return jsonify({"messages": history}), 200
-    except ValueError:
-        return jsonify({"messages": []}), 200
+        return jsonify({
+            "messages": history, 
+            "has_more": has_more, 
+            "next_page": page + 1 if has_more else None
+        }), 200
 
+    except ValueError:
+        return jsonify({"messages": [], "has_more": False}), 200
 
 # ══════════════════════════════════════════════════════════════
 # ─── PARSER ───
@@ -305,6 +326,42 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
             
     elif not has_leftovers and fallback_text and not nlp_entities.product_id and not getattr(nlp_entities, 'target_category_slugs', None) and not nlp_entities.tag_slugs and not nlp_entities.attributes and not nlp_entities.semantic_matches:
         still_unmatched_pos = [fallback_text]
+
+    # Stop-Word Filter to protect the API search_term
+    STOP_WORDS = {
+        # Articles & Conjunctions
+        "a", "an", "the", "and", "or", "for", "to", "of", "in", "on", "at", "by", "with",
+        # Pronouns & Be Verbs
+        "is", "are", "am", "i", "i'm", "im", "my", "me", "you", "your", "it", "that", "this", "these", "those",
+        # Question Words
+        "what", "how", "who", "where", "why", "which", "do", "does", "did", "can", "could", "would",
+        # Conversational / E-commerce Verbs
+        "show", "tell", "give", "find", "search", "looking", "look", "suggest", "recommend", "want", "need",
+        # Generic Nouns
+        "product", "products", "item", "items", "option", "options", "something", "anything", "some", "any",
+        # Politeness
+        "please", "thanks", "thank", "hello", "hi", "hey"
+    }
+    
+    # 🚀 Upgraded: Word-by-word filtering instead of full-phrase matching
+    def _clean_leftovers(text_chunk):
+        words = text_chunk.split()
+        kept_words = [w for w in words if w.lower().strip() not in STOP_WORDS]
+        return " ".join(kept_words)
+
+    cleaned_pos = []
+    for t in still_unmatched_pos:
+        cleaned = _clean_leftovers(t)
+        if cleaned:
+            cleaned_pos.append(cleaned)
+    still_unmatched_pos = cleaned_pos
+
+    cleaned_neg = []
+    for t in still_unmatched_neg:
+        cleaned = _clean_leftovers(t)
+        if cleaned:
+            cleaned_neg.append(cleaned)
+    still_unmatched_neg = cleaned_neg
 
     entities.search_term = ", ".join(still_unmatched_pos) if still_unmatched_pos else None
     entities.excluded_search_term = ", ".join(still_unmatched_neg) if still_unmatched_neg else None
