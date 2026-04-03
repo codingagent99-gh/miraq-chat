@@ -14,9 +14,7 @@ def _build_search_context_string(entities: ExtractedEntities) -> str:
     
     if getattr(entities, 'product_name', None):
         desc_parts.append(f"Product: **{entities.product_name}**")
-    elif getattr(entities, 'search_term', None):
-        desc_parts.append(f"Search: **{entities.search_term}**")
-        
+
     if getattr(entities, 'category_name', None):
         desc_parts.append(f"Category: **{entities.category_name}**")
         
@@ -28,9 +26,25 @@ def _build_search_context_string(entities: ExtractedEntities) -> str:
             desc_parts.append(f"{clean_name}: **{clean_val}**")
             
     if getattr(entities, 'tag_slugs', None):
-        for tag in entities.tag_slugs:
-            clean_tag = tag.replace("-", " ").title()
-            desc_parts.append(f"Tag: **{clean_tag}**")
+        clean_tags = [t.replace("-", " ").title() for t in entities.tag_slugs]
+        if len(clean_tags) == 1:
+            tag_str = clean_tags[0]
+        else:
+            tag_str = ", ".join(clean_tags[:-1]) + " & " + clean_tags[-1]
+        desc_parts.append(f"Tag: **{tag_str}**")
+
+    if getattr(entities, 'attr_tag_or_pairs', None):
+        for pair in entities.attr_tag_or_pairs:
+            display = pair.get("display_text", "")
+            if display:
+                # Capitalise but preserve punctuation (e.g. '7/16" thick' -> '7/16" Thick')
+                clean = " ".join(w.capitalize() for w in display.split())
+            else:
+                # Fallback: reconstruct from term slug
+                clean = pair.get("attr_term", "").replace("-", " ").title()
+            taxonomy = pair.get("attr_taxonomy", "")
+            label = taxonomy.replace("pa_", "").replace("-", " ").title() if taxonomy else "Filter"
+            desc_parts.append(f"{label}: **{clean}**")
 
     # EXCLUSIONS
     if getattr(entities, 'excluded_tags', None):
@@ -253,14 +267,10 @@ def generate_bot_message(
             )
             
         # Standard fallback for general generic searches
-        search = (
-            entities.product_name or entities.category_name
-            or next(iter(entities.attributes.values()), None)
-            or entities.search_term
-            or "your criteria"
-        )
+        context = _build_search_context_string(entities)
+        search_desc = context if context else entities.product_name or entities.category_name or "your criteria"
         return (
-            f"I couldn't find any products matching **{search}**. 😕\n\n"
+            f"I couldn't find any products matching {search_desc}. 😕\n\n"
             "Try broadening your search or ask me about:\n"
             "• Our product collections\n"
             "• Available categories\n"

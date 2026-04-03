@@ -64,7 +64,8 @@ def _attr_slug_for_label(label: str) -> Optional[str]:
         return None
     label_lower = label.lower().strip()
     for attr in l.all_attributes_raw:
-        if attr.get("attribute_label", "").lower().strip() == label_lower:
+        attr_label = (attr.get("attribute_label") or attr.get("name") or attr.get("attribute_name") or "").lower().strip()
+        if attr_label == label_lower:
             return attr.get("taxonomy")
     return None
 
@@ -241,6 +242,11 @@ def _build_advanced_filter_call(
             attr_taxonomy = pair.get("attr_taxonomy", "")
             raw_attr_term = pair.get("attr_term", "")
             
+            if attr_taxonomy and not attr_taxonomy.startswith("pa_"):
+                resolved_slug = _attr_slug_for_label(attr_taxonomy)
+                if resolved_slug:
+                    attr_taxonomy = resolved_slug
+            
             term_slug = raw_attr_term.lower().replace(" ", "-") if raw_attr_term else ""
             if attr_taxonomy and raw_attr_term and l:
                 fetched_slug = l.get_attribute_term_slug(attr_taxonomy, raw_attr_term)
@@ -265,12 +271,19 @@ def _build_advanced_filter_call(
         body["stock_status"] = "instock"
     elif in_stock is False:
         body["stock_status"] = "outofstock"
-    # Apply the top-level parameters defined in the updated custom API spec
+
+    # has_strong_filters = len(conditions) > 0
+
     if product_id:
         body["ids"] = [product_id]
         body.pop("stock_status", None)
     elif search_term:
-        body["search"] = search_term
+        logger.info(f"Ignored leftover search_term='{search_term}' — relying strictly on taxonomy.")
+    # elif search_term:
+    #     if not has_strong_filters:
+    #         body["search"] = search_term
+    #     else:
+    #         logger.info(f"Suppressing search_term='{search_term}' — strong taxonomy filters exist.")
             
     import json as built_in_json
     logger.debug(

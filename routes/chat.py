@@ -92,7 +92,10 @@ def _finalize_turn(conversation, flask_response):
     
     # 2. Update Conversation State
     conversation.flow_state = data.get("flow_state", conversation.flow_state)
-    flag_modified(conversation, "context_data") # Alert SQLAlchemy to JSONB change
+    
+    # Force new object reference for SQLAlchemy JSONB mutation tracking
+    conversation.context_data = dict(conversation.context_data)
+    flag_modified(conversation, "context_data")
     
     # 3. Commit Transaction
     db.session.commit()
@@ -160,97 +163,137 @@ def get_chat_history():
 # ══════════════════════════════════════════════════════════════
 
 def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
-    """Hybrid Parser: Secures exact matches first, uses NLP on leftovers, then Vector AI for synonyms."""
+    """Hybrid Parser: Uses Longest-String Substring Matching on natural language."""
     
-    terms = [t.strip().lower() for t in msg.split(",") if t.strip()]
-    if not terms:
-        return None
-        
+    msg_lower = msg.lower()
     entities = ExtractedEntities()
     if not hasattr(entities, 'target_category_slugs'):
         entities.target_category_slugs = set()
         
-    unmatched_terms = []
+    # Run baseline classification exactly once at the top
+    original_nlp_result = classify(msg)
+        
+    if not loader:
+        return original_nlp_result
 
-    # ─── PHASE 1: EXACT MATCH SECURE ───
-    for term in terms:
-        term_matched = False
+    # ─── PHASE 1: LONGEST-STRING EXACT MATCH ───
+    # Fetch the pre-sorted catalog from memory in O(1) time
+    catalog_items = getattr(loader, 'longest_match_catalog', [])
 
-        # 1. Product Check
-        if loader and hasattr(loader, 'product_by_name_lower') and term in loader.product_by_name_lower:
-            prod = loader.product_by_name_lower[term]
-            entities.product_name = prod.get("name")
-            entities.product_slug = prod.get("slug", "")
-            entities.product_id = prod.get("id")
-            term_matched = True
+    # Group items by identical string while preserving length-sorted order.
+    # (Python dictionaries maintain insertion order)
+    grouped_catalog = {}
+    for name, match_type, data in catalog_items:
+        if name not in grouped_catalog:
+            grouped_catalog[name] = []
+        grouped_catalog[name].append((match_type, data))
 
-        # 2. Category Check
-        elif loader and term in getattr(loader, 'category_by_name_lower', {}):
-            cat = loader.category_by_name_lower[term]
-            entities.target_category_slugs.add(cat.get("slug"))
-            if not getattr(entities, 'category_name', None):
-                entities.category_name = cat.get("name")
-            term_matched = True
+    unmatched_text = msg_lower
+    import re
+    
+    for name, matches in grouped_catalog.items():
+        if len(name) < 3:
+            continue
             
-        # 3. Tag Check
-        elif loader and term in getattr(loader, 'tag_by_name_lower', {}):
-            tag = loader.tag_by_name_lower[term]
-            entities.tag_slugs.append(tag.get("slug"))
-            entities.tag_ids.append(tag.get("id"))
-            term_matched = True
+        # Use negative lookarounds instead of \b to support quotes/punctuation
+        pattern = r'(?<!\w)' + re.escape(name) + r'(?!\w)'
+        
+        if re.search(pattern, unmatched_text):
+            # Check if this exact string yielded BOTH a Tag and an Attribute
+            types_matched = [m[0] for m in matches]
+            is_collision = 'tag' in types_matched and 'attribute' in types_matched
             
-        # 4. Attribute Check
-        elif loader and hasattr(loader, 'all_attributes_raw'):
-            for attr in loader.all_attributes_raw:
-                label = attr.get("attribute_label", "").lower().strip()
-                for attr_val in attr.get("terms", []):
-                    if term == attr_val.get("name", "").lower():
-                        term_slug = attr_val.get("slug")
+            if is_collision:
+                tag_data = next(m[1] for m in matches if m[0] == 'tag')
+                attr_data = next(m[1] for m in matches if m[0] == 'attribute')
+                
+                # Pass both to the API builder as a tied pair!
+                if not hasattr(entities, 'attr_tag_or_pairs'):
+                    entities.attr_tag_or_pairs = []
+                    
+                entities.attr_tag_or_pairs.append({
+                    "tag_slug":      tag_data.get("slug"),
+                    "attr_taxonomy": attr_data.get("label", ""),  # label e.g. "finish" -> resolved to "pa_finish" by api_builder
+                    "attr_term":     attr_data.get("slug"),       # term slug e.g. "7-16", "matte"
+                    "display_text":  name                         # original matched text for bot message
+                })
+                
+            else:
+                # Standard assignment for single matches
+                for match_type, data in matches:
+                    if match_type == 'tag':
+                        entities.tag_slugs.append(data.get("slug"))
+                        entities.tag_ids.append(data.get("id"))
+                    elif match_type == 'product':
+                        if not entities.product_id:
+                            entities.product_name = data.get("name")
+                            entities.product_slug = data.get("slug", "")
+                            entities.product_id = data.get("id")
+                    elif match_type == 'category':
+                        # Retrieve ALL slugs that share this category name
+                        name_lower = data.get("name", "").lower()
+                        all_slugs = getattr(loader, 'category_slugs_by_name', {}).get(name_lower, [data.get("slug")])
+                        entities.target_category_slugs.update(all_slugs)
+                        
+                        cat_name = data.get("name") or ""
+                        if not getattr(entities, 'category_name', None):
+                            entities.category_name = cat_name
+                        elif cat_name and cat_name not in entities.category_name:
+                            import re as _re
+                            existing = [n.strip() for n in _re.split(r',\s*|\s*&\s*', entities.category_name) if n.strip()]
+                            existing.append(cat_name)
+                            entities.category_name = ", ".join(existing[:-1]) + " & " + existing[-1] if len(existing) > 1 else existing[0]
+                    elif match_type == 'attribute':
+                        label = data['label']
+                        term_slug = data['slug']
                         if label not in entities.attributes:
                             entities.attributes[label] = term_slug
                         else:
                             entities.attributes[label] += f",{term_slug}"
-                        term_matched = True
-                        break
-                if term_matched:
-                    break
-        
-        if not term_matched:
-            unmatched_terms.append(term)
+            
+            # Remove the matched phrase from the string ONCE for all matches
+            unmatched_text = re.sub(pattern, " ", unmatched_text)
 
-    if not unmatched_terms:
-        resolved_intent = Intent.PRODUCT_SEARCH if entities.product_id else Intent.FILTER_BY_ATTRIBUTE
-        return ClassifiedResult(intent=resolved_intent, entities=entities, confidence=1.0)
-        
-    from classifier import classify 
-    
-    fallback_text = ", ".join(unmatched_terms)
-    nlp_result = classify(fallback_text)
+    # ─── PHASE 2: REGEX NLP FALLBACK ───
+    # Pass the UNMATCHED text to the classifier to get numerical entities and leftovers
+    nlp_result = classify(unmatched_text)
     nlp_entities = nlp_result.entities
     
-    if nlp_entities.product_id and not entities.product_id:
+    # Merge Positive Entities
+    if getattr(nlp_entities, 'product_id', None) and not getattr(entities, 'product_id', None):
         entities.product_name = nlp_entities.product_name
         entities.product_slug = nlp_entities.product_slug
         entities.product_id = nlp_entities.product_id
         
-    if hasattr(nlp_entities, 'target_category_slugs') and nlp_entities.target_category_slugs:
+    if getattr(nlp_entities, 'target_category_slugs', None):
         entities.target_category_slugs.update(nlp_entities.target_category_slugs)
-        if not getattr(entities, 'category_name', None):
-            entities.category_name = nlp_entities.category_name
+        nlp_cat_name = getattr(nlp_entities, 'category_name', None) or ""
+        if nlp_cat_name:
+            if not getattr(entities, 'category_name', None):
+                entities.category_name = nlp_cat_name
+            elif nlp_cat_name not in entities.category_name:
+                import re as _re
+                existing = [n.strip() for n in _re.split(r',\s*|\s*&\s*', entities.category_name) if n.strip()]
+                existing.append(nlp_cat_name)
+                entities.category_name = ", ".join(existing[:-1]) + " & " + existing[-1] if len(existing) > 1 else existing[0]
             
-    for tid, tslug in zip(nlp_entities.tag_ids, nlp_entities.tag_slugs):
-        if tid not in entities.tag_ids:
-            entities.tag_ids.append(tid)
-            entities.tag_slugs.append(tslug)
-            
-    if nlp_entities.attributes:
+    if getattr(nlp_entities, 'tag_ids', None):
+        for tid, tslug in zip(nlp_entities.tag_ids, nlp_entities.tag_slugs):
+            if tid not in entities.tag_ids:
+                entities.tag_ids.append(tid)
+                entities.tag_slugs.append(tslug)
+                
+    if getattr(nlp_entities, 'attributes', None):
         for k, v in nlp_entities.attributes.items():
             if k not in entities.attributes:
                 entities.attributes[k] = v
             else:
-                if v not in entities.attributes[k]:
-                    entities.attributes[k] += f",{v}"
-                    
+                existing_vals = entities.attributes[k].split(",")
+                new_vals = [val for val in v.split(",") if val not in existing_vals]
+                if new_vals:
+                    entities.attributes[k] += "," + ",".join(new_vals)
+    
+    # Merge Exclusions & Numerical Values
     if getattr(nlp_entities, 'excluded_tags', None):
         if not hasattr(entities, 'excluded_tags'): entities.excluded_tags = []
         entities.excluded_tags.extend(nlp_entities.excluded_tags)
@@ -279,26 +322,95 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
                     
     if nlp_entities.semantic_matches:
         entities.semantic_matches.extend(nlp_entities.semantic_matches)
+        
+    if getattr(original_nlp_result.entities, 'attr_tag_or_pairs', None):
+        if not hasattr(entities, 'attr_tag_or_pairs'):
+            entities.attr_tag_or_pairs = []
+
+        for pair in original_nlp_result.entities.attr_tag_or_pairs:
+            if pair not in entities.attr_tag_or_pairs:
+                entities.attr_tag_or_pairs.append(pair)
+
+            # Clean up Phase 1 greedy matches:
+            # If Phase 1 matched "7/16" as a pure attribute, it forces a strict AND.
+            # We must remove it from `attributes` so the OR-pair can do its job.
+            attr_term = pair.get("attr_term", "")
+            if attr_term and hasattr(entities, 'attributes'):
+                keys_to_remove = []
+                for k, v in entities.attributes.items():
+                    # Handle comma-separated values safely
+                    vals = [x.strip() for x in v.split(",")]
+                    if attr_term in vals:
+                        vals.remove(attr_term)
+                        if not vals:
+                            keys_to_remove.append(k)
+                        else:
+                            entities.attributes[k] = ",".join(vals)
+                            
+                for k in keys_to_remove:
+                    del entities.attributes[k]
                                    
+
+    # ─── PHASE 2.5 & 3: ADJECTIVE ISOLATION & SEMANTIC FALLBACK ───
+    STOP_WORDS = {
+        "a", "an", "the", "and", "or", "for", "to", "of", "in", "on", "at", "by", "with", "from",
+        "is", "are", "am", "i", "i'm", "im", "my", "me", "you", "your", "it", "that", "this", "these", "those",
+        "what", "how", "who", "where", "why", "which", "do", "does", "did", "can", "could", "would",
+        "show", "tell", "give", "find", "search", "looking", "look", "suggest", "recommend", "want", "need",
+        "product", "products", "item", "items", "option", "options", "something", "anything", "some", "any",
+        "series", "collection", "line", "brand", "style", "type", "have", "has", "had",
+        "please", "thanks", "thank", "hello", "hi", "hey"
+    }
+    
+    def _clean_leftovers(text_chunk):
+        if not text_chunk: return ""
+        # 🚀 FIX: Swap commas for spaces so upstream comma-delimited strings split cleanly
+        text_chunk = text_chunk.replace(",", " ")
+        words = text_chunk.split()
+        kept_words = []
+        for w in words:
+            # Strip basic punctuation from the edges of words
+            clean_w = w.lower().strip('?,.!;:')
+            if clean_w and clean_w not in STOP_WORDS:
+                kept_words.append(clean_w)
+        return " ".join(kept_words)
+
+    # Determine what text needs semantic processing
+    raw_pos = getattr(nlp_entities, 'search_term', None)
+    
+    # 🚀 FIX: Restored the semantic_matches guard to prevent duplicate vector passes
+    if not raw_pos and unmatched_text and not nlp_entities.product_id and not getattr(nlp_entities, 'target_category_slugs', None) and not nlp_entities.tag_slugs and not nlp_entities.attributes and not nlp_entities.semantic_matches:
+        raw_pos = unmatched_text
+
+    raw_neg = getattr(nlp_entities, 'excluded_search_term', None)
+
+    # Clean the text FIRST to isolate meaningful adjectives
+    cleaned_pos_text = _clean_leftovers(raw_pos)
+    cleaned_neg_text = _clean_leftovers(raw_neg)
+
     still_unmatched_pos = []
     still_unmatched_neg = []
-    has_leftovers = getattr(nlp_entities, 'search_term', None) or getattr(nlp_entities, 'excluded_search_term', None)
-    
-    if has_leftovers and loader:
+
+    if (cleaned_pos_text or cleaned_neg_text) and loader:
         import torch
         from sentence_transformers import util
         SEMANTIC_THRESHOLD = 0.55 
         
         if not hasattr(loader, 'semantic_tensors') or loader.semantic_tensors is None:
-            logger.warning("Phase 2.5: Vector AI skipped because semantic_tensors is None!")
-            if getattr(nlp_entities, 'search_term', None): still_unmatched_pos.extend(nlp_entities.search_term.split(","))
-            if getattr(nlp_entities, 'excluded_search_term', None): still_unmatched_neg.extend(nlp_entities.excluded_search_term.split(","))
+            if cleaned_pos_text: still_unmatched_pos.append(cleaned_pos_text)
+            if cleaned_neg_text: still_unmatched_neg.append(cleaned_neg_text)
         else:
             def _process_vectors(term_string, is_negative=False):
                 unmatched = []
-                chunks = [t.strip() for t in term_string.split(",") if t.strip()]
-                for term in chunks:
-                    user_vector = loader.vector_model.encode(term, convert_to_tensor=True)
+                # Split into isolated words to test adjectives individually against vectors
+                words = term_string.split()
+                
+                for raw_word in words:
+                    # 🚀 FIX: Final defensive guard against empty strings before hitting the tensor
+                    word = raw_word.strip()
+                    if not word: continue
+                        
+                    user_vector = loader.vector_model.encode(word, convert_to_tensor=True)
                     cosine_scores = util.cos_sim(user_vector, loader.semantic_tensors)[0]
                     top_results = torch.topk(cosine_scores, k=3)
                     
@@ -307,84 +419,55 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
                         if score.item() >= SEMANTIC_THRESHOLD:
                             matched_slug = loader.semantic_keys[idx]
                             candidate_data = loader.semantic_dictionary[matched_slug].copy()
-                            candidate_data["user_text"] = term
+                            candidate_data["user_text"] = word
                             candidate_data["score"] = score.item()
                             candidate_data["is_negative"] = is_negative
                             candidates.append(candidate_data)
                     
                     if candidates:
+                        if not hasattr(entities, 'semantic_matches'):
+                            entities.semantic_matches = []
                         entities.semantic_matches.append(candidates)
-                        logger.info(f"Vector Match: '{term}' mapped to '{candidates[0]['suggested_name']}' (Score: {candidates[0]['score']:.2f} | Negative: {is_negative})")
                     else:
-                        unmatched.append(term)
+                        unmatched.append(word)
                 return unmatched
 
-            if getattr(nlp_entities, 'search_term', None):
-                still_unmatched_pos = _process_vectors(nlp_entities.search_term, is_negative=False)
-            if getattr(nlp_entities, 'excluded_search_term', None):
-                still_unmatched_neg = _process_vectors(nlp_entities.excluded_search_term, is_negative=True)
-            
-    elif not has_leftovers and fallback_text and not nlp_entities.product_id and not getattr(nlp_entities, 'target_category_slugs', None) and not nlp_entities.tag_slugs and not nlp_entities.attributes and not nlp_entities.semantic_matches:
-        still_unmatched_pos = [fallback_text]
+            if cleaned_pos_text:
+                still_unmatched_pos.extend(_process_vectors(cleaned_pos_text, is_negative=False))
+            if cleaned_neg_text:
+                still_unmatched_neg.extend(_process_vectors(cleaned_neg_text, is_negative=True))
+    else:
+        if cleaned_pos_text: still_unmatched_pos.append(cleaned_pos_text)
+        if cleaned_neg_text: still_unmatched_neg.append(cleaned_neg_text)
 
-    # Stop-Word Filter to protect the API search_term
-    STOP_WORDS = {
-        # Articles & Conjunctions
-        "a", "an", "the", "and", "or", "for", "to", "of", "in", "on", "at", "by", "with",
-        # Pronouns & Be Verbs
-        "is", "are", "am", "i", "i'm", "im", "my", "me", "you", "your", "it", "that", "this", "these", "those",
-        # Question Words
-        "what", "how", "who", "where", "why", "which", "do", "does", "did", "can", "could", "would",
-        # Conversational / E-commerce Verbs
-        "show", "tell", "give", "find", "search", "looking", "look", "suggest", "recommend", "want", "need",
-        # Generic Nouns
-        "product", "products", "item", "items", "option", "options", "something", "anything", "some", "any",
-        # Politeness
-        "please", "thanks", "thank", "hello", "hi", "hey"
+    # Rejoin whatever survived both the Stop Words AND the Semantic AI
+    entities.search_term = " ".join(still_unmatched_pos) if still_unmatched_pos else None
+    entities.excluded_search_term = " ".join(still_unmatched_neg) if still_unmatched_neg else None
+
+
+    # ─── SAFETY LOCK: RESTORING CORRECTNESS ───
+    resolved_intent = original_nlp_result.intent
+    final_confidence = original_nlp_result.confidence
+
+    catalog_intent_values = {
+        "filter_by_attribute", 
+        "product_search", 
+        "product_variations",
+        "product_by_category",
+        "product_by_tag",
+        "product_by_attribute",
+        "catalog_search",
+        "category_browse",         
+        "product_by_collection",   
+        "product_list"             
     }
     
-    # 🚀 Upgraded: Word-by-word filtering instead of full-phrase matching
-    def _clean_leftovers(text_chunk):
-        words = text_chunk.split()
-        kept_words = [w for w in words if w.lower().strip() not in STOP_WORDS]
-        return " ".join(kept_words)
-
-    cleaned_pos = []
-    for t in still_unmatched_pos:
-        cleaned = _clean_leftovers(t)
-        if cleaned:
-            cleaned_pos.append(cleaned)
-    still_unmatched_pos = cleaned_pos
-
-    cleaned_neg = []
-    for t in still_unmatched_neg:
-        cleaned = _clean_leftovers(t)
-        if cleaned:
-            cleaned_neg.append(cleaned)
-    still_unmatched_neg = cleaned_neg
-
-    entities.search_term = ", ".join(still_unmatched_pos) if still_unmatched_pos else None
-    entities.excluded_search_term = ", ".join(still_unmatched_neg) if still_unmatched_neg else None
-
-    # SAFETY LOCK 2: Preserve conversational AI intents
-    # Removed Intent.UNKNOWN from this set so it doesn't get overwritten!
-    CATALOG_INTENTS = {Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_SEARCH, Intent.PRODUCT_VARIATIONS}
-    
-    if nlp_result.intent in CATALOG_INTENTS:
-        # Do not overwrite PRODUCT_VARIATIONS
-        if nlp_result.intent == Intent.PRODUCT_VARIATIONS:
-            resolved_intent = Intent.PRODUCT_VARIATIONS
+    if resolved_intent.value in catalog_intent_values or entities.product_id:
+        if resolved_intent.value == "product_variations":
+            pass
         else:
             resolved_intent = Intent.PRODUCT_SEARCH if entities.product_id else Intent.FILTER_BY_ATTRIBUTE
-    else:
-        # Let UNKNOWN, GREETINGS, and other intents pass through untouched
-        resolved_intent = nlp_result.intent
-    
-    # Do not artificially boost confidence if the intent is UNKNOWN
-    if resolved_intent == Intent.UNKNOWN:
-        final_confidence = nlp_result.confidence
-    else:
-        final_confidence = max(nlp_result.confidence, 0.95)
+            final_confidence = max(final_confidence, 0.95)
     
     return ClassifiedResult(intent=resolved_intent, entities=entities, confidence=final_confidence)
 
@@ -430,7 +513,9 @@ def chat():
         db.session.commit()
         
     customer_id = conversation.customer_id
-    user_context = conversation.context_data
+    user_context = conversation.context_data or {}
+    if user_context is not conversation.context_data:
+        conversation.context_data = user_context
 
     truncated_msg = message[:100] + "..." if len(message) > 100 else message
     logger.info(f'POST /chat | session={session_id} | message="{sanitize_log_string(truncated_msg)}" | customer_id={customer_id} | flow_state={conversation.flow_state}')
@@ -547,12 +632,36 @@ def chat():
         if current_flow_state == FlowState.AWAITING_FILTER_CLARIFICATION:
             pending_semantic = user_context.get("pending_semantic_match")
             if pending_semantic:
+                
                 msg_lower = message.lower().strip()
                 
-                is_accept = msg_lower == "yes - use these filters" or msg_lower.startswith("yes - use ") or msg_lower.startswith("yes - exclude ") or msg_lower in ["yes", "y", "yep", "sure", "ok"]
+                # 🚀 NEW: Check if the exact suggestion name is contained anywhere in the message
+                is_accept = False
+                selected_match = None
+                
+                if "options" in pending_semantic:
+                    for opt in pending_semantic["options"]:
+                        if opt["suggested_name"].lower() in msg_lower:
+                            is_accept = True
+                            selected_match = opt
+                            break
+                
+                # Fallback to the existing strict prefix checks
+                if not is_accept and (
+                    msg_lower == "yes - use these filters" 
+                    or msg_lower.startswith("yes - use ") 
+                    or msg_lower.startswith("yes - exclude ") 
+                    or msg_lower.startswith("use ")
+                    or msg_lower.startswith("exclude ")
+                    or msg_lower in ["yes", "y", "yep", "sure", "ok"]
+                ):
+                    is_accept = True
+                    if "options" in pending_semantic:
+                        selected_match = pending_semantic["options"][0]
+
                 is_reject = msg_lower.startswith("no - ") or msg_lower in ["no", "n", "nope"]
                 is_cancel = msg_lower in ["cancel", "exit", "stop", "nevermind", "never mind", "abort", "start over"]
-
+                
                 if is_cancel:
                     user_context.pop("pending_semantic_match", None)
                     
@@ -562,13 +671,11 @@ def chat():
                     
                     if is_accept:
                         options_to_apply = []
-                        if "options" in pending_semantic:
-                            if len(pending_semantic["options"]) > 1 and ("use " in msg_lower or "exclude " in msg_lower):
-                                selected_name = message.replace("Yes - use ", "").replace("Yes - exclude ", "").replace("Use ", "").replace("Exclude ", "").strip()
-                                selected_match = next((opt for opt in pending_semantic["options"] if opt["suggested_name"].lower() == selected_name.lower()), pending_semantic["options"][0])
-                                options_to_apply.append(selected_match)
-                            else:
-                                options_to_apply.extend(pending_semantic["options"])
+                        # 🚀 NEW: Use the selected_match directly instead of doing brittle string replacements
+                        if selected_match:
+                            options_to_apply.append(selected_match)
+                        elif "options" in pending_semantic:
+                            options_to_apply.extend(pending_semantic["options"])
                                 
                         options_to_apply.extend(pending_semantic.get("extra_semantics", []))
                         
@@ -643,6 +750,8 @@ def chat():
                     user_context["flow_state"] = FlowState.IDLE.value
                     user_context.pop("pending_semantic_match", None)
                     
+                    conversation.context_data = user_context
+                    
                     bypass_intent = Intent.PRODUCT_SEARCH if getattr(entities, 'product_id', None) else Intent.FILTER_BY_ATTRIBUTE
                     bypass_result = ClassifiedResult(intent=bypass_intent, entities=entities, confidence=0.98)
                     _skip_classification = True
@@ -671,7 +780,7 @@ def chat():
             resp = handle_flow(flow_result, user_context, str(conversation.id), customer_id, page, start_time, mock_sessions)
             if resp: return _finalize_turn(conversation, resp)
 
-        if flow_result:
+        elif flow_result:  # 🚀 FIX: Changed to elif to prevent the double-fire
             resp = handle_flow(flow_result, user_context, str(conversation.id), customer_id, page, start_time, mock_sessions)
             if resp: return _finalize_turn(conversation, resp)
 
@@ -809,6 +918,10 @@ def chat():
                 
                 elapsed = time.time() - start_time
                 user_context["pending_semantic_match"] = stashed_semantic_data
+                
+                # Explicitly re-attach the mutated dictionary to the refreshed ORM object
+                conversation.context_data = user_context 
+                flag_modified(conversation, "context_data")
                 
                 return _finalize_turn(conversation, jsonify({
                     "success": True,

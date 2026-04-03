@@ -173,6 +173,7 @@ class StoreLoader:
         self.tag_by_id: Dict[int, Dict] = {}
         self.product_by_name_lower: Dict[str, Dict] = {}
         self.product_name_tokens: List[tuple] = []
+        self.longest_match_catalog: List[tuple] = []
 
         self.category_keywords: Dict[str, int] = {}
         self._store_generic_terms: set = set()
@@ -598,6 +599,60 @@ class StoreLoader:
                     generic.add(word)
         return generic
 
+    def _build_longest_match_catalog(self):
+        """
+        Caches a pre-sorted list of all store terms (longest to shortest) 
+        for lightning-fast O(1) access during chat message parsing.
+        """
+        catalog_items = []
+        
+        # 1. Products
+        if hasattr(self, 'product_by_name_lower'):
+            for name, data in self.product_by_name_lower.items():
+                catalog_items.append((name, 'product', data))
+                
+        # 2. Categories
+        if hasattr(self, 'category_by_name_lower'):
+            for name, data in self.category_by_name_lower.items():
+                catalog_items.append((name, 'category', data))
+                
+        # 3. Attributes (With Combined "Term + Label" support)
+        if hasattr(self, 'all_attributes_raw'):
+            for attr in self.all_attributes_raw:
+                # Bulletproof label extraction for Woo & Custom APIs
+                label_raw = attr.get("attribute_label") or attr.get("name") or attr.get("attribute_name") or ""
+                label = label_raw.lower().strip()
+                
+                for attr_val in attr.get("terms", []):
+                    if attr_val.get("count", 0) == 0:
+                        continue
+                    name = attr_val.get("name", "").lower().strip()
+                    
+                    attr_payload = {
+                        'label': label,
+                        'slug': attr_val.get("slug"),
+                        'taxonomy': attr.get("taxonomy") or attr.get("attribute_name") or "",
+                        'name': attr_val.get("name", "")
+                    }
+                    
+                    catalog_items.append((name, 'attribute', attr_payload))
+                    
+                    # Store combined term + label to prevent Tag-collisions
+                    if label and label not in name:
+                        combined = f"{name} {label}"
+                        catalog_items.append((combined, 'attribute', attr_payload))
+                        
+        # 4. Tags
+        if hasattr(self, 'tag_by_name_lower'):
+            for name, data in self.tag_by_name_lower.items():
+                if data.get("count", 0) == 0:
+                    continue
+                catalog_items.append((name, 'tag', data))
+
+        # Python's stable sort ensures Attributes beat Tags on length ties
+        catalog_items.sort(key=lambda x: len(x[0]), reverse=True)
+        self.longest_match_catalog = catalog_items
+
     def _build_lookups(self):
         self._store_generic_terms = self._build_store_generic_terms()
 
@@ -606,6 +661,7 @@ class StoreLoader:
         self.category_by_slug = {}
         self.category_by_id = {}
         self.category_by_name_lower = {}
+        self.category_slugs_by_name = {}
         self.tag_by_slug = {}
         self.tag_by_id = {}
         self.tag_by_name_lower = {}
@@ -618,7 +674,11 @@ class StoreLoader:
                 if not attr.get("visible", True): continue
                 taxonomy_slug = attr.get("taxonomy", "")
                 attr_id = attr.get("attribute_id")
-                entry = {"id": attr_id, "name": attr.get("attribute_label", ""), "slug": taxonomy_slug}
+                entry = {
+                    "id": attr_id,
+                    "name": attr.get("attribute_label") or attr.get("name") or attr.get("attribute_name") or "",
+                    "slug": taxonomy_slug
+                }
                 self.attribute_by_slug[taxonomy_slug] = entry
                 self.attribute_by_id[attr_id] = entry
                 self.attribute_terms[attr_id] = attr.get("terms", [])
@@ -630,6 +690,10 @@ class StoreLoader:
             self.category_by_id[cat_id] = entry
             self.category_by_slug[entry["slug"]] = entry
             self.category_by_name_lower[name_lower] = entry
+            if name_lower not in self.category_slugs_by_name:
+                self.category_slugs_by_name[name_lower] = []
+            self.category_slugs_by_name[name_lower].append(entry["slug"])
+
             if entry["slug"] != "uncategorized" and entry["count"] > 0:
                 self._generate_category_keywords(entry)
 
@@ -653,6 +717,9 @@ class StoreLoader:
             for word in words:
                 if len(word) > 2 and word not in self._store_generic_terms:
                     self.product_name_tokens.append((word, entry))
+
+        # 🚀 NEW: Build the sorted catalog for O(1) longest-string matching
+        self._build_longest_match_catalog()
 
     def _generate_category_keywords(self, cat_entry: Dict):
         cat_id = cat_entry["id"]

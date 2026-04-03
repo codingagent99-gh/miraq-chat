@@ -14,7 +14,6 @@ from config.store_config import (
     GENERIC_NOISE_WORDS
 )
 import os
-import re
 import calendar
 from datetime import datetime, timezone, timedelta
 from dateutil.relativedelta import relativedelta
@@ -908,63 +907,78 @@ def _extract_order_id(text: str, entities: ExtractedEntities):
     match = re.search(r'order\s*#?\s*(\d+)', text)
     if match: entities.order_id = int(match.group(1))
 
-def _extract_time_range(text: str, entities: ExtractedEntities):
-    logger.debug(f"_extract_time_range: ENTERED with text='{text}'")
-    now = datetime.now(timezone.utc)
+def _normalize_fused_dates(text: str) -> str:
+    """
+    Pre-processes text to fix missing spaces in common date/time expressions 
+    so dateparser can successfully understand them.
+    """
+    # Fix fused relative words: "lastmonth" -> "last month", "thisweek" -> "this week"
+    text = re.sub(r'\b(last|past|this)(day|week|month|year)s?\b', r'\1 \2', text)
+    
+    # Fix fused numbered relative words: "last30days" -> "last 30 days", "past2weeks" -> "past 2 weeks"
+    text = re.sub(r'\b(last|past|this)(\d+)(days|weeks|months|years)\b', r'\1 \2 \3', text)
+    
+    # Optional: Fix raw 8-digit dates (MMDDYYYY) into a format dateparser prefers (MM-DD-YYYY)
+    # This prevents it from thinking "04122026" is just a random 8-digit order number
+    text = re.sub(r'\b(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(20\d{2})\b', r'\1-\2-\3', text)
 
-    # 1. FAST REGEXES (Rolling Windows for explicit numbers)
-    m = re.search(r'(?:last|past)\s+(\d+)\s+(day|week|month|year)s?', text)
-    if m:
-        n = int(m.group(1))
-        unit = m.group(2)
-        if unit == 'day': entities.date_after = (now - timedelta(days=n)).strftime('%Y-%m-%dT00:00:00')
-        elif unit == 'week': entities.date_after = (now - timedelta(weeks=n)).strftime('%Y-%m-%dT00:00:00')
-        elif unit == 'month': entities.date_after = (now - relativedelta(months=n)).strftime('%Y-%m-%dT00:00:00')
-        elif unit == 'year': entities.date_after = (now - relativedelta(years=n)).strftime('%Y-%m-%dT00:00:00')
-        logger.debug(f"_extract_time_range: EXIT | date_after={getattr(entities, 'date_after', None)} | date_before={getattr(entities, 'date_before', None)}")
+    return text
+
+def _extract_time_range(text: str, entities):
+    text_lower = text.lower()
+    now = datetime.now()
+
+    # ══════════════════════════════════════════════════════════════
+    # 1. FAST REGEXES — Unconditional execution (O(1) safe processing)
+    # ══════════════════════════════════════════════════════════════
+    
+    # Match: "last 30 days", "past 2 weeks", etc.
+    m_rel = re.search(r'(?:last|past)\s+(\d+)\s+(day|week|month|year)s?', text_lower)
+    if m_rel:
+        amount = int(m_rel.group(1))
+        unit = m_rel.group(2)
+        if unit == 'day':
+            start_date = now - timedelta(days=amount)
+        elif unit == 'week':
+            start_date = now - timedelta(weeks=amount)
+        elif unit == 'month':
+            start_date = now - timedelta(days=amount * 30)
+        else: # year
+            start_date = now - timedelta(days=amount * 365)
+            
+        entities.date_after = start_date.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        entities.date_before = now.replace(hour=23, minute=59, second=59, microsecond=999999).isoformat()
         return
 
-    # 2. CALENDAR-ALIGNED REGEXES (For vague relative terms)
-    if re.search(r'(?:last|past)\s+week', text):
-        # e.g., Previous completed Monday-Sunday week
-        today = now.date()
-        last_monday = today - timedelta(days=today.weekday() + 7)
-        last_sunday = last_monday + timedelta(days=6)
-        entities.date_after = last_monday.strftime('%Y-%m-%dT00:00:00')
-        entities.date_before = last_sunday.strftime('%Y-%m-%dT23:59:59')
-        logger.debug(f"_extract_time_range: EXIT | date_after={getattr(entities, 'date_after', None)} | date_before={getattr(entities, 'date_before', None)}")
+    # Match: "this week", "this month", "this year"
+    m_this = re.search(r'\b(?:this)\s+(week|month|year)\b', text_lower)
+    if m_this:
+        unit = m_this.group(1)
+        if unit == 'week':
+            start_date = now - timedelta(days=now.weekday())
+        elif unit == 'month':
+            start_date = now.replace(day=1)
+        else: # year
+            start_date = now.replace(month=1, day=1)
+            
+        entities.date_after = start_date.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        entities.date_before = now.replace(hour=23, minute=59, second=59, microsecond=999999).isoformat()
         return
 
-    if re.search(r'(?:last|past)\s+month', text):
-        # e.g., If today is April 15, get March 1 to March 31
-        first_day_this_month = now.replace(day=1)
-        last_day_prev_month = first_day_this_month - timedelta(days=1)
-        entities.date_after = last_day_prev_month.replace(day=1).strftime('%Y-%m-%dT00:00:00')
-        entities.date_before = last_day_prev_month.strftime('%Y-%m-%dT23:59:59')
-        logger.debug(f"_extract_time_range: EXIT | date_after={getattr(entities, 'date_after', None)} | date_before={getattr(entities, 'date_before', None)}")
-        return
 
-    if re.search(r'(?:last|past)\s+year', text):
-        # e.g., If today is 2026, get Jan 1 2025 to Dec 31 2025
-        last_year = now.year - 1
-        entities.date_after = f"{last_year}-01-01T00:00:00"
-        entities.date_before = f"{last_year}-12-31T23:59:59"
-        logger.debug(f"_extract_time_range: EXIT | date_after={getattr(entities, 'date_after', None)} | date_before={getattr(entities, 'date_before', None)}")
-        return
+    # ══════════════════════════════════════════════════════════════
+    # 2. ORDER SIGNAL GUARD — Restricts dateparser execution
+    # ══════════════════════════════════════════════════════════════
+    order_signals = re.search(r'\b(order|orders|ordered|purchase|purchased|bought|buy|history)\b', text_lower)
+    if not order_signals:
+        return  
 
-    if re.search(r'this\s+month', text): entities.date_after = now.replace(day=1).strftime('%Y-%m-%dT00:00:00'); return
-    if re.search(r'this\s+year', text): entities.date_after = now.replace(month=1, day=1).strftime('%Y-%m-%dT00:00:00'); return
-
-    # 3. DYNAMIC PARSING
-    if not DATEPARSER_AVAILABLE:
-        logger.debug(f"_extract_time_range: EXIT | date_after={getattr(entities, 'date_after', None)} | date_before={getattr(entities, 'date_before', None)}")
-        return
-
-    # Normalize fused date formats before parsing (e.g. "18mar" → "18 mar")
-    normalized_text = re.sub(r'(\d{1,2})(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)', r'\1 \2', text, flags=re.IGNORECASE)
-
-    # Detect open-ended range intent BEFORE parsing (only relevant for day-level branch)
-    is_open_range = bool(re.search(r'\b(from|since|after|starting)\b', text, re.IGNORECASE))
+    # ══════════════════════════════════════════════════════════════
+    # 3. DATEPARSER — Guarded execution with strict historical settings
+    # ══════════════════════════════════════════════════════════════
+    
+    # Normalize fused dates (e.g., "lastmonth" -> "last month", "04122026" -> "04-12-2026")
+    normalized_text = _normalize_fused_dates(text_lower)
 
     parsed_results = search_dates(
         normalized_text,
@@ -973,55 +987,17 @@ def _extract_time_range(text: str, entities: ExtractedEntities):
             'RETURN_AS_TIMEZONE_AWARE': False
         }
     )
-
-    if not parsed_results:
-        # Failure to Parse: No recognizable date found. Defer to LLM fallback.
-        logger.debug(f"_extract_time_range: EXIT | date_after={getattr(entities, 'date_after', None)} | date_before={getattr(entities, 'date_before', None)}")
-        return
-
-    if len(parsed_results) >= 3:
-        # Complexity Bailout: Too many dates to safely assume a bounding box. Defer to LLM fallback.
-        logger.debug(f"_extract_time_range: EXIT | date_after={getattr(entities, 'date_after', None)} | date_before={getattr(entities, 'date_before', None)}")
-        return
-
-    # 4. EXACTLY 2 DATES (Range Logic)
-    if len(parsed_results) == 2:
-        dates = sorted([r[1] for r in parsed_results])
-        entities.date_after = dates[0].strftime('%Y-%m-%dT00:00:00')
-        entities.date_before = dates[1].strftime('%Y-%m-%dT23:59:59')
-        logger.debug(f"_extract_time_range: EXIT | date_after={getattr(entities, 'date_after', None)} | date_before={getattr(entities, 'date_before', None)}")
-        return
-
-    # 5. EXACTLY 1 DATE (Granularity-Aware Bounding Box)
-    matched_string, parsed_date = parsed_results[0]
-    matched_lower = matched_string.lower()
-
-    has_day_token = bool(re.search(r'\b\d{1,2}(?:st|nd|rd|th)?\b', matched_lower))
-    has_year_token = bool(re.search(r'\b\d{4}\b', matched_string))
-    has_month_token = bool(re.search(r'\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b', matched_lower))
-
-    if has_year_token and not has_month_token and not has_day_token and parsed_date.month == 1 and parsed_date.day == 1:
-        # Year-level: "orders from 2024" → full year bounding box regardless of open-range intent
-        entities.date_after = parsed_date.strftime('%Y-01-01T00:00:00')
-        entities.date_before = parsed_date.strftime('%Y-12-31T23:59:59')
-
-    elif parsed_date.day == 1 and not has_day_token:
-        # Month-level: "orders from March" → full month bounding box regardless of open-range intent
-        last_day = calendar.monthrange(parsed_date.year, parsed_date.month)[1]
-        entities.date_after = parsed_date.strftime('%Y-%m-%dT00:00:00')
-        entities.date_before = parsed_date.replace(day=last_day).strftime('%Y-%m-%dT23:59:59')
-
-    else:
-        # Day-level: apply open-range logic here
-        entities.date_after = parsed_date.strftime('%Y-%m-%dT00:00:00')
-        if is_open_range:
-            # "from/since feb 26" → start of that day until now, no upper bound
-            pass  # date_before intentionally left unset — WooCommerce defaults to now
-        else:
-            # "on feb 26" → strict 24-hour window
-            entities.date_before = parsed_date.strftime('%Y-%m-%dT23:59:59')
-
-    logger.debug(f"_extract_time_range: EXIT | date_after={getattr(entities, 'date_after', None)} | date_before={getattr(entities, 'date_before', None)}")
+    
+    if parsed_results:
+        # Grab the first recognized date sequence
+        extracted_date = parsed_results[0][1]
+        
+        # Double-check to ensure naive datetime (prevents Postgres offset-aware comparison crashes)
+        if extracted_date.tzinfo is not None:
+            extracted_date = extracted_date.replace(tzinfo=None)
+            
+        entities.date_after = extracted_date.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        entities.date_before = extracted_date.replace(hour=23, minute=59, second=59, microsecond=999999).isoformat()
        
 def _extract_quantity(text: str, entities: ExtractedEntities):
     match = re.search(r'(\d+)\s*(qty|quantity|pcs|pieces|units|boxes|sq\s*ft)', text)
