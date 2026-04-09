@@ -621,6 +621,8 @@ def _extract_category(text: str, entities: ExtractedEntities) -> str:
         name_lower = cat.get("name", "").lower().strip()
         if len(name_lower) < 3: 
             continue
+        if cat.get("count", 0) == 0:
+            continue
 
         pattern = _create_flexible_pattern(name_lower)
         try:

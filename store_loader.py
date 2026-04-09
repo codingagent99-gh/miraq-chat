@@ -35,7 +35,8 @@ DEV_CACHE_ENABLED = os.getenv("DEV_CACHE", "false").lower() == "true"
 DEV_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dev_cache")
 
 # Path configuration based on your folder structure
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+DATA_FOLDER = os.getenv("DATA_FOLDER", "data")
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), DATA_FOLDER)
 FILE_MAP = {
     "attributes": "all-attributes-and-terms.json",
     "tags":       "list-of-all-tags.json",
@@ -280,8 +281,20 @@ class StoreLoader:
                     "taxonomy": taxonomy,
                     "slug": term["slug"]
                 }
+                
+        # 3. Add Categories
+        for name_lower, cat in self.category_by_name_lower.items():
+            if cat.get("count", 0) > 0 and cat.get("slug") != "uncategorized":
+                clean_name = name_lower.replace("-", " ")
+                corpus_texts.append(clean_name)
+                self.semantic_keys.append(cat["slug"])
+                self.semantic_dictionary[cat["slug"]] = {
+                    "suggested_name": cat["name"],
+                    "type": "category",
+                    "slug": cat["slug"]
+                }
 
-        # 3. Generate the Math Coordinates (Tensors)
+        # 4. Generate the Math Coordinates (Tensors)
         if corpus_texts and self.vector_model:
             self.semantic_tensors = self.vector_model.encode(corpus_texts, convert_to_tensor=True)
             
@@ -614,6 +627,9 @@ class StoreLoader:
         # 2. Categories
         if hasattr(self, 'category_by_name_lower'):
             for name, data in self.category_by_name_lower.items():
+                # Prevent 0-product categories from hijacking exact string matches
+                if data.get("count", 0) == 0:
+                    continue
                 catalog_items.append((name, 'category', data))
                 
         # 3. Attributes (With Combined "Term + Label" support)
@@ -713,10 +729,10 @@ class StoreLoader:
             self.product_by_name_lower[name_lower] = entry
             
             # Token match list
-            words = re.split(r'[\s\-_]+', name_lower)
-            for word in words:
-                if len(word) > 2 and word not in self._store_generic_terms:
-                    self.product_name_tokens.append((word, entry))
+            # words = re.split(r'[\s\-_]+', name_lower)
+            # for word in words:
+            #     if len(word) > 2 and word not in self._store_generic_terms:
+            #         self.product_name_tokens.append((word, entry))
 
         # 🚀 NEW: Build the sorted catalog for O(1) longest-string matching
         self._build_longest_match_catalog()
@@ -770,14 +786,19 @@ class StoreLoader:
     # ─────────────────────────────────────────────
     # QUERY METHODS
     # ─────────────────────────────────────────────
-
     def get_category_id(self, keyword: str) -> Optional[int]:
         keyword = keyword.lower().strip()
 
         if keyword in self.category_by_name_lower:
-            return self.category_by_name_lower[keyword]["id"]
+            entry = self.category_by_name_lower[keyword]
+            if entry.get("count", 0) > 0:
+                return entry["id"]
+                
         if keyword in self.category_by_slug:
-            return self.category_by_slug[keyword]["id"]
+            entry = self.category_by_slug[keyword]
+            if entry.get("count", 0) > 0:
+                return entry["id"]
+                
         if keyword in self.category_keywords:
             return self.category_keywords[keyword]
 
@@ -832,10 +853,10 @@ class StoreLoader:
             if re.search(rf'\b{re.escape(name_lower)}\b', text_lower):
                 candidates.append(entry)
 
-        if not candidates:
-            for token, entry in self.product_name_tokens:
-                if re.search(rf'\b{re.escape(token)}\b', text_lower):
-                    candidates.append(entry)
+        # if not candidates:
+        #     for token, entry in self.product_name_tokens:
+        #         if re.search(rf'\b{re.escape(token)}\b', text_lower):
+        #             candidates.append(entry)
 
         stop_words = self._store_generic_terms.copy()
         stop_words.update({"sample", "samples", "product", "item", "size", "sizes"})

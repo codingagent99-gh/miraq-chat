@@ -259,6 +259,16 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
     nlp_result = classify(unmatched_text)
     nlp_entities = nlp_result.entities
     
+    # Purge zero-count categories injected by classify()
+    if loader and getattr(nlp_entities, 'target_category_slugs', None):
+        alive_slugs = {
+            s for s in nlp_entities.target_category_slugs
+            if loader.category_by_slug.get(s, {}).get("count", 0) > 0
+        }
+        nlp_entities.target_category_slugs = alive_slugs
+        if not alive_slugs:
+            nlp_entities.category_name = None
+    
     # Merge Positive Entities
     if getattr(nlp_entities, 'product_id', None) and not getattr(entities, 'product_id', None):
         entities.product_name = nlp_entities.product_name
@@ -364,28 +374,24 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
     
     def _clean_leftovers(text_chunk):
         if not text_chunk: return ""
-        # 🚀 FIX: Swap commas for spaces so upstream comma-delimited strings split cleanly
         text_chunk = text_chunk.replace(",", " ")
         words = text_chunk.split()
         kept_words = []
         for w in words:
-            # Strip basic punctuation from the edges of words
             clean_w = w.lower().strip('?,.!;:')
             if clean_w and clean_w not in STOP_WORDS:
                 kept_words.append(clean_w)
         return " ".join(kept_words)
 
-    # Determine what text needs semantic processing
-    raw_pos = getattr(nlp_entities, 'search_term', None)
+    # Preserve the strict WooCommerce search term (stripped of generic noise)
+    strict_search_term = getattr(nlp_entities, 'search_term', None)
     
-    # 🚀 FIX: Restored the semantic_matches guard to prevent duplicate vector passes
-    if not raw_pos and unmatched_text and not nlp_entities.product_id and not getattr(nlp_entities, 'target_category_slugs', None) and not nlp_entities.tag_slugs and not nlp_entities.attributes and not nlp_entities.semantic_matches:
-        raw_pos = unmatched_text
-
+    # Give the Vector AI the full unstripped context!
+    raw_pos_for_vectors = unmatched_text if unmatched_text else strict_search_term
     raw_neg = getattr(nlp_entities, 'excluded_search_term', None)
 
     # Clean the text FIRST to isolate meaningful adjectives
-    cleaned_pos_text = _clean_leftovers(raw_pos)
+    cleaned_pos_text = _clean_leftovers(raw_pos_for_vectors)
     cleaned_neg_text = _clean_leftovers(raw_neg)
 
     still_unmatched_pos = []
@@ -402,34 +408,56 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
         else:
             def _process_vectors(term_string, is_negative=False):
                 unmatched = []
-                # Split into isolated words to test adjectives individually against vectors
-                words = term_string.split()
+                phrase = term_string.strip()
+                if not phrase: return unmatched
                 
-                for raw_word in words:
-                    # 🚀 FIX: Final defensive guard against empty strings before hitting the tensor
-                    word = raw_word.strip()
-                    if not word: continue
-                        
-                    user_vector = loader.vector_model.encode(word, convert_to_tensor=True)
-                    cosine_scores = util.cos_sim(user_vector, loader.semantic_tensors)[0]
-                    top_results = torch.topk(cosine_scores, k=3)
-                    
-                    candidates = []
-                    for score, idx in zip(top_results[0], top_results[1]):
-                        if score.item() >= SEMANTIC_THRESHOLD:
-                            matched_slug = loader.semantic_keys[idx]
-                            candidate_data = loader.semantic_dictionary[matched_slug].copy()
-                            candidate_data["user_text"] = word
-                            candidate_data["score"] = score.item()
-                            candidate_data["is_negative"] = is_negative
-                            candidates.append(candidate_data)
-                    
-                    if candidates:
-                        if not hasattr(entities, 'semantic_matches'):
-                            entities.semantic_matches = []
-                        entities.semantic_matches.append(candidates)
+                # Evaluate the WHOLE phrase first to preserve semantic context!
+                user_vector = loader.vector_model.encode(phrase, convert_to_tensor=True)
+                cosine_scores = util.cos_sim(user_vector, loader.semantic_tensors)[0]
+                top_results = torch.topk(cosine_scores, k=3)
+                
+                candidates = []
+                for score, idx in zip(top_results[0], top_results[1]):
+                    if score.item() >= SEMANTIC_THRESHOLD:
+                        matched_slug = loader.semantic_keys[idx]
+                        candidate_data = loader.semantic_dictionary[matched_slug].copy()
+                        candidate_data["user_text"] = phrase
+                        candidate_data["score"] = score.item()
+                        candidate_data["is_negative"] = is_negative
+                        candidates.append(candidate_data)
+                
+                if candidates:
+                    if not hasattr(entities, 'semantic_matches'):
+                        entities.semantic_matches = []
+                    entities.semantic_matches.append(candidates)
+                else:
+                    # Fall back to testing individual words if the full phrase fails
+                    words = phrase.split()
+                    if len(words) > 1:
+                        for word in words:
+                            w_vector = loader.vector_model.encode(word, convert_to_tensor=True)
+                            w_scores = util.cos_sim(w_vector, loader.semantic_tensors)[0]
+                            w_top = torch.topk(w_scores, k=3)
+                            
+                            w_candidates = []
+                            for w_score, w_idx in zip(w_top[0], w_top[1]):
+                                if w_score.item() >= SEMANTIC_THRESHOLD:
+                                    matched_slug = loader.semantic_keys[w_idx]
+                                    candidate_data = loader.semantic_dictionary[matched_slug].copy()
+                                    candidate_data["user_text"] = word
+                                    candidate_data["score"] = w_score.item()
+                                    candidate_data["is_negative"] = is_negative
+                                    w_candidates.append(candidate_data)
+                            
+                            if w_candidates:
+                                if not hasattr(entities, 'semantic_matches'):
+                                    entities.semantic_matches = []
+                                entities.semantic_matches.append(w_candidates)
+                            else:
+                                unmatched.append(word)
                     else:
-                        unmatched.append(word)
+                        unmatched.append(phrase)
+                        
                 return unmatched
 
             if cleaned_pos_text:
@@ -441,9 +469,44 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
         if cleaned_neg_text: still_unmatched_neg.append(cleaned_neg_text)
 
     # Rejoin whatever survived both the Stop Words AND the Semantic AI
-    entities.search_term = " ".join(still_unmatched_pos) if still_unmatched_pos else None
+    entities.search_term = " ".join(still_unmatched_pos) if still_unmatched_pos else strict_search_term
     entities.excluded_search_term = " ".join(still_unmatched_neg) if still_unmatched_neg else None
-
+    
+    # 🚀 FIX: Auto-Materialize High-Confidence Matches & Bypass UI Interceptor
+    if hasattr(entities, 'semantic_matches') and entities.semantic_matches:
+        AUTO_APPLY_THRESHOLD = 0.85
+        surviving_matches = []
+        
+        for candidates in entities.semantic_matches:
+            if not candidates: continue
+            best = max(candidates, key=lambda c: c.get("score", 0))
+            
+            if best.get("score", 0) >= AUTO_APPLY_THRESHOLD:
+                match_type = best.get("type")
+                slug = best.get("slug")
+                
+                if match_type == "category" and slug and not entities.target_category_slugs:
+                    entities.target_category_slugs.add(slug)
+                    entities.category_name = best.get("suggested_name", slug)
+                elif match_type == "tag" and slug and slug not in entities.tag_slugs:
+                    entities.tag_slugs.append(slug)
+                    l = get_store_loader()
+                    if l:
+                        tag = l.tag_by_slug.get(slug)
+                        if tag: entities.tag_ids.append(tag["id"])
+                elif match_type == "attribute" and slug:
+                    taxonomy = best.get("taxonomy", "")
+                    if taxonomy and taxonomy not in entities.attributes:
+                        entities.attributes[taxonomy] = slug
+                        
+                # Nullify search term since we mapped it to taxonomy
+                entities.search_term = None 
+            else:
+                # Keep low-confidence matches for UI Clarification
+                surviving_matches.append(candidates)
+        
+        # Overwrite so UI only intercepts weak matches
+        entities.semantic_matches = surviving_matches
 
     # ─── SAFETY LOCK: RESTORING CORRECTNESS ───
     resolved_intent = original_nlp_result.intent
