@@ -2,8 +2,8 @@ module.exports = {
   apps: [
     {
       name: "libretranslate",
-      script: "/home/apps/varchaswi/miraq-chat/.venv/bin/python3",
-      args: "-m libretranslate --host 0.0.0.0 --port 5011 --load-only en,es",
+      script: "/home/apps/varchaswi/miraq-chat/.venv/bin/libretranslate",
+      args: "--host 0.0.0.0 --port 5011 --load-only en,es",
       watch: false,
       autorestart: true,
       max_restarts: 5,
