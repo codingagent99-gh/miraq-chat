@@ -35,6 +35,7 @@ from handlers.llm_handler import run_llm_fallback
 from handlers.order_handler import handle_reorder, handle_order_detail, handle_quick_order, handle_historical_search
 from handlers.variant_handler import handle_variant_selection, handle_variation_product, handle_quantity_and_variant_check
 from handlers.search_handler import log_matched_products, handle_empty_results
+from utils.language_utils import detect_and_translate
 
 logger = get_logger("miraq_chat")
 chat_bp = Blueprint("chat", __name__)
@@ -54,12 +55,6 @@ def resolve_session_id():
             logger.warning(f"Invalid X-MiraQ-Session format received: {miraq_session}")
     return uuid.uuid4()
 
-def get_wc_session_token():
-    """Extracts WooCommerce session for cart context."""
-    wc_session = request.headers.get('X-WC-Session')
-    if wc_session and re.match(r'^[\w\-\|]{20,100}$', wc_session):
-        return wc_session
-    return None
 
 def _finalize_turn(conversation, flask_response):
     """
@@ -559,9 +554,18 @@ def chat():
     message = body.get("message", "").strip()
     page = int(body.get("page", 1))
 
+    # ─── Language Detection & Translation ───────────────────────────────────
+    # Detect if the message is Spanish (or another supported language) and
+    # translate it to English before passing it through the rest of the pipeline.
+    message, was_translated, detected_lang = detect_and_translate(message)
+    if was_translated:
+        logger.info(
+            f"[LangCheck] Message translated from '{detected_lang}' to English | "
+            f"translated='{message[:100]}'"
+        )
+
     # 1. Resolve Sessions and Setup DB
     session_id = resolve_session_id()
-    wc_session = get_wc_session_token()
 
     conversation = Conversation.query.get(session_id)
     if not conversation:
