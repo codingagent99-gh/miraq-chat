@@ -482,7 +482,13 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
         if cleaned_neg_text: still_unmatched_neg.append(cleaned_neg_text)
 
     # Rejoin whatever survived both the Stop Words AND the Semantic AI
-    entities.search_term = " ".join(still_unmatched_pos) if still_unmatched_pos else strict_search_term
+    if still_unmatched_pos:
+        entities.search_term = " ".join(still_unmatched_pos)
+    else:
+        # Prevent STOP_WORDS from being resurrected via strict_search_term fallback
+        fallback = _clean_leftovers(strict_search_term)
+        entities.search_term = fallback if fallback else None
+
     entities.excluded_search_term = " ".join(still_unmatched_neg) if still_unmatched_neg else None
     
     # Auto-Materialize High-Confidence Matches & Bypass UI Interceptor
