@@ -526,7 +526,8 @@ def classify(utterance: str) -> ClassifiedResult:
                 actual_tax = ""
                 if loader and loader.all_attributes_raw:
                     for a in loader.all_attributes_raw:
-                        if a.get("attribute_label", "").lower().strip() == attr_label:
+                        label_raw = a.get("attribute_label") or a.get("name") or a.get("attribute_name") or ""
+                        if label_raw.lower().strip() == attr_label:
                             actual_tax = a.get("taxonomy", "")
                             break
                             

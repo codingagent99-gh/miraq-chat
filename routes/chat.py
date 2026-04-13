@@ -184,14 +184,25 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
         grouped_catalog[name].append((match_type, data))
 
     unmatched_text = msg_lower
-    import re
     
     for name, matches in grouped_catalog.items():
         if len(name) < 3:
             continue
             
+        # Make Phase 1 plural/singular tolerant safely
+        parts = []
+        for w in name.split():
+            # Only strip plural 's' if it doesn't end in 'ss' (avoids glass→glas)
+            if w.endswith('s') and not w.endswith('ss') and len(w) > 3:
+                # "tones" → "tones?" matches "tone" or "tones"
+                parts.append(rf'{re.escape(w[:-1])}s?')
+            else:
+                # "beige" stays "beige" — no spurious plural suffix added
+                parts.append(re.escape(w))
+        flexible_name = r'\s+'.join(parts)
+        
         # Use negative lookarounds instead of \b to support quotes/punctuation
-        pattern = r'(?<!\w)' + re.escape(name) + r'(?!\w)'
+        pattern = r'(?<!\w)(' + flexible_name + r')(?!\w)'
         
         if re.search(pattern, unmatched_text):
             # Check if this exact string yielded BOTH a Tag and an Attribute
@@ -234,8 +245,7 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
                         if not getattr(entities, 'category_name', None):
                             entities.category_name = cat_name
                         elif cat_name and cat_name not in entities.category_name:
-                            import re as _re
-                            existing = [n.strip() for n in _re.split(r',\s*|\s*&\s*', entities.category_name) if n.strip()]
+                            existing = [n.strip() for n in re.split(r',\s*|\s*&\s*', entities.category_name) if n.strip()]
                             existing.append(cat_name)
                             entities.category_name = ", ".join(existing[:-1]) + " & " + existing[-1] if len(existing) > 1 else existing[0]
                     elif match_type == 'attribute':
@@ -277,8 +287,7 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
             if not getattr(entities, 'category_name', None):
                 entities.category_name = nlp_cat_name
             elif nlp_cat_name not in entities.category_name:
-                import re as _re
-                existing = [n.strip() for n in _re.split(r',\s*|\s*&\s*', entities.category_name) if n.strip()]
+                existing = [n.strip() for n in re.split(r',\s*|\s*&\s*', entities.category_name) if n.strip()]
                 existing.append(nlp_cat_name)
                 entities.category_name = ", ".join(existing[:-1]) + " & " + existing[-1] if len(existing) > 1 else existing[0]
             
@@ -336,14 +345,11 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
             if pair not in entities.attr_tag_or_pairs:
                 entities.attr_tag_or_pairs.append(pair)
 
-            # Clean up Phase 1 greedy matches:
-            # If Phase 1 matched "7/16" as a pure attribute, it forces a strict AND.
-            # We must remove it from `attributes` so the OR-pair can do its job.
+            # ─── 1. Clean up redundant attributes ───
             attr_term = pair.get("attr_term", "")
             if attr_term and hasattr(entities, 'attributes'):
                 keys_to_remove = []
                 for k, v in entities.attributes.items():
-                    # Handle comma-separated values safely
                     vals = [x.strip() for x in v.split(",")]
                     if attr_term in vals:
                         vals.remove(attr_term)
@@ -354,6 +360,17 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
                             
                 for k in keys_to_remove:
                     del entities.attributes[k]
+            
+            # ─── 2. Clean up redundant categories ───
+            cat_slugs = pair.get("cat_slugs", [])
+            if cat_slugs and hasattr(entities, 'target_category_slugs'):
+                for c_slug in cat_slugs:
+                    if c_slug in entities.target_category_slugs:
+                        entities.target_category_slugs.remove(c_slug)
+                
+                # If removing the overlap leaves the category list empty, nullify the name
+                if not entities.target_category_slugs:
+                    entities.category_name = None
                                    
 
     # ─── PHASE 2.5 & 3: ADJECTIVE ISOLATION & SEMANTIC FALLBACK ───
@@ -364,7 +381,8 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
         "show", "tell", "give", "find", "search", "looking", "look", "suggest", "recommend", "want", "need",
         "product", "products", "item", "items", "option", "options", "something", "anything", "some", "any",
         "series", "collection", "line", "brand", "style", "type", "have", "has", "had",
-        "please", "thanks", "thank", "hello", "hi", "hey"
+        "please", "thanks", "thank", "hello", "hi", "hey",
+        "under", "over", "above", "below", "latest", "newest", "recent", "new", "top", "bottom"
     }
     
     def _clean_leftovers(text_chunk):
@@ -467,7 +485,7 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
     entities.search_term = " ".join(still_unmatched_pos) if still_unmatched_pos else strict_search_term
     entities.excluded_search_term = " ".join(still_unmatched_neg) if still_unmatched_neg else None
     
-    # 🚀 FIX: Auto-Materialize High-Confidence Matches & Bypass UI Interceptor
+    # Auto-Materialize High-Confidence Matches & Bypass UI Interceptor
     if hasattr(entities, 'semantic_matches') and entities.semantic_matches:
         AUTO_APPLY_THRESHOLD = 0.85
         surviving_matches = []
@@ -702,7 +720,7 @@ def chat():
                 
                 msg_lower = message.lower().strip()
                 
-                # 🚀 NEW: Check if the exact suggestion name is contained anywhere in the message
+                # Check if the exact suggestion name is contained anywhere in the message
                 is_accept = False
                 selected_match = None
                 
@@ -732,13 +750,14 @@ def chat():
                 if is_cancel:
                     user_context.pop("pending_semantic_match", None)
                     
-                if is_accept or is_reject:
+                is_skip = msg_lower in ["skip - use my current filters", "skip"]
+
+                if is_accept or is_reject or is_skip:
                     entities = ExtractedEntities()
                     entities.target_category_slugs = set()
                     
                     if is_accept:
                         options_to_apply = []
-                        # 🚀 NEW: Use the selected_match directly instead of doing brittle string replacements
                         if selected_match:
                             options_to_apply.append(selected_match)
                         elif "options" in pending_semantic:
@@ -773,15 +792,16 @@ def chat():
                                         if opt["slug"] not in entities.attributes[taxonomy].split(","): entities.attributes[taxonomy] += f",{opt['slug']}"
 
                     elif is_reject:
-                        entities.search_term = pending_semantic.get("options", [{}])[0].get("user_text", "")
                         if "rejected_semantic_terms" not in user_context: user_context["rejected_semantic_terms"] = []
                         for opt in pending_semantic.get("options", []):
                             user_context["rejected_semantic_terms"].append(opt["suggested_name"])
 
+                    # is_skip: no action here — carryovers below do all the work
+
                     leftovers = pending_semantic.get("pending_other_semantics", [])
                     if leftovers: entities.semantic_matches.extend(leftovers)
 
-                    if pending_semantic.get("carryover_search_term"): entities.search_term = pending_semantic["carryover_search_term"]
+                    # ── Carryover Restore ──
                     if pending_semantic.get("carryover_tags"): entities.tag_slugs.extend(pending_semantic["carryover_tags"])
                     if pending_semantic.get("carryover_categories"): entities.target_category_slugs.update(pending_semantic["carryover_categories"])
                     if pending_semantic.get("carryover_category_name"): entities.category_name = pending_semantic["carryover_category_name"]
@@ -813,6 +833,21 @@ def chat():
                             if k not in entities.excluded_attributes: entities.excluded_attributes[k] = v
                             else: entities.excluded_attributes[k].extend(v)
 
+                    # Restore OR pairs (added in previous session)
+                    if pending_semantic.get("carryover_attr_tag_or_pairs"):
+                        if not hasattr(entities, 'attr_tag_or_pairs'): entities.attr_tag_or_pairs = []
+                        entities.attr_tag_or_pairs.extend(pending_semantic["carryover_attr_tag_or_pairs"])
+
+                    # search_term assignment moved here so carryover_search_term doesn't silently overwrite is_reject / is_skip intent
+                    if is_reject:
+                        entities.search_term = pending_semantic.get("options", [{}])[0].get("user_text", "")
+                    elif is_skip:
+                        entities.search_term = None
+                    else:
+                        # is_accept: only restore search_term if nothing was matched
+                        if pending_semantic.get("carryover_search_term"):
+                            entities.search_term = pending_semantic["carryover_search_term"]
+
                     current_flow_state = FlowState.IDLE
                     user_context["flow_state"] = FlowState.IDLE.value
                     user_context.pop("pending_semantic_match", None)
@@ -822,7 +857,6 @@ def chat():
                     bypass_intent = Intent.PRODUCT_SEARCH if getattr(entities, 'product_id', None) else Intent.FILTER_BY_ATTRIBUTE
                     bypass_result = ClassifiedResult(intent=bypass_intent, entities=entities, confidence=0.98)
                     _skip_classification = True
-
 
         flow_context = {
             "pending_product_name": user_context.get("pending_product_name"),
@@ -935,22 +969,27 @@ def chat():
                     "carryover_in_stock": getattr(entities, 'in_stock', None),
                     "carryover_on_sale": getattr(entities, 'on_sale', None),
                     "carryover_min_price": getattr(entities, 'min_price', None),
-                    "carryover_max_price": getattr(entities, 'max_price', None)
+                    "carryover_max_price": getattr(entities, 'max_price', None),
+                    "carryover_attr_tag_or_pairs": list(getattr(entities, 'attr_tag_or_pairs', [])),
+                    "carryover_categories": list(getattr(entities, 'target_category_slugs', set())),  # 🚀 ADD
+                    "carryover_category_name": getattr(entities, 'category_name', None),            
                 }
                 
-                if hasattr(entities, 'target_category_slugs'):
-                    stashed_semantic_data["carryover_categories"] = list(entities.target_category_slugs)
-                    stashed_semantic_data["carryover_category_name"] = getattr(entities, 'category_name', None)
-                
-                suggestion_buttons = []
+                has_strong_filters = bool(
+                    entities.target_category_slugs or
+                    entities.tag_slugs or
+                    entities.attributes or
+                    getattr(entities, 'attr_tag_or_pairs', [])
+                )
 
+                suggestion_buttons = []
                 if has_ties:
                     active_group = valid_term_groups[0]
                     user_original_term = active_group[0]["user_text"]
                     is_negative = active_group[0].get("is_negative", False)
                     
                     stashed_semantic_data["options"] = active_group
-                    stashed_semantic_data["pending_other_semantics"] = valid_term_groups[1:] 
+                    stashed_semantic_data["pending_other_semantics"] = valid_term_groups[1:]
                     
                     action_word = "EXCLUDE" if is_negative else "USE"
                     bot_message = f"I found multiple matches for '{user_original_term}'. Which one did you mean to {action_word}?"
@@ -958,11 +997,13 @@ def chat():
                         verb = "Exclude" if candidate.get("is_negative") else "Use"
                         suggestion_buttons.append(f"{verb} {candidate['suggested_name']}")
                     suggestion_buttons.append(f"No - search for '{user_original_term}'")
-                    
+                    if has_strong_filters:                                          # 🚀
+                        suggestion_buttons.append("Skip - use my current filters") # 🚀
+
                 else:
                     primary_semantics = [group[0] for group in valid_term_groups]
-                    stashed_semantic_data["options"] = [primary_semantics[0]] 
-                    stashed_semantic_data["extra_semantics"] = primary_semantics[1:] 
+                    stashed_semantic_data["options"] = [primary_semantics[0]]
+                    stashed_semantic_data["extra_semantics"] = primary_semantics[1:]
                     
                     suggested_names = [f["suggested_name"] for f in primary_semantics]
                     is_negative = primary_semantics[0].get("is_negative", False)
@@ -975,11 +1016,15 @@ def chat():
                             bot_message = f"I don't have an exact match for '{primary_semantics[0]['user_text']}', but I do have **{suggested_names[0]}**. Would you like to use that filter?"
                             suggestion_buttons.append(f"Yes - use {suggested_names[0]}")
                         suggestion_buttons.append(f"No - search for '{primary_semantics[0]['user_text']}'")
+                        if has_strong_filters:                                          # 🚀
+                            suggestion_buttons.append("Skip - use my current filters") # 🚀
                     else:
                         joined_names = " and ".join(suggested_names)
                         bot_message = f"I don't have exact matches, but I found **{joined_names}**. Would you like to apply these filters?"
                         suggestion_buttons.append("Yes - use these filters")
                         suggestion_buttons.append("No - use my original text")
+                        if has_strong_filters:                                          # 🚀
+                            suggestion_buttons.append("Skip - use my current filters") # 🚀
 
                 suggestion_buttons.append("Cancel")
                 
