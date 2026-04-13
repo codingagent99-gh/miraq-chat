@@ -52,7 +52,7 @@ BROWSER_HEADERS = {
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate",
 }
 
 
@@ -519,6 +519,8 @@ class StoreLoader:
             for attempt in range(max_retries):
                 try:
                     resp = self.session.get(url, params=params, timeout=self.timeout)
+                    if page == 1:
+                        logger.debug(f"RAW RESPONSE [{resp.status_code}]: {resp.text[:500]}")
                     resp.raise_for_status()
                     data = resp.json()
                     break
