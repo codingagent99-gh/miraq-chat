@@ -175,8 +175,7 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
     # Fetch the pre-sorted catalog from memory in O(1) time
     catalog_items = getattr(loader, 'longest_match_catalog', [])
 
-    # Group items by identical string while preserving length-sorted order.
-    # (Python dictionaries maintain insertion order)
+    # Group items by identical string (Python dicts preserve the length-sorted order automatically)
     grouped_catalog = {}
     for name, match_type, data in catalog_items:
         if name not in grouped_catalog:
@@ -190,14 +189,13 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
             continue
             
         # Make Phase 1 plural/singular tolerant safely
+        # Normalize hyphens → spaces so "black-look" slug matches "black look" in text
+        normalized_name = name.replace('-', ' ')
         parts = []
-        for w in name.split():
-            # Only strip plural 's' if it doesn't end in 'ss' (avoids glass→glas)
+        for w in normalized_name.split():
             if w.endswith('s') and not w.endswith('ss') and len(w) > 3:
-                # "tones" → "tones?" matches "tone" or "tones"
                 parts.append(rf'{re.escape(w[:-1])}s?')
             else:
-                # "beige" stays "beige" — no spurious plural suffix added
                 parts.append(re.escape(w))
         flexible_name = r'\s+'.join(parts)
         
@@ -543,13 +541,18 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
         "product_by_collection",   
         "product_list"             
     }
-    
-    if resolved_intent.value in catalog_intent_values or entities.product_id:
-        if resolved_intent.value == "product_variations":
-            pass
-        else:
-            resolved_intent = Intent.PRODUCT_SEARCH if entities.product_id else Intent.FILTER_BY_ATTRIBUTE
-            final_confidence = max(final_confidence, 0.95)
+
+    # Protect action intents from being downgraded
+    ACTION_INTENTS = {
+        "place_order", "quick_order", "order_item",
+        "product_variations", "product_detail", "product_attribute_info"
+    }
+
+    if resolved_intent.value in ACTION_INTENTS:
+        pass  # Keep intact — these are deliberate user actions
+    elif resolved_intent.value in catalog_intent_values or entities.product_id:
+        resolved_intent = Intent.PRODUCT_SEARCH if entities.product_id else Intent.FILTER_BY_ATTRIBUTE
+        final_confidence = max(final_confidence, 0.95)
     
     return ClassifiedResult(intent=resolved_intent, entities=entities, confidence=final_confidence)
 
@@ -1056,6 +1059,25 @@ def chat():
                     "flow_state": FlowState.AWAITING_FILTER_CLARIFICATION.value,
                     "pagination": default_pagination(page),
                 }))
+                
+        # ── Guardrail: catch empty order intents before wasting an API call ──
+        if intent in ORDER_CREATE_INTENTS and not getattr(entities, 'product_id', None) and not getattr(entities, 'product_name', None):
+            elapsed = time.time() - start_time
+            return _finalize_turn(conversation, jsonify({
+                "success": True,
+                "bot_message": "Which product would you like to order? You can tell me the name or browse the catalog.",
+                "intent": "clarification_needed",
+                "products": [],
+                "suggestions": ["Show me the catalog", "Cancel"],
+                "session_id": str(conversation.id),
+                "metadata": {
+                    "confidence": 1.0,
+                    "products_count": 0,
+                    "response_time_ms": round(elapsed * 1000),
+                },
+                "pagination": default_pagination(page),
+                "flow_state": FlowState.IDLE.value,
+            }))
 
         api_calls = build_api_calls(result, page, user_message=message, session_id=str(conversation.id), customer_id=customer_id)
 
@@ -1097,6 +1119,15 @@ def chat():
                         (order_data if intent in ORDER_INTENTS else all_products_raw).append(data)
 
             log_matched_products(all_products_raw, api_calls_to_execute)
+
+            # Save last product to memory for next-turn pronoun/variant resolution
+            if all_products_raw and not _resolve_variant:
+                first_prod = all_products_raw[0]
+                user_context["last_product"] = {"id": first_prod.get("id"), "name": first_prod.get("name")}
+                user_context["pending_product_id"] = first_prod.get("id")
+                user_context["pending_product_name"] = first_prod.get("name")
+                conversation.context_data = user_context
+                flag_modified(conversation, "context_data")
         
         if intent == Intent.FETCH_CUSTOMER:
             elapsed = int((time.time() - start_time) * 1000)
@@ -1172,7 +1203,14 @@ def chat():
         if resp: return _finalize_turn(conversation, resp)
 
         resp = handle_quick_order(intent, entities, all_products_raw, last_product_ctx, customer_id, str(conversation.id), page, start_time, mock_sessions, ORDER_CREATE_INTENTS)
-        if resp: return _finalize_turn(conversation, resp)
+        if resp:
+            # Save pending_product_id before early exit so Turn 2 can find it
+            if getattr(entities, 'product_id', None):
+                user_context["pending_product_id"] = entities.product_id
+                user_context["pending_product_name"] = getattr(entities, 'product_name', None)
+                conversation.context_data = user_context
+                flag_modified(conversation, "context_data")
+            return _finalize_turn(conversation, resp)
 
         resp = handle_variation_product(intent, entities, api_responses, api_calls_to_execute, confidence, order_data, str(conversation.id), page, start_time, mock_sessions)
         if resp: return _finalize_turn(conversation, resp)

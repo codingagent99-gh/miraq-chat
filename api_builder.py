@@ -263,7 +263,55 @@ def _build_advanced_filter_call(
                 
             if len(or_conditions) >= 2:
                 conditions.append(_make_or_group(or_conditions))
-                      
+                
+    # Cross-Taxonomy Overlap Merger
+
+    def _normalize_term(t):
+        t = str(t).lower().strip()
+        # Ensure plurals like 'mosaics' cluster seamlessly with singulars like 'mosaic'
+        if t.endswith('s') and not t.endswith('ss'):
+            return t[:-1]
+        return t
+
+    flattened_in_conditions = []
+    other_conditions = []
+
+    for cond in conditions:
+        if cond.get("operator") == "IN" and "terms" in cond and len(cond["terms"]) > 0:
+            flattened_in_conditions.append(cond)
+        elif cond.get("relation") == "OR":
+            all_ins = True
+            for sub in cond.get("conditions", []):
+                if not (sub.get("operator") == "IN" and "terms" in sub and len(sub["terms"]) > 0):
+                    all_ins = False
+                    break
+            if all_ins:
+                for sub in cond.get("conditions", []):
+                    flattened_in_conditions.append(sub)
+            else:
+                other_conditions.append(cond)
+        else:
+            other_conditions.append(cond)
+
+    term_groups = {}
+    for cond in flattened_in_conditions:
+        # Group by the normalized first term (e.g., "mosaics" -> "mosaic")
+        base_term = _normalize_term(cond["terms"][0])
+        if base_term not in term_groups:
+            term_groups[base_term] = []
+        if cond not in term_groups[base_term]:
+            term_groups[base_term].append(cond)
+
+    final_conditions = list(other_conditions)
+    for base_term, group in term_groups.items():
+        if len(group) == 1:
+            final_conditions.append(group[0])
+        else:
+            final_conditions.append(_make_or_group(group))
+
+    conditions = final_conditions
+    # ─── End Cross-Taxonomy Merger ───
+
 
     body = _serialize_query(conditions, page, per_page, min_price=min_price, max_price=max_price)
 
@@ -272,19 +320,15 @@ def _build_advanced_filter_call(
     elif in_stock is False:
         body["stock_status"] = "outofstock"
 
-    # has_strong_filters = len(conditions) > 0
-
     if product_id:
         body["ids"] = [product_id]
         body.pop("stock_status", None)
+        # Clear taxonomy conditions as they are redundant
+        body.pop("filters", None)
+    
     elif search_term:
         logger.info(f"Ignored leftover search_term='{search_term}' — relying strictly on taxonomy.")
-    # elif search_term:
-    #     if not has_strong_filters:
-    #         body["search"] = search_term
-    #     else:
-    #         logger.info(f"Suppressing search_term='{search_term}' — strong taxonomy filters exist.")
-            
+
     import json as built_in_json
     logger.debug(
         f"api_builder: Executing advanced filter with body: {built_in_json.dumps(body)}"

@@ -83,8 +83,9 @@ def handle_variant_selection(
     if not (current_flow_state == FlowState.AWAITING_VARIANT_SELECTION and customer_id):
         return None
 
-    _var_product_id = user_context.get("pending_product_id")
-    _var_product_name = user_context.get("pending_product_name", "the product")
+    _var_product_id = user_context.get("pending_product_id") or getattr(entities, 'product_id', None)
+    _var_product_name = user_context.get("pending_product_name") or getattr(entities, 'product_name', None) or "the product"
+
     _var_quantity = user_context.get("pending_quantity")
     logger.info(f"Step 3.55: Variant selection response | pending_product_id={_var_product_id} | pending_quantity={_var_quantity}")
 
@@ -384,7 +385,6 @@ def handle_variant_selection(
         "pagination": default_pagination(page),
     }), 200
 
-
 def handle_variation_product(
     intent,
     entities,
@@ -397,12 +397,7 @@ def handle_variation_product(
     start_time,
     sessions,
 ):
-    """
-    Step 3.7: Format parent product + matched variations for PRODUCT_SEARCH /
-    PRODUCT_DETAIL / PRODUCT_VARIATIONS when a specific product_id is present.
-    Returns Flask response or None.
-    """
-    VARIATION_INTENTS = {Intent.PRODUCT_SEARCH, Intent.PRODUCT_DETAIL, Intent.PRODUCT_VARIATIONS}
+    VARIATION_INTENTS = {Intent.PRODUCT_SEARCH, Intent.PRODUCT_DETAIL, Intent.PRODUCT_VARIATIONS, Intent.PRODUCT_ATTRIBUTE_INFO}
     if not (intent in VARIATION_INTENTS and entities.product_id):
         return None
 
@@ -413,10 +408,26 @@ def handle_variation_product(
         if not resp.get("success"):
             continue
         data = resp.get("data")
-        if isinstance(data, dict) and data.get("id") == entities.product_id:
-            parent_product_raw = data
-        elif isinstance(data, list) and data and data[0].get("parent_id") is not None:
-            variations_raw = data
+
+        if isinstance(data, dict) and "products" in data:
+            items = data["products"]
+        elif isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = [data]
+        else:
+            items = []
+
+        for item in items:
+            if isinstance(item, dict) and item.get("id") == entities.product_id:
+                parent_product_raw = item
+                break
+
+        if not parent_product_raw and items and isinstance(items[0], dict) and items[0].get("parent_id") is not None:
+            variations_raw = items
+            
+        if parent_product_raw and parent_product_raw.get("variations"):
+            variations_raw = parent_product_raw.get("variations")
 
     if not parent_product_raw:
         return None
@@ -435,21 +446,16 @@ def handle_variation_product(
                 f"**{entities.category_name}** category — it's part of "
                 f"**{actual_cats}**."
             )
-            logger.info(
-                f"Step 3.7: Category mismatch detected | "
-                f"product={parent_formatted['name']} | "
-                f"requested_category={entities.category_name} | "
-                f"actual_categories={actual_cats}"
-            )
             entities.category_name = actual_cats
 
     has_attributes = bool(entities.attributes)
-    matched_variation = None  # best single-variation match for PRODUCT_DETAIL price lookups
+    matched_variation = None
 
-    if variations_raw and has_attributes:
-        # For PRODUCT_DETAIL: use match_variation_to_entities to find the single best
-        # variation matching the user's requested attributes (e.g. Finish=Silky, Size=3"x3").
-        # This surfaces the correct price instead of returning all 50+ variations.
+    # Prevent chat flood! If they just asked for info, ONLY return the parent card.
+    if intent == Intent.PRODUCT_ATTRIBUTE_INFO:
+        products = [parent_formatted]
+        logger.info("Step 3.7: Attribute Info requested. Returning ONLY parent product card.")
+    elif variations_raw and has_attributes:
         if intent == Intent.PRODUCT_DETAIL:
             matched_variation = match_variation_to_entities(variations_raw, entities)
             if matched_variation:
@@ -465,12 +471,12 @@ def handle_variation_product(
                 variation_products = [format_variation(v, parent_product_raw) for v in filtered_vars]
         else:
             filtered_vars = _filter_variations_by_entities(variations_raw, entities)
+            if not filtered_vars and variations_raw:
+                start = (page - 1) * DEFAULT_PER_PAGE
+                filtered_vars = variations_raw[start : start + DEFAULT_PER_PAGE]
             variation_products = [format_variation(v, parent_product_raw) for v in filtered_vars]
         products = [parent_formatted] + variation_products
     elif variations_raw:
-        # ── No specific attributes requested — paginate variations in-memory ──
-        # The API fetched all variations (per_page=100) because attribute-matching
-        # needs the full set. For display, slice to DEFAULT_PER_PAGE per page.
         total_variations = len(variations_raw)
         start = (page - 1) * DEFAULT_PER_PAGE
         end = start + DEFAULT_PER_PAGE
@@ -483,10 +489,75 @@ def handle_variation_product(
         )
     else:
         products = [parent_formatted]
+        
+    # ─── SMART BOT MESSAGE GENERATOR ───
+    if intent in (Intent.PRODUCT_ATTRIBUTE_INFO, Intent.PRODUCT_VARIATIONS) and (variations_raw or parent_product_raw):
+        
+        # 🚀 FIX 2: Bulletproof check to fetch missing sizes
+        has_full_options = False
+        for pa in parent_product_raw.get("attributes", []):
+            if isinstance(pa, dict) and pa.get("options"):
+                has_full_options = True
+                break
+                
+        if not has_full_options:
+            logger.info(f"Step 3.7: Parent attributes missing options. Fetching full product {entities.product_id} from Woo API.")
+            parent_call = WooAPICall(
+                method="GET",
+                endpoint=f"{WOO_BASE_URL}/products/{entities.product_id}",
+                params={},
+                description=f"Fetch full parent product attributes for '{parent_formatted['name']}'"
+            )
+            parent_resp = woo_client.execute(parent_call)
+            if parent_resp.get("success"):
+                full_parent_data = parent_resp.get("data", {})
+                parent_product_raw["attributes"] = full_parent_data.get("attributes", [])
 
-    bot_message = generate_bot_message(intent, entities, products, confidence, order_data)
+        attr_values = {}
+        
+        for pa in parent_product_raw.get("attributes", []):
+            if isinstance(pa, dict) and pa.get("name"):
+                pa_name = pa.get("name").replace("pa_", "").replace("-", " ").title()
+                if pa_name not in attr_values: attr_values[pa_name] = set()
+                for opt in pa.get("options", []):
+                    if str(opt).strip():
+                        attr_values[pa_name].add(str(opt).strip())
+                    
+        for var in variations_raw:
+            opts = _get_safe_options(var.get("attributes", []))
+            for k, v in opts.items():
+                if k and str(v).strip():
+                    if k not in attr_values: attr_values[k] = set()
+                    attr_values[k].add(str(v).strip())
+                    
+        if attr_values:
+            attr_summary = []
+            for k, v_set in attr_values.items():
+                if v_set:
+                    options_str = ", ".join(sorted(list(v_set)))
+                    attr_summary.append(f"• **{k}**: {options_str}")
+                    
+            summary_text = f"📏 Here are all the available options for **{parent_formatted['name']}**:\n\n" + "\n".join(attr_summary)
+            
+            if intent == Intent.PRODUCT_ATTRIBUTE_INFO:
+                bot_message = summary_text
+            else:
+                bot_message = f"{summary_text}\n\n{generate_bot_message(intent, entities, products, confidence, order_data)}"
+        else:
+            bot_message = generate_bot_message(intent, entities, products, confidence, order_data)
+    else:
+        bot_message = generate_bot_message(intent, entities, products, confidence, order_data)
+
     if category_mismatch_msg:
         bot_message = f"⚠️ {category_mismatch_msg}\n\n{bot_message}"
+        
+    if intent == Intent.PRODUCT_VARIATIONS and not variations_raw:
+        if parent_product_raw.get("type", "simple") != "variable":
+            bot_message = (
+                f"**{parent_formatted['name']}** is a single standard product "
+                f"and doesn't come in multiple variations (like different colors or sizes). "
+                f"Here's the item:"
+            )
 
     suggestions = generate_suggestions(intent, entities, products)
     elapsed = time.time() - start_time
@@ -501,8 +572,6 @@ def handle_variation_product(
         "variations_found": len(variations_raw),
         "variations_matched": len(products) - 1 if variations_raw else 0,
         "category_mismatch": bool(category_mismatch_msg),
-        # For PRODUCT_DETAIL: surface matched variation price so response_generator
-        # and frontend can display it directly without scanning the products list.
         **({"matched_variation_price": (
             matched_variation.get("sale_price")
             or matched_variation.get("price")
@@ -517,10 +586,9 @@ def handle_variation_product(
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
-    # ── Build pagination — override for in-memory paginated variations ──
-    if variations_raw and not has_attributes:
+    if variations_raw and not has_attributes and intent != Intent.PRODUCT_ATTRIBUTE_INFO:
         total_variations = len(variations_raw)
-        total_pages = max(1, -(-total_variations // DEFAULT_PER_PAGE))  # ceil division
+        total_pages = max(1, -(-total_variations // DEFAULT_PER_PAGE))
         pagination = {
             "page": page,
             "per_page": DEFAULT_PER_PAGE,

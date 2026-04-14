@@ -412,22 +412,29 @@ def classify(utterance: str) -> ClassifiedResult:
     _extract_quantity(text, entities)
 
     attr_text = entity_text
+    tag_text = text
+
     if entities.product_name:
-        attr_text = attr_text.replace(entities.product_name.lower(), " ")
+        p_name = entities.product_name.lower()
+        attr_text = attr_text.replace(p_name, " ")
+        tag_text = tag_text.replace(p_name, " ")
         
     if entities.quantity:
         attr_text = re.sub(rf'(?<![\dxX\-])\b{entities.quantity}\b(?![\dxX\-])', ' ', attr_text, count=1)
+        tag_text = re.sub(rf'(?<![\dxX\-])\b{entities.quantity}\b(?![\dxX\-])', ' ', tag_text, count=1)
 
     _loader = get_store_loader()
     _type_mask_terms = set(pt.lower() for pt in PRODUCT_TYPE_TERMS)
     if _loader:
         _type_mask_terms |= _loader._store_generic_terms
     for _pt in _type_mask_terms:
+        # 🚀 ONLY mask generic terms for attributes, NOT tags! 
+        # This prevents words like 'look' from being destroyed before the tag extractor runs.
         attr_text = re.sub(rf'\b{re.escape(_pt)}\b', ' ', attr_text).strip()
 
     # --- 3. POSITIVE CONSTRAINTS (Non-Destructive Extraction) ---
     _extract_attributes(attr_text, entities)
-    _extract_tag(attr_text, entities)               
+    _extract_tag(tag_text, entities)   
     
     # --- 4. SECONDARY EXTRACTIONS ---
     _extract_collection_year(text, entities)
