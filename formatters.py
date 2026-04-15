@@ -224,19 +224,22 @@ def _filter_variations_by_entities(
     """
     Filter variation list by the attributes the user specified.
     Handles both Native WC arrays and Custom API flat dicts.
+    Supports comma-separated OR logic (e.g., 'white,gray').
     """
     filters: List[tuple] = []
     FINISH_SYNONYMS = {"matt": "matte", "glossy": "polished", "gloss": "polished"}
 
     for attr_label, attr_value in entities.attributes.items():
-        val_lower = attr_value.lower().replace("-", " ")
-        filters.append((attr_label, val_lower))
+        # Split by comma to support OR logic
+        vals_lower = [v.strip() for v in attr_value.lower().replace("-", " ").split(",") if v.strip()]
+        filters.append((attr_label, vals_lower))
+        
         if attr_label == "finish":
-            normalized = FINISH_SYNONYMS.get(val_lower, val_lower)
-            if normalized != val_lower:
-                filters.append((attr_label, normalized))
+            norm_vals = [FINISH_SYNONYMS.get(v, v) for v in vals_lower]
+            if norm_vals != vals_lower:
+                filters.append((attr_label, norm_vals))
         if attr_label == "colors":
-            filters.append(("colors 2", val_lower))
+            filters.append(("colors 2", vals_lower))
 
     if not filters:
         return variations
@@ -260,12 +263,21 @@ def _filter_variations_by_entities(
                 clean_v = a.get("option", "").replace("-", " ").strip().lower()
                 var_attrs[clean_k] = clean_v
 
-        # Check if it matches the user's requested filters
-        if all(
-            any(f_val in var_attrs.get(f_name, "") for f_name in var_attrs if f_name == attr_name or f_name.startswith(attr_name))
-            or any(f_val in opt for opt in var_attrs.values())
-            for attr_name, f_val in filters
-        ):
+        # Check if it matches ALL filter categories (AND logic across attributes)
+        matches_all_filters = True
+        for attr_name, f_vals in filters:
+            matched_this_filter = False
+            # For each category, it must match ANY of the provided comma-separated values (OR logic)
+            for f_val in f_vals:
+                if any(f_val in var_attrs.get(f_name, "") for f_name in var_attrs if f_name == attr_name or f_name.startswith(attr_name)) or any(f_val in opt for opt in var_attrs.values()):
+                    matched_this_filter = True
+                    break
+            
+            if not matched_this_filter:
+                matches_all_filters = False
+                break
+                
+        if matches_all_filters:
             matched.append(var)
 
     return matched if matched else variations

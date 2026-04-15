@@ -33,7 +33,7 @@ REQUEST_TIMEOUT = 30
 # Dev cache settings
 DEV_CACHE_ENABLED = os.getenv("DEV_CACHE", "false").lower() == "true"
 DEV_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dev_cache")
-
+UPDATE_DEV_CACHE_ENABLED = os.getenv("UPDATE_DEV_CACHE", "false").lower() == "true"
 # Path configuration based on your folder structure
 DATA_FOLDER = os.getenv("DATA_FOLDER", "data")
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), DATA_FOLDER)
@@ -202,6 +202,23 @@ class StoreLoader:
     # ─────────────────────────────────────────────
     # LOADING & FETCHING LOGIC
     # ─────────────────────────────────────────────
+    def _save_to_local_files(self):
+        """Saves live API data back to local JSON cache files (when UPDATE_DEV_CACHE=true)."""
+        os.makedirs(DATA_DIR, exist_ok=True)
+        files_to_save = {
+            FILE_MAP["categories"]: self.categories,
+            FILE_MAP["tags"]:       self.tags,
+            FILE_MAP["attributes"]: self.all_attributes_raw,
+            FILE_MAP["products"]:   self.products,
+        }
+        for filename, data in files_to_save.items():
+            path = os.path.join(DATA_DIR, filename)
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                logger.info(f"StoreLoader: 💾 Saved {len(data)} items → {filename}")
+            except Exception as e:
+                logger.error(f"StoreLoader: Failed to save {filename}: {e}")
 
     def _run_scanner_async(self):
         """Runs the heavy NLP scanner in the background so it doesn't freeze the server."""
@@ -221,6 +238,10 @@ class StoreLoader:
                 else:
                     self._load_from_live_api()
                     self._loaded_from_cache = False
+                    
+                    if UPDATE_DEV_CACHE_ENABLED:
+                        self._save_to_local_files()
+                        logger.info("StoreLoader: ✅ Dev cache files updated from live API")
 
                 self._build_lookups()
                 self._validate_load()
@@ -269,9 +290,6 @@ class StoreLoader:
         for attr in self.all_attributes_raw:
             taxonomy = attr.get("attribute_name", "") or attr.get("taxonomy", "")
             for term in attr.get("terms", []):
-                # Optional: Skip empty attributes to keep vectors lean
-                if term.get("count", 0) == 0: continue 
-                
                 clean_name = term.get("name", "").replace("-", " ").lower()
                 corpus_texts.append(clean_name)
                 self.semantic_keys.append(term["slug"])
@@ -642,8 +660,6 @@ class StoreLoader:
                 label = label_raw.lower().strip()
                 
                 for attr_val in attr.get("terms", []):
-                    if attr_val.get("count", 0) == 0:
-                        continue
                     name = attr_val.get("name", "").lower().strip()
                     
                     attr_payload = {
@@ -666,8 +682,6 @@ class StoreLoader:
                 if data.get("count", 0) == 0:
                     continue
                 catalog_items.append((name, 'tag', data))
-
-        # Python's stable sort ensures Attributes beat Tags on length ties
         catalog_items.sort(key=lambda x: len(x[0]), reverse=True)
         self.longest_match_catalog = catalog_items
 
@@ -1076,7 +1090,6 @@ class StoreLoader:
         candidates = [
             t for t in terms
             if t.get("name", "").lower().strip() != failed_lower
-            and t.get("count", 0) > 0
         ]
         candidates.sort(key=lambda x: x.get("count", 0), reverse=True)
         return [t["name"] for t in candidates[:limit]]

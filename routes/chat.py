@@ -88,6 +88,21 @@ def _finalize_turn(conversation, flask_response):
     # 2. Update Conversation State
     conversation.flow_state = data.get("flow_state", conversation.flow_state)
     
+    # Wipe context variables when outgoing state resets
+    if conversation.flow_state in ("idle", "awaiting_anything_else"):
+        keys_to_wipe = [
+            "pending_product_id", "pending_product_name", 
+            "pending_quantity", "pending_variation_id", "resolved_attributes"
+        ]
+        # Remove from database session
+        for k in keys_to_wipe:
+            conversation.context_data.pop(k, None)
+            
+        # Remove from outgoing response so frontend doesn't re-cache it
+        if "metadata" in data:
+            for k in keys_to_wipe:
+                data["metadata"].pop(k, None)
+    
     # Force new object reference for SQLAlchemy JSONB mutation tracking
     conversation.context_data = dict(conversation.context_data)
     flag_modified(conversation, "context_data")
@@ -98,7 +113,6 @@ def _finalize_turn(conversation, flask_response):
     # 4. Inject explicit UUID into payload for frontend
     data["session_id"] = str(conversation.id)
     return jsonify(data), status_code
-
 
 # ══════════════════════════════════════════════════════════════
 # ─── HISTORY ROUTE ───
@@ -306,6 +320,17 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
                     entities.attributes[k] += "," + ",".join(new_vals)
     
     # Merge Exclusions & Numerical Values
+    
+    if getattr(original_nlp_result.entities, 'target_attribute', None):
+        entities.target_attribute = original_nlp_result.entities.target_attribute
+        
+    if getattr(original_nlp_result.entities, 'target_attributes', None):
+        if not hasattr(entities, 'target_attributes'): 
+            entities.target_attributes = []
+        for t_attr in original_nlp_result.entities.target_attributes:
+            if t_attr not in entities.target_attributes:
+                entities.target_attributes.append(t_attr)
+
     if getattr(nlp_entities, 'excluded_tags', None):
         if not hasattr(entities, 'excluded_tags'): entities.excluded_tags = []
         entities.excluded_tags.extend(nlp_entities.excluded_tags)
@@ -634,6 +659,29 @@ def chat():
 
         # Mock sessions dict to prevent existing handlers from crashing
         mock_sessions = {str(session_id): {"history": [], "user_context": user_context}}
+        
+        # ─── Step 0: Check conversation flow state ───
+        try:
+            current_flow_state = FlowState(conversation.flow_state)
+        except ValueError:
+            current_flow_state = FlowState.IDLE
+
+        # ─── WIPE STALE CART DATA ON NEW CONVERSATIONS ───
+        if current_flow_state in (FlowState.IDLE, FlowState.AWAITING_ANYTHING_ELSE):
+            _keys_to_wipe = [
+                "pending_product_id", "pending_product_name", 
+                "pending_quantity", "pending_variation_id", "resolved_attributes"
+            ]
+            _wiped = False
+            for k in _keys_to_wipe:
+                if k in user_context:
+                    user_context.pop(k)
+                    _wiped = True
+            
+            if _wiped:
+                conversation.context_data = user_context
+                flag_modified(conversation, "context_data")
+        # ─────────────────────────────────────────────────
 
         # ─── Step 0.5: Suggestion retry intercept ───
         _suggestion_retry = body.get("suggestion_retry")
@@ -890,24 +938,13 @@ def chat():
             resp = handle_flow(flow_result, user_context, str(conversation.id), customer_id, page, start_time, mock_sessions)
             if resp: return _finalize_turn(conversation, resp)
 
-        elif flow_result:  # 🚀 FIX: Changed to elif to prevent the double-fire
+        elif flow_result:
             resp = handle_flow(flow_result, user_context, str(conversation.id), customer_id, page, start_time, mock_sessions)
             if resp: return _finalize_turn(conversation, resp)
 
         _resolve_variant = bool(flow_result and flow_result.get("resolve_variant"))
-
-        if _resolve_variant:
-            intent = Intent.QUICK_ORDER
-            entities = ExtractedEntities()
-            confidence = 1.0
-            api_calls = []
-            api_calls_to_execute = []
-            api_responses = []
-            all_products_raw = []
-            order_data = []
-            last_product_ctx = None
-            
-        elif _skip_classification:
+        
+        if _skip_classification:
             result = bypass_result
             intent = result.intent
             entities = result.entities
@@ -923,32 +960,43 @@ def chat():
             entities = result.entities
             confidence = result.confidence
 
+            # 🚀 LOCK IN VARIANT STATE: Intercept after NLP extracts attributes, but before LLM
+            if current_flow_state == FlowState.AWAITING_VARIANT_SELECTION:
+                _resolve_variant = True
+                intent = Intent.QUICK_ORDER
+                result.intent = intent
+                entities.product_id = user_context.get("pending_product_id")
+                entities.product_name = user_context.get("pending_product_name")
+                confidence = 1.0
+
             # Setup minimal session history for LLM
             session_history = [{"role": m.role, "message": m.content} for m in conversation.messages[-4:-1]]
 
-            llm_outcome = run_llm_fallback(
-                message=message,
-                intent=intent,
-                entities=entities,
-                confidence=confidence,
-                session_id=str(conversation.id),
-                session_history=session_history,
-                store_loader=store_loader,
-                page=page,
-                start_time=start_time,
-                order_create_intents=ORDER_CREATE_INTENTS,
-                user_context=user_context,
-                sessions=mock_sessions,
-            )
+            # Skip LLM fallback if we just forced the variant selection intent
+            if not _resolve_variant:
+                llm_outcome = run_llm_fallback(
+                    message=message,
+                    intent=intent,
+                    entities=entities,
+                    confidence=confidence,
+                    session_id=str(conversation.id),
+                    session_history=session_history,
+                    store_loader=store_loader,
+                    page=page,
+                    start_time=start_time,
+                    order_create_intents=ORDER_CREATE_INTENTS,
+                    user_context=user_context,
+                    sessions=mock_sessions,
+                )
 
-            if llm_outcome is not None:
-                if not isinstance(llm_outcome, tuple) or not isinstance(llm_outcome[0], tuple):
-                    if hasattr(llm_outcome, 'get_data'):  
-                        return _finalize_turn(conversation, llm_outcome)
-                    if isinstance(llm_outcome, tuple) and len(llm_outcome) == 2 and isinstance(llm_outcome[1], int):
-                        return _finalize_turn(conversation, llm_outcome)
-                if isinstance(llm_outcome, tuple) and len(llm_outcome) == 4:
-                    intent, entities, confidence, result = llm_outcome
+                if llm_outcome is not None:
+                    if not isinstance(llm_outcome, tuple) or not isinstance(llm_outcome[0], tuple):
+                        if hasattr(llm_outcome, 'get_data'):  
+                            return _finalize_turn(conversation, llm_outcome)
+                        if isinstance(llm_outcome, tuple) and len(llm_outcome) == 2 and isinstance(llm_outcome[1], int):
+                            return _finalize_turn(conversation, llm_outcome)
+                    if isinstance(llm_outcome, tuple) and len(llm_outcome) == 4:
+                        intent, entities, confidence, result = llm_outcome
 
         # Do not trigger semantic clarification if the user is asking an informational question
         if entities.semantic_matches and current_flow_state != FlowState.AWAITING_FILTER_CLARIFICATION and intent not in (Intent.PRODUCT_ATTRIBUTE_INFO, Intent.PRODUCT_VARIATIONS):
@@ -981,7 +1029,7 @@ def chat():
                     "carryover_min_price": getattr(entities, 'min_price', None),
                     "carryover_max_price": getattr(entities, 'max_price', None),
                     "carryover_attr_tag_or_pairs": list(getattr(entities, 'attr_tag_or_pairs', [])),
-                    "carryover_categories": list(getattr(entities, 'target_category_slugs', set())),  # 🚀 ADD
+                    "carryover_categories": list(getattr(entities, 'target_category_slugs', set())),
                     "carryover_category_name": getattr(entities, 'category_name', None),            
                 }
                 
@@ -1007,8 +1055,8 @@ def chat():
                         verb = "Exclude" if candidate.get("is_negative") else "Use"
                         suggestion_buttons.append(f"{verb} {candidate['suggested_name']}")
                     suggestion_buttons.append(f"No - search for '{user_original_term}'")
-                    if has_strong_filters:                                          # 🚀
-                        suggestion_buttons.append("Skip - use my current filters") # 🚀
+                    if has_strong_filters:
+                        suggestion_buttons.append("Skip - use my current filters")
 
                 else:
                     primary_semantics = [group[0] for group in valid_term_groups]
@@ -1026,15 +1074,15 @@ def chat():
                             bot_message = f"I don't have an exact match for '{primary_semantics[0]['user_text']}', but I do have **{suggested_names[0]}**. Would you like to use that filter?"
                             suggestion_buttons.append(f"Yes - use {suggested_names[0]}")
                         suggestion_buttons.append(f"No - search for '{primary_semantics[0]['user_text']}'")
-                        if has_strong_filters:                                          # 🚀
-                            suggestion_buttons.append("Skip - use my current filters") # 🚀
+                        if has_strong_filters:
+                            suggestion_buttons.append("Skip - use my current filters")
                     else:
                         joined_names = " and ".join(suggested_names)
                         bot_message = f"I don't have exact matches, but I found **{joined_names}**. Would you like to apply these filters?"
                         suggestion_buttons.append("Yes - use these filters")
                         suggestion_buttons.append("No - use my original text")
-                        if has_strong_filters:                                          # 🚀
-                            suggestion_buttons.append("Skip - use my current filters") # 🚀
+                        if has_strong_filters:
+                            suggestion_buttons.append("Skip - use my current filters")
 
                 suggestion_buttons.append("Cancel")
                 
@@ -1086,11 +1134,12 @@ def chat():
             _resolve_user_placeholders(api_calls, customer_id)
 
         last_product_ctx = user_context.get("last_product")
-            
+        all_products_raw = []
+        order_data = []
+        api_responses = []
+        api_calls_to_execute = []
+           
         if not _resolve_variant:
-            all_products_raw = []
-            order_data = []
-
             filtered_api_calls = []
             if intent in ORDER_CREATE_INTENTS:
                 for call in api_calls:
@@ -1125,10 +1174,11 @@ def chat():
             if all_products_raw and not _resolve_variant:
                 first_prod = all_products_raw[0]
                 user_context["last_product"] = {"id": first_prod.get("id"), "name": first_prod.get("name")}
-                user_context["pending_product_id"] = first_prod.get("id")
-                user_context["pending_product_name"] = first_prod.get("name")
-                conversation.context_data = user_context
-                flag_modified(conversation, "context_data")
+                if current_flow_state != FlowState.AWAITING_VARIANT_SELECTION:
+                    user_context["pending_product_id"] = first_prod.get("id")
+                    user_context["pending_product_name"] = first_prod.get("name")
+                    conversation.context_data = user_context
+                    flag_modified(conversation, "context_data")
         
         if intent == Intent.FETCH_CUSTOMER:
             elapsed = int((time.time() - start_time) * 1000)

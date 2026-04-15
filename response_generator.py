@@ -577,67 +577,92 @@ def _format_order_history_message(orders: List[dict], date_after: str = None) ->
 
 def _generate_attribute_info_message(products: List[dict], entities: ExtractedEntities) -> str:
     """
-    Build a focused prose answer listing the available options for a specific
-    attribute (e.g. size, finish, color) of a named product.
+    Build a focused answer listing options for ALL requested attributes.
+    Handles multi-target queries like 'what sizes and sample sizes are available?'
     """
-    target_attr = (getattr(entities, 'target_attribute', None) or 'options').lower()
+    # Build target list — prefer the new list, fall back to legacy single string
+    raw_targets = getattr(entities, 'target_attributes', None) or []
+    if not raw_targets:
+        single = getattr(entities, 'target_attribute', None)
+        if single:
+            raw_targets = [single]
+    target_attrs = [a.lower() for a in raw_targets] or ['options']
 
     parent = next((p for p in products if p.get('type') != 'variation'), products[0])
     product_name = parent.get('name', 'This product')
-
     attrs = parent.get('attributes', [])
     all_attrs = parent.get('raw_attributes', attrs)
-    
-    matched_attr = None
-    for attr in all_attrs:
-        attr_name_lower = attr.get('name', '').lower()
-        if target_attr in attr_name_lower or attr_name_lower in target_attr:
-            matched_attr = attr
-            break
-
     variations = [p for p in products if p.get('type') == 'variation']
 
-    if matched_attr:
-        options = matched_attr.get('options', [])
-        attr_display_name = matched_attr.get('name', target_attr.title())
+    def _find_attr(target: str, already_claimed: set):
+        """Exact match first, then partial — never reuse a claimed attr."""
+        # Pass 1: exact
+        for attr in all_attrs:
+            name_lower = attr.get('name', '').lower()
+            if name_lower == target and name_lower not in already_claimed:
+                return attr
+        # Pass 2: partial
+        for attr in all_attrs:
+            name_lower = attr.get('name', '').lower()
+            if name_lower not in already_claimed:
+                if target in name_lower or name_lower in target:
+                    return attr
+        return None
+
+    def _in_stock_for(target: str):
+        in_stock_opts = set()
+        for v in variations:
+            if v.get('in_stock') or v.get('stock_status') == 'instock':
+                for a in v.get('attributes', []):
+                    if target in a.get('name', '').lower():
+                        opt = a.get('option', '')
+                        if opt:
+                            in_stock_opts.add(opt)
+        return in_stock_opts
+
+    claimed = set()
+    msg_parts = []
+
+    for target in target_attrs:
+        matched = _find_attr(target, claimed)
+        if not matched:
+            continue
+        claimed.add(matched.get('name', '').lower())
+
+        options = matched.get('options', [])
+        display_name = matched.get('name', target.title())
 
         if not options:
-            return (
-                f"I found **{product_name}** but the {attr_display_name.lower()} "
-                f"options aren't listed in our catalog. "
-                f"Try asking: *'What variations does {product_name} come in?'*"
+            msg_parts.append(
+                f"• **{display_name}**: options not listed in catalog"
             )
+            continue
 
-        opts_formatted = ", ".join(f"**{o}**" for o in options)
-        msg = f"📐 **{product_name}** is available in the following {attr_display_name.lower()}:\n\n{opts_formatted}"
+        opts_str = ", ".join(f"**{o}**" for o in options)
+        line = f"• **{display_name}**: {opts_str}"
 
-        if variations:
-            in_stock_opts = set()
-            for v in variations:
-                stock_ok = v.get('in_stock') or v.get('stock_status') == 'instock'
-                if stock_ok:
-                    for a in v.get('attributes', []):
-                        if target_attr in a.get('name', '').lower():
-                            opt = a.get('option', '')
-                            if opt:
-                                in_stock_opts.add(opt)
-            if in_stock_opts and 0 < len(in_stock_opts) < len(options):
-                msg += f"\n\n✅ Currently in stock: {', '.join(sorted(in_stock_opts))}"
+        in_stock = _in_stock_for(target)
+        if in_stock and 0 < len(in_stock) < len(options):
+            line += f" ✅ (In stock: {', '.join(sorted(in_stock))})"
 
-        return msg
+        msg_parts.append(line)
 
+    if msg_parts:
+        return f"**{product_name}** — available options:\n\n" + "\n".join(msg_parts)
+
+    # Fallback: no targeted attributes matched — show everything
     if attrs:
-        msg = f"📐 Here are the available options for **{product_name}**:\n\n"
+        msg = f"Here are the available options for **{product_name}**:\n\n"
         for attr in attrs[:6]:
             opts = ', '.join(attr.get('options', [])[:8])
             msg += f"• **{attr.get('name', '')}:** {opts}\n"
         return msg
 
     return (
-        f"I found **{product_name}** but couldn't retrieve its {target_attr} options from the catalog. "
-        f"Try asking: *'What variations does {product_name} come in?'*"
+        f"I found **{product_name}** but couldn't retrieve its "
+        f"{', '.join(target_attrs)} options. "
+        f"Try: *'What variations does {product_name} come in?'*"
     )
-
 
 def format_order_detail(order: dict) -> str:
     """Format a single order into a rich detail message."""

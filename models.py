@@ -201,7 +201,8 @@ class ExtractedEntities:
     explicit_last_order: bool = False
 
     # ──── Attribute info query ────
-    target_attribute: Optional[str] = None     # attribute the user is asking about, e.g. "size", "finish"
+    target_attribute: Optional[str] = None     # backward compat: always = target_attributes[0]
+    target_attributes: List[str] = field(default_factory=list)
 
     # ──── Price range fields ────
     min_price: Optional[float] = None   # e.g. "over $50" → 50.0

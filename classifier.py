@@ -433,22 +433,31 @@ def classify(utterance: str) -> ClassifiedResult:
         attr_text = re.sub(rf'\b{re.escape(_pt)}\b', ' ', attr_text).strip()
         
     # ─── QUESTION MASK: Prevent "what colors/sizes/etc" from false attribute extraction ───
-    # e.g. "what colors are available" must NOT extract visual:color as a filter
-    _question_word_re = r'\b(?:what|which|how\s+many|tell\s+me\s+(?:the|about))\s+'
+    _question_word_re = r'\b(?:what|which|how\s+many|tell\s+me\s+(?:the|about))\s+(?:[\w\']+\s+){0,3}'
     _qmask_loader = get_store_loader()
     if _qmask_loader and _qmask_loader.all_attributes_raw:
-        for _qattr in _qmask_loader.all_attributes_raw:
+        _sorted_attrs = sorted(
+            _qmask_loader.all_attributes_raw,
+            key=lambda a: len(a.get("attribute_label", "")),
+            reverse=True
+        )
+        _words_to_mask = set()
+        for _qattr in _sorted_attrs:
             _qlabel = _qattr.get("attribute_label", "").lower().strip()
             if not _qlabel:
                 continue
             for _qword in ([_qlabel] + _qlabel.split()):
                 if len(_qword) < 4:
                     continue
-                if re.search(_question_word_re + re.escape(_qword) + r's?\b', attr_text, re.IGNORECASE):
-                    attr_text = re.sub(re.escape(_qword) + r's?', ' ', attr_text, flags=re.IGNORECASE)
-                    if not getattr(entities, 'target_attribute', None):
-                        entities.target_attribute = _qlabel
+                if re.search(_question_word_re + re.escape(_qword) + r's?\b', text, re.IGNORECASE):
+                    _words_to_mask.add(re.escape(_qword) + r's?')
+                    if _qlabel not in entities.target_attributes:
+                        entities.target_attributes.append(_qlabel)
                     break
+        for _w in _words_to_mask:
+            attr_text = re.sub(_w, ' ', attr_text, flags=re.IGNORECASE)
+        if entities.target_attributes:
+            entities.target_attribute = entities.target_attributes[0]
 
     # --- 3. POSITIVE CONSTRAINTS (Non-Destructive Extraction) ---
     _extract_attributes(attr_text, entities)

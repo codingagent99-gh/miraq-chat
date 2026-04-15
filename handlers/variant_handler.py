@@ -62,12 +62,24 @@ def handle_variant_selection(
     """
 
     _ABANDON_INTENTS = {
-        Intent.PRODUCT_SEARCH, Intent.PRODUCT_LIST, Intent.CATEGORY_BROWSE,
-        Intent.CATEGORY_LIST, Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_QUICK_SHIP, 
+        Intent.PRODUCT_LIST, Intent.CATEGORY_BROWSE,
+        Intent.CATEGORY_LIST, Intent.PRODUCT_QUICK_SHIP, 
         Intent.GREETING,
     }
     
-    if current_flow_state == FlowState.AWAITING_VARIANT_SELECTION and intent in _ABANDON_INTENTS:
+    # ── SMART CHECK: Are they searching for a completely different product? ──
+    is_searching_new_product = False
+    
+    if intent in (Intent.PRODUCT_SEARCH, Intent.FILTER_BY_ATTRIBUTE):
+        new_id = getattr(entities, 'product_id', None)
+        pending_id = user_context.get("pending_product_id")
+        
+        # If they found a new product, and it's NOT the one we are currently ordering -> Abandon
+        if new_id and pending_id and new_id != pending_id:
+            is_searching_new_product = True
+
+    # Now we only abandon if it's an explicit abandon intent OR they searched for a different product
+    if current_flow_state == FlowState.AWAITING_VARIANT_SELECTION and (intent in _ABANDON_INTENTS or is_searching_new_product):
         logger.info(
             f"Step 3.55: Abandoning variant flow — new intent={intent.value} detected | "
             f"message=\"{sanitize_log_string(message)}\""
@@ -197,6 +209,7 @@ def handle_variant_selection(
         _resolved_variation = matched[0]
         _resolved_variation_id = _resolved_variation["id"]
         logger.info(f"Step 3.55: Resolved to variation_id={_resolved_variation_id}")
+        user_context["pending_variation_id"] = _resolved_variation_id
 
         if _resolved_variation.get("stock_status") == "outofstock" or _resolved_variation.get("in_stock") is False:
             elapsed = time.time() - start_time
@@ -300,18 +313,21 @@ def handle_variant_selection(
                 "flow_state": FlowState.AWAITING_NEW_ADDRESS.value,
                 "pagination": default_pagination(page),
             }), 200
-
-    resolved_attributes = {}
+            
+    # Initialize with PREVIOUSLY resolved attributes.
+    resolved_attributes = dict(prev_resolved) if prev_resolved else {}
+    
     if len(matched) > 1:
         attr_values = {}
         for v in matched:
             for name, opt in _get_safe_options(v.get("attributes", [])).items():
                 if name and opt:
                     attr_values.setdefault(name, set()).add(opt)
+        
         for attr_name, options in attr_values.items():
             if len(options) == 1:
                 resolved_attributes[attr_name] = list(options)[0]
-        
+
     if prev_resolved:
         for k, v in prev_resolved.items():
             if k not in resolved_attributes:
@@ -364,6 +380,8 @@ def handle_variant_selection(
         prompt_msg = build_variant_prompt(parent_raw, _var_product_name, resolved_attributes)
         if len(all_variations) > 0:
             prompt_msg = "Sorry, I couldn't find that exact variant. " + prompt_msg
+            
+    user_context["resolved_attributes"] = resolved_attributes
 
     elapsed = time.time() - start_time
     return jsonify({
@@ -491,9 +509,12 @@ def handle_variation_product(
         products = [parent_formatted]
         
     # ─── SMART BOT MESSAGE GENERATOR ───
-    if intent in (Intent.PRODUCT_ATTRIBUTE_INFO, Intent.PRODUCT_VARIATIONS) and (variations_raw or parent_product_raw):
+    # Only show the massive attribute dump if it's an INFO intent, 
+    # OR if they asked for variations but provided NO specific attributes to filter by.
+    should_show_summary = intent == Intent.PRODUCT_ATTRIBUTE_INFO or (intent == Intent.PRODUCT_VARIATIONS and not has_attributes)
+
+    if should_show_summary and (variations_raw or parent_product_raw):
         
-        # 🚀 FIX 2: Bulletproof check to fetch missing sizes
         has_full_options = False
         for pa in parent_product_raw.get("attributes", []):
             if isinstance(pa, dict) and pa.get("options"):
@@ -531,13 +552,32 @@ def handle_variation_product(
                     attr_values[k].add(str(v).strip())
                     
         if attr_values:
+            target_attrs = getattr(entities, 'target_attributes', [])
+            
+            if target_attrs and intent == Intent.PRODUCT_ATTRIBUTE_INFO:
+                target_attrs_lower = [t.lower() for t in target_attrs]
+                filtered_attr_values = {}
+                
+                for k, v_set in attr_values.items():
+                    k_lower = k.lower()
+                    if any(t in k_lower or k_lower in t for t in target_attrs_lower):
+                        filtered_attr_values[k] = v_set
+                
+                if filtered_attr_values:
+                    attr_values = filtered_attr_values
+                    intro_text = f"Here are the requested options for **{parent_formatted['name']}**:\n\n"
+                else:
+                    intro_text = f"I couldn't find those specific options, but here are all available options for **{parent_formatted['name']}**:\n\n"
+            else:
+                intro_text = f"Here are all the available options for **{parent_formatted['name']}**:\n\n"
+
             attr_summary = []
             for k, v_set in attr_values.items():
                 if v_set:
                     options_str = ", ".join(sorted(list(v_set)))
                     attr_summary.append(f"• **{k}**: {options_str}")
                     
-            summary_text = f"📏 Here are all the available options for **{parent_formatted['name']}**:\n\n" + "\n".join(attr_summary)
+            summary_text = intro_text + "\n".join(attr_summary)
             
             if intent == Intent.PRODUCT_ATTRIBUTE_INFO:
                 bot_message = summary_text
@@ -546,6 +586,7 @@ def handle_variation_product(
         else:
             bot_message = generate_bot_message(intent, entities, products, confidence, order_data)
     else:
+        # Bypasses the summary dump and just prints the matched products!
         bot_message = generate_bot_message(intent, entities, products, confidence, order_data)
 
     if category_mismatch_msg:
