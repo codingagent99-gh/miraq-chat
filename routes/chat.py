@@ -950,7 +950,8 @@ def chat():
                 if isinstance(llm_outcome, tuple) and len(llm_outcome) == 4:
                     intent, entities, confidence, result = llm_outcome
 
-        if entities.semantic_matches and current_flow_state != FlowState.AWAITING_FILTER_CLARIFICATION:
+        # Do not trigger semantic clarification if the user is asking an informational question
+        if entities.semantic_matches and current_flow_state != FlowState.AWAITING_FILTER_CLARIFICATION and intent not in (Intent.PRODUCT_ATTRIBUTE_INFO, Intent.PRODUCT_VARIATIONS):
             rejected_list = user_context.get("rejected_semantic_terms", [])
             valid_term_groups = []
             
