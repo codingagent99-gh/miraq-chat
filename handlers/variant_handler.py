@@ -147,8 +147,9 @@ def handle_variant_selection(
     user_msg_lower = message.lower()
     user_msg_clean = _STRIP_QUOTES_RE.sub('', user_msg_lower)
     
-    # Create a heavily stripped version of the message to safely catch attributes mixed with commas/punctuation
-    msg_for_extraction = f" {re.sub(r'[^\w\s]', ' ', user_msg_clean)} "
+    # Extract regex outside the f-string for Python 3.10 compatibility
+    stripped_text = re.sub(r'[^\w\s]', ' ', user_msg_clean)
+    msg_for_extraction = f" {stripped_text} "
     msg_for_extraction = re.sub(r'\s+', ' ', msg_for_extraction) # Collapse multiple spaces
     
     # Catch newly spoken attributes from the user's message
@@ -165,7 +166,6 @@ def handle_variant_selection(
                 prev_resolved[nice_name] = opt
             elif opt_clean == user_msg_clean.strip():
                 prev_resolved[nice_name] = opt
-
 
     if _resolve_variant:
         user_text_lower = message.lower()
