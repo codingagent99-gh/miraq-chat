@@ -988,7 +988,8 @@ def chat():
             if resp: return _finalize_turn(conversation, resp)
 
         _resolve_variant = bool(flow_result and flow_result.get("resolve_variant"))
-        
+        store_loader = get_store_loader()
+
         if _skip_classification:
             result = bypass_result
             intent = result.intent
@@ -996,7 +997,6 @@ def chat():
             confidence = result.confidence
             
         else:
-            store_loader = get_store_loader()
             result = parse_csv_message(message, store_loader)
             if not result:
                 result = classify(message)
@@ -1041,7 +1041,8 @@ def chat():
                     if isinstance(llm_outcome, tuple) and len(llm_outcome) == 2 and isinstance(llm_outcome[1], int):
                         return _finalize_turn(conversation, llm_outcome)
                 if isinstance(llm_outcome, tuple) and len(llm_outcome) == 4:
-                    intent, entities, confidence, result = llm_outcome        
+                    intent, entities, confidence, result = llm_outcome
+                      
         if entities.semantic_matches and current_flow_state != FlowState.AWAITING_FILTER_CLARIFICATION and intent not in (Intent.PRODUCT_ATTRIBUTE_INFO, Intent.PRODUCT_VARIATIONS):
             rejected_list = user_context.get("rejected_semantic_terms", [])
             valid_term_groups = []
