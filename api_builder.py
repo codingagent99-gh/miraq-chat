@@ -281,11 +281,16 @@ def _build_advanced_filter_call(
             flattened_in_conditions.append(cond)
         elif cond.get("relation") == "OR":
             all_ins = True
+            base_terms = set()
             for sub in cond.get("conditions", []):
                 if not (sub.get("operator") == "IN" and "terms" in sub and len(sub["terms"]) > 0):
                     all_ins = False
                     break
-            if all_ins:
+                base_terms.add(_normalize_term(sub["terms"][0]))
+                
+            # Only flatten OR groups if all their terms are semantically identical.
+            # This protects mixed-term intentional OR pairs (like "black" attr OR "black-look" tag).
+            if all_ins and len(base_terms) == 1:
                 for sub in cond.get("conditions", []):
                     flattened_in_conditions.append(sub)
             else:
