@@ -238,7 +238,7 @@ def handle_flow_state(
         else:
             return {
                 "bot_message": "How many would you like to order? Please enter a number.",
-                "suggestions": ["1", "5", "10", "25"],
+                "suggestions": ["1", "5", "10", "25", "Cancel Order"],
                 "flow_state": FlowState.AWAITING_QUANTITY.value,
                 "pass_through": False,
             }
