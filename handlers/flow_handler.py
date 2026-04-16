@@ -104,6 +104,11 @@ def _handle_create_order(flow_result, user_context, session_id, customer_id, pag
     if pending_variation_id:
         _confirmed_line_item["variation_id"] = pending_variation_id
 
+    resolved_attrs = user_context.get("resolved_attributes", {})
+    if resolved_attrs:
+        meta_data = [{"key": k, "value": v} for k, v in resolved_attrs.items()]
+        _confirmed_line_item["meta_data"] = meta_data
+
     order_body: dict = {
         "status": "processing",
         "customer_id": customer_id,

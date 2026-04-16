@@ -184,7 +184,7 @@ def build_out_of_stock_response(product_name: str, product_raw: dict, intent, se
         "pagination": default_pagination(page),
     }), 200
 
-def build_variant_prompt(parent_raw: dict, product_name: str, resolved_attributes: dict = None) -> str:
+def build_variant_prompt(parent_raw: dict, product_name: str, resolved_attributes: dict = None, variations_list: list = None) -> str:
     """Builds a friendly prompt listing the available variation options."""
     import logging
     log = logging.getLogger("miraq_chat")
@@ -195,23 +195,23 @@ def build_variant_prompt(parent_raw: dict, product_name: str, resolved_attribute
     missing_attrs = {}
     
     # ── METHOD 1: Deduce options directly from the variations array ──
-    # This works perfectly with your custom 'products-advanced-new' API
-    variations = parent_raw.get("variations", [])
+    variations = variations_list if variations_list is not None else parent_raw.get("variations", [])
     log.info(f"build_variant_prompt: Scanning {len(variations)} variations for {product_name}")
     
     for v in variations:
+        if not isinstance(v, dict):
+            continue
         v_attrs = v.get("attributes", {})
         
-        # Custom API format: {"pa_colors": "waterfall-havana"}
+        # Custom API format
         if isinstance(v_attrs, dict):
             for k, val in v_attrs.items():
                 if not val: continue
-                # Clean taxonomy slug to a nice name (e.g., "pa_colors" -> "Colors")
                 nice_name = k.replace("pa_", "").replace("-", " ").title()
                 if nice_name.lower() not in resolved_keys_lower:
                     missing_attrs.setdefault(nice_name, set()).add(val)
                     
-        # Standard WC fallback: [{"name": "Colors", "option": "Havana"}]
+        # Standard WC fallback
         elif isinstance(v_attrs, list):
             for a in v_attrs:
                 name = a.get("name", "")
@@ -219,17 +219,24 @@ def build_variant_prompt(parent_raw: dict, product_name: str, resolved_attribute
                 if name and val and name.lower() not in resolved_keys_lower:
                     missing_attrs.setdefault(name, set()).add(val)
 
-    # ── METHOD 2: Fallback to parent attributes if variations loop found nothing ──
-    if not missing_attrs:
-        attributes = parent_raw.get("attributes", [])
-        if isinstance(attributes, list):
-            for attr in attributes:
-                if isinstance(attr, dict) and attr.get("variation") is True:
-                    name = attr.get("name", "")
-                    if name and name.lower() not in resolved_keys_lower:
-                        opts = attr.get("options", [])
-                        if opts:
-                            missing_attrs[name] = set(opts)
+    # ── METHOD 2: Supplement with parent-level "Any" variation axes ──
+    # ALWAYS run this to fill in axes that WooCommerce left blank ("") on variations!
+    attributes = parent_raw.get("attributes", [])
+    if isinstance(attributes, list):
+        for attr in attributes:
+            if isinstance(attr, dict) and attr.get("variation") is True:
+                name = attr.get("name", "")
+                nice_name = name.replace("pa_", "").replace("-", " ").title() if name.startswith("pa_") else name.title()
+                
+                if nice_name and nice_name.lower() not in resolved_keys_lower:
+                    opts = attr.get("options", [])
+                    if opts:
+                        # Merge parent options to fill the gaps
+                        if nice_name not in missing_attrs:
+                            missing_attrs[nice_name] = set()
+                        for o in opts:
+                            if str(o).strip():
+                                missing_attrs[nice_name].add(str(o).strip())
 
     log.info(f"build_variant_prompt: Extracted attributes = {missing_attrs}")
 
@@ -239,13 +246,10 @@ def build_variant_prompt(parent_raw: dict, product_name: str, resolved_attribute
             cleaned_vals = [val.replace("-", " ").title() for val in v]
             missing_attrs[k] = sorted(list(set(cleaned_vals)))
 
-    # Fallback if we STILL couldn't find any options
     if not missing_attrs:
         return f"I'd love to order **{product_name}** for you! Which variant would you like? Please specify your options."
 
-    # Build the dynamic list of options
     msg = f"I'd love to order **{product_name}** for you! To make sure I get the right one, please choose from the following options:\n\n"
-    
     for name, options in missing_attrs.items():
         if options:
             display_opts = options[:8]

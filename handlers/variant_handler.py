@@ -9,7 +9,7 @@ Each public function returns a Flask response or None to fall through.
 """
 
 import time
-
+import re
 from flask import jsonify
 
 from app_config import WOO_BASE_URL, CLASSIFIER_PROVIDER_TAG, get_currency_symbol
@@ -31,7 +31,6 @@ from handlers.chat_utils import (
     _TOKENIZE_RE,
 )
 from api_builder import match_variation_to_entities
-
 from datetime import datetime, timezone
 
 logger = get_logger("miraq_chat")
@@ -97,17 +96,20 @@ def handle_variant_selection(
 
     _var_product_id = user_context.get("pending_product_id") or getattr(entities, 'product_id', None)
     _var_product_name = user_context.get("pending_product_name") or getattr(entities, 'product_name', None) or "the product"
-
     _var_quantity = user_context.get("pending_quantity")
     logger.info(f"Step 3.55: Variant selection response | pending_product_id={_var_product_id} | pending_quantity={_var_quantity}")
 
     if not _var_product_id:
         return None
-
+    
     _session_data = sessions.get(session_id, {})
     _var_cache = _session_data.get("variation_cache", {}).get(str(_var_product_id))
+    
+    # Fetch parent_raw early so we know the EXACT variation axes required
+    parent_raw = {}
     if _var_cache:
         all_variations = _var_cache["variations"]
+        parent_raw = _var_cache.get("parent_raw", {})
         logger.info(f"Step 3.55: Using session-cached variations ({len(all_variations)}) — skipping API call")
         _variations_loaded = True
     else:
@@ -121,41 +123,51 @@ def handle_variant_selection(
         _variations_loaded = var_resp.get("success") and isinstance(var_resp.get("data"), list)
         if _variations_loaded:
             all_variations = var_resp["data"]
+        parent_call = WooAPICall(
+            method="GET",
+            endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}",
+            params={},
+            description=f"Fetch parent product '{_var_product_name}'",
+        )
+        parent_resp = woo_client.execute(parent_call)
+        parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
 
     if not _variations_loaded:
         return None
 
     prev_resolved = user_context.get("resolved_attributes", {})
-    if prev_resolved:
-        user_msg_lower = message.lower()
-        user_msg_clean = _STRIP_QUOTES_RE.sub('', user_msg_lower)
-        refined_resolved = dict(prev_resolved)
-        for attr_name, attr_val in prev_resolved.items():
-            candidate_options = set()
-            for var in all_variations:
-                opts = _get_safe_options(var.get("attributes", []))
-                for name, opt in opts.items():
-                    if name.lower() == attr_name.lower():
-                        candidate_options.add(opt)
-            current_val_lower = attr_val.lower()
-            for opt in candidate_options:
-                opt_lower = opt.lower()
-                opt_clean = _STRIP_QUOTES_RE.sub('', opt_lower)
-                if (current_val_lower in opt_lower and opt_lower != current_val_lower and opt_clean in user_msg_clean):
-                    refined_resolved[attr_name] = opt
-                    break
-        prev_resolved = refined_resolved
+    # Extract ALL variation-capable attributes from the parent product
+    candidate_options = {}
+    for attr in parent_raw.get("attributes", []):
+        if attr.get("variation"):
+            name = attr.get("name", "")
+            nice_name = name.replace("pa_", "").replace("-", " ").title() if name.startswith("pa_") else name.title()
+            candidate_options[nice_name] = set(str(o) for o in attr.get("options", []) if str(o).strip())
 
-        pre_filtered = []
-        for var in all_variations:
-            var_attrs = {k.lower(): v.lower() for k, v in _get_safe_options(var.get("attributes", [])).items()}
-            if all(prev_resolved[attr_name].lower() in var_attrs.get(attr_name.lower(), "") for attr_name in prev_resolved):
-                pre_filtered.append(var)
-        if pre_filtered:
-            all_variations = pre_filtered
+    user_msg_lower = message.lower()
+    user_msg_clean = _STRIP_QUOTES_RE.sub('', user_msg_lower)
+    
+    # Create a heavily stripped version of the message to safely catch attributes mixed with commas/punctuation
+    msg_for_extraction = f" {re.sub(r'[^\w\s]', ' ', user_msg_clean)} "
+    msg_for_extraction = re.sub(r'\s+', ' ', msg_for_extraction) # Collapse multiple spaces
+    
+    # Catch newly spoken attributes from the user's message
+    for nice_name, opts in candidate_options.items():
+        for opt in opts:
+            opt_clean = _STRIP_QUOTES_RE.sub('', opt.lower()).strip()
+            
+            # Strip punctuation from the option as well so they match perfectly
+            opt_for_exact = re.sub(r'[^\w\s]', ' ', opt_clean)
+            opt_for_exact = re.sub(r'\s+', ' ', opt_for_exact).strip()
+            
+            # Check padded string
+            if opt_for_exact and f" {opt_for_exact} " in msg_for_extraction:
+                prev_resolved[nice_name] = opt
+            elif opt_clean == user_msg_clean.strip():
+                prev_resolved[nice_name] = opt
+
 
     if _resolve_variant:
-        import re
         user_text_lower = message.lower()
         user_text_clean = _STRIP_QUOTES_RE.sub('', user_text_lower)
         user_tokens = set(_TOKENIZE_RE.findall(user_text_clean))
@@ -165,12 +177,10 @@ def handle_variant_selection(
         
         scores = []
         for var in all_variations:
-            if not var.get("attributes"):
-                continue
-                
+            if not var.get("attributes"): continue  
             base_score = score_variation_against_text(var, user_text_clean, user_tokens)
             
-            # 🚀 FIX: Manually strip quotes and punctuation from DB options to catch dimensions
+            # Manually strip quotes and punctuation from DB options to catch dimensions
             opts = _get_safe_options(var.get("attributes", []))
             for opt_val in opts.values():
                 clean_opt = _STRIP_QUOTES_RE.sub('', opt_val.lower()).strip()
@@ -205,7 +215,16 @@ def handle_variant_selection(
             if text_matched and len(text_matched) < len(candidates):
                 matched = text_matched
 
-    if len(matched) == 1:
+    # Check if all REQUIRED wildcard/variation axes have been resolved!
+    missing_required = []
+    resolved_keys_lower = {k.lower() for k in prev_resolved.keys()}
+    for nice_name in candidate_options.keys():
+        if nice_name.lower() not in resolved_keys_lower:
+            missing_required.append(nice_name)
+
+    is_fully_resolved = len(missing_required) == 0
+
+    if len(matched) >= 1 and is_fully_resolved:
         _resolved_variation = matched[0]
         _resolved_variation_id = _resolved_variation["id"]
         logger.info(f"Step 3.55: Resolved to variation_id={_resolved_variation_id}")
@@ -231,14 +250,16 @@ def handle_variant_selection(
                 "pagination": default_pagination(page),
             }), 200
 
-        _variant_label = " / ".join(_get_safe_options(_resolved_variation.get("attributes", [])).values())
-        
+        _variant_label = " / ".join(prev_resolved.values())
+
         _variant_price = (
             _resolved_variation.get("sale_price")
             or _resolved_variation.get("price")
             or _resolved_variation.get("regular_price")
             or ""
         )
+
+        user_context["resolved_attributes"] = prev_resolved
 
         if not _var_quantity:
             _price_line = f"\n**Unit Price:** {get_currency_symbol()}{_variant_price}" if _variant_price else ""
@@ -261,6 +282,7 @@ def handle_variant_selection(
                     "pending_product_id": _var_product_id,
                     "pending_product_name": _var_product_name,
                     "pending_variation_id": _resolved_variation_id,
+                    "resolved_attributes": prev_resolved,
                     "response_time_ms": round(elapsed * 1000),
                 },
                 "flow_state": FlowState.AWAITING_QUANTITY.value,
@@ -275,6 +297,7 @@ def handle_variant_selection(
             "pending_product_name": _var_product_name,
             "pending_quantity": _var_quantity,
             "pending_variation_id": _resolved_variation_id,
+            "resolved_attributes": prev_resolved,
             "response_time_ms": round((time.time() - start_time) * 1000),
         }
 
@@ -314,48 +337,42 @@ def handle_variant_selection(
                 "pagination": default_pagination(page),
             }), 200
             
-    # Initialize with PREVIOUSLY resolved attributes.
+    # ── Fallback: Need to ask for missing info ──
     resolved_attributes = dict(prev_resolved) if prev_resolved else {}
     
-    if len(matched) > 1:
-        attr_values = {}
-        for v in matched:
-            for name, opt in _get_safe_options(v.get("attributes", [])).items():
-                if name and opt:
-                    attr_values.setdefault(name, set()).add(opt)
-        
-        for attr_name, options in attr_values.items():
-            if len(options) == 1:
-                resolved_attributes[attr_name] = list(options)[0]
-
-    if prev_resolved:
-        for k, v in prev_resolved.items():
-            if k not in resolved_attributes:
-                resolved_attributes[k] = v
-
-    _session_parent = sessions.get(session_id, {}).get("variation_cache", {}).get(str(_var_product_id), {}).get("parent_raw")
-    if _session_parent:
-        parent_raw = _session_parent
-    else:
-        parent_call = WooAPICall(
-            method="GET",
-            endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}",
-            params={},
-            description=f"Fetch parent product '{_var_product_name}'",
-        )
-        parent_resp = woo_client.execute(parent_call)
-        parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
-
-    if len(matched) > 1:
+    if not is_fully_resolved:
+        # 🚀 UPDATE: Pass all_variations so wildcard axes are merged perfectly
+        prompt_msg = build_variant_prompt(parent_raw, _var_product_name, resolved_attributes, all_variations)
+        # If we have a generic variation matched, we shouldn't say "Sorry I couldn't find that exact variant"
+        prompt_msg = prompt_msg.replace("Sorry, I couldn't find that exact variant. ", "")
+    elif len(matched) > 1:
+        # Traditional Ambiguity Handling
         attr_values_all = {}
         for v in matched:
+            if v.get("stock_status") == "outofstock" or v.get("in_stock") is False:
+                continue
             for name, opt in _get_safe_options(v.get("attributes", [])).items():
                 if name and opt:
                     attr_values_all.setdefault(name, set()).add(opt)
         
         _already_resolved = {k.lower() for k in resolved_attributes}
+        
+        # 🚀 NEW: Supplement with parent-level wildcard options for ambiguity resolution
+        for attr in parent_raw.get("attributes", []):
+            if isinstance(attr, dict) and attr.get("variation") is True:
+                name = attr.get("name", "")
+                nice_name = name.replace("pa_", "").replace("-", " ").title() if name.startswith("pa_") else name.title()
+                if nice_name and nice_name.lower() not in _already_resolved:
+                    opts = attr.get("options", [])
+                    if opts:
+                        if nice_name not in attr_values_all:
+                            attr_values_all[nice_name] = set()
+                        for o in opts:
+                            if str(o).strip():
+                                attr_values_all[nice_name].add(str(o).strip())
+
         ambiguous = {
-            k: sorted(v)
+            k: sorted(list(v))
             for k, v in attr_values_all.items()
             if len(v) > 1 and k.lower() not in _already_resolved
         }
@@ -377,7 +394,8 @@ def handle_variant_selection(
                 + "\n\nWhich one would you like?"
             )
     else:
-        prompt_msg = build_variant_prompt(parent_raw, _var_product_name, resolved_attributes)
+        # 🚀 UPDATE: Pass all_variations
+        prompt_msg = build_variant_prompt(parent_raw, _var_product_name, resolved_attributes, all_variations)
         if len(all_variations) > 0:
             prompt_msg = "Sorry, I couldn't find that exact variant. " + prompt_msg
             
@@ -709,6 +727,32 @@ def handle_quantity_and_variant_check(
             "flow_state": FlowState.IDLE.value,
             "pagination": default_pagination(page),
         }), 200
+        
+    # Pre-fetch full attributes for the prompt if the custom API stripped them!
+    _raw_for_prompt = {}
+    _variations_for_cache = []
+    if product.get("type") == "variable" or product.get("variations"):
+        _raw_for_prompt = next((p for p in all_products_raw if not p.get("parent_id")), {})
+        
+        has_full_options = False
+        for pa in _raw_for_prompt.get("attributes", []):
+            if isinstance(pa, dict) and pa.get("options"):
+                has_full_options = True
+                break
+                
+        if not has_full_options:
+            logger.info(f"Step 5.5: Parent attributes missing options. Fetching full product {product.get('id')} from Woo API.")
+            parent_call = WooAPICall(
+                method="GET",
+                endpoint=f"{WOO_BASE_URL}/products/{product.get('id')}",
+                params={},
+                description=f"Fetch full parent product attributes for '{product['name']}'"
+            )
+            parent_resp = woo_client.execute(parent_call)
+            if parent_resp.get("success"):
+                _raw_for_prompt["attributes"] = parent_resp.get("data", {}).get("attributes", [])
+                
+        _variations_for_cache = _raw_for_prompt.get("variations", [])
 
     # No quantity yet
     if not entities.quantity:
@@ -769,7 +813,8 @@ def handle_quantity_and_variant_check(
 
             # --- NORMAL: NEEDS VARIANT SELECTION ---
             from handlers.chat_utils import build_variant_prompt
-            prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}))
+            # Pass _variations_for_cache
+            prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache)
             if session_id and session_id in sessions:
                 _pid = str(product.get("id"))
                 sessions[session_id].setdefault("variation_cache", {})[_pid] = {
@@ -817,8 +862,6 @@ def handle_quantity_and_variant_check(
 
     # Quantity known but variable product not yet resolved
     if entities.quantity and not order_data and (product.get("type") == "variable" or product.get("variations")):
-        _raw_for_prompt = next((p for p in all_products_raw if not p.get("parent_id")), {})
-        _variations_for_cache = _raw_for_prompt.get("variations", [])
         
         # --- FAST TRACK: QUANTITY AND VARIANT BOTH RESOLVED! ---
         if len(_variations_for_cache) == 1:
@@ -896,7 +939,8 @@ def handle_quantity_and_variant_check(
 
         # --- NORMAL: NEEDS VARIANT SELECTION ---
         from handlers.chat_utils import build_variant_prompt
-        prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}))
+        # Pass _variations_for_cache
+        prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache)
         if session_id and session_id in sessions:
             _pid = str(product.get("id"))
             sessions[session_id].setdefault("variation_cache", {})[_pid] = {

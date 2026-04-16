@@ -1141,9 +1141,22 @@ def chat():
                     "flow_state": FlowState.AWAITING_FILTER_CLARIFICATION.value,
                     "pagination": default_pagination(page),
                 }))
-                
         # ── Guardrail: catch empty order intents before wasting an API call ──
-        if intent in ORDER_CREATE_INTENTS and not getattr(entities, 'product_id', None) and not getattr(entities, 'product_name', None):
+        _is_empty_order = False
+        if intent in ORDER_CREATE_INTENTS and not getattr(entities, 'product_id', None):
+            _p_name = (getattr(entities, 'product_name', None) or "").lower().strip()
+            _s_term = (getattr(entities, 'search_term', None) or "").lower().strip()
+            
+            # Catch generic filler words that the NLP might accidentally extract
+            _generic_words = {"", "product", "a product", "the product", "item", "an item", "something", "anything", "order", "some"}
+            
+            if _p_name in _generic_words and _s_term in _generic_words and not getattr(entities, 'attributes', {}) and not getattr(entities, 'target_category_slugs', set()):
+                _is_empty_order = True
+                logger.info(f"🛑 Caught generic words, stopping API call | p_name='{_p_name}' | s_term='{_s_term}'")
+            else:
+                logger.debug(f"✅ Valid order intent | p_name='{_p_name}' | s_term='{_s_term}'")
+
+        if _is_empty_order:
             elapsed = time.time() - start_time
             return _finalize_turn(conversation, jsonify({
                 "success": True,

@@ -62,7 +62,19 @@ class OrderActionEvaluator(IntentEvaluator):
                 entities.order_count = 1
             return Intent.HISTORICAL_SEARCH, 0.96
         
-        if re.search(r"\b(order|buy|purchase)\b|\bwant\s+to\s+(order|buy|purchase|get)\b|\bi'?d\s+like\s+to\s+(order|buy|purchase|get)\b", text) and entities.order_item_name and not re.search(r"\b(track|tracking|status|where|last|history|previous|past|look|show|search|browse|find|see|display)\b", text):
+        # Catch explicit order phrases even if the product name is missing!
+        _is_tracking_or_info = re.search(r"\b(track|tracking|status|where|last|history|previous|past|look|show|search|browse|find|see|display)\b", text)
+        
+        # 1. Explicitly states they want to order (e.g. "I want to order a product")
+        if re.search(r"\bwant\s+to\s+(order|buy|purchase)\b|\bi'?d\s+like\s+to\s+(order|buy|purchase)\b|\bplace\s+(an?\s+)?order\b", text) and not _is_tracking_or_info:
+            return Intent.QUICK_ORDER, 0.93
+            
+        # 2. Uses order keywords alongside an extracted product name (e.g. "order plumeria")
+        if re.search(r"\b(order|buy|purchase)\b", text) and (entities.order_item_name or entities.product_name) and not _is_tracking_or_info:
+            return Intent.QUICK_ORDER, 0.93
+            
+        # 3. Solitary generic order commands (e.g. just "order" or "buy an item")
+        if re.search(r"^(order|buy|purchase)\s*(a\s+product|an\s+item|something|)?$", text.strip()) and not _is_tracking_or_info:
             return Intent.QUICK_ORDER, 0.93
 
         if entities.order_id:
