@@ -1318,13 +1318,21 @@ def chat():
 
         # Final Formatting
         products = []
-        if intent == Intent.CATEGORY_LIST:
+        categories = []
+        suggestions_list=[]
+        
+        if intent in (Intent.CATEGORY_LIST, Intent.PRODUCT_CATALOG):
             seen_names = set()
             for cat in all_products_raw:
                 name = cat.get("name", "")
                 if name and name not in seen_names:
                     seen_names.add(name)
-                    products.append(format_category(cat))
+                    categories.append({
+                        "id": cat.get("id"),
+                        "name": name.replace("&amp;", "&"),
+                        "slug": cat.get("slug", ""),
+                        "count": cat.get("count", 0)
+                    })
         else:
             for p in all_products_raw:
                 if p.get("parent_id"): continue
@@ -1335,15 +1343,21 @@ def chat():
         
         _pagination_data = build_pagination(page, api_responses, api_calls_to_execute)
         
-        bot_message = generate_bot_message(
-            intent, 
-            entities, 
-            products, 
-            confidence, 
-            order_data, 
-            total_items=_pagination_data.get("total_items"),
-            page=page 
-        )
+        # CUSTOM CATALOG MESSAGE & SUGGESTIONS
+        if intent in (Intent.CATEGORY_LIST, Intent.PRODUCT_CATALOG):
+            bot_message = "Here are our top categories to help you get started!"
+            suggestions_list = ["Cancel"]
+        else:
+            bot_message = generate_bot_message(
+                intent, 
+                entities, 
+                products, 
+                confidence, 
+                order_data, 
+                total_items=_pagination_data.get("total_items"),
+                page=page 
+            )
+            suggestions_list = generate_suggestions(intent, entities, products)
 
         elapsed = time.time() - start_time
         response = {
@@ -1351,11 +1365,13 @@ def chat():
             "bot_message": bot_message,
             "intent": intent.value,
             "products": products,
-            "suggestions": generate_suggestions(intent, entities, products),
+            "categories": categories,
+            "suggestions": suggestions_list,
             "session_id": str(conversation.id),
             "metadata": {
                 "confidence": round(confidence, 2),
                 "products_count": len(products),
+                "categories_count": len(categories),
                 "provider": CLASSIFIER_PROVIDER_TAG,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "response_time_ms": round(elapsed * 1000),
@@ -1364,7 +1380,7 @@ def chat():
             },
             "pagination": _pagination_data,
         }
-
+        
         if intent in (Intent.ORDER_HISTORY, Intent.LAST_ORDER) and order_data:
             response["orders"] = [format_order_for_frontend(o) for o in order_data]
             response["order_pagination"] = build_pagination(page, api_responses, api_calls_to_execute)
