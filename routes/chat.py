@@ -1160,7 +1160,7 @@ def chat():
             elapsed = time.time() - start_time
             return _finalize_turn(conversation, jsonify({
                 "success": True,
-                "bot_message": "Which product would you like to order? You can tell me the name or browse the catalog.",
+                "bot_message": "To place an order, please include the product name! For example, you can type: **'I want to order Plumeria'**.",
                 "intent": "clarification_needed",
                 "products": [],
                 "suggestions": ["Show me the catalog", "Cancel"],
@@ -1173,7 +1173,7 @@ def chat():
                 "pagination": default_pagination(page),
                 "flow_state": FlowState.IDLE.value,
             }))
-
+            
         api_calls = build_api_calls(result, page, user_message=message, session_id=str(conversation.id), customer_id=customer_id)
 
         if customer_id:
