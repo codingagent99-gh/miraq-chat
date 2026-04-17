@@ -2,7 +2,8 @@ import os
 import json
 from collections import defaultdict
 from chat_logger import get_logger
-from classifier import classify, _normalize_for_tag_compare
+from classifier import classify
+from classifier.utils import normalize_for_tag_compare
 from api_builder import build_api_calls
 
 logger = get_logger("miraq_admin")
@@ -35,7 +36,7 @@ def simulate_single_term(term: str) -> dict:
 
     def add_loc(raw_text, loc_string, base_type):
         if not raw_text: return
-        tokens = _normalize_for_tag_compare(raw_text.replace('-', ' '))
+        tokens = normalize_for_tag_compare(raw_text.replace('-', ' '))
         if tokens:
             all_locations.add(loc_string)
             for token in tokens:
