@@ -659,7 +659,7 @@ def handle_variation_product(
         all_variation_axes = {
             attr.get("name", "").replace("pa_", "").replace("-", " ").title()
             for attr in parent_product_raw.get("attributes", [])
-            if attr.get("variation")
+            if isinstance(attr, dict) and attr.get("variation")
         }
         missing_axes = all_variation_axes - set(var_attrs.keys())
 
