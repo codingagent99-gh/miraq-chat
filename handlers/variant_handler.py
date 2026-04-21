@@ -651,39 +651,65 @@ def handle_variation_product(
     suggestions = generate_suggestions(intent, entities, products)
 
     if resolved_variation and user_context is not None and conversation is not None:
-        variation_name = (
-            resolved_variation.get("variation_label")
-            or next(
-                (str(v) for v in resolved_variation.get("attributes", {}).values() if v),
-                "this variant"
+        # ── Wildcard detection ─────────────────────────────────────────────────
+        # WooCommerce requires ALL variation axes in the cart payload, even when a
+        # variation only defines a subset (leaving others as wildcards).
+        # Detect missing axes and ask the user before going to cart confirmation.
+        var_attrs = _get_safe_options(resolved_variation.get("attributes", []))
+        all_variation_axes = {
+            attr.get("name", "").replace("pa_", "").replace("-", " ").title()
+            for attr in parent_product_raw.get("attributes", [])
+            if attr.get("variation")
+        }
+        missing_axes = all_variation_axes - set(var_attrs.keys())
+
+        if missing_axes:
+            # ── Partial match: collect remaining axes first ────────────────────
+            logger.info(
+                f"Step 3.7: Variation {resolved_variation.get('id')} is wildcard — "
+                f"missing axes: {missing_axes} — → AWAITING_VARIANT_SELECTION"
             )
-        )
-        pending_name = f"{parent_formatted['name']} — {variation_name}"
+            user_context["pending_product_id"]   = parent_product_raw.get("id")
+            user_context["pending_variation_id"] = resolved_variation.get("id")
+            user_context["pending_product_name"] = parent_formatted["name"]
+            user_context["resolved_attributes"]  = var_attrs  # e.g. {"Colors": "VIRGINIA Angora"}
+            conversation.context_data = user_context
+            flag_modified(conversation, "context_data")
 
-        # Persist for the cart confirmation Yes handler in chat.py
-        user_context["pending_product_id"]   = parent_product_raw.get("id")
-        user_context["pending_variation_id"] = resolved_variation.get("id")
-        user_context["pending_product_name"] = pending_name
-        
-        user_context["resolved_attributes"] = _get_safe_options(
-            resolved_variation.get("attributes", [])
-        )
-        
-        conversation.context_data = user_context
-        flag_modified(conversation, "context_data")
+            bot_message = build_variant_prompt(
+                parent_product_raw, parent_formatted["name"], var_attrs, variations_raw
+            )
+            suggestions = ["Cancel"]
+            next_flow_state = FlowState.AWAITING_VARIANT_SELECTION.value
 
-        bot_message = (
-            f"Here's **{pending_name}**. ✅ In stock\n\n"
-            f"Would you like to add it to your cart?"
-        )
-        suggestions = ["Yes, add it", "No thanks", "Show all variants"]
-        next_flow_state = FlowState.AWAITING_CART_CONFIRMATION.value
-        logger.info(
-            f"Step 3.7: Single variation resolved — "
-            f"product_id={parent_product_raw.get('id')} "
-            f"variation_id={resolved_variation.get('id')} "
-            f"→ AWAITING_CART_CONFIRMATION"
-        )
+        else:
+            # ── Fully specified: go to cart confirmation ───────────────────────
+            variation_name = (
+                resolved_variation.get("variation_label")
+                or " / ".join(var_attrs.values())
+                or "this variant"
+            )
+            pending_name = f"{parent_formatted['name']} — {variation_name}"
+
+            user_context["pending_product_id"]   = parent_product_raw.get("id")
+            user_context["pending_variation_id"] = resolved_variation.get("id")
+            user_context["pending_product_name"] = pending_name
+            user_context["resolved_attributes"]  = var_attrs
+            conversation.context_data = user_context
+            flag_modified(conversation, "context_data")
+
+            bot_message = (
+                f"Here's **{pending_name}**. ✅ In stock\n\n"
+                f"Would you like to add it to your cart?"
+            )
+            suggestions = ["Yes, add it", "No thanks", "Show all variants"]
+            next_flow_state = FlowState.AWAITING_CART_CONFIRMATION.value
+            logger.info(
+                f"Step 3.7: Single variation fully resolved — "
+                f"product_id={parent_product_raw.get('id')} "
+                f"variation_id={resolved_variation.get('id')} "
+                f"→ AWAITING_CART_CONFIRMATION"
+            )
 
     # ── Pagination ──
     if variations_raw and not has_attributes and intent != Intent.PRODUCT_ATTRIBUTE_INFO:
