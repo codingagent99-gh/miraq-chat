@@ -32,6 +32,7 @@ DEFAULT_CONTEXT = {
     "carryover_on_sale": None,
     "carryover_min_price": None,
     "carryover_max_price": None,
+    "cart": [],   # List of {product_id, variation_id, qty, name, price}
 }
 
 

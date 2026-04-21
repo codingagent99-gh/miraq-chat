@@ -144,16 +144,19 @@ def phase2_nlp_merge(
                 entities.target_attributes.append(t_attr)
 
     # Merge action fields from original NLP (full text)
+    # 🚀 FIX: Salvage Product & Action fields that were being dropped during masking!
+    # We pull these from the ORIGINAL NLP result so they aren't destroyed.
     _action_fields = [
-        'quantity', 'order_id', 'reorder', 'explicit_last_order', 'order_item_name',
-        'quick_ship', 'customer_updates', 'billing_updates', 'shipping_updates',
+        'product_id', 'product_name', 'product_slug',  # <--- Add these three!
+        'quantity', 'order_id', 'reorder', 'explicit_last_order', 'order_item_name', 
+        'quick_ship', 'customer_updates', 'billing_updates', 'shipping_updates', 
         'customer_fields_requested'
     ]
     for _f in _action_fields:
         _val = getattr(original_nlp_result.entities, _f, None)
         if _val is not None and _val != [] and _val != {}:
             setattr(entities, _f, _val)
-
+    
     # Merge OR pairs from original result
     if getattr(original_nlp_result.entities, 'attr_tag_or_pairs', None):
         if not hasattr(entities, 'attr_tag_or_pairs'):

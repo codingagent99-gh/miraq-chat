@@ -6,8 +6,7 @@ import re
 from datetime import datetime, timezone
 
 from flask import jsonify
-from config.settings import DEFAULT_PER_PAGE
-from app_config import WOO_BASE_URL, get_currency_symbol
+from app_config import WOO_BASE_URL, DEFAULT_PER_PAGE, get_currency_symbol
 from models import WooAPICall
 from woo_client import woo_client
 from conversation_flow import FlowState

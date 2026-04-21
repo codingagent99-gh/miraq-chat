@@ -10,8 +10,7 @@ import json
 from typing import List, Optional
 
 from models import WooAPICall
-from config.settings import DEFAULT_PER_PAGE
-from app_config import CUSTOM_API_BASE_URL
+from app_config import CUSTOM_API_BASE_URL, DEFAULT_PER_PAGE
 from chat_logger import get_logger
 
 from api_builder.query_tree import (

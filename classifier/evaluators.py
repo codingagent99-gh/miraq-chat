@@ -281,6 +281,36 @@ class GeneralFallbackEvaluator(IntentEvaluator):
         return Intent.UNKNOWN, 0.0
 
 
+class CartCheckoutEvaluator(IntentEvaluator):
+    def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
+
+        # VIEW_CART
+        if re.search(r'\b(view|show|see|check|open|go\s+to)\b.*\bcart\b'
+                     r'|\bcart\b.*\b(view|show|see)\b'
+                     r'|^(my\s+)?cart\s*[?.]?$', text):
+            return Intent.VIEW_CART, 0.95
+
+        # CHECKOUT
+        if re.search(r'\b(checkout|check\s*out|complete\s*(the\s+)?order'
+                     r'|place\s*(the\s+)?order|proceed\s*to\s*checkout)\b', text):
+            return Intent.CHECKOUT, 0.95
+
+        # REMOVE_FROM_CART
+        if re.search(r'\b(remove|delete|take\s+out|drop)\b.{0,20}\b(from\s+)?(my\s+)?cart\b', text):
+            return Intent.REMOVE_FROM_CART, 0.93
+
+        # UPDATE_CART_QTY
+        if re.search(r'\b(change|update|set)\b.{0,20}\b(quantity|qty)\b', text):
+            return Intent.UPDATE_CART_QTY, 0.91
+
+        # ADD_TO_CART — explicit phrase only (ambiguous "yes" handled via flow state)
+        if re.search(r'\badd\b.{0,20}\b(to\s+(my\s+)?cart)\b', text):
+            return Intent.ADD_TO_CART, 0.95
+        if re.search(r'\b(put|throw|toss)\b.{0,15}\bin\s+(to\s+)?(my\s+)?cart\b', text):
+            return Intent.ADD_TO_CART, 0.92
+
+        return None, 0.0
+
 # ═══════════════════════════════════════════
 # PIPELINE RUNNER
 # ═══════════════════════════════════════════
@@ -308,6 +338,7 @@ class ClassifierPipeline:
 # ─── Default pipeline factory ───
 
 DEFAULT_EVALUATORS = [
+    CartCheckoutEvaluator(),
     OrderActionEvaluator(),
     DiscountEvaluator(),
     ProductDetailEvaluator(),

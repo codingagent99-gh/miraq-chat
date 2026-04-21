@@ -10,8 +10,7 @@ import re
 from typing import List, Optional
 
 from models import Intent, ClassifiedResult, WooAPICall, ExtractedEntities
-from config.settings import DEFAULT_PER_PAGE, DEFAULT_ORDER_PER_PAGE
-from app_config import WOO_BASE_URL
+from app_config import WOO_BASE_URL, DEFAULT_PER_PAGE, DEFAULT_ORDER_PER_PAGE
 from config.store_config import TAG_SLUG_QUICK_SHIP
 from chat_logger import get_logger
 
@@ -32,10 +31,6 @@ BASE = WOO_BASE_URL
 # ══════════════════════════════════════════════════════════════
 
 def match_variation_to_entities(variations: list, entities) -> Optional[dict]:
-    """
-    Given a list of WooCommerce variation dicts and extracted entities, return
-    the variation that best matches the user's requested attributes.
-    """
     if not variations or not entities.attributes:
         return None
 
@@ -52,14 +47,17 @@ def match_variation_to_entities(variations: list, entities) -> Optional[dict]:
 
             for v_k, v_v in var_attrs.items():
                 if ent_k in v_k or v_k in ent_k:
-                    if ent_v == v_v or ent_v in v_v or v_v in ent_v:
+                    if ent_v == v_v:
+                        score += 10   # exact match — heavily weighted
+                    elif ent_v in v_v or v_v in ent_v:
                         score += 1
-                        break
+                    break
 
         if score > best_score:
             best_score = score
             best_variation = variation
 
+    # Only return a match if at least one attribute matched meaningfully
     return best_variation if best_score > 0 else None
 
 
@@ -127,6 +125,7 @@ def build_api_calls(
         Intent.ORDER_STATUS:          _build_order_tracking,  # same logic
         Intent.PLACE_ORDER:           _build_place_order,
         Intent.UPDATE_CUSTOMER:       _build_update_customer,
+        Intent.CHECKOUT:              _build_checkout,
     }
 
     builder = _BUILDERS.get(intent)
@@ -556,6 +555,53 @@ def _build_update_customer(e, page, customer_id: Optional[int] = None) -> list:
         method="PUT", endpoint=f"{BASE}/customers/{customer_id}",
         params={}, body=payload,
         description=f"Update customer id={customer_id} | fields={list(payload.keys())}",
+    )]
+    
+def _build_checkout(e, page) -> list:
+    """
+    Build a WooCommerce order creation call from the in-memory cart.
+    cart_items is stamped into entities by chat.py before this is called.
+    """
+    if not e.cart_items:
+        logger.warning("api_builder: CHECKOUT called but entities.cart_items is empty")
+        return []
+
+    line_items = [
+        {
+            "product_id": item["product_id"],
+            **({"variation_id": item["variation_id"]} if item.get("variation_id") else {}),
+            "quantity": item["qty"],
+        }
+        for item in e.cart_items
+    ]
+
+    shipping = (
+        e.shipping_updates
+        or {k: v for k, v in e.billing_updates.items()}
+        or {}
+    )
+
+    payload = {
+        "payment_method": "cod",           # default; frontend can override
+        "payment_method_title": "Cash on Delivery",
+        "set_paid": False,
+        "customer_id": "CURRENT_USER_ID",  # resolved by _resolve_user_placeholders
+        "line_items": line_items,
+    }
+
+    if shipping:
+        payload["shipping"] = shipping
+        payload["billing"] = shipping      # mirror shipping to billing if not split
+
+    logger.debug(f"api_builder: _build_checkout | {len(line_items)} line items")
+
+    return [WooAPICall(
+        method="POST",
+        endpoint=f"{BASE}/orders",
+        params={},
+        body=payload,
+        description=f"Create order for {len(line_items)} cart item(s)",
+        requires_resolution=["customer_id"],
     )]
 
 

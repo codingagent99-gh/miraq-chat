@@ -10,10 +10,11 @@ from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify
 from models import db, Conversation, Message, Intent
 from sqlalchemy.orm.attributes import flag_modified
-
+import re
 from models import ExtractedEntities, ClassifiedResult, WooAPICall
 from app_config import (
     ORDER_INTENTS,
+    CART_INTENTS,
     ORDER_CREATE_INTENTS,
     CLASSIFIER_PROVIDER_TAG,
     get_currency_symbol,
@@ -38,7 +39,7 @@ from handlers.filter_clarification_handler import resolve_filter_clarification
 from handlers.semantic_clarification_handler import build_semantic_clarification
 from parsers.catalog_parser import parse_csv_message
 from utils.language_utils import detect_and_translate
-
+from handlers.cart_handler import handle_cart_intent
 logger = get_logger("miraq_chat")
 chat_bp = Blueprint("chat", __name__)
 
@@ -314,6 +315,53 @@ def _build_final_response(
         )
         suggestions_list = generate_suggestions(intent, entities, products)
 
+    # ── Determine flow state ──────────────────────────────────────────────────
+    #
+    # Priority order:
+    #   1. Checkout/order success      → AWAITING_ANYTHING_ELSE
+    #   2. Single product found during browsing → AWAITING_CART_CONFIRMATION
+    #   3. Everything else             → IDLE
+    #
+    # AWAITING_CART_CONFIRMATION only fires when:
+    #   - Intent is a browsing/search intent (not an order intent)
+    #   - Exactly one product came back (ambiguous multi-results shouldn't
+    #     auto-prompt "add to cart?")
+    #   - A product_id is resolvable (so the Yes handler has something to add)
+    #
+    _BROWSING_INTENTS = {
+        Intent.PRODUCT_SEARCH,
+        Intent.PRODUCT_DETAIL,
+        Intent.PRODUCT_LIST,
+        Intent.PRODUCT_BY_TAG,
+        Intent.PRODUCT_BY_COLLECTION,
+        Intent.FILTER_BY_ATTRIBUTE,
+        Intent.CATEGORY_BROWSE,
+    }
+
+    _single_product_found = (
+        len(products) == 1
+        and (
+            entities.product_id
+            or conversation.context_data.get("pending_product_id")
+        )
+    )
+
+    if intent in ORDER_CREATE_INTENTS and order_data:
+        next_flow_state = FlowState.AWAITING_ANYTHING_ELSE.value
+
+    elif intent in _BROWSING_INTENTS and _single_product_found:
+        next_flow_state = FlowState.AWAITING_CART_CONFIRMATION.value
+        # Inject confirmation prompt into bot message and suggestions
+        product_name = products[0].get("name", "this product")
+        bot_message = (
+            f"{bot_message}\n\nWould you like to add **{product_name}** to your cart?"
+        )
+        suggestions_list = ["Yes, add it", "No thanks", "Continue shopping"]
+
+    else:
+        next_flow_state = FlowState.IDLE.value
+
+    # ── Build response ────────────────────────────────────────────────────────
     elapsed = time.time() - start_time
     response = {
         "success": True,
@@ -334,20 +382,16 @@ def _build_final_response(
             "entities": _entities_to_dict(entities),
         },
         "pagination": pagination,
+        "flow_state": next_flow_state,
     }
 
     if intent in (Intent.ORDER_HISTORY, Intent.LAST_ORDER) and order_data:
         response["orders"] = [format_order_for_frontend(o) for o in order_data]
-        response["order_pagination"] = build_pagination(page, api_responses, api_calls_to_execute)
-
-    response["flow_state"] = (
-        FlowState.AWAITING_ANYTHING_ELSE.value
-        if intent in ORDER_CREATE_INTENTS and order_data
-        else FlowState.IDLE.value
-    )
+        response["order_pagination"] = build_pagination(
+            page, api_responses, api_calls_to_execute
+        )
 
     return _finalize_turn(conversation, jsonify(response))
-
 
 # ══════════════════════════════════════════════════════════════
 # ─── HELPER: Handle customer intent responses ───
@@ -535,7 +579,7 @@ def chat():
             )
             if flow_result and flow_result.get("override_message"):
                 message = flow_result["override_message"]
-
+                
         if flow_result:
             _persistent_keys = [
                 "pending_product_id", "pending_product_name", "pending_quantity",
@@ -550,14 +594,71 @@ def chat():
             logger.info(f"[MEMORY TRACE 3] STATE MACHINE returned: {flow_result}")
             logger.info(f"[MEMORY TRACE 4] UPDATED user_context: {user_context}")
 
-        if flow_result and not flow_result.get("pass_through") and not flow_result.get("override_message"):
-            resp = handle_flow(flow_result, user_context, str(conversation.id), customer_id, page, start_time, mock_sessions)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # ── Cart confirmation intercept — MUST be before handle_flow ──
+        # handle_flow crashes on any flow_result without "bot_message".
+        # Action-based results are owned here and must never reach it.
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if flow_result and flow_result.get("action") == "confirm_add_to_cart":
+            pid   = user_context.get("pending_product_id")
+            vid   = user_context.get("pending_variation_id")
+            qty   = user_context.get("pending_quantity") or 1
+            name  = user_context.get("pending_product_name", "item")
+            # ADD THIS ↓
+            resolved = user_context.get("resolved_attributes") or {}
+            variation_attributes = [
+                {"attribute": f"pa_{k.lower().replace(' ', '-')}", "value": v}
+                for k, v in resolved.items()
+            ]
+
+            if pid:
+                elapsed = round((time.time() - start_time) * 1000)
+                return _finalize_turn(conversation, jsonify({
+                    "success":     True,
+                    "bot_message": f"✅ Adding **{name}** to your cart...",
+                    "action":      "trigger_frontend_cart_add",
+                    "metadata":    {
+                        "product_id":           pid,
+                        "variation_id":         vid,
+                        "quantity":             qty,
+                        "variation_attributes": variation_attributes,  # ADD THIS ↓
+                        "response_time_ms":     elapsed,
+                    },
+                    "intent":      Intent.ADD_TO_CART.value,
+                    "suggestions": ["Continue shopping", "Go to cart", "Checkout"],
+                    "session_id":  str(conversation.id),
+                    "pagination":  default_pagination(page),
+                    "flow_state":  FlowState.IDLE.value,
+                }))
+                
+        if flow_result and flow_result.get("action") == "decline_add_to_cart":
+            elapsed = round((time.time() - start_time) * 1000)
+            return _finalize_turn(conversation, jsonify({
+                "success":     True,
+                "bot_message": "No problem! What else are you looking for?",
+                "intent":      "browse",
+                "products":    [],
+                "suggestions": ["Show me products", "View categories", "View cart"],
+                "session_id":  str(conversation.id),
+                "metadata":    {"response_time_ms": elapsed},
+                "pagination":  default_pagination(page),
+                "flow_state":  FlowState.IDLE.value,
+            }))
+
+        # ── Flow router ──────────────────────────────────────────────────
+        # pass_through=True  → state machine defers to classifier (fall through)
+        # action key present → already handled above (confirm/decline blocks)
+        # action=None        → ambiguous intent, also defer to classifier
+        # otherwise          → flow owns this turn, let handle_flow respond
+        if flow_result and not flow_result.get("pass_through") \
+                and "action" not in flow_result:
+            resp = handle_flow(
+                flow_result, user_context, str(conversation.id),
+                customer_id, page, start_time, mock_sessions,
+            )
             if resp:
                 return _finalize_turn(conversation, resp)
-        elif flow_result:
-            resp = handle_flow(flow_result, user_context, str(conversation.id), customer_id, page, start_time, mock_sessions)
-            if resp:
-                return _finalize_turn(conversation, resp)
+        # else: fall through to classifier
 
         # ── Step 3: Classify ──
         _resolve_variant = bool(flow_result and flow_result.get("resolve_variant"))
@@ -620,6 +721,17 @@ def chat():
         empty_resp = _check_empty_order(intent, entities, conversation, page, start_time)
         if empty_resp:
             return empty_resp
+        
+        # ── Step 6.5: Cart intent fork ──
+        if intent in CART_INTENTS or intent == Intent.CHECKOUT:
+            # handle_cart_intent will now call woo_cart.py
+            cart_resp = handle_cart_intent(
+                intent, entities, user_context, conversation, page, start_time
+            )
+            if cart_resp is not None:
+                conversation.context_data = user_context
+                flag_modified(conversation, "context_data")
+                return _finalize_turn(conversation, cart_resp)
 
         # ── Step 7: Execute API calls ──
         api_calls = build_api_calls(result, page, user_message=message, session_id=str(conversation.id), customer_id=customer_id)
@@ -679,7 +791,20 @@ def chat():
                 flag_modified(conversation, "context_data")
             return _finalize_turn(conversation, resp)
 
-        resp = handle_variation_product(intent, entities, api_responses, api_calls_to_execute, confidence, order_data, str(conversation.id), page, start_time, mock_sessions)
+        resp = handle_variation_product(
+            intent, 
+            entities, 
+            api_responses, 
+            api_calls_to_execute, 
+            confidence, 
+            order_data, 
+            str(conversation.id), 
+            page, 
+            start_time, 
+            mock_sessions,
+            user_context=user_context,
+            conversation=conversation,
+            )
         if resp:
             return _finalize_turn(conversation, resp)
 

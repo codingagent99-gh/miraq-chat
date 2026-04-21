@@ -78,6 +78,13 @@ class Intent(Enum):
     GREETING               = "greeting"
 
     UNKNOWN                = "unknown"
+    
+    # Cart
+    ADD_TO_CART       = "add_to_cart"
+    VIEW_CART         = "view_cart"
+    REMOVE_FROM_CART  = "remove_from_cart"
+    UPDATE_CART_QTY   = "update_cart_qty"
+    CHECKOUT          = "checkout"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -211,11 +218,26 @@ class ExtractedEntities:
     # ──── Search hints (unresolvable descriptors like "premium", "rustic") ────
     search_hints: List[str] = field(default_factory=list)
 
+    # ──── Cart ────
+    cart_items: List[dict] = field(default_factory=list)
+    # Populated by chat.py before build_api_calls is called for CHECKOUT.
+    # Each item: {product_id, variation_id, qty, name}
+
     # ──── Helper methods ────
 
     def get_or_pairs(self) -> list:
-        """Return attr_tag_or_pairs as a list, or empty list."""
-        return list(self.attr_tag_or_pairs) if self.attr_tag_or_pairs else []
+        result = []
+        for p in self.attr_tag_or_pairs:
+            if isinstance(p, OrPair):
+                result.append(p)
+            elif isinstance(p, dict):
+                result.append(OrPair(
+                    tag_slug=p.get("tag_slug"),
+                    cat_slugs=p.get("cat_slugs", []),
+                    attr_taxonomy=p.get("attr_taxonomy"),
+                    attr_term=p.get("attr_term"),
+                ))
+        return result
 
     def get_filter_kwargs(self) -> dict:
         """
