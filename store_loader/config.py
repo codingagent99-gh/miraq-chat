@@ -7,11 +7,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-WOO_BASE_URL = os.getenv("WOO_BASE_URL", "https://wgc.net.in/hn/wp-json/wc/v3")
-CUSTOM_API_BASE_URL = os.getenv("CUSTOM_API_BASE_URL", WOO_BASE_URL.replace("/wc/v3", "/custom-api/v1"))
-WOO_CONSUMER_KEY = os.getenv("WOO_CONSUMER_KEY", "")
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Single source of truth — same pattern as app_config.py
+_WP_BASE = os.getenv("WP_BASE_URL", "https://wgc.net.in/hn")
+
+WOO_BASE_URL        = os.getenv("WOO_BASE_URL",        f"{_WP_BASE}/wp-json/wc/v3")
+CUSTOM_API_BASE_URL = os.getenv("CUSTOM_API_BASE_URL", f"{_WP_BASE}/wp-json/custom-api/v1")
+
+WOO_CONSUMER_KEY    = os.getenv("WOO_CONSUMER_KEY", "")
 WOO_CONSUMER_SECRET = os.getenv("WOO_CONSUMER_SECRET", "")
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT     = 30
 
 DEV_CACHE_ENABLED = os.getenv("DEV_CACHE", "false").lower() == "true"
 DEV_CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".dev_cache")
