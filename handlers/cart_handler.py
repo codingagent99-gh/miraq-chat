@@ -58,7 +58,7 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
         return _resp(
             action      = "trigger_frontend_view_cart",
             bot_message = "Here's your cart! 🛒",
-            suggestions = ["Checkout", "Continue shopping", "Clear cart"],
+            suggestions = ["Checkout", "Browse products", "Clear cart"],
         )
 
     # ── ADD_TO_CART ───────────────────────────────────────────────────────────
@@ -80,7 +80,7 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
         return _resp(
             action      = "trigger_frontend_cart_add",
             bot_message = f"Adding **{name}** to your cart... 🛒",
-            suggestions = ["Continue shopping", "Go to cart", "Checkout"],
+            suggestions = ["Browse products", "Go to cart", "Checkout"],
             metadata    = {
                 "product_id":   product_id,
                 "variation_id": variation_id,  # None is fine — frontend guards it
@@ -107,7 +107,7 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
         return _resp(
             action      = "trigger_frontend_cart_remove",
             bot_message = "Removing that item from your cart...",
-            suggestions = ["View cart", "Continue shopping"],
+            suggestions = ["View cart", "Browse products"],
             metadata    = {"item_key": item_key},
         )
 
@@ -130,7 +130,7 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
         return _resp(
             action      = "trigger_frontend_cart_update",
             bot_message = f"Updating quantity to {qty}...",
-            suggestions = ["View cart", "Continue shopping", "Checkout"],
+            suggestions = ["View cart", "Browse products", "Checkout"],
             metadata    = {
                 "item_key": item_key,
                 "quantity": qty,
@@ -142,7 +142,7 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
         return _resp(
             action      = "trigger_frontend_view_cart",
             bot_message = "Taking you to checkout! 🧾",
-            suggestions = ["Continue shopping"],
+            suggestions = ["Browse products"],
         )
 
     # Unknown cart intent — should never reach here given CART_INTENTS guard in
