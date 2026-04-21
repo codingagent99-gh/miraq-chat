@@ -651,6 +651,31 @@ def handle_variation_product(
     suggestions = generate_suggestions(intent, entities, products)
 
     if resolved_variation and user_context is not None and conversation is not None:
+
+        # ── parent_product_raw from advanced search has stripped attributes.
+        # Check if variation flags are present; if not, fetch the full product
+        # so all_variation_axes is correctly populated before the wildcard check.
+        has_variation_flags = any(
+            isinstance(attr, dict) and "variation" in attr
+            for attr in parent_product_raw.get("attributes", [])
+        )
+        if not has_variation_flags:
+            logger.info(
+                f"Step 3.7: parent attributes missing variation flags — "
+                f"fetching full product {parent_product_raw.get('id')} for wildcard validation."
+            )
+            _full_parent_call = WooAPICall(
+                method="GET",
+                endpoint=f"{WOO_BASE_URL}/products/{parent_product_raw.get('id')}",
+                params={},
+                description="Fetch full parent product attributes for wildcard check",
+            )
+            _full_parent_resp = woo_client.execute(_full_parent_call)
+            if _full_parent_resp.get("success"):
+                parent_product_raw["attributes"] = (
+                    _full_parent_resp.get("data", {}).get("attributes", [])
+                )
+
         # ── Wildcard detection ─────────────────────────────────────────────────
         # WooCommerce requires ALL variation axes in the cart payload, even when a
         # variation only defines a subset (leaving others as wildcards).
