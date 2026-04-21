@@ -665,13 +665,9 @@ def handle_variation_product(
         user_context["pending_variation_id"] = resolved_variation.get("id")
         user_context["pending_product_name"] = pending_name
         
-        # Extract variation attributes so the cart confirmation handler can build
-        # the correct Store API payload (WC requires variation array for variable products)
-        user_context["resolved_attributes"] = {
-            attr.get("name", "").replace("pa_", "").replace("-", " ").title(): attr.get("option", "")
-            for attr in resolved_variation.get("attributes", [])
-            if attr.get("option")
-        }
+        user_context["resolved_attributes"] = _get_safe_options(
+            resolved_variation.get("attributes", [])
+        )
         
         conversation.context_data = user_context
         flag_modified(conversation, "context_data")
