@@ -31,7 +31,6 @@ from chat_logger import get_logger, sanitize_log_string
 from handlers.chat_utils import (
     default_pagination,
     build_variant_prompt,
-    fetch_shipping_address,
 )
 
 logger = get_logger("miraq_chat")
@@ -611,50 +610,38 @@ def handle_quick_order(
                         "pagination": default_pagination(page),
                     }), 200
 
-    # Simple product or resolved variation — proceed to shipping
-    logger.info(f"Step 3.6: Product resolved, proceeding to shipping | product_id={_order_product_id} | variation_id={_order_variation_id} | quantity={entities.quantity}")
+    # Simple product or resolved variation — go to cart confirmation
+    logger.info(f"Step 3.6: Product resolved, proceeding to cart confirmation | product_id={_order_product_id} | variation_id={_order_variation_id} | quantity={entities.quantity}")
 
-    shipping_address = fetch_shipping_address(customer_id, "Step 3.6")
-    has_address = bool(shipping_address and (shipping_address.get("address_1") or shipping_address.get("city")))
+    quantity = entities.quantity or 1
+    variant_label = ""
+    if _order_variation_id and _order_product_raw:
+        attrs = (_order_product_raw or {}).get("attributes", [])
+        if isinstance(attrs, list):
+            variant_label = " / ".join(
+                a.get("option", "") for a in attrs if isinstance(a, dict) and a.get("option")
+            )
 
-    base_meta = {
-        "pending_product_id": _order_product_id,
-        "pending_product_name": _order_product_name,
-        "pending_quantity": entities.quantity,
-        "pending_variation_id": _order_variation_id,
-        "response_time_ms": round((time.time() - start_time) * 1000),
-    }
+    variant_suffix = f" ({variant_label})" if variant_label else ""
+    cart_msg = f"Got it — add **{_order_product_name}**{variant_suffix} ×{quantity} to your cart?"
 
-    if has_address:
-        addr_parts = [p for p in [
-            shipping_address.get("address_1", ""), shipping_address.get("address_2", ""),
-            shipping_address.get("city", ""), shipping_address.get("state", ""),
-            shipping_address.get("postcode", ""), shipping_address.get("country", ""),
-        ] if p]
-        addr_display = ", ".join(addr_parts)
-        return jsonify({
-            "success": True,
-            "bot_message": (
-                f"Your shipping address on file:\n\n📦 **{addr_display}**\n\n"
-                "Would you like to ship to this address, or use a different one?"
-            ),
-            "intent": "guided_flow",
-            "products": [],
-            "suggestions": ["Yes, use this address", "Change address", "Cancel"],
-            "session_id": session_id,
-            "metadata": {**base_meta, "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value},
-            "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value,
-            "pagination": default_pagination(page),
-        }), 200
-    else:
-        return jsonify({
-            "success": True,
-            "bot_message": "No shipping address is on file. Please type your shipping address (street, city, state, zip code):",
-            "intent": "guided_flow",
-            "products": [],
-            "suggestions": [],
-            "session_id": session_id,
-            "metadata": {**base_meta, "flow_state": FlowState.AWAITING_NEW_ADDRESS.value},
-            "flow_state": FlowState.AWAITING_NEW_ADDRESS.value,
-            "pagination": default_pagination(page),
-        }), 200
+    elapsed = time.time() - start_time
+    return jsonify({
+        "success": True,
+        "bot_message": cart_msg,
+        "intent": "guided_flow",
+        "products": [],
+        "suggestions": ["Yes, add it", "No thanks", "Browse products"],
+        "session_id": session_id,
+        "metadata": {
+            "pending_product_id": _order_product_id,
+            "pending_product_name": _order_product_name,
+            "pending_quantity": quantity,
+            "pending_variation_id": _order_variation_id,
+            "resolved_attributes": getattr(entities, 'attributes', {}),
+            "flow_state": FlowState.AWAITING_CART_CONFIRMATION.value,
+            "response_time_ms": round(elapsed * 1000),
+        },
+        "flow_state": FlowState.AWAITING_CART_CONFIRMATION.value,
+        "pagination": default_pagination(page),
+    }), 200

@@ -24,7 +24,6 @@ from handlers.chat_utils import (
     default_pagination,
     build_pagination,
     build_variant_prompt,
-    fetch_shipping_address,
     score_variation_against_text,
     _STRIP_QUOTES_RE,
     _TOKENIZE_RE,
@@ -322,53 +321,29 @@ def handle_variant_selection(
                 "pagination": default_pagination(page),
             }), 200
         
-        shipping_address = fetch_shipping_address(customer_id, "Step 3.55")
-        has_address = bool(shipping_address and (shipping_address.get("address_1") or shipping_address.get("city")))
-
-        base_meta = {
-            "pending_product_id": _var_product_id,
-            "pending_product_name": _var_product_name,
-            "pending_quantity": _var_quantity,
-            "pending_variation_id": _resolved_variation_id,
-            "resolved_attributes": prev_resolved,
-            "response_time_ms": round((time.time() - start_time) * 1000),
-        }
-
-        if has_address:
-            addr_parts = [p for p in [
-                shipping_address.get("address_1", ""), shipping_address.get("address_2", ""),
-                shipping_address.get("city", ""), shipping_address.get("state", ""),
-                shipping_address.get("postcode", ""), shipping_address.get("country", ""),
-            ] if p]
-            addr_display = ", ".join(addr_parts)
-            elapsed = time.time() - start_time
-            return jsonify({
-                "success": True,
-                "bot_message": (
-                    f"Your shipping address on file:\n\n📦 **{addr_display}**\n\n"
-                    "Would you like to ship to this address, or use a different one?"
-                ),
-                "intent": "guided_flow",
-                "products": [],
-                "suggestions": ["Yes, use this address", "Change address", "Cancel Order"],
-                "session_id": session_id,
-                "metadata": {**base_meta, "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value},
-                "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value,
-                "pagination": default_pagination(page),
-            }), 200
-        else:
-            elapsed = time.time() - start_time
-            return jsonify({
-                "success": True,
-                "bot_message": "No shipping address is on file. Please type your shipping address (street, city, state, zip code):",
-                "intent": "guided_flow",
-                "products": [],
-                "suggestions": ["Cancel Order"],
-                "session_id": session_id,
-                "metadata": {**base_meta, "flow_state": FlowState.AWAITING_NEW_ADDRESS.value},
-                "flow_state": FlowState.AWAITING_NEW_ADDRESS.value,
-                "pagination": default_pagination(page),
-            }), 200
+        quantity = _var_quantity or 1
+        variant_suffix = f" ({_variant_label})" if _variant_label else ""
+        cart_msg = f"Got it — add **{_var_product_name}**{variant_suffix} ×{quantity} to your cart?"
+        elapsed = time.time() - start_time
+        return jsonify({
+            "success": True,
+            "bot_message": cart_msg,
+            "intent": "guided_flow",
+            "products": [],
+            "suggestions": ["Yes, add it", "No thanks", "Browse products"],
+            "session_id": session_id,
+            "metadata": {
+                "pending_product_id": _var_product_id,
+                "pending_product_name": _var_product_name,
+                "pending_quantity": quantity,
+                "pending_variation_id": _resolved_variation_id,
+                "resolved_attributes": prev_resolved,
+                "flow_state": FlowState.AWAITING_CART_CONFIRMATION.value,
+                "response_time_ms": round(elapsed * 1000),
+            },
+            "flow_state": FlowState.AWAITING_CART_CONFIRMATION.value,
+            "pagination": default_pagination(page),
+        }), 200
             
     # ── Fallback: Need to ask for missing info ──
     resolved_attributes = dict(prev_resolved) if prev_resolved else {}
