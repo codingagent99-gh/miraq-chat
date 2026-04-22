@@ -70,8 +70,9 @@ def extract_address(text: str) -> Optional[Dict[str, Any]]:
 
     has_postcode = bool(uk_match or us_match or in_match)
 
-    # Need at least one strong signal: trigger phrase OR (address keyword + number)
-    if not has_trigger and not (has_keyword and has_street_no) and not has_postcode:
+    # Need at least one strong signal: trigger phrase OR (address keyword + number) OR postcode
+    has_address_signal = has_trigger or (has_keyword and has_street_no) or has_postcode
+    if not has_address_signal:
         return None
 
     # ── Try to pull apart the address from the trigger phrase ──

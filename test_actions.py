@@ -796,9 +796,9 @@ class TestVariantFlowTermination:
                 )
 
             if resp is None:
-                # handle_variant_selection may return None; that's acceptable
-                # for this code path — the test is verifying the flow goes to cart confirm
-                return
+                # handle_variant_selection may return None when variation matching fails;
+                # in that case, this test can't verify the flow state assertion
+                pytest.skip("handle_variant_selection returned None; skipping flow_state assertion")
 
             data, status = resp
             resp_json = data.get_json()
