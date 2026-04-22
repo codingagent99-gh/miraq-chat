@@ -18,12 +18,22 @@ from api_builder.store_helpers import (
     loader,
 )
 
-
 def resolve_or_pair(pair: OrPair) -> OrPair:
     """
     Return a new OrPair with taxonomy and term slugs fully resolved.
     Does NOT mutate the original.
     """
+    # ── Defensive coercion: catalog_parser builds attr_tag_or_pairs as plain
+    # dicts; JSON round-trips can also produce dicts. Normalize before any
+    # attribute access so we never crash on .attr_taxonomy etc.
+    if isinstance(pair, dict):
+        pair = OrPair(
+            tag_slug=pair.get("tag_slug"),
+            cat_slugs=list(pair.get("cat_slugs") or []),
+            attr_taxonomy=pair.get("attr_taxonomy"),
+            attr_term=pair.get("attr_term"),
+        )
+
     taxonomy = pair.attr_taxonomy or ""
     term = pair.attr_term or ""
 

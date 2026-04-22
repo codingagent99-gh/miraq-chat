@@ -732,16 +732,23 @@ def chat():
                 conversation.context_data = user_context
                 flag_modified(conversation, "context_data")
                 return _finalize_turn(conversation, cart_resp)
-
+            
         # ── Step 7: Execute API calls ──
-        api_calls = build_api_calls(result, page, user_message=message, session_id=str(conversation.id), customer_id=customer_id)
-        if customer_id:
-            _resolve_user_placeholders(api_calls, customer_id)
-
         last_product_ctx = user_context.get("last_product")
-        all_products_raw, order_data, api_responses, api_calls_to_execute = _execute_api_calls(intent, api_calls, _resolve_variant)
 
-        if not _resolve_variant:
+        if _resolve_variant:
+            # Variant resolution uses session-cached variations — no API calls needed.
+            # Skipping build_api_calls entirely prevents or_pairs dict-vs-OrPair crashes
+            # that occur when catalog_parser populates attr_tag_or_pairs as plain dicts.
+            api_calls = []
+            all_products_raw, order_data, api_responses, api_calls_to_execute = [], [], [], []
+        else:
+            api_calls = build_api_calls(result, page, user_message=message, session_id=str(conversation.id), customer_id=customer_id)
+            if customer_id:
+                _resolve_user_placeholders(api_calls, customer_id)
+
+            all_products_raw, order_data, api_responses, api_calls_to_execute = _execute_api_calls(intent, api_calls, _resolve_variant)
+
             log_matched_products(all_products_raw, api_calls_to_execute)
 
             if all_products_raw:
