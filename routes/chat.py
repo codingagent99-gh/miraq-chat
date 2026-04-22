@@ -640,7 +640,7 @@ def chat():
                         product_id   = pid,
                         quantity     = qty,
                         variation_id = vid,
-                        variation    = variation_attributes or None,
+                        variation    = variation_attributes,
                     )],
                 }))
                 

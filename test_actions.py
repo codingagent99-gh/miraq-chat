@@ -35,23 +35,6 @@ from core.actions import (
 class TestFinalizeEnvelope:
     """Test that _finalize_turn injects an 'actions' key on every response."""
 
-    def _make_app(self, headless_enabled: bool = False):
-        """Create a minimal Flask app wired to the real _finalize_turn."""
-        app = Flask(__name__)
-        app.config["TESTING"] = True
-
-        # Patch HEADLESS_CHECKOUT_ENABLED before importing routes
-        import app_config
-        import core.actions as actions_mod
-        app_config.HEADLESS_CHECKOUT_ENABLED = headless_enabled
-
-        import importlib
-        import routes.chat as chat_module
-        # Re-bind the module-level constant so _finalize_turn sees the right value
-        chat_module.HEADLESS_CHECKOUT_ENABLED = headless_enabled
-
-        return app, chat_module
-
     def test_actions_key_present_when_no_actions_in_payload(self):
         """A response that sets no 'actions' key still gets actions: [] injected."""
         app = Flask(__name__)
@@ -59,7 +42,6 @@ class TestFinalizeEnvelope:
 
         with app.app_context():
             from flask import jsonify
-            import routes.chat as chat_module
 
             # Build a minimal response WITHOUT an 'actions' key
             resp = jsonify({
