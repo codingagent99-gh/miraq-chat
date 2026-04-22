@@ -54,6 +54,7 @@ def classify(utterance: str) -> ClassifiedResult:
     extract_product_name(entity_text, entities)
     extract_category(entity_text, entities)
     extract_quantity(text, entities)
+    extract_order_item(text, entities)
 
     # ─── 2.5. Prepare masked text for attribute/tag extraction ───
     attr_text = entity_text
@@ -63,6 +64,13 @@ def classify(utterance: str) -> ClassifiedResult:
         p_lower = entities.product_name.lower()
         attr_text = attr_text.replace(p_lower, " ")
         tag_text = tag_text.replace(p_lower, " ")
+        
+    # ── Also mask order_item_name so the product word isn't matched as an attribute ──
+    _oi = getattr(entities, 'order_item_name', None)
+    if _oi and _oi.lower() != (entities.product_name or "").lower():
+        _oi_lower = _oi.lower()
+        attr_text = attr_text.replace(_oi_lower, " ")
+        tag_text = tag_text.replace(_oi_lower, " ")
 
     if entities.quantity:
         attr_text = re.sub(rf'(?<![\dxX\-])\b{entities.quantity}\b(?![\dxX\-])', ' ', attr_text, count=1)
@@ -88,7 +96,6 @@ def classify(utterance: str) -> ClassifiedResult:
     logger.debug("ClassifierPipeline: Calling extract_time_range")
     extract_time_range(text, entities)
     logger.debug(f"ClassifierPipeline: After extract_time_range | entities={entities}")
-    extract_order_item(text, entities)
     extract_unresolved_descriptors(text, entities)
     extract_price_range(text, entities)
     extract_customer_updates(text, entities)

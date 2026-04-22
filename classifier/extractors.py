@@ -347,11 +347,16 @@ def _resolve_attribute_or_tag(
                         exact_tag_matched = True
                     break
 
-    if exact_tag_matched and not entities.product_name:
+    # ── Has product context = product_name OR order_item_name is set ──
+    # When the user says "order Aura matte white", order_item_name="Aura" is set
+    # early, so attributes should route to entities.attributes not tag/or_pair mode.
+    _has_product_ctx = bool(entities.product_name or getattr(entities, 'order_item_name', None))
+
+    if exact_tag_matched and not _has_product_ctx:
         if covering_tag_id not in entities.tag_ids:
             entities.tag_ids.append(covering_tag_id)
             entities.tag_slugs.append(covering_tag_slug)
-    elif covered_by_tag and not entities.product_name:
+    elif covered_by_tag and not _has_product_ctx:
         entities.attr_tag_or_pairs.append({
             "tag_slug": covering_tag_slug,
             "attr_taxonomy": taxonomy,
@@ -361,7 +366,6 @@ def _resolve_attribute_or_tag(
         entities.attributes[label] = term.get("slug", term.get("name", ""))
         entities.attribute_slug = taxonomy
         entities.attribute_term_ids = [term["id"]]
-
 
 # ══════════════════════════════════════════════════════════════
 # TAG EXTRACTION
@@ -654,6 +658,14 @@ def extract_time_range(text: str, entities: ExtractedEntities):
         return
 
     normalized = _normalize_fused_dates(text_lower)
+
+    # ── Strip tile/sample-size dimension patterns before dateparser ──
+    # e.g. 3"x3", 12"x24", 6x6, 4"x12" are misread as calendar dates
+    normalized = re.sub(r'\d+\s*["\']?\s*[xX×]\s*["\']?\d+\s*["\']?', ' ', normalized)
+    # Also strip isolated quoted-inch numbers like 3" or 12"
+    normalized = re.sub(r'\b\d+\s*["\'](?!\s*(?:[xX×]|\d))', ' ', normalized)
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+
     parsed = search_dates(normalized, settings={'PREFER_DATES_FROM': 'past', 'RETURN_AS_TIMEZONE_AWARE': False})
     if parsed:
         extracted = parsed[0][1]

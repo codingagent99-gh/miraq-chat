@@ -862,7 +862,43 @@ def handle_quantity_and_variant_check(
     if not products_formatted:
         return None
 
-    product = products_formatted[0]
+    product = products_formatted[0]  # initial candidate
+
+    # Guard: verify the result actually matches what the user asked for
+    _requested_name = getattr(entities, 'order_item_name', None) or getattr(entities, 'product_name', None)
+    if _requested_name and products_formatted:
+        _req_lower = _requested_name.lower()
+        _name_match = next(
+            (p for p in products_formatted
+            if _req_lower in p.get('name', '').lower()
+            or p.get('name', '').lower() in _req_lower),
+            None
+        )
+        if _name_match:
+            product = _name_match
+        else:
+            logger.warning(
+                f"Step 5.5: Name mismatch — user requested '{_requested_name}' but "
+                f"API returned {[p.get('name') for p in products_formatted]}. Aborting order flow."
+            )
+            elapsed = time.time() - start_time
+            return jsonify({
+                "success": True,
+                "bot_message": (
+                    f"I couldn't find **{_requested_name}** in our catalog. "
+                    "Could you double-check the product name, or would you like to browse the catalog?"
+                ),
+                "intent": intent.value,
+                "products": [],
+                "suggestions": ["Browse catalog", "Show all products"],
+                "session_id": session_id,
+                "metadata": {
+                    "flow_state": FlowState.IDLE.value,
+                    "response_time_ms": round(elapsed * 1000),
+                },
+                "flow_state": FlowState.IDLE.value,
+                "pagination": default_pagination(page),
+            }), 200
     
     logger.info(
         f"🛑 DEBUG STEP 5.5 | Product: {product.get('name')} | "

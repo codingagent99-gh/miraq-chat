@@ -235,6 +235,33 @@ def _build_quick_order(e, page) -> list:
     attr_filters = resolve_attr_filters(e.attributes)
     if not (e.product_id or search_term):
         return []
+
+    # Determine if any taxonomy-based filters are available
+    has_taxonomy = bool(
+        e.product_id
+        or e.tag_slugs
+        or e.target_category_slugs
+        or attr_filters
+        or e.attr_tag_or_pairs
+    )
+
+    if not has_taxonomy and search_term:
+        # No taxonomy match — the custom filter endpoint will return garbage.
+        # Fall back to standard WooCommerce text search.
+        logger.info(f"_build_quick_order: No taxonomy signals for '{search_term}', falling back to WooCommerce text search")
+        return [WooAPICall(
+            method="GET",
+            endpoint=f"{BASE}/products",
+            params={
+                "search": search_term,
+                "per_page": DEFAULT_PER_PAGE,
+                "page": page,
+                "status": "publish",
+            },
+            description=f"Text search for product '{search_term}' (quick order fallback)",
+            requires_resolution=["create_order_from_product"],
+        )]
+
     return [build_advanced_filter_call(
         product_id=e.product_id,
         search_term=search_term if not e.product_id else None,

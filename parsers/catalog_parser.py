@@ -111,12 +111,22 @@ def phase2_nlp_merge(
     entities: ExtractedEntities,
     original_nlp_result: ClassifiedResult,
     loader,
+    original_msg: str = "",
 ) -> None:
     """
     Classify the unmatched text and merge NLP entities into the accumulator.
     Mutates `entities` in place.
+
+    Optimization: if Phase 1 matched nothing, unmatched_text == original_msg,
+    so re-classifying it would be an exact duplicate of original_nlp_result.
+    We reuse it directly instead of making a second classify() call.
     """
-    nlp_result = classify(unmatched_text)
+    if original_msg and unmatched_text.strip() == original_msg.strip():
+        logger.debug("phase2_nlp_merge: Phase 1 matched nothing — reusing original_nlp_result, skipping re-classify")
+        nlp_result = original_nlp_result
+    else:
+        nlp_result = classify(unmatched_text)
+
     nlp_entities = nlp_result.entities
 
     # Purge zero-count categories injected by classify()
@@ -144,19 +154,18 @@ def phase2_nlp_merge(
                 entities.target_attributes.append(t_attr)
 
     # Merge action fields from original NLP (full text)
-    # 🚀 FIX: Salvage Product & Action fields that were being dropped during masking!
-    # We pull these from the ORIGINAL NLP result so they aren't destroyed.
+    # Salvage Product & Action fields that were being dropped during masking
     _action_fields = [
-        'product_id', 'product_name', 'product_slug',  # <--- Add these three!
-        'quantity', 'order_id', 'reorder', 'explicit_last_order', 'order_item_name', 
-        'quick_ship', 'customer_updates', 'billing_updates', 'shipping_updates', 
+        'product_id', 'product_name', 'product_slug',
+        'quantity', 'order_id', 'reorder', 'explicit_last_order', 'order_item_name',
+        'quick_ship', 'customer_updates', 'billing_updates', 'shipping_updates',
         'customer_fields_requested'
     ]
     for _f in _action_fields:
         _val = getattr(original_nlp_result.entities, _f, None)
         if _val is not None and _val != [] and _val != {}:
             setattr(entities, _f, _val)
-    
+
     # Merge OR pairs from original result
     if getattr(original_nlp_result.entities, 'attr_tag_or_pairs', None):
         if not hasattr(entities, 'attr_tag_or_pairs'):
@@ -191,7 +200,6 @@ def phase2_nlp_merge(
                     entities.category_name = None
 
     return nlp_entities  # caller needs search_term from this
-
 
 # ══════════════════════════════════════════════════════════════
 # PHASE 3: Semantic Vector Search
@@ -390,7 +398,8 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
     entities, unmatched_text = phase1_catalog_match(msg, loader)
 
     # Phase 2: NLP fallback merge
-    nlp_entities = phase2_nlp_merge(unmatched_text, entities, original_nlp_result, loader)
+    # Pass original_msg so phase2 can skip re-classify when Phase 1 matched nothing
+    nlp_entities = phase2_nlp_merge(unmatched_text, entities, original_nlp_result, loader, original_msg=msg)
 
     # Phase 3: Semantic vector search
     phase3_semantic_search(unmatched_text, nlp_entities, entities, loader)

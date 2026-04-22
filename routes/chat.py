@@ -678,8 +678,6 @@ def chat():
             result = bypass_result
         else:
             result = parse_csv_message(message, store_loader)
-            if not result:
-                result = classify(message)
 
         intent = result.intent
         entities = result.entities
@@ -716,9 +714,13 @@ def chat():
                     intent, entities, confidence, result = llm_outcome
 
         # ── Step 5: Semantic clarification ──
+        
         if (entities.semantic_matches
             and current_flow_state != FlowState.AWAITING_FILTER_CLARIFICATION
-            and intent not in (Intent.PRODUCT_ATTRIBUTE_INFO, Intent.PRODUCT_VARIATIONS)):
+            and intent not in (
+                Intent.PRODUCT_ATTRIBUTE_INFO, Intent.PRODUCT_VARIATIONS,
+                Intent.QUICK_ORDER, Intent.PLACE_ORDER, Intent.ORDER_ITEM,
+            )):
             clarification_resp = build_semantic_clarification(
                 entities, user_context, str(conversation.id), page, start_time, flow_result,
             )
