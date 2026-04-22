@@ -646,18 +646,28 @@ def chat():
             }))
 
         # ── Flow router ──────────────────────────────────────────────────
-        # pass_through=True  → state machine defers to classifier (fall through)
-        # action key present → already handled above (confirm/decline blocks)
-        # action=None        → ambiguous intent, also defer to classifier
-        # otherwise          → flow owns this turn, let handle_flow respond
-        if flow_result and not flow_result.get("pass_through") \
-                and "action" not in flow_result:
+        # OR when the flow result carries a deferred action that needs flow_handler
+        # to execute (fetch_customer_address, create_order, fetch_price_summary).
+        # pass_through=True alone means "also let classifier run after", but it must
+        # NOT skip flow_handler when one of these action flags is present.
+        _needs_flow_handler = (
+            flow_result
+            and "action" not in flow_result
+            and (
+                not flow_result.get("pass_through")
+                or flow_result.get("fetch_customer_address")
+                or flow_result.get("create_order")
+                or flow_result.get("fetch_price_summary")
+            )
+        )
+        if _needs_flow_handler:
             resp = handle_flow(
                 flow_result, user_context, str(conversation.id),
                 customer_id, page, start_time, mock_sessions,
             )
             if resp:
                 return _finalize_turn(conversation, resp)
+
         # else: fall through to classifier
 
         # ── Step 3: Classify ──

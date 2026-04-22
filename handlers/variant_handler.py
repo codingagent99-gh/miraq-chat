@@ -258,12 +258,45 @@ def handle_variant_selection(
             or _resolved_variation.get("regular_price")
             or ""
         )
-
+        
         user_context["resolved_attributes"] = prev_resolved
 
         if not _var_quantity:
             _price_line = f"\n**Unit Price:** {get_currency_symbol()}{_variant_price}" if _variant_price else ""
             elapsed = time.time() - start_time
+
+            # ── If this flow originated from a cart/browse action (not an order
+            # intent), go back to cart confirmation so the user can choose.
+            _pending_action = user_context.get("pending_action", "order")
+
+            if _pending_action == "cart":
+                user_context.pop("pending_action", None)
+                _pending_name = f"{_var_product_name} — {_variant_label}"
+                user_context["pending_product_name"] = _pending_name
+                return jsonify({
+                    "success": True,
+                    "bot_message": (
+                        f"Here's **{_pending_name}**. ✅ In stock"
+                        f"{_price_line}\n\n"
+                        f"Would you like to add it to your cart?"
+                    ),
+                    "intent": "guided_flow",
+                    "products": [],
+                    "suggestions": ["Yes, add it", "No thanks", "Show all variants"],
+                    "session_id": session_id,
+                    "metadata": {
+                        "flow_state": FlowState.AWAITING_CART_CONFIRMATION.value,
+                        "pending_product_id": _var_product_id,
+                        "pending_product_name": _pending_name,
+                        "pending_variation_id": _resolved_variation_id,
+                        "resolved_attributes": prev_resolved,
+                        "response_time_ms": round(elapsed * 1000),
+                    },
+                    "flow_state": FlowState.AWAITING_CART_CONFIRMATION.value,
+                    "pagination": default_pagination(page),
+                }), 200
+                
+            # Order flow — ask for quantity
             return jsonify({
                 "success": True,
                 "bot_message": (
@@ -288,7 +321,7 @@ def handle_variant_selection(
                 "flow_state": FlowState.AWAITING_QUANTITY.value,
                 "pagination": default_pagination(page),
             }), 200
-
+        
         shipping_address = fetch_shipping_address(customer_id, "Step 3.55")
         has_address = bool(shipping_address and (shipping_address.get("address_1") or shipping_address.get("city")))
 
