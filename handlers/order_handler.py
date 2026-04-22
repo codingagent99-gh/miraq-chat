@@ -16,11 +16,11 @@ from app_config import (
     WOO_BASE_URL,
     DEFAULT_PAYMENT_METHOD,
     DEFAULT_PAYMENT_METHOD_TITLE,
-    CUSTOM_API_BASE_URL
+    CUSTOM_API_BASE_URL,
+    DEFAULT_PER_PAGE,
+    DEFAULT_ORDER_PER_PAGE
 )
 
-# From your api_builder.py (Line 12)
-from config.settings import DEFAULT_PER_PAGE, DEFAULT_ORDER_PER_PAGE
 from datetime import datetime, timezone
 from models import Intent, WooAPICall
 from woo_client import woo_client

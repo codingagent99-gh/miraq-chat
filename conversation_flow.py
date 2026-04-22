@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 from app_config import BOT_NAME
 
-
 class FlowState(Enum):
     """Possible conversation states."""
     IDLE = "idle"                          # No active flow
@@ -32,7 +31,10 @@ class FlowState(Enum):
     AWAITING_ORDER_DETAIL = "awaiting_order_detail"            # User asked for order detail / clicked an order
     AWAITING_REORDER_ID = "awaiting_reorder_id"
     AWAITING_FILTER_CLARIFICATION = "awaiting_filter_clarification"
-
+    AWAITING_ADDRESS         = "awaiting_address"
+    AWAITING_CHECKOUT_CONFIRM = "awaiting_checkout_confirm"
+    AWAITING_CART_CONFIRMATION = "awaiting_cart_confirmation"
+    
 @dataclass
 class ConversationContext:
     """Tracks the state of a multi-turn conversation."""
@@ -98,11 +100,46 @@ def handle_flow_state(
     Returns a response dict if the flow handles it, or None to fall through
     to normal classifier pipeline.
     """
+    import re
+    
     text = message.lower().strip()
 
     # ══════════════════════════════════════════════════════════
     # ── GLOBAL ESCAPE HATCH: Allow users to exit ANY flow ──
     # ══════════════════════════════════════════════════════════
+    
+    if state == FlowState.AWAITING_CART_CONFIRMATION:
+        text = message.lower().strip()
+
+        _yes = re.search(
+            r'\b(yes|yeah|yep|sure|okay|ok|go\s+ahead|add\s+it|add\s+to\s+cart)\b',
+            text
+        )
+        _no = re.search(
+            r'\b(no|nope|cancel|skip|not\s+now|continue\s+shopping)\b',
+            text
+        )
+
+        if _yes:
+            return {
+                "action": "confirm_add_to_cart",   # explicit sentinel
+                "flow_state": FlowState.IDLE.value,
+                "pass_through": False,             # do NOT fall through to classify
+            }
+        elif _no:
+            return {
+                "action": "decline_add_to_cart",
+                "flow_state": FlowState.IDLE.value,
+                "pass_through": False,
+            }
+        else:
+            # Ambiguous — reset state and let classify handle it normally
+            return {
+                "action": None,
+                "flow_state": FlowState.IDLE.value,
+                "pass_through": True,
+            }
+            
     if state not in (FlowState.IDLE, FlowState.AWAITING_ANYTHING_ELSE):
         # Exact matches or starts-with to prevent accidental triggers 
         # (e.g., we want to catch "cancel order" but not "I want to order cancela tiles")

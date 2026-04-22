@@ -13,19 +13,33 @@ from models import Intent
 load_dotenv()
 
 # ═══════════════════════════════════════════
-# ENVIRONMENT VARIABLES
+# BASE URLs
 # ═══════════════════════════════════════════
 
-WOO_BASE_URL = os.getenv("WOO_BASE_URL", "https://wgc.net.in/hn/wp-json/wc/v3")
+_WP_BASE = os.getenv("WP_BASE_URL", "https://wgc.net.in/hn")
+
+# WooCommerce admin REST API  (/wc/v3 — products, orders, customers)
+WOO_BASE_URL = os.getenv(
+    "WOO_BASE_URL",
+    f"{_WP_BASE}/wp-json/wc/v3",
+)
+
+# WooCommerce Store API  (/wc/store/v1 — cart, checkout, session-aware)
+WOO_STORE_API_URL = os.getenv(            # ← was reading WOO_BASE_URL by mistake
+    "WOO_STORE_API_URL",
+    f"{_WP_BASE}/wp-json/wc/store/v1",
+)
+
+# Custom plugin API  (/custom-api/v1 — nonce refresh, etc.)
+CUSTOM_API_BASE_URL = os.getenv(
+    "CUSTOM_API_BASE_URL",
+    f"{_WP_BASE}/wp-json/custom-api/v1",
+)
+
 WOO_CONSUMER_KEY = os.getenv("WOO_CONSUMER_KEY", "")
 WOO_CONSUMER_SECRET = os.getenv("WOO_CONSUMER_SECRET", "")
 PORT = int(os.getenv("PORT", 5009))
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
-
-# Custom API base URL — defaults to deriving from WOO_BASE_URL by replacing the
-# WooCommerce path segment. Set explicitly if your custom API lives elsewhere.
-_custom_api_default = WOO_BASE_URL.replace("/wp-json/wc/v3", "/wp-json/custom-api/v1")
-CUSTOM_API_BASE_URL = os.getenv("CUSTOM_API_BASE_URL", _custom_api_default)
 
 # ═══════════════════════════════════════════════════════════════
 # STORE IDENTITY
@@ -92,6 +106,14 @@ ORDER_INTENTS = {
     Intent.HISTORICAL_SEARCH,
 }
 
+CART_INTENTS = {
+    Intent.ADD_TO_CART,
+    Intent.VIEW_CART,
+    Intent.REMOVE_FROM_CART,
+    Intent.UPDATE_CART_QTY,
+    Intent.CHECKOUT,
+}
+
 ORDER_CREATE_INTENTS = {
     Intent.QUICK_ORDER,
     Intent.ORDER_ITEM,
@@ -112,6 +134,16 @@ MAX_DISPLAYED_ITEMS = 3  # Maximum number of items to show before truncating wit
 # Change to "bacs" (bank transfer) or "stripe" etc. as needed.
 DEFAULT_PAYMENT_METHOD = "cod"
 DEFAULT_PAYMENT_METHOD_TITLE = "Cash on Delivery"
+
+# ═══════════════════════════════════════════
+# API DEFAULTS  (move from settings.py)
+# ═══════════════════════════════════════════
+DEFAULT_PER_PAGE        = int(os.getenv("CHAT_PER_PAGE", "4"))
+DEFAULT_ORDER_PER_PAGE  = int(os.getenv("CHAT_ORDERS_PER_PAGE", "5"))
+DEFAULT_STATUS          = "publish"
+DEFAULT_STOCK_STATUS    = "instock"
+REQUEST_TIMEOUT         = int(os.getenv("REQUEST_TIMEOUT", "30"))
+LOG_LEVEL               = os.getenv("LOG_LEVEL", "INFO")
 
 # ═══════════════════════════════════════════
 # LLM FALLBACK CONFIGURATION
