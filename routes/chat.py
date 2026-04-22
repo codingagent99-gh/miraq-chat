@@ -18,7 +18,9 @@ from app_config import (
     ORDER_CREATE_INTENTS,
     CLASSIFIER_PROVIDER_TAG,
     get_currency_symbol,
+    HEADLESS_CHECKOUT_ENABLED,
 )
+from core.actions import _filter_actions_by_flag, build_add_to_cart
 from woo_client import woo_client
 from formatters import format_product, format_custom_product, format_category, _entities_to_dict
 from response_generator import generate_bot_message, generate_suggestions, _resolve_user_placeholders
@@ -119,6 +121,11 @@ def _finalize_turn(conversation, flask_response):
 
     # 4. Inject session ID
     data["session_id"] = str(conversation.id)
+
+    # 5. Inject actions array (always present; filter by feature flag)
+    raw_actions = data.get("actions") if isinstance(data.get("actions"), list) else []
+    data["actions"] = _filter_actions_by_flag(raw_actions, HEADLESS_CHECKOUT_ENABLED)
+
     return jsonify(data), status_code
 
 
@@ -629,6 +636,12 @@ def chat():
                     "session_id":  str(conversation.id),
                     "pagination":  default_pagination(page),
                     "flow_state":  FlowState.IDLE.value,
+                    "actions":     [build_add_to_cart(
+                        product_id   = pid,
+                        quantity     = qty,
+                        variation_id = vid,
+                        variation    = variation_attributes,
+                    )],
                 }))
                 
         if flow_result and flow_result.get("action") == "decline_add_to_cart":

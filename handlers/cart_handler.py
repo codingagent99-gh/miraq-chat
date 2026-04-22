@@ -21,6 +21,7 @@ from flask import jsonify
 from models import Intent
 from conversation_flow import FlowState
 from handlers.chat_utils import default_pagination
+from core.actions import build_add_to_cart, build_open_cart_panel
 
 logger = logging.getLogger("miraq_chat")
 
@@ -36,7 +37,7 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
     session_id = str(conversation.id)
 
     # ── Shared response builder ───────────────────────────────────────────────
-    def _resp(action: str, bot_message: str, suggestions: list, metadata: dict = None):
+    def _resp(action: str, bot_message: str, suggestions: list, metadata: dict = None, actions: list = None):
         return jsonify({
             "success":     True,
             "bot_message": bot_message,
@@ -51,6 +52,7 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
             },
             "pagination":  default_pagination(page),
             "flow_state":  FlowState.IDLE.value,
+            "actions":     actions if actions is not None else [],
         })
 
     # ── VIEW_CART ─────────────────────────────────────────────────────────────
@@ -59,6 +61,7 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
             action      = "trigger_frontend_view_cart",
             bot_message = "Here's your cart! 🛒",
             suggestions = ["Checkout", "Browse products", "Clear cart"],
+            actions     = [build_open_cart_panel()],
         )
 
     # ── ADD_TO_CART ───────────────────────────────────────────────────────────
@@ -86,6 +89,11 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
                 "variation_id": variation_id,  # None is fine — frontend guards it
                 "quantity":     qty,
             },
+            actions     = [build_add_to_cart(
+                product_id   = product_id,
+                quantity     = qty,
+                variation_id = variation_id,
+            )],
         )
 
     # ── REMOVE_FROM_CART ──────────────────────────────────────────────────────
@@ -102,6 +110,7 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
                 action      = "trigger_frontend_view_cart",
                 bot_message = "Which item would you like to remove? Tap it in your cart.",
                 suggestions = ["View cart"],
+                actions     = [build_open_cart_panel()],
             )
 
         return _resp(
@@ -125,6 +134,7 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
                 action      = "trigger_frontend_view_cart",
                 bot_message = "Which item's quantity would you like to update? Tap it in your cart.",
                 suggestions = ["View cart"],
+                actions     = [build_open_cart_panel()],
             )
 
         return _resp(
@@ -143,6 +153,7 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
             action      = "trigger_frontend_view_cart",
             bot_message = "Taking you to checkout! 🧾",
             suggestions = ["Browse products"],
+            actions     = [build_open_cart_panel()],
         )
 
     # Unknown cart intent — should never reach here given CART_INTENTS guard in

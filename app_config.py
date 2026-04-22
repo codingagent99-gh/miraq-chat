@@ -220,6 +220,12 @@ LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "10"))
 LLM_FALLBACK_ENABLED = os.getenv("LLM_FALLBACK_ENABLED", "true").lower() == "true"
 LLM_RETRY_ON_EMPTY_RESULTS = os.getenv("LLM_RETRY_ON_EMPTY_RESULTS", "true").lower() == "true"
 
+# Headless WooCommerce Store API checkout migration flag.
+# When True, checkout-only actions (OPEN_CHECKOUT_PANEL, PROPOSE_CHECKOUT_ADDRESS,
+# UPDATE_CART_ITEM, REMOVE_CART_ITEM) are included in the actions[] envelope.
+# Defaults to False — set to "true", "1", or "yes" to enable.
+HEADLESS_CHECKOUT_ENABLED = os.getenv("HEADLESS_CHECKOUT_ENABLED", "false").lower() in ("1", "true", "yes")
+
 # Cost estimation (USD per 1000 tokens)
 LLM_COST_PER_1K_INPUT = float(os.getenv("LLM_COST_PER_1K_INPUT", "0.002"))
 LLM_COST_PER_1K_OUTPUT = float(os.getenv("LLM_COST_PER_1K_OUTPUT", "0.008"))

@@ -30,6 +30,12 @@ User Utterance → Classifier → Entity Extraction → API Builder → WooComme
 - **Discounts**: on-sale, clearance, bulk, coupons
 - **Account**: wishlist, order tracking, order placement
 
+## Feature Flags
+
+| Variable | Default | Description |
+|---|---|---|
+| `HEADLESS_CHECKOUT_ENABLED` | `false` | Gates the headless WooCommerce Store API checkout migration. When `true` (or `"1"` / `"yes"`), checkout-only actions (`OPEN_CHECKOUT_PANEL`, `PROPOSE_CHECKOUT_ADDRESS`, `UPDATE_CART_ITEM`, `REMOVE_CART_ITEM`) are included in the `actions[]` array on every chat response, allowing the React widget to drive the full checkout flow against `/wc/store/v1`. Cart-level actions (`ADD_TO_CART`, `OPEN_CART_PANEL`) are always emitted regardless of this flag, since they mirror existing frontend behaviour. The flag defaults to `false` for backward compatibility and will be removed once the migration is complete in a later PR. |
+
 ## Store API Base
 
 ```
