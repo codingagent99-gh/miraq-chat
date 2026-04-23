@@ -20,7 +20,7 @@ from app_config import (
     get_currency_symbol,
     HEADLESS_CHECKOUT_ENABLED,
 )
-from core.actions import _filter_actions_by_flag, build_add_to_cart, build_open_checkout_panel
+from core.actions import _filter_actions_by_flag, build_add_to_cart, build_open_checkout_panel, build_open_cart_panel
 from woo_client import woo_client
 from formatters import format_product, format_custom_product, format_category, _entities_to_dict
 from response_generator import generate_bot_message, generate_suggestions, _resolve_user_placeholders
@@ -752,14 +752,17 @@ def chat():
                     variation_id = vid,
                     variation    = variation_attributes,
                 )]
-                actions.append(build_open_checkout_panel())  # filtered by flag in _finalize_turn
+                # Open the CART panel so the user can review what was added
+                # before proceeding to checkout. (Previously this opened the
+                # checkout panel directly, skipping cart review and producing
+                # a duplicate checkout CTA alongside the suggestion chip.)
+                actions.append(build_open_cart_panel())
 
-                if HEADLESS_CHECKOUT_ENABLED:
-                    bot_msg = f"✅ Added **{name}** to your cart. Opening checkout…"
-                    suggestions = ["Continue shopping", "Show me more products"]
-                else:
-                    bot_msg = f"✅ Adding **{name}** to your cart..."
-                    suggestions = ["Browse products", "Go to cart", "Checkout"]
+                bot_msg = f"✅ Added **{name}** ×{qty} to your cart. Opening your cart so you can review…"
+                # Single, unambiguous next-step suggestion set. "Proceed to
+                # checkout" is the ONLY checkout entry-point now — the
+                # OPEN_CHECKOUT_PANEL action is no longer auto-emitted here.
+                suggestions = ["Proceed to checkout", "Continue shopping", "View cart"]
 
                 return _ft(jsonify({
                     "success":     True,
