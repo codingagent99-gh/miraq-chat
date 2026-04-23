@@ -20,7 +20,7 @@ from app_config import (
     get_currency_symbol,
     HEADLESS_CHECKOUT_ENABLED,
 )
-from core.actions import _filter_actions_by_flag, build_add_to_cart
+from core.actions import _filter_actions_by_flag, build_add_to_cart, build_open_checkout_panel
 from woo_client import woo_client
 from formatters import format_product, format_custom_product, format_category, _entities_to_dict
 from response_generator import generate_bot_message, generate_suggestions, _resolve_user_placeholders
@@ -40,10 +40,73 @@ from handlers.suggestion_retry_handler import handle_suggestion_retry
 from handlers.filter_clarification_handler import resolve_filter_clarification
 from handlers.semantic_clarification_handler import build_semantic_clarification
 from parsers.catalog_parser import parse_csv_message
+from parsers.address_parser import extract_address, address_summary
 from utils.language_utils import detect_and_translate
 from handlers.cart_handler import handle_cart_intent
+from core.actions import build_propose_checkout_address
 logger = get_logger("miraq_chat")
 chat_bp = Blueprint("chat", __name__)
+
+
+def _maybe_attach_address_proposal(response_data: dict, message: str, customer_id) -> None:
+    """
+    Inspect *message* for a plausible postal address.  When one is found AND
+    HEADLESS_CHECKOUT_ENABLED is True, append a PROPOSE_CHECKOUT_ADDRESS action
+    to response_data["actions"] and update bot_message / suggestions.
+
+    Mutates *response_data* in-place; returns None.  Silent on any error.
+    """
+    if not HEADLESS_CHECKOUT_ENABLED:
+        return
+    if not customer_id:
+        return
+
+    try:
+        parsed = extract_address(message)
+        if not parsed:
+            return
+
+        # Fetch the customer's saved billing/shipping for the "existing_on_file" field
+        existing = None
+        try:
+            from app_config import WOO_BASE_URL
+            from models import WooAPICall
+            from woo_client import woo_client as _woo
+            cust_call = WooAPICall(
+                method="GET",
+                endpoint=f"{WOO_BASE_URL}/customers/{customer_id}",
+                params={},
+                description="Fetch customer address for PROPOSE_CHECKOUT_ADDRESS",
+            )
+            cust_resp = _woo.execute(cust_call)
+            if cust_resp.get("success") and isinstance(cust_resp.get("data"), dict):
+                _billing  = cust_resp["data"].get("billing", {})
+                _shipping = cust_resp["data"].get("shipping", {})
+                existing  = _shipping if (_shipping.get("address_1") or _shipping.get("city")) else (
+                    _billing if (_billing.get("address_1") or _billing.get("city")) else None
+                )
+        except Exception:
+            pass  # proceed without existing address
+
+        action = build_propose_checkout_address(parsed=parsed, existing_on_file=existing)
+        actions = response_data.get("actions")
+        if not isinstance(actions, list):
+            actions = []
+        actions.append(action)
+        response_data["actions"] = actions
+
+        summary = address_summary(parsed)
+        response_data["bot_message"] = (
+            f"I noticed an address — **{summary}**. "
+            "Would you like to use it for shipping?"
+        )
+        response_data["suggestions"] = [
+            "Use the new address",
+            "Use my saved address",
+            "Let me type a different one",
+        ]
+    except Exception as exc:
+        logger.warning(f"_maybe_attach_address_proposal failed silently | error={exc}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -61,7 +124,7 @@ def resolve_session_id():
     return uuid.uuid4()
 
 
-def _finalize_turn(conversation, flask_response):
+def _finalize_turn(conversation, flask_response, *, _proposal_message=None, _proposal_customer_id=None):
     """
     Interceptor: Extracts bot message from Flask response, saves to DB,
     commits the transaction, and returns the updated response.
@@ -79,6 +142,10 @@ def _finalize_turn(conversation, flask_response):
     if not data:
         db.session.commit()
         return flask_response
+
+    # 0. Optionally attach PROPOSE_CHECKOUT_ADDRESS action
+    if _proposal_message and _proposal_customer_id:
+        _maybe_attach_address_proposal(data, _proposal_message, _proposal_customer_id)
 
     # 1. Save Bot Message
     bot_msg = Message(
@@ -98,7 +165,6 @@ def _finalize_turn(conversation, flask_response):
     _WIPE_KEYS = [
         "pending_product_id", "pending_product_name",
         "pending_quantity", "pending_variation_id", "resolved_attributes",
-        "pending_shipping_address", "use_existing_address", "use_new_address",
     ]
 
     if conversation.flow_state in ("idle", "awaiting_anything_else", "closing"):
@@ -541,6 +607,14 @@ def chat():
 
         mock_sessions = {str(session_id): {"history": [], "user_context": user_context}}
 
+        def _ft(resp):
+            """Local alias: wraps _finalize_turn with address-proposal context."""
+            return _finalize_turn(
+                conversation, resp,
+                _proposal_message=message,
+                _proposal_customer_id=customer_id,
+            )
+
         # ── Resolve flow state ──
         try:
             current_flow_state = FlowState(conversation.flow_state)
@@ -552,7 +626,7 @@ def chat():
         # ── Step 0.5: Suggestion retry (early exit) ──
         sr_resp = handle_suggestion_retry(body, message, str(conversation.id), customer_id, page, start_time)
         if sr_resp:
-            return _finalize_turn(conversation, sr_resp)
+            return _ft(sr_resp)
 
         # ── Step 1: Filter clarification bypass ──
         _skip_classification = False
@@ -590,8 +664,7 @@ def chat():
         if flow_result:
             _persistent_keys = [
                 "pending_product_id", "pending_product_name", "pending_quantity",
-                "pending_variation_id", "pending_shipping_address",
-                "use_existing_address", "use_new_address", "resolved_attributes",
+                "pending_variation_id", "resolved_attributes",
             ]
             for k in _persistent_keys:
                 if k in flow_result and flow_result[k] is not None:
@@ -611,7 +684,6 @@ def chat():
             vid   = user_context.get("pending_variation_id")
             qty   = user_context.get("pending_quantity") or 1
             name  = user_context.get("pending_product_name", "item")
-            # ADD THIS ↓
             resolved = user_context.get("resolved_attributes") or {}
             variation_attributes = [
                 {"attribute": f"pa_{k.lower().replace(' ', '-')}", "value": v}
@@ -620,33 +692,43 @@ def chat():
 
             if pid:
                 elapsed = round((time.time() - start_time) * 1000)
-                return _finalize_turn(conversation, jsonify({
+                actions = [build_add_to_cart(
+                    product_id   = pid,
+                    quantity     = qty,
+                    variation_id = vid,
+                    variation    = variation_attributes,
+                )]
+                actions.append(build_open_checkout_panel())  # filtered by flag in _finalize_turn
+
+                if HEADLESS_CHECKOUT_ENABLED:
+                    bot_msg = f"✅ Added **{name}** to your cart. Opening checkout…"
+                    suggestions = ["Continue shopping", "Show me more products"]
+                else:
+                    bot_msg = f"✅ Adding **{name}** to your cart..."
+                    suggestions = ["Browse products", "Go to cart", "Checkout"]
+
+                return _ft(jsonify({
                     "success":     True,
-                    "bot_message": f"✅ Adding **{name}** to your cart...",
+                    "bot_message": bot_msg,
                     "action":      "trigger_frontend_cart_add",
                     "metadata":    {
                         "product_id":           pid,
                         "variation_id":         vid,
                         "quantity":             qty,
-                        "variation_attributes": variation_attributes,  # ADD THIS ↓
+                        "variation_attributes": variation_attributes,
                         "response_time_ms":     elapsed,
                     },
                     "intent":      Intent.ADD_TO_CART.value,
-                    "suggestions": ["Browse products", "Go to cart", "Checkout"],
+                    "suggestions": suggestions,
                     "session_id":  str(conversation.id),
                     "pagination":  default_pagination(page),
                     "flow_state":  FlowState.IDLE.value,
-                    "actions":     [build_add_to_cart(
-                        product_id   = pid,
-                        quantity     = qty,
-                        variation_id = vid,
-                        variation    = variation_attributes,
-                    )],
+                    "actions":     actions,
                 }))
                 
         if flow_result and flow_result.get("action") == "decline_add_to_cart":
             elapsed = round((time.time() - start_time) * 1000)
-            return _finalize_turn(conversation, jsonify({
+            return _ft(jsonify({
                 "success":     True,
                 "bot_message": "No problem! What else are you looking for?",
                 "intent":      "browse",
@@ -659,19 +741,11 @@ def chat():
             }))
 
         # ── Flow router ──────────────────────────────────────────────────
-        # OR when the flow result carries a deferred action that needs flow_handler
-        # to execute (fetch_customer_address, create_order, fetch_price_summary).
-        # pass_through=True alone means "also let classifier run after", but it must
-        # NOT skip flow_handler when one of these action flags is present.
+        # pass_through=True means "also let classifier run after"
         _needs_flow_handler = (
             flow_result
             and "action" not in flow_result
-            and (
-                not flow_result.get("pass_through")
-                or flow_result.get("fetch_customer_address")
-                or flow_result.get("create_order")
-                or flow_result.get("fetch_price_summary")
-            )
+            and not flow_result.get("pass_through")
         )
         if _needs_flow_handler:
             resp = handle_flow(
@@ -679,7 +753,7 @@ def chat():
                 customer_id, page, start_time, mock_sessions,
             )
             if resp:
-                return _finalize_turn(conversation, resp)
+                return _ft(resp)
 
         # else: fall through to classifier
 
@@ -720,9 +794,9 @@ def chat():
             if llm_outcome is not None:
                 if not isinstance(llm_outcome, tuple) or not isinstance(llm_outcome[0], tuple):
                     if hasattr(llm_outcome, 'get_data'):
-                        return _finalize_turn(conversation, llm_outcome)
+                        return _ft(llm_outcome)
                     if isinstance(llm_outcome, tuple) and len(llm_outcome) == 2 and isinstance(llm_outcome[1], int):
-                        return _finalize_turn(conversation, llm_outcome)
+                        return _ft(llm_outcome)
                 if isinstance(llm_outcome, tuple) and len(llm_outcome) == 4:
                     intent, entities, confidence, result = llm_outcome
 
@@ -740,7 +814,7 @@ def chat():
             if clarification_resp:
                 conversation.context_data = user_context
                 flag_modified(conversation, "context_data")
-                return _finalize_turn(conversation, clarification_resp)
+                return _ft(clarification_resp)
 
         # ── Step 6: Empty order guard ──
         empty_resp = _check_empty_order(intent, entities, conversation, page, start_time)
@@ -756,7 +830,7 @@ def chat():
             if cart_resp is not None:
                 conversation.context_data = user_context
                 flag_modified(conversation, "context_data")
-                return _finalize_turn(conversation, cart_resp)
+                return _ft(cart_resp)
             
         # ── Step 7: Execute API calls ──
         last_product_ctx = user_context.get("last_product")
@@ -796,23 +870,23 @@ def chat():
         # ── Step 9: Route through specialized handlers ──
         resp = handle_reorder(intent, entities, order_data, customer_id, str(conversation.id), page, start_time, mock_sessions)
         if resp:
-            return _finalize_turn(conversation, resp)
+            return _ft(resp)
 
         resp = handle_order_detail(current_flow_state, customer_id, user_context, str(conversation.id), page, start_time)
         if resp:
-            return _finalize_turn(conversation, resp)
+            return _ft(resp)
 
         resp = handle_historical_search(intent, entities, order_data, customer_id, str(conversation.id), page, start_time, mock_sessions)
         if resp:
-            return _finalize_turn(conversation, resp)
+            return _ft(resp)
 
         resp = handle_variant_selection(current_flow_state, intent, entities, message, customer_id, str(conversation.id), page, start_time, mock_sessions, user_context, _resolve_variant)
         if resp:
-            return _finalize_turn(conversation, resp)
+            return _ft(resp)
 
         resp = handle_quantity_and_variant_check(intent, entities, all_products_raw, order_data, ORDER_CREATE_INTENTS, str(conversation.id), page, start_time, mock_sessions, customer_id=customer_id)
         if resp:
-            return _finalize_turn(conversation, resp)
+            return _ft(resp)
 
         resp = handle_quick_order(intent, entities, all_products_raw, last_product_ctx, customer_id, str(conversation.id), page, start_time, mock_sessions, ORDER_CREATE_INTENTS)
         if resp:
@@ -821,7 +895,7 @@ def chat():
                 user_context["pending_product_name"] = getattr(entities, 'product_name', None)
                 conversation.context_data = user_context
                 flag_modified(conversation, "context_data")
-            return _finalize_turn(conversation, resp)
+            return _ft(resp)
 
         resp = handle_variation_product(
             intent, 
@@ -838,12 +912,12 @@ def chat():
             conversation=conversation,
             )
         if resp:
-            return _finalize_turn(conversation, resp)
+            return _ft(resp)
 
         store_loader = get_store_loader()
         all_products_raw, resp = handle_empty_results(intent, entities, all_products_raw, message, str(conversation.id), page, start_time, confidence, mock_sessions, store_loader)
         if resp:
-            return _finalize_turn(conversation, resp)
+            return _ft(resp)
 
         # ── Step 10: Final response ──
         return _build_final_response(

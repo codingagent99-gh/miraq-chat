@@ -3,14 +3,13 @@ handlers/chat_utils.py — Shared helper functions used across chat handlers.
 """
 
 import re
-from datetime import datetime, timezone
 
 from flask import jsonify
 from app_config import WOO_BASE_URL, DEFAULT_PER_PAGE, get_currency_symbol
 from models import WooAPICall
 from woo_client import woo_client
 from conversation_flow import FlowState
-from chat_logger import get_logger, sanitize_log_string
+from chat_logger import get_logger
 
 logger = get_logger("miraq_chat")
 
@@ -304,82 +303,3 @@ def score_variation_against_text(variation: dict, user_text_clean: str, user_tok
                 score += len(overlap)
 
     return score
-
-def fetch_shipping_address(customer_id: int, step_label: str) -> dict | None:
-    """Fetch a customer's shipping address from WooCommerce. Returns dict or None."""
-    try:
-        cust_call = WooAPICall(
-            method="GET",
-            endpoint=f"{WOO_BASE_URL}/customers/{customer_id}",
-            params={},
-            body={},
-            description=f"Fetch customer {customer_id} shipping address ({step_label})",
-        )
-        cust_resp = woo_client.execute(cust_call)
-        if cust_resp.get("success") and isinstance(cust_resp.get("data"), dict):
-            return cust_resp["data"].get("shipping", {})
-    except Exception as exc:
-        logger.warning(f"{step_label}: Could not fetch customer address | error={exc}")
-    return None
-
-
-def shipping_address_response(
-    session_id: str,
-    page: int,
-    start_time: float,
-    base_meta: dict,
-    shipping_address: dict | None,
-) -> object:
-    """
-    Build the jsonify response for the shipping address confirmation step.
-    Returns a Flask response asking the user to confirm or enter an address.
-    """
-    import time
-    has_address = bool(
-        shipping_address
-        and (shipping_address.get("address_1") or shipping_address.get("city"))
-    )
-
-    if has_address:
-        addr_parts = [
-            p for p in [
-                shipping_address.get("address_1", ""),
-                shipping_address.get("address_2", ""),
-                shipping_address.get("city", ""),
-                shipping_address.get("state", ""),
-                shipping_address.get("postcode", ""),
-                shipping_address.get("country", ""),
-            ] if p
-        ]
-        addr_display = ", ".join(addr_parts)
-        base_meta["flow_state"] = FlowState.AWAITING_SHIPPING_CONFIRM.value
-        base_meta["response_time_ms"] = round((time.time() - start_time) * 1000)
-        return jsonify({
-            "success": True,
-            "bot_message": (
-                f"Your shipping address on file:\n\n"
-                f"📦 **{addr_display}**\n\n"
-                "Would you like to ship to this address, or use a different one?"
-            ),
-            "intent": "guided_flow",
-            "products": [],
-            "suggestions": ["Yes, use this address", "Change address", "Cancel"],
-            "session_id": session_id,
-            "metadata": base_meta,
-            "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value,
-            "pagination": default_pagination(page),
-        }), 200
-    else:
-        base_meta["flow_state"] = FlowState.AWAITING_NEW_ADDRESS.value
-        base_meta["response_time_ms"] = round((time.time() - start_time) * 1000)
-        return jsonify({
-            "success": True,
-            "bot_message": "No shipping address is on file. Please type your shipping address (street, city, state, zip code):",
-            "intent": "guided_flow",
-            "products": [],
-            "suggestions": [],
-            "session_id": session_id,
-            "metadata": base_meta,
-            "flow_state": FlowState.AWAITING_NEW_ADDRESS.value,
-            "pagination": default_pagination(page),
-        }), 200

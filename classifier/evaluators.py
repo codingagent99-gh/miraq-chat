@@ -68,6 +68,10 @@ class OrderActionEvaluator(IntentEvaluator):
         if re.search(r"^(order|buy|purchase)\s*(a\s+product|an\s+item|something|)?$", text.strip()) and not _is_tracking_or_info:
             return Intent.QUICK_ORDER, 0.93
 
+        # "get me [N] X" — add to cart / order intent
+        if re.search(r"\bget\s+me\b", text) and not _is_tracking_or_info:
+            return Intent.QUICK_ORDER, 0.91
+
         if entities.order_id:
             if re.search(r"\b(what|which|show|list|tell)\b.*\b(products?|items?)\b", text):
                 return Intent.HISTORICAL_SEARCH, 0.97
