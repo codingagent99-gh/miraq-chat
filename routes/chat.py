@@ -579,9 +579,18 @@ def chat():
     page = int(body.get("page", 1))
 
     # ── Language detection ──
-    message, was_translated, detected_lang = detect_and_translate(message)
-    if was_translated:
-        logger.info(f"[LangCheck] translated from '{detected_lang}' | '{message[:100]}'")
+    # Skip translation during variant selection — the user is typing back
+    # catalog attribute values (colors, dimensions, finishes) that were shown
+    # to them verbatim. Running translation on these corrupts the strings
+    # (e.g. 12"X24" → 12 "X24") and breaks attribute matching downstream.
+    _payload_flow_state = body.get("user_context", {}).get("flow_state", "idle")
+    if _payload_flow_state == FlowState.AWAITING_VARIANT_SELECTION.value:
+        was_translated, detected_lang = False, "en"
+        logger.debug("[LangCheck] Skipping translation — AWAITING_VARIANT_SELECTION flow")
+    else:
+        message, was_translated, detected_lang = detect_and_translate(message)
+        if was_translated:
+            logger.info(f"[LangCheck] translated from '{detected_lang}' | '{message[:100]}'")
 
     # ── Session & DB setup ──
     session_id = resolve_session_id()
