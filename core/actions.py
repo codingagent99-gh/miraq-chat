@@ -12,7 +12,9 @@ Builder functions return dicts ready for JSON serialisation.  They raise
 ``ValueError`` when a required field is missing so callers get an immediate,
 readable error rather than a silent bad payload on the wire.
 
-All six action types are always emitted — there is no feature flag gating.
+All six action types are always emitted — there is no feature flag gating:
+``ADD_TO_CART``, ``OPEN_CART_PANEL``, ``UPDATE_CART_ITEM``, ``REMOVE_CART_ITEM``,
+``OPEN_CHECKOUT_PANEL``, ``PROPOSE_CHECKOUT_ADDRESS``.
 """
 
 from __future__ import annotations
