@@ -21,7 +21,6 @@ from app_config import (
     DEFAULT_ORDER_PER_PAGE
 )
 
-from datetime import datetime, timezone
 from models import Intent, WooAPICall
 from woo_client import woo_client
 from formatters import format_product
@@ -35,7 +34,7 @@ from handlers.chat_utils import (
 
 logger = get_logger("miraq_chat")
 
-def handle_historical_search(intent, entities, order_data, customer_id, session_id, page, start_time, sessions):
+def handle_historical_search(intent, entities, order_data, customer_id, session_id, page, start_time):
     """Step 3.5c: Filter past orders by specific attributes or tags."""
     if intent != Intent.HISTORICAL_SEARCH:
         return None
@@ -255,7 +254,7 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
         "flow_state": FlowState.IDLE.value,
     }), 200
     
-def handle_reorder(intent, entities, order_data, customer_id, session_id, page, start_time, sessions):
+def handle_reorder(intent, entities, order_data, customer_id, session_id, page, start_time):
     """Step 3.5: Create a new order from the last order's line items."""
     if intent != Intent.REORDER:
         return None
@@ -265,15 +264,6 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
         elapsed = time.time() - start_time
         bot_msg = "Which order would you like to reorder? 🔄\n\nPlease provide the order number (e.g., #12345), or simply say 'my last order'."
         
-        if session_id and session_id in sessions:
-            sessions[session_id]["history"].append({
-                "role": "bot",
-                "message": bot_msg,
-                "intent": "guided_flow",
-                "products_count": 0,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
-            
         return jsonify({
             "success": True,
             "bot_message": bot_msg,
@@ -449,7 +439,6 @@ def handle_quick_order(
     session_id,
     page,
     start_time,
-    sessions,
     order_create_intents,
 ):
     """Step 3.6: Resolve product and proceed to shipping for QUICK_ORDER / ORDER_ITEM / PLACE_ORDER."""
@@ -525,14 +514,6 @@ def handle_quick_order(
         if not _order_variation_id and not has_attrs:
             logger.info(f"Step 3.6: Variable product with no variant info | product_id={_order_product_id}")
             prompt_msg = build_variant_prompt(_order_product_raw or {}, _order_product_name, getattr(entities, 'attributes', {}))
-
-            if session_id and session_id in sessions:
-                _pfv = _prefetched_variations or []
-                sessions[session_id].setdefault("variation_cache", {})[str(_order_product_id)] = {
-                    "variations": _pfv,
-                    "parent_raw": _order_product_raw or {},
-                }
-                logger.info(f"Step 3.6: Cached {len(_pfv)} variations for product_id={_order_product_id} in session")
 
             elapsed = time.time() - start_time
             return jsonify({

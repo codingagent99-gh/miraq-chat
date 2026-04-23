@@ -33,7 +33,6 @@ def run_llm_fallback(
     start_time: float,
     order_create_intents: set,
     user_context: dict,
-    sessions: dict,
 ):
     """
     Run LLM fallback if needed.
@@ -129,13 +128,6 @@ def run_llm_fallback(
         elapsed = time.time() - start_time
         llm_metadata = llm_result.get("metadata", {})
         llm_metadata["response_time_ms"] = round(elapsed * 1000)
-
-        if session_id and session_id in sessions:
-            sessions[session_id]["history"].append({
-                "role": "bot",
-                "message": llm_result["bot_message"],
-                "intent": "conversational",
-            })
 
         return jsonify({
             "success": True,

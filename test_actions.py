@@ -428,7 +428,6 @@ class TestHandleQuickOrderToCartConfirm:
                 session_id="test-session",
                 page=1,
                 start_time=0.0,
-                sessions={},
                 order_create_intents={Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER},
             )
             return resp.get_json(), status
@@ -621,12 +620,6 @@ class TestVariantFlowTermination:
                     session_id="test",
                     page=1,
                     start_time=0.0,
-                    sessions={"test": {"variation_cache": {
-                        "10": {
-                            "variations": [variation_raw],
-                            "parent_raw": {"id": 10, "name": "Aura Tile", "type": "variable", "attributes": []},
-                        }
-                    }}},
                     user_context=user_context,
                     _resolve_variant=True,
                 )
