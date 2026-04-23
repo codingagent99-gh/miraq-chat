@@ -46,6 +46,37 @@ from core.actions import build_propose_checkout_address
 logger = get_logger("miraq_chat")
 chat_bp = Blueprint("chat", __name__)
 
+def _resolve_variation_slugs(resolved: dict, store_loader) -> list:
+    """
+    Convert resolved_attributes display names → WC term slugs for the cart payload.
+    e.g. {"Colors": "APOLLO Bianco", "Finish": "Matte"}
+      → [{"attribute": "pa_colors", "value": "apollobianco"},
+         {"attribute": "pa_finish",  "value": "matte"}]
+    """
+    attr_terms = getattr(store_loader, 'attributes', []) if store_loader else []
+
+    # Build lookup: taxonomy → {display_name_lower: slug}
+    slug_lookup: dict = {}
+    for attr in attr_terms:
+        taxonomy = attr.get("taxonomy", "")
+        slug_lookup[taxonomy] = {
+            term["name"].lower(): term["slug"]
+            for term in attr.get("terms", [])
+        }
+
+    result = []
+    for label, display_value in resolved.items():
+        taxonomy = f"pa_{label.lower().replace(' ', '-')}"
+        term_map = slug_lookup.get(taxonomy, {})
+        # Use matched slug, or fall back to naive slugify (strip spaces/quotes)
+        slug = term_map.get(
+            str(display_value).lower(),
+            re.sub(r'[^a-z0-9]+', '', str(display_value).lower())
+        )
+        result.append({"attribute": taxonomy, "value": slug})
+
+    return result
+
 def _maybe_attach_address_proposal(
     response_data: dict,
     message: str,
@@ -743,10 +774,7 @@ def chat():
             qty   = user_context.get("pending_quantity") or 1
             name  = user_context.get("pending_product_name", "item")
             resolved = user_context.get("resolved_attributes") or {}
-            variation_attributes = [
-                {"attribute": f"pa_{k.lower().replace(' ', '-')}", "value": v}
-                for k, v in resolved.items()
-            ]
+            variation_attributes = _resolve_variation_slugs(resolved, get_store_loader())
 
             if pid:
                 elapsed = round((time.time() - start_time) * 1000)
