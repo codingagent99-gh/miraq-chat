@@ -1034,16 +1034,17 @@ def handle_quantity_and_variant_check(
 
     # Quantity known but variable product not yet resolved
     if entities.quantity and not order_data and (product.get("type") == "variable" or product.get("variations")):
-        
-        # --- FAST TRACK: QUANTITY AND VARIANT BOTH RESOLVED! ---
+
+        # --- FAST TRACK: QUANTITY AND VARIANT BOTH RESOLVED → cart confirmation ---
         if len(_variations_for_cache) == 1:
             _resolved_var = _variations_for_cache[0]
+            from conversation_flow import FlowState
             if _resolved_var.get("stock_status") == "outofstock" or _resolved_var.get("in_stock") is False:
                 elapsed = time.time() - start_time
-                from conversation_flow import FlowState
+                
                 return jsonify({
                     "success": True,
-                    "bot_message": f"I'm sorry, but that specific variant is currently out of stock! 😔",
+                    "bot_message": "I'm sorry, but that specific variant is currently out of stock! 😔",
                     "intent": intent.value,
                     "products": products_formatted[:1],
                     "suggestions": ["Show similar products", "Browse categories"],
@@ -1056,62 +1057,32 @@ def handle_quantity_and_variant_check(
                     "pagination": default_pagination(page),
                 }), 200
 
-            shipping_address = fetch_shipping_address(customer_id, "Step 5.5 FastTrack")
-            has_address = bool(shipping_address and (shipping_address.get("address_1") or shipping_address.get("city")))
-
-            base_meta = {
-                "pending_product_id": product.get("id"),
-                "pending_product_name": product["name"],
-                "pending_quantity": entities.quantity,
-                "pending_variation_id": _resolved_var["id"],
-                "response_time_ms": round((time.time() - start_time) * 1000),
-            }
-
-            if has_address:
-                addr_parts = [p for p in [
-                    shipping_address.get("address_1", ""), shipping_address.get("address_2", ""),
-                    shipping_address.get("city", ""), shipping_address.get("state", ""),
-                    shipping_address.get("postcode", ""), shipping_address.get("country", ""),
-                ] if p]
-                addr_display = ", ".join(addr_parts)
-                elapsed = time.time() - start_time
-                from conversation_flow import FlowState
-                return jsonify({
-                    "success": True,
-                    "bot_message": (
-                        f"Great! I have everything I need to order **{entities.quantity}** of **{product['name']}**.\n\n"
-                        f"Your shipping address on file:\n\n📦 **{addr_display}**\n\n"
-                        "Would you like to ship to this address, or use a different one?"
-                    ),
-                    "intent": intent.value,
-                    "products": products_formatted[:1],
-                    "suggestions": ["Yes, use this address", "Change address", "Cancel Order"],
-                    "session_id": session_id,
-                    "metadata": {**base_meta, "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value},
-                    "flow_state": FlowState.AWAITING_SHIPPING_CONFIRM.value,
-                    "pagination": default_pagination(page),
-                }), 200
-            else:
-                elapsed = time.time() - start_time
-                from conversation_flow import FlowState
-                return jsonify({
-                    "success": True,
-                    "bot_message": (
-                        f"Great! I have everything I need to order **{entities.quantity}** of **{product['name']}**.\n\n"
-                        "No shipping address is on file. Please type your shipping address (street, city, state, zip code):"
-                    ),
-                    "intent": intent.value,
-                    "products": products_formatted[:1],
-                    "suggestions": ["Cancel Order"],
-                    "session_id": session_id,
-                    "metadata": {**base_meta, "flow_state": FlowState.AWAITING_NEW_ADDRESS.value},
-                    "flow_state": FlowState.AWAITING_NEW_ADDRESS.value,
-                    "pagination": default_pagination(page),
-                }), 200
+            _var_label = " / ".join(_get_safe_options(_resolved_var.get("attributes", [])).values())
+            _variant_suffix = f" ({_var_label})" if _var_label else ""
+            elapsed = time.time() - start_time
+            return jsonify({
+                "success": True,
+                "bot_message": (
+                    f"Got it — add **{product['name']}**{_variant_suffix} ×{entities.quantity} to your cart?"
+                ),
+                "intent": intent.value,
+                "products": products_formatted[:1],
+                "suggestions": ["Yes, add it", "No thanks", "Browse products"],
+                "session_id": session_id,
+                "metadata": {
+                    "flow_state":           FlowState.AWAITING_CART_CONFIRMATION.value,
+                    "pending_product_id":   product.get("id"),
+                    "pending_product_name": product["name"],
+                    "pending_quantity":     entities.quantity,
+                    "pending_variation_id": _resolved_var["id"],
+                    "response_time_ms":     round(elapsed * 1000),
+                },
+                "flow_state": FlowState.AWAITING_CART_CONFIRMATION.value,
+                "pagination": default_pagination(page),
+            }), 200
 
         # --- NORMAL: NEEDS VARIANT SELECTION ---
         from handlers.chat_utils import build_variant_prompt
-        # Pass _variations_for_cache
         prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache)
         if session_id and session_id in sessions:
             _pid = str(product.get("id"))
@@ -1130,14 +1101,16 @@ def handle_quantity_and_variant_check(
             "suggestions": ["Cancel Order"],
             "session_id": session_id,
             "metadata": {
-                "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
-                "pending_product_id": product.get("id"),
+                "flow_state":           FlowState.AWAITING_VARIANT_SELECTION.value,
+                "pending_product_id":   product.get("id"),
                 "pending_product_name": product["name"],
-                "pending_quantity": entities.quantity,
-                "response_time_ms": round(elapsed * 1000),
+                "pending_quantity":     entities.quantity,
+                "response_time_ms":     round(elapsed * 1000),
             },
             "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
             "pagination": default_pagination(page),
         }), 200
+
+    return None
 
     return None
