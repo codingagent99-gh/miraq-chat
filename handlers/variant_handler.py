@@ -50,7 +50,6 @@ def handle_variant_selection(
     session_id,
     page,
     start_time,
-    sessions,
     user_context,
     _resolve_variant,
 ):
@@ -82,12 +81,10 @@ def handle_variant_selection(
             f"Step 3.55: Abandoning variant flow — new intent={intent.value} detected | "
             f"message=\"{sanitize_log_string(message)}\""
         )
-        if session_id and session_id in sessions:
-            sessions[session_id]["flow_state"] = FlowState.IDLE.value
-            sessions[session_id]["user_context"].pop("pending_product_id", None)
-            sessions[session_id]["user_context"].pop("pending_product_name", None)
-            sessions[session_id]["user_context"].pop("pending_quantity", None)
-            sessions[session_id]["user_context"].pop("resolved_attributes", None)
+        user_context.pop("pending_product_id", None)
+        user_context.pop("pending_product_name", None)
+        user_context.pop("pending_quantity", None)
+        user_context.pop("resolved_attributes", None)
         return None
 
     if not (current_flow_state == FlowState.AWAITING_VARIANT_SELECTION and customer_id):
@@ -101,35 +98,26 @@ def handle_variant_selection(
     if not _var_product_id:
         return None
     
-    _session_data = sessions.get(session_id, {})
-    _var_cache = _session_data.get("variation_cache", {}).get(str(_var_product_id))
-    
     # Fetch parent_raw early so we know the EXACT variation axes required
     parent_raw = {}
-    if _var_cache:
-        all_variations = _var_cache["variations"]
-        parent_raw = _var_cache.get("parent_raw", {})
-        logger.info(f"Step 3.55: Using session-cached variations ({len(all_variations)}) — skipping API call")
-        _variations_loaded = True
-    else:
-        var_call = WooAPICall(
-            method="GET",
-            endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}/variations",
-            params={"per_page": 100, "status": "publish"},
-            description=f"Fetch variations for variant selection of '{_var_product_name}'",
-        )
-        var_resp = woo_client.execute(var_call)
-        _variations_loaded = var_resp.get("success") and isinstance(var_resp.get("data"), list)
-        if _variations_loaded:
-            all_variations = var_resp["data"]
-        parent_call = WooAPICall(
-            method="GET",
-            endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}",
-            params={},
-            description=f"Fetch parent product '{_var_product_name}'",
-        )
-        parent_resp = woo_client.execute(parent_call)
-        parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
+    var_call = WooAPICall(
+        method="GET",
+        endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}/variations",
+        params={"per_page": 100, "status": "publish"},
+        description=f"Fetch variations for variant selection of '{_var_product_name}'",
+    )
+    var_resp = woo_client.execute(var_call)
+    _variations_loaded = var_resp.get("success") and isinstance(var_resp.get("data"), list)
+    if _variations_loaded:
+        all_variations = var_resp["data"]
+    parent_call = WooAPICall(
+        method="GET",
+        endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}",
+        params={},
+        description=f"Fetch parent product '{_var_product_name}'",
+    )
+    parent_resp = woo_client.execute(parent_call)
+    parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
 
     if not _variations_loaded:
         return None
@@ -439,7 +427,6 @@ def handle_variation_product(
     session_id,
     page,
     start_time,
-    sessions,
     # ── New params for cart confirmation flow ──
     user_context=None,
     conversation=None,
@@ -784,15 +771,6 @@ def handle_variation_product(
         ),
     }
 
-    if session_id and session_id in sessions:
-        sessions[session_id]["history"].append({
-            "role": "bot",
-            "message": bot_message,
-            "intent": intent.value,
-            "products_count": len(products),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
-
     return jsonify({
         "success":     True,
         "bot_message": bot_message,
@@ -814,7 +792,6 @@ def handle_quantity_and_variant_check(
     session_id,
     page,
     start_time,
-    sessions,
     customer_id=None,
 ):
     """
@@ -984,13 +961,6 @@ def handle_quantity_and_variant_check(
             from handlers.chat_utils import build_variant_prompt
             # Pass _variations_for_cache
             prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache)
-            if session_id and session_id in sessions:
-                _pid = str(product.get("id"))
-                sessions[session_id].setdefault("variation_cache", {})[_pid] = {
-                    "variations": _variations_for_cache,
-                    "parent_raw": _raw_for_prompt,
-                }
-                logger.info(f"Step 5.5: Cached {len(_variations_for_cache)} variations for product_id={_pid} in session")
             elapsed = time.time() - start_time
             return jsonify({
                 "success": True,
@@ -1078,13 +1048,6 @@ def handle_quantity_and_variant_check(
         # --- NORMAL: NEEDS VARIANT SELECTION ---
         from handlers.chat_utils import build_variant_prompt
         prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache)
-        if session_id and session_id in sessions:
-            _pid = str(product.get("id"))
-            sessions[session_id].setdefault("variation_cache", {})[_pid] = {
-                "variations": _variations_for_cache,
-                "parent_raw": _raw_for_prompt,
-            }
-            logger.info(f"Step 5.5: Cached {len(_variations_for_cache)} variations for product_id={_pid} in session")
         elapsed = time.time() - start_time
         return jsonify({
             "success": True,

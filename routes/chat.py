@@ -624,8 +624,6 @@ def chat():
         db.session.add(user_msg)
         db.session.commit()
 
-        mock_sessions = {str(session_id): {"history": [], "user_context": user_context}}
-
         def _ft(resp):
             """Local alias: wraps _finalize_turn with address-proposal context."""
             return _finalize_turn(
@@ -796,7 +794,7 @@ def chat():
         if _needs_flow_handler:
             resp = handle_flow(
                 flow_result, user_context, str(conversation.id),
-                customer_id, page, start_time, mock_sessions,
+                customer_id, page, start_time,
             )
             if resp:
                 return _ft(resp)
@@ -834,7 +832,6 @@ def chat():
                 session_id=str(conversation.id), session_history=session_history,
                 store_loader=store_loader, page=page, start_time=start_time,
                 order_create_intents=ORDER_CREATE_INTENTS, user_context=user_context,
-                sessions=mock_sessions,
             )
 
             if llm_outcome is not None:
@@ -914,7 +911,7 @@ def chat():
             return cust_resp
 
         # ── Step 9: Route through specialized handlers ──
-        resp = handle_reorder(intent, entities, order_data, customer_id, str(conversation.id), page, start_time, mock_sessions)
+        resp = handle_reorder(intent, entities, order_data, customer_id, str(conversation.id), page, start_time)
         if resp:
             return _ft(resp)
 
@@ -922,19 +919,19 @@ def chat():
         if resp:
             return _ft(resp)
 
-        resp = handle_historical_search(intent, entities, order_data, customer_id, str(conversation.id), page, start_time, mock_sessions)
+        resp = handle_historical_search(intent, entities, order_data, customer_id, str(conversation.id), page, start_time)
         if resp:
             return _ft(resp)
 
-        resp = handle_variant_selection(current_flow_state, intent, entities, message, customer_id, str(conversation.id), page, start_time, mock_sessions, user_context, _resolve_variant)
+        resp = handle_variant_selection(current_flow_state, intent, entities, message, customer_id, str(conversation.id), page, start_time, user_context, _resolve_variant)
         if resp:
             return _ft(resp)
 
-        resp = handle_quantity_and_variant_check(intent, entities, all_products_raw, order_data, ORDER_CREATE_INTENTS, str(conversation.id), page, start_time, mock_sessions, customer_id=customer_id)
+        resp = handle_quantity_and_variant_check(intent, entities, all_products_raw, order_data, ORDER_CREATE_INTENTS, str(conversation.id), page, start_time, customer_id=customer_id)
         if resp:
             return _ft(resp)
 
-        resp = handle_quick_order(intent, entities, all_products_raw, last_product_ctx, customer_id, str(conversation.id), page, start_time, mock_sessions, ORDER_CREATE_INTENTS)
+        resp = handle_quick_order(intent, entities, all_products_raw, last_product_ctx, customer_id, str(conversation.id), page, start_time, ORDER_CREATE_INTENTS)
         if resp:
             if getattr(entities, 'product_id', None):
                 user_context["pending_product_id"] = entities.product_id
@@ -953,7 +950,6 @@ def chat():
             str(conversation.id), 
             page, 
             start_time, 
-            mock_sessions,
             user_context=user_context,
             conversation=conversation,
             )
@@ -961,7 +957,7 @@ def chat():
             return _ft(resp)
 
         store_loader = get_store_loader()
-        all_products_raw, resp = handle_empty_results(intent, entities, all_products_raw, message, str(conversation.id), page, start_time, confidence, mock_sessions, store_loader)
+        all_products_raw, resp = handle_empty_results(intent, entities, all_products_raw, message, str(conversation.id), page, start_time, confidence, store_loader)
         if resp:
             return _ft(resp)
 

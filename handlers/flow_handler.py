@@ -24,7 +24,6 @@ def handle_flow(
     customer_id,
     page: int,
     start_time: float,
-    sessions: dict,
 ):
     """
     Process the result of handle_flow_state().

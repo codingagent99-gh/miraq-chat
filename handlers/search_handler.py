@@ -75,7 +75,6 @@ def handle_empty_results(
     page,
     start_time,
     confidence,
-    sessions,
     store_loader,
 ):
     """
@@ -102,12 +101,6 @@ def handle_empty_results(
             f"returning local no-results response (skipping LLM retry)"
         )
         elapsed = time.time() - start_time
-        if session_id and session_id in sessions:
-            sessions[session_id]["history"].append({
-                "role": "bot",
-                "message": _no_results_msg,
-                "intent": intent.value,
-            })
         _filter_suggestions = build_suggestions(entities, store_loader)
         return all_products_raw, (jsonify({
             "success": True,
@@ -208,13 +201,6 @@ def handle_empty_results(
         llm_metadata["response_time_ms"] = round(elapsed * 1000)
         llm_metadata["original_intent"] = intent.value
         llm_metadata["confidence"] = round(confidence, 2)
-
-        if session_id and session_id in sessions:
-            sessions[session_id]["history"].append({
-                "role": "bot",
-                "message": suggestion_msg,
-                "intent": intent.value,
-            })
 
         _filter_suggestions = build_suggestions(entities, store_loader)
         return all_products_raw, (jsonify({
