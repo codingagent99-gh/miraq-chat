@@ -884,7 +884,6 @@ def handle_quantity_and_variant_check(
     # ── OUT OF STOCK INTERCEPT ──
     if product.get("stock_status") == "outofstock":
         elapsed = time.time() - start_time
-        from conversation_flow import FlowState
         return jsonify({
             "success": True,
             "bot_message": f"I'm so sorry, but **{product['name']}** is currently out of stock!",
@@ -937,7 +936,6 @@ def handle_quantity_and_variant_check(
                 _resolved_var = _variations_for_cache[0]
                 if _resolved_var.get("stock_status") == "outofstock" or _resolved_var.get("in_stock") is False:
                     elapsed = time.time() - start_time
-                    from conversation_flow import FlowState
                     return jsonify({
                         "success": True,
                         "bot_message": f"I'm sorry, but that specific variant is currently out of stock! 😔",
@@ -958,7 +956,6 @@ def handle_quantity_and_variant_check(
                 _var_label = " / ".join(_get_safe_options(_resolved_var.get("attributes", [])).values())
                 
                 elapsed = time.time() - start_time
-                from conversation_flow import FlowState
                 return jsonify({
                     "success": True,
                     "bot_message": (
@@ -995,7 +992,6 @@ def handle_quantity_and_variant_check(
                 }
                 logger.info(f"Step 5.5: Cached {len(_variations_for_cache)} variations for product_id={_pid} in session")
             elapsed = time.time() - start_time
-            from conversation_flow import FlowState
             return jsonify({
                 "success": True,
                 "bot_message": prompt_msg,
@@ -1014,7 +1010,6 @@ def handle_quantity_and_variant_check(
             }), 200
 
         elapsed = time.time() - start_time
-        from conversation_flow import FlowState
         return jsonify({
             "success": True,
             "bot_message": f"Sure, I can order **{product['name']}** for you! How many do you need? You can tap an option below or type any exact number in the chat. 🛒",
@@ -1038,7 +1033,6 @@ def handle_quantity_and_variant_check(
         # --- FAST TRACK: QUANTITY AND VARIANT BOTH RESOLVED → cart confirmation ---
         if len(_variations_for_cache) == 1:
             _resolved_var = _variations_for_cache[0]
-            from conversation_flow import FlowState
             if _resolved_var.get("stock_status") == "outofstock" or _resolved_var.get("in_stock") is False:
                 elapsed = time.time() - start_time
                 
@@ -1092,7 +1086,6 @@ def handle_quantity_and_variant_check(
             }
             logger.info(f"Step 5.5: Cached {len(_variations_for_cache)} variations for product_id={_pid} in session")
         elapsed = time.time() - start_time
-        from conversation_flow import FlowState
         return jsonify({
             "success": True,
             "bot_message": prompt_msg,

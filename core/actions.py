@@ -12,14 +12,7 @@ Builder functions return dicts ready for JSON serialisation.  They raise
 ``ValueError`` when a required field is missing so callers get an immediate,
 readable error rather than a silent bad payload on the wire.
 
-Gating logic
-------------
-``_filter_actions_by_flag(actions, enabled)`` removes actions that are only
-valid when the headless checkout feature flag is ON.  When the flag is OFF the
-checkout-only action types (``OPEN_CHECKOUT_PANEL``, ``PROPOSE_CHECKOUT_ADDRESS``,
-``UPDATE_CART_ITEM``, ``REMOVE_CART_ITEM``) are stripped before serialisation.
-Cart actions (``ADD_TO_CART``, ``OPEN_CART_PANEL``) always pass through because
-they mirror existing backend behaviour that the frontend already handles.
+All six action types are always emitted — there is no feature flag gating.
 """
 
 from __future__ import annotations
@@ -34,25 +27,15 @@ from typing import Any, Dict, List, Optional
 class ActionType:
     """String constants for every action type in the headless checkout contract."""
 
-    # Cart actions — always emitted regardless of HEADLESS_CHECKOUT_ENABLED.
+    # Cart actions.
     ADD_TO_CART      = "ADD_TO_CART"
     OPEN_CART_PANEL  = "OPEN_CART_PANEL"
 
-    # Checkout-only actions — gated behind HEADLESS_CHECKOUT_ENABLED.
+    # Checkout actions.
     UPDATE_CART_ITEM          = "UPDATE_CART_ITEM"
     REMOVE_CART_ITEM          = "REMOVE_CART_ITEM"
     OPEN_CHECKOUT_PANEL       = "OPEN_CHECKOUT_PANEL"
     PROPOSE_CHECKOUT_ADDRESS  = "PROPOSE_CHECKOUT_ADDRESS"
-
-
-# Set of action types that are gated behind HEADLESS_CHECKOUT_ENABLED.
-# Only these are stripped when the flag is OFF; all others pass through.
-_CHECKOUT_GATED_ACTIONS: frozenset = frozenset({
-    ActionType.UPDATE_CART_ITEM,
-    ActionType.REMOVE_CART_ITEM,
-    ActionType.OPEN_CHECKOUT_PANEL,
-    ActionType.PROPOSE_CHECKOUT_ADDRESS,
-})
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -168,35 +151,3 @@ def build_propose_checkout_address(
     return {"type": ActionType.PROPOSE_CHECKOUT_ADDRESS, "payload": payload}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Flag filter
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _filter_actions_by_flag(
-    actions: List[Dict[str, Any]],
-    enabled: bool,
-) -> List[Dict[str, Any]]:
-    """
-    Filter ``actions`` based on the ``HEADLESS_CHECKOUT_ENABLED`` flag value.
-
-    When ``enabled`` is ``False``, any action whose ``type`` is in
-    ``_CHECKOUT_GATED_ACTIONS`` is removed.  Cart-level actions
-    (``ADD_TO_CART``, ``OPEN_CART_PANEL``) are always kept.
-
-    When ``enabled`` is ``True``, all actions are kept unchanged.
-
-    Parameters
-    ----------
-    actions:
-        List of action dicts (each with ``type`` and ``payload`` keys).
-    enabled:
-        Value of the ``HEADLESS_CHECKOUT_ENABLED`` feature flag.
-
-    Returns
-    -------
-    List[Dict[str, Any]]
-        Filtered list (never ``None``; empty list when all are gated out).
-    """
-    if enabled:
-        return list(actions)
-    return [a for a in actions if a.get("type") not in _CHECKOUT_GATED_ACTIONS]
