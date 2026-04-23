@@ -63,23 +63,34 @@ class WooClient:
 
         try:
             if api_call.method == "GET":
+                custom_headers = {
+                    "X-Consumer-Key":    WOO_CONSUMER_KEY,
+                    "X-Consumer-Secret": WOO_CONSUMER_SECRET,
+                } if is_custom_api else {}
+
                 resp = self.session.get(
                     api_call.endpoint,
                     params=params,
+                    headers=custom_headers,
                     timeout=30,
                 )
             else:
-                # For non-GET methods, only add auth if not custom API
                 auth_params = {} if is_custom_api else {
                     "consumer_key": WOO_CONSUMER_KEY,
                     "consumer_secret": WOO_CONSUMER_SECRET,
                 }
+                custom_headers = {
+                    "X-Consumer-Key":    WOO_CONSUMER_KEY,
+                    "X-Consumer-Secret": WOO_CONSUMER_SECRET,
+                } if is_custom_api else {}
+
                 resp = self.session.request(
                     method=api_call.method,
                     url=api_call.endpoint,
                     params=auth_params,
                     json=api_call.body,
-                    timeout=30,
+                    headers=custom_headers,
+                    timeout=45,
                 )
 
             resp.raise_for_status()
