@@ -250,17 +250,19 @@ def handle_flow_state(
             "flow_state": FlowState.AWAITING_REORDER_ID.value,
             "pass_through": False,
         }
+    
     # ── State: Awaiting quantity for an order ──
-    # After user provides quantity → go to cart confirmation
+    # After user provides quantity → emit cart-confirmation prompt
     if state == FlowState.AWAITING_QUANTITY:
         import re
         qty_match = re.search(r"\b(\d+)\b", text)
         if qty_match:
             quantity = int(qty_match.group(1))
             return {
+                "action": "prompt_cart_confirmation",   # routes/chat.py builds the prompt
                 "flow_state": FlowState.AWAITING_CART_CONFIRMATION.value,
                 "pending_quantity": quantity,
-                "pass_through": True,
+                "pass_through": False,
             }
         else:
             return {

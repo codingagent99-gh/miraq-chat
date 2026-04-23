@@ -674,6 +674,37 @@ def chat():
             logger.info(f"[MEMORY TRACE 3] STATE MACHINE returned: {flow_result}")
             logger.info(f"[MEMORY TRACE 4] UPDATED user_context: {user_context}")
 
+        # ── Cart confirmation PROMPT intercept (after AWAITING_QUANTITY) ──
+        if flow_result and flow_result.get("action") == "prompt_cart_confirmation":
+            pid       = user_context.get("pending_product_id")
+            vid       = user_context.get("pending_variation_id")
+            qty       = user_context.get("pending_quantity") or 1
+            name      = user_context.get("pending_product_name", "item")
+            resolved  = user_context.get("resolved_attributes") or {}
+            variant_label = " / ".join(str(v) for v in resolved.values()) if resolved else ""
+            variant_suffix = f" ({variant_label})" if variant_label else ""
+
+            elapsed = round((time.time() - start_time) * 1000)
+            return _finalize_turn(conversation, jsonify({
+                "success":     True,
+                "bot_message": f"Got it — add **{name}**{variant_suffix} ×{qty} to your cart?",
+                "intent":      "guided_flow",
+                "products":    [],
+                "suggestions": ["Yes, add it", "No thanks", "Browse products"],
+                "session_id":  str(conversation.id),
+                "metadata": {
+                    "flow_state":           FlowState.AWAITING_CART_CONFIRMATION.value,
+                    "pending_product_id":   pid,
+                    "pending_product_name": name,
+                    "pending_quantity":     qty,
+                    "pending_variation_id": vid,
+                    "resolved_attributes":  resolved,
+                    "response_time_ms":     elapsed,
+                },
+                "flow_state":  FlowState.AWAITING_CART_CONFIRMATION.value,
+                "pagination":  default_pagination(page),
+                "actions":     [],
+            }))
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # ── Cart confirmation intercept — MUST be before handle_flow ──
         # handle_flow crashes on any flow_result without "bot_message".
