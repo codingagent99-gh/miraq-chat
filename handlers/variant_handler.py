@@ -1112,5 +1112,3 @@ def handle_quantity_and_variant_check(
         }), 200
 
     return None
-
-    return None

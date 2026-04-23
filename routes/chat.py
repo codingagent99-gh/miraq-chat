@@ -47,18 +47,30 @@ from core.actions import build_propose_checkout_address
 logger = get_logger("miraq_chat")
 chat_bp = Blueprint("chat", __name__)
 
-
-def _maybe_attach_address_proposal(response_data: dict, message: str, customer_id) -> None:
+def _maybe_attach_address_proposal(
+    response_data: dict,
+    message: str,
+    customer_id,
+    current_flow_state=None,
+) -> None:
     """
     Inspect *message* for a plausible postal address.  When one is found AND
     HEADLESS_CHECKOUT_ENABLED is True, append a PROPOSE_CHECKOUT_ADDRESS action
     to response_data["actions"] and update bot_message / suggestions.
+
+    Skipped during multi-turn flows (variant labels, quantity replies, etc.
+    commonly contain dimension strings or comma-delimited tokens that look
+    like addresses but aren't).
 
     Mutates *response_data* in-place; returns None.  Silent on any error.
     """
     if not HEADLESS_CHECKOUT_ENABLED:
         return
     if not customer_id:
+        return
+    # Only propose addresses from a clean conversational turn — never from
+    # a guided flow reply (variant text, quantity, "Yes, add it", etc.)
+    if current_flow_state is not None and current_flow_state != FlowState.IDLE:
         return
 
     try:
@@ -107,8 +119,7 @@ def _maybe_attach_address_proposal(response_data: dict, message: str, customer_i
         ]
     except Exception as exc:
         logger.warning(f"_maybe_attach_address_proposal failed silently | error={exc}")
-
-
+        
 # ══════════════════════════════════════════════════════════════
 # ─── DATABASE SESSION HELPERS ───
 # ══════════════════════════════════════════════════════════════
@@ -123,8 +134,14 @@ def resolve_session_id():
             logger.warning(f"Invalid X-MiraQ-Session format received: {miraq_session}")
     return uuid.uuid4()
 
-
-def _finalize_turn(conversation, flask_response, *, _proposal_message=None, _proposal_customer_id=None):
+def _finalize_turn(
+    conversation,
+    flask_response,
+    *,
+    _proposal_message=None,
+    _proposal_customer_id=None,
+    _proposal_flow_state=None,
+):
     """
     Interceptor: Extracts bot message from Flask response, saves to DB,
     commits the transaction, and returns the updated response.
@@ -145,7 +162,12 @@ def _finalize_turn(conversation, flask_response, *, _proposal_message=None, _pro
 
     # 0. Optionally attach PROPOSE_CHECKOUT_ADDRESS action
     if _proposal_message and _proposal_customer_id:
-        _maybe_attach_address_proposal(data, _proposal_message, _proposal_customer_id)
+        _maybe_attach_address_proposal(
+            data,
+            _proposal_message,
+            _proposal_customer_id,
+            current_flow_state=_proposal_flow_state,
+        )
 
     # 1. Save Bot Message
     bot_msg = Message(
@@ -613,6 +635,7 @@ def chat():
                 conversation, resp,
                 _proposal_message=message,
                 _proposal_customer_id=customer_id,
+                _proposal_flow_state=current_flow_state,
             )
 
         # ── Resolve flow state ──

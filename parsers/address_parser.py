@@ -4,9 +4,13 @@ parsers/address_parser.py
 Detects a plausible address in a free-text user message and converts it
 to a normalised address dict suitable for the PROPOSE_CHECKOUT_ADDRESS action.
 
-The parser is intentionally lightweight — it looks for the structural
-hallmarks of a postal address (street number + name, city, optional
-postcode) rather than trying to parse every world address format.
+The parser is intentionally conservative — it only fires on STRONG signals:
+  - an explicit trigger phrase ("ship it to", "my address is", …), OR
+  - a real postcode (UK / US ZIP / Indian PIN).
+
+A bare keyword + number is NOT enough: product descriptions like
+"Ansel Charcoal Block Mosaic, 12\"x24\"" contain "block" and digits but
+are not addresses.
 """
 
 import re
@@ -24,18 +28,16 @@ _UK_POSTCODE_RE = re.compile(
 # US ZIP:  12345  or  12345-6789
 _US_ZIP_RE = re.compile(r'\b\d{5}(?:-\d{4})?\b')
 
-# Indian PIN code:  6-digit number
+# Indian PIN code:  6-digit number starting non-zero
 _IN_PIN_RE = re.compile(r'\b[1-9]\d{5}\b')
 
-# Minimum-viable street: starts with a digit (house/flat number)
-_STREET_NUMBER_RE = re.compile(r'\b\d+[A-Z]?\b', re.IGNORECASE)
-
-# Common address-indicator words
+# Common address-indicator words (kept for parsing, NOT for triggering).
+# Note: "block" intentionally removed — too common in product names.
 _ADDRESS_KEYWORDS_RE = re.compile(
     r'\b(street|st|road|rd|avenue|ave|boulevard|blvd|lane|ln|drive|dr|'
     r'court|ct|place|pl|way|close|crescent|park|square|row|mews|'
     r'terrace|gardens|gate|hill|grove|house|flat|apt|apartment|floor|'
-    r'building|bldg|suite|ste|unit|block|sector|nagar|colony|layout)\b',
+    r'building|bldg|suite|ste|unit|sector|nagar|colony|layout)\b',
     re.IGNORECASE,
 )
 
@@ -46,6 +48,12 @@ _ADDRESS_TRIGGER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Dimension/measurement patterns — common in product specs, NEVER in addresses.
+# e.g. 12"x24", 6'x6', 3 x 3, 12X24
+_DIMENSION_RE = re.compile(
+    r'\b\d+\s*["\']?\s*[xX]\s*\d+\s*["\']?\b'
+)
+
 
 def extract_address(text: str) -> Optional[Dict[str, Any]]:
     """
@@ -54,32 +62,37 @@ def extract_address(text: str) -> Optional[Dict[str, Any]]:
     Returns a dict with whichever fields could be identified, or ``None``
     if no plausible address is found.
 
+    Triggers ONLY on:
+      - an explicit address trigger phrase, OR
+      - a real postcode (UK / US ZIP / IN PIN).
+
     Returned keys (all optional): ``address_1``, ``city``, ``postcode``,
-    ``country`` (inferred from postcode format when possible).
+    ``state``, ``country`` (inferred from postcode format when possible).
     """
     if not text:
         return None
 
-    has_trigger   = bool(_ADDRESS_TRIGGER_RE.search(text))
-    has_keyword   = bool(_ADDRESS_KEYWORDS_RE.search(text))
-    has_street_no = bool(_STREET_NUMBER_RE.search(text))
+    # Hard reject: dimension strings ("12\"x24\"", "6 x 6") never appear in
+    # real addresses but routinely appear in product variant labels.
+    if _DIMENSION_RE.search(text):
+        return None
+
+    has_trigger = bool(_ADDRESS_TRIGGER_RE.search(text))
 
     uk_match = _UK_POSTCODE_RE.search(text)
     us_match = _US_ZIP_RE.search(text)
     in_match = _IN_PIN_RE.search(text)
-
     has_postcode = bool(uk_match or us_match or in_match)
 
-    # Need at least one strong signal: trigger phrase OR (address keyword + number) OR postcode
-    has_address_signal = has_trigger or (has_keyword and has_street_no) or has_postcode
-    if not has_address_signal:
+    # STRONG signal required: trigger phrase OR real postcode.
+    # The old (keyword + number) heuristic is too noisy for product catalogs.
+    if not (has_trigger or has_postcode):
         return None
 
     # ── Try to pull apart the address from the trigger phrase ──
     remainder = text
     trigger_m = _ADDRESS_TRIGGER_RE.search(text)
     if trigger_m:
-        # Everything after the trigger is the address
         remainder = text[trigger_m.end():].strip(" ,.-")
 
     # ── Split on comma — most addresses are comma-delimited ──
