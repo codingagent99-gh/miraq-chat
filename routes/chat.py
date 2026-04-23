@@ -18,9 +18,8 @@ from app_config import (
     ORDER_CREATE_INTENTS,
     CLASSIFIER_PROVIDER_TAG,
     get_currency_symbol,
-    HEADLESS_CHECKOUT_ENABLED,
 )
-from core.actions import _filter_actions_by_flag, build_add_to_cart, build_open_checkout_panel, build_open_cart_panel
+from core.actions import build_add_to_cart, build_open_checkout_panel, build_open_cart_panel
 from woo_client import woo_client
 from formatters import format_product, format_custom_product, format_category, _entities_to_dict
 from response_generator import generate_bot_message, generate_suggestions, _resolve_user_placeholders
@@ -54,9 +53,9 @@ def _maybe_attach_address_proposal(
     current_flow_state=None,
 ) -> None:
     """
-    Inspect *message* for a plausible postal address.  When one is found AND
-    HEADLESS_CHECKOUT_ENABLED is True, append a PROPOSE_CHECKOUT_ADDRESS action
-    to response_data["actions"] and update bot_message / suggestions.
+    Inspect *message* for a plausible postal address.  When one is found,
+    append a PROPOSE_CHECKOUT_ADDRESS action to response_data["actions"] and
+    update bot_message / suggestions.
 
     Skipped during multi-turn flows (variant labels, quantity replies, etc.
     commonly contain dimension strings or comma-delimited tokens that look
@@ -64,8 +63,6 @@ def _maybe_attach_address_proposal(
 
     Mutates *response_data* in-place; returns None.  Silent on any error.
     """
-    if not HEADLESS_CHECKOUT_ENABLED:
-        return
     if not customer_id:
         return
     # Only propose addresses from a clean conversational turn — never from
@@ -210,9 +207,9 @@ def _finalize_turn(
     # 4. Inject session ID
     data["session_id"] = str(conversation.id)
 
-    # 5. Inject actions array (always present; filter by feature flag)
+    # 5. Inject actions array (always present)
     raw_actions = data.get("actions") if isinstance(data.get("actions"), list) else []
-    data["actions"] = _filter_actions_by_flag(raw_actions, HEADLESS_CHECKOUT_ENABLED)
+    data["actions"] = list(raw_actions)
 
     return jsonify(data), status_code
 
@@ -767,14 +764,6 @@ def chat():
                 return _ft(jsonify({
                     "success":     True,
                     "bot_message": bot_msg,
-                    "action":      "trigger_frontend_cart_add",
-                    "metadata":    {
-                        "product_id":           pid,
-                        "variation_id":         vid,
-                        "quantity":             qty,
-                        "variation_attributes": variation_attributes,
-                        "response_time_ms":     elapsed,
-                    },
                     "intent":      Intent.ADD_TO_CART.value,
                     "suggestions": suggestions,
                     "session_id":  str(conversation.id),

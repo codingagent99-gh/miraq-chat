@@ -4,15 +4,9 @@ cart_handler.py
 All cart mutations are owned by the browser session (WooCommerce Store API
 requires nonce + cookie auth that only the frontend holds).
 
-This handler never calls woo_cart.py. Instead it returns an `action` signal
-that the frontend's useChat.ts intercepts and dispatches to useCart.ts, which
-hits /wc/store/v1 with the correct credentials.
-
-Action contract (must match useChat.ts switch/if blocks):
-  trigger_frontend_view_cart    — open cart panel + fetch latest state
-  trigger_frontend_cart_add     — add item (product_id, variation_id, quantity)
-  trigger_frontend_cart_remove  — remove item by cart item key
-  trigger_frontend_cart_update  — update item quantity by cart item key
+This handler never calls woo_cart.py. Instead it returns an ``actions[]``
+array that the frontend's useChat.ts dispatches via onActions to useCart.ts,
+which hits /wc/store/v1 with the correct credentials.
 """
 
 import time
@@ -37,11 +31,10 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
     session_id = str(conversation.id)
 
     # ── Shared response builder ───────────────────────────────────────────────
-    def _resp(action: str, bot_message: str, suggestions: list, metadata: dict = None, actions: list = None):
+    def _resp(bot_message: str, suggestions: list, metadata: dict = None, actions: list = None):
         return jsonify({
             "success":     True,
             "bot_message": bot_message,
-            "action":      action,
             "intent":      intent.value,
             "products":    [],
             "suggestions": suggestions,
@@ -58,7 +51,6 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
     # ── VIEW_CART ─────────────────────────────────────────────────────────────
     if intent == Intent.VIEW_CART:
         return _resp(
-            action      = "trigger_frontend_view_cart",
             bot_message = "Here's your cart! 🛒",
             suggestions = ["Checkout", "Browse products", "Clear cart"],
             actions     = [build_open_cart_panel()],
@@ -81,7 +73,6 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
             return None
 
         return _resp(
-            action      = "trigger_frontend_cart_add",
             bot_message = f"Adding **{name}** to your cart... 🛒",
             suggestions = ["Browse products", "Go to cart", "Checkout"],
             metadata    = {
@@ -107,14 +98,12 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
                 "handle_cart_intent: REMOVE_FROM_CART with no pending_cart_item_key"
             )
             return _resp(
-                action      = "trigger_frontend_view_cart",
                 bot_message = "Which item would you like to remove? Tap it in your cart.",
                 suggestions = ["View cart"],
                 actions     = [build_open_cart_panel()],
             )
 
         return _resp(
-            action      = "trigger_frontend_cart_remove",
             bot_message = "Removing that item from your cart...",
             suggestions = ["View cart", "Browse products"],
             metadata    = {"item_key": item_key},
@@ -131,14 +120,12 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
                 item_key, qty,
             )
             return _resp(
-                action      = "trigger_frontend_view_cart",
                 bot_message = "Which item's quantity would you like to update? Tap it in your cart.",
                 suggestions = ["View cart"],
                 actions     = [build_open_cart_panel()],
             )
 
         return _resp(
-            action      = "trigger_frontend_cart_update",
             bot_message = f"Updating quantity to {qty}...",
             suggestions = ["View cart", "Browse products", "Checkout"],
             metadata    = {
@@ -150,7 +137,6 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
     # ── CHECKOUT ──────────────────────────────────────────────────────────────
     if intent == Intent.CHECKOUT:
         return _resp(
-            action      = "trigger_frontend_view_cart",
             bot_message = "Taking you to checkout! 🧾",
             suggestions = ["Browse products"],
             actions     = [build_open_cart_panel()],

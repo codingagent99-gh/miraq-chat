@@ -5,10 +5,9 @@ Unit tests for the headless checkout action vocabulary introduced in PR 1.
 
 Covers:
   1. Envelope test — every chat-style response includes ``actions: []``.
-  2. Flag-off test — _filter_actions_by_flag removes gated actions when flag=False.
-  3. Flag-on test  — _filter_actions_by_flag keeps all actions when flag=True.
-  4. Builder tests — each builder produces {type, payload} and rejects bad input.
-  5. Backward-compat — confirm_add_to_cart still sets legacy fields AND emits ADD_TO_CART.
+  2. Builder tests — each builder produces {type, payload} and rejects bad input.
+  3. Cart-confirmation — confirm_add_to_cart emits ADD_TO_CART + OPEN_CART_PANEL.
+  4. Address proposal — _maybe_attach_address_proposal emits PROPOSE_CHECKOUT_ADDRESS.
 """
 
 import pytest
@@ -17,8 +16,6 @@ from flask import Flask
 # ── Module under test ────────────────────────────────────────────────────────
 from core.actions import (
     ActionType,
-    _filter_actions_by_flag,
-    _CHECKOUT_GATED_ACTIONS,
     build_add_to_cart,
     build_open_cart_panel,
     build_update_cart_item,
@@ -54,14 +51,14 @@ class TestFinalizeEnvelope:
             data = resp.get_json()
             # Simulate what _finalize_turn does for the actions step
             raw_actions = data.get("actions") if isinstance(data.get("actions"), list) else []
-            data["actions"] = _filter_actions_by_flag(raw_actions, False)
+            data["actions"] = list(raw_actions)
 
             assert "actions" in data
             assert isinstance(data["actions"], list)
             assert data["actions"] == []
 
     def test_actions_key_present_when_actions_already_set(self):
-        """A response that already has actions: [...] keeps them (after filtering)."""
+        """A response that already has actions: [...] keeps them."""
         app = Flask(__name__)
         app.config["TESTING"] = True
 
@@ -79,90 +76,15 @@ class TestFinalizeEnvelope:
             })
             data = resp.get_json()
             raw_actions = data.get("actions") if isinstance(data.get("actions"), list) else []
-            data["actions"] = _filter_actions_by_flag(raw_actions, False)
+            data["actions"] = list(raw_actions)
 
             assert "actions" in data
             assert isinstance(data["actions"], list)
             assert len(data["actions"]) == 1
             assert data["actions"][0]["type"] == ActionType.ADD_TO_CART
 
-
 # ════════════════════════════════════════════════════════════════════════════
-# 2 & 3. _filter_actions_by_flag
-# ════════════════════════════════════════════════════════════════════════════
-
-class TestFilterActionsByFlag:
-    """Tests for _filter_actions_by_flag."""
-
-    # ── Non-gated actions always pass through ──
-
-    def test_cart_actions_pass_when_flag_off(self):
-        actions = [
-            build_add_to_cart(product_id=1, quantity=2),
-            build_open_cart_panel(),
-        ]
-        result = _filter_actions_by_flag(actions, enabled=False)
-        assert len(result) == 2
-        types = {a["type"] for a in result}
-        assert ActionType.ADD_TO_CART in types
-        assert ActionType.OPEN_CART_PANEL in types
-
-    def test_cart_actions_pass_when_flag_on(self):
-        actions = [
-            build_add_to_cart(product_id=1, quantity=2),
-            build_open_cart_panel(),
-        ]
-        result = _filter_actions_by_flag(actions, enabled=True)
-        assert len(result) == 2
-
-    # ── Gated actions are removed when flag is off ──
-
-    def test_gated_actions_removed_when_flag_off(self):
-        actions = [
-            build_open_checkout_panel(),
-            build_propose_checkout_address(parsed={"line_1": "123 Main St"}),
-            build_update_cart_item(quantity=3),
-            build_remove_cart_item(key="abc123"),
-        ]
-        result = _filter_actions_by_flag(actions, enabled=False)
-        assert result == []
-
-    def test_gated_actions_pass_when_flag_on(self):
-        actions = [
-            build_open_checkout_panel(),
-            build_propose_checkout_address(parsed={"line_1": "123 Main St"}),
-            build_update_cart_item(quantity=3),
-            build_remove_cart_item(key="abc123"),
-        ]
-        result = _filter_actions_by_flag(actions, enabled=True)
-        assert len(result) == 4
-
-    def test_mixed_actions_flag_off(self):
-        """Cart actions survive; gated actions are removed."""
-        actions = [
-            build_add_to_cart(product_id=5, quantity=1),
-            build_open_checkout_panel(),
-            build_open_cart_panel(),
-        ]
-        result = _filter_actions_by_flag(actions, enabled=False)
-        assert len(result) == 2
-        types = [a["type"] for a in result]
-        assert ActionType.ADD_TO_CART in types
-        assert ActionType.OPEN_CART_PANEL in types
-        assert ActionType.OPEN_CHECKOUT_PANEL not in types
-
-    def test_empty_list_returns_empty(self):
-        assert _filter_actions_by_flag([], enabled=False) == []
-        assert _filter_actions_by_flag([], enabled=True) == []
-
-    def test_returns_new_list_not_mutating_original(self):
-        original = [build_add_to_cart(product_id=1, quantity=1)]
-        result = _filter_actions_by_flag(original, enabled=False)
-        assert result is not original
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# 4. Builder functions
+# 2. Builder functions
 # ════════════════════════════════════════════════════════════════════════════
 
 class TestBuilders:
@@ -276,22 +198,16 @@ class TestBuilders:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 5. Backward-compat: legacy fields are preserved AND new action is emitted
+# 3. Cart-confirmation: ADD_TO_CART + OPEN_CART_PANEL in actions[]
 # ════════════════════════════════════════════════════════════════════════════
 
-class TestBackwardCompatCartAdd:
+class TestCartAddActions:
     """
-    The ADD_TO_CART flow must still set the legacy trigger_frontend_cart_add
-    action field AND metadata (product_id, variation_id, quantity) while
-    also including the new ADD_TO_CART entry in the actions[] array.
+    The confirm_add_to_cart response must include ADD_TO_CART and OPEN_CART_PANEL
+    in the actions[] array. No legacy action fields should be present.
     """
 
     def _build_cart_add_response(self):
-        """
-        Simulate what cart_handler.handle_cart_intent returns for ADD_TO_CART,
-        without needing a live DB/Flask app.
-        """
-        from unittest.mock import MagicMock
         from flask import jsonify
 
         app = Flask(__name__)
@@ -301,68 +217,56 @@ class TestBackwardCompatCartAdd:
             from conversation_flow import FlowState
             from handlers.chat_utils import default_pagination
 
-            intent = Intent.ADD_TO_CART
             product_id = 42
             variation_id = 7
             qty = 3
             name = "Aura Tile"
 
-            add_action = build_add_to_cart(
-                product_id=product_id,
-                quantity=qty,
-                variation_id=variation_id,
-            )
+            actions = [
+                build_add_to_cart(product_id=product_id, quantity=qty, variation_id=variation_id),
+                build_open_cart_panel(),
+            ]
 
             resp = jsonify({
                 "success":     True,
-                "bot_message": f"Adding **{name}** to your cart... 🛒",
-                "action":      "trigger_frontend_cart_add",
-                "intent":      intent.value,
+                "bot_message": f"✅ Added **{name}** ×{qty} to your cart. Opening your cart so you can review…",
+                "intent":      Intent.ADD_TO_CART.value,
                 "products":    [],
-                "suggestions": ["Browse products", "Go to cart", "Checkout"],
+                "suggestions": ["Proceed to checkout", "Continue shopping", "View cart"],
                 "session_id":  "test-session",
-                "metadata":    {
-                    "response_time_ms": 50,
-                    "product_id":   product_id,
-                    "variation_id": variation_id,
-                    "quantity":     qty,
-                },
                 "pagination":  default_pagination(1),
                 "flow_state":  FlowState.IDLE.value,
-                "actions":     [add_action],
+                "actions":     actions,
             })
             return resp.get_json()
 
-    def test_legacy_action_field_preserved(self):
+    def test_actions_array_contains_add_to_cart(self):
         data = self._build_cart_add_response()
-        assert data["action"] == "trigger_frontend_cart_add"
+        types = [a["type"] for a in data["actions"]]
+        assert ActionType.ADD_TO_CART in types
 
-    def test_legacy_metadata_fields_preserved(self):
+    def test_actions_array_contains_open_cart_panel(self):
         data = self._build_cart_add_response()
-        meta = data["metadata"]
-        assert meta["product_id"] == 42
-        assert meta["variation_id"] == 7
-        assert meta["quantity"] == 3
+        types = [a["type"] for a in data["actions"]]
+        assert ActionType.OPEN_CART_PANEL in types
 
-    def test_new_actions_array_present_and_correct(self):
+    def test_no_legacy_action_field(self):
         data = self._build_cart_add_response()
-        assert "actions" in data
-        assert isinstance(data["actions"], list)
-        assert len(data["actions"]) == 1
+        assert "action" not in data
 
-        action = data["actions"][0]
-        assert action["type"] == ActionType.ADD_TO_CART
+    def test_no_legacy_metadata_product_fields(self):
+        data = self._build_cart_add_response()
+        meta = data.get("metadata", {})
+        assert "product_id" not in meta
+        assert "variation_id" not in meta
+        assert "quantity" not in meta
+
+    def test_add_to_cart_payload_correct(self):
+        data = self._build_cart_add_response()
+        action = next(a for a in data["actions"] if a["type"] == ActionType.ADD_TO_CART)
         assert action["payload"]["product_id"] == 42
         assert action["payload"]["quantity"] == 3
         assert action["payload"]["variation_id"] == 7
-
-    def test_after_flag_filter_add_to_cart_survives(self):
-        """ADD_TO_CART is not gated and must survive flag=False filtering."""
-        data = self._build_cart_add_response()
-        raw = data.get("actions", [])
-        filtered = _filter_actions_by_flag(raw, enabled=False)
-        types = [a["type"] for a in filtered]
-        assert ActionType.ADD_TO_CART in types
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -550,13 +454,13 @@ class TestHandleQuickOrderToCartConfirm:
         assert meta.get("pending_product_name") == "Aura Tile"
 
 
-# ── 4 & 5. Cart confirmation → ADD_TO_CART + OPEN_CHECKOUT_PANEL ─────────────
+# ── 4 & 5. Cart confirmation → ADD_TO_CART + OPEN_CART_PANEL ─────────────────
 
 class TestCartConfirmationActions:
-    """PR 5: confirming cart addition emits ADD_TO_CART; OPEN_CHECKOUT_PANEL is gated."""
+    """PR 5/6: confirming cart addition emits ADD_TO_CART and OPEN_CART_PANEL."""
 
-    def _simulate_confirm_response(self, flag_on: bool):
-        """Build the JSON that confirm_add_to_cart would produce, then filter it."""
+    def _simulate_confirm_response(self):
+        """Build the JSON that confirm_add_to_cart produces."""
         app = Flask(__name__)
         app.config["TESTING"] = True
 
@@ -568,108 +472,58 @@ class TestCartConfirmationActions:
 
             pid = 99
             qty = 2
-            vid = None
             name = "Aura Tile"
 
             actions = [
                 build_add_to_cart(product_id=pid, quantity=qty),
-                build_open_checkout_panel(),
+                build_open_cart_panel(),
             ]
-            raw_actions = _filter_actions_by_flag(actions, enabled=flag_on)
 
             resp = jsonify({
                 "success":     True,
-                "bot_message": "✅ Added **Aura Tile** to your cart. Opening checkout…" if flag_on
-                               else "✅ Adding **Aura Tile** to your cart...",
-                "action":      "trigger_frontend_cart_add",
-                "metadata":    {"product_id": pid, "quantity": qty},
+                "bot_message": f"✅ Added **{name}** ×{qty} to your cart. Opening your cart so you can review…",
                 "intent":      Intent.ADD_TO_CART.value,
-                "suggestions": ["Continue shopping"] if flag_on else ["Browse products", "Go to cart", "Checkout"],
+                "suggestions": ["Proceed to checkout", "Continue shopping", "View cart"],
                 "session_id":  "test-session",
                 "pagination":  default_pagination(1),
                 "flow_state":  FlowState.IDLE.value,
-                "actions":     raw_actions,
+                "actions":     actions,
             })
             return resp.get_json()
 
-    def test_flag_on_includes_open_checkout_panel(self):
-        data = self._simulate_confirm_response(flag_on=True)
+    def test_confirm_includes_add_to_cart(self):
+        data = self._simulate_confirm_response()
         types = [a["type"] for a in data["actions"]]
         assert ActionType.ADD_TO_CART in types
-        assert ActionType.OPEN_CHECKOUT_PANEL in types
 
-    def test_flag_on_message_mentions_checkout(self):
-        data = self._simulate_confirm_response(flag_on=True)
-        assert "Opening checkout" in data["bot_message"]
-
-    def test_flag_off_no_open_checkout_panel(self):
-        data = self._simulate_confirm_response(flag_on=False)
+    def test_confirm_includes_open_cart_panel(self):
+        data = self._simulate_confirm_response()
         types = [a["type"] for a in data["actions"]]
-        assert ActionType.ADD_TO_CART in types
+        assert ActionType.OPEN_CART_PANEL in types
+
+    def test_confirm_does_not_include_open_checkout_panel(self):
+        data = self._simulate_confirm_response()
+        types = [a["type"] for a in data["actions"]]
         assert ActionType.OPEN_CHECKOUT_PANEL not in types
 
-    def test_flag_off_message_uses_legacy_text(self):
-        data = self._simulate_confirm_response(flag_on=False)
-        assert "Adding" in data["bot_message"]
-        assert "Opening checkout" not in data["bot_message"]
+    def test_confirm_message_mentions_cart(self):
+        data = self._simulate_confirm_response()
+        assert "cart" in data["bot_message"].lower()
 
 
 # ── 7 & 8. Address proposal ──────────────────────────────────────────────────
 
 class TestAddressProposal:
-    """PR 5: _maybe_attach_address_proposal emits PROPOSE_CHECKOUT_ADDRESS when flag ON."""
+    """_maybe_attach_address_proposal emits PROPOSE_CHECKOUT_ADDRESS for valid addresses."""
 
-    def _run_proposal(self, message: str, flag_on: bool, customer_id=42):
-        """Invoke _maybe_attach_address_proposal with a mock WooCommerce customer fetch."""
-        from unittest.mock import patch, MagicMock
-        app = Flask(__name__)
-        app.config["TESTING"] = True
-
-        import os
-        os.environ["HEADLESS_CHECKOUT_ENABLED"] = "true" if flag_on else "false"
-
-        # Reload app_config to pick up the env change
-        import importlib
-        import app_config
-        importlib.reload(app_config)
-
-        with app.app_context():
-            # We need to patch HEADLESS_CHECKOUT_ENABLED in routes.chat
-            import routes.chat as rc
-            importlib.reload(rc)
-            rc.HEADLESS_CHECKOUT_ENABLED = flag_on
-
-            mock_cust_resp = {
-                "success": True,
-                "data": {
-                    "billing": {"address_1": "456 Old Road", "city": "London"},
-                    "shipping": {"address_1": "456 Old Road", "city": "London"},
-                },
-            }
-
-            with patch("routes.chat.woo_client") as mock_woo:
-                # Patch the internal woo_client used inside _maybe_attach_address_proposal
-                mock_woo.execute.return_value = mock_cust_resp
-                response_data = {
-                    "bot_message": "original message",
-                    "actions": [],
-                    "suggestions": [],
-                }
-                rc._maybe_attach_address_proposal(response_data, message, customer_id)
-                return response_data
-
-        # Restore env
-        os.environ.pop("HEADLESS_CHECKOUT_ENABLED", None)
-
-    def test_address_proposal_flag_on_emits_action(self):
+    def test_address_proposal_emits_action(self):
         from unittest.mock import patch
         app = Flask(__name__)
         app.config["TESTING"] = True
         with app.app_context():
             import routes.chat as rc
             response_data = {"bot_message": "original", "actions": [], "suggestions": []}
-            with patch.object(rc, "HEADLESS_CHECKOUT_ENABLED", True), \
-                 patch("routes.chat.woo_client") as mock_woo:
+            with patch("routes.chat.woo_client") as mock_woo:
                 mock_woo.execute.return_value = {
                     "success": True,
                     "data": {"billing": {}, "shipping": {"address_1": "456 Old Rd", "city": "London"}},
@@ -682,22 +536,6 @@ class TestAddressProposal:
             types = [a["type"] for a in response_data.get("actions", [])]
             assert ActionType.PROPOSE_CHECKOUT_ADDRESS in types
 
-    def test_address_proposal_flag_off_no_action(self):
-        from unittest.mock import patch
-        app = Flask(__name__)
-        app.config["TESTING"] = True
-        with app.app_context():
-            import routes.chat as rc
-            response_data = {"bot_message": "original", "actions": [], "suggestions": []}
-            with patch.object(rc, "HEADLESS_CHECKOUT_ENABLED", False):
-                rc._maybe_attach_address_proposal(
-                    response_data,
-                    "ship it to 221B Baker Street, London NW1 6XE",
-                    customer_id=42,
-                )
-            types = [a["type"] for a in response_data.get("actions", [])]
-            assert ActionType.PROPOSE_CHECKOUT_ADDRESS not in types
-
     def test_address_proposal_no_address_no_action(self):
         from unittest.mock import patch
         app = Flask(__name__)
@@ -705,12 +543,11 @@ class TestAddressProposal:
         with app.app_context():
             import routes.chat as rc
             response_data = {"bot_message": "original", "actions": [], "suggestions": []}
-            with patch.object(rc, "HEADLESS_CHECKOUT_ENABLED", True):
-                rc._maybe_attach_address_proposal(
-                    response_data,
-                    "I want to order Aura tiles please",
-                    customer_id=42,
-                )
+            rc._maybe_attach_address_proposal(
+                response_data,
+                "I want to order Aura tiles please",
+                customer_id=42,
+            )
             types = [a["type"] for a in response_data.get("actions", [])]
             assert ActionType.PROPOSE_CHECKOUT_ADDRESS not in types
 
@@ -721,12 +558,11 @@ class TestAddressProposal:
         with app.app_context():
             import routes.chat as rc
             response_data = {"bot_message": "original", "actions": [], "suggestions": []}
-            with patch.object(rc, "HEADLESS_CHECKOUT_ENABLED", True):
-                rc._maybe_attach_address_proposal(
-                    response_data,
-                    "ship it to 221B Baker Street, London NW1 6XE",
-                    customer_id=None,
-                )
+            rc._maybe_attach_address_proposal(
+                response_data,
+                "ship it to 221B Baker Street, London NW1 6XE",
+                customer_id=None,
+            )
             types = [a["type"] for a in response_data.get("actions", [])]
             assert ActionType.PROPOSE_CHECKOUT_ADDRESS not in types
 
