@@ -199,7 +199,6 @@ def _build_reorder(e, page) -> list:
         requires_resolution=["customer_id", "reorder_step2"],
     )]
 
-
 def _build_historical_search(e, page) -> list:
     params = {"customer": "CURRENT_USER_ID", "orderby": "date", "order": "desc"}
     if getattr(e, 'order_id', None):
@@ -208,6 +207,12 @@ def _build_historical_search(e, page) -> list:
         params["per_page"] = e.order_count
     else:
         params["per_page"] = 20
+
+    if getattr(e, "date_after", None):
+        params["after"] = e.date_after
+    if getattr(e, "date_before", None):
+        params["before"] = e.date_before
+
     return [WooAPICall(
         method="GET", endpoint=f"{BASE}/orders", params=params,
         description="Fetch past orders to find a historical seed product",

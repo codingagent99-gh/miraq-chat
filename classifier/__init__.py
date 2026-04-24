@@ -36,7 +36,6 @@ from classifier.extractors import (
 
 logger = get_logger("miraq_chat")
 
-
 def classify(utterance: str) -> ClassifiedResult:
     """Classify user utterance into intent + entities using the Evaluation Pipeline."""
     text = utterance.lower().strip()
@@ -64,8 +63,8 @@ def classify(utterance: str) -> ClassifiedResult:
         p_lower = entities.product_name.lower()
         attr_text = attr_text.replace(p_lower, " ")
         tag_text = tag_text.replace(p_lower, " ")
-        
-    # ── Also mask order_item_name so the product word isn't matched as an attribute ──
+
+    # ── Mask order_item_name so the product word isn't matched as an attribute ──
     _oi = getattr(entities, 'order_item_name', None)
     if _oi and _oi.lower() != (entities.product_name or "").lower():
         _oi_lower = _oi.lower()
@@ -85,6 +84,27 @@ def classify(utterance: str) -> ClassifiedResult:
 
     # ─── 2.6. Question mask ───
     attr_text = _apply_question_mask(text, attr_text, entities)
+
+    # ─── 2.7. Date-span mask ─────────────────────────────────────────────────
+    # Mask "between DAY MONTH and DAY MONTH" and "between DAY and DAY MONTH"
+    # before attribute extraction runs, so date numbers aren't grabbed as
+    # attribute values (e.g. "7" being matched as thickness "7mm").
+    _MONTH_NAMES_PAT = (
+        r'(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|'
+        r'jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)'
+    )
+    # Pattern 1: "between 7 feb and 31 march"
+    attr_text = re.sub(
+        rf'\bbetween\s+\d{{1,2}}(?:st|nd|rd|th)?\s+{_MONTH_NAMES_PAT}(?:\s+\d{{4}})?\s+'
+        rf'and\s+\d{{1,2}}(?:st|nd|rd|th)?\s+{_MONTH_NAMES_PAT}(?:\s+\d{{4}})?',
+        ' ', attr_text, flags=re.IGNORECASE
+    )
+    # Pattern 2: "between 6th and 7th dec"
+    attr_text = re.sub(
+        rf'\bbetween\s+\d{{1,2}}(?:st|nd|rd|th)?\s+and\s+\d{{1,2}}(?:st|nd|rd|th)?\s+{_MONTH_NAMES_PAT}(?:\s+\d{{4}})?',
+        ' ', attr_text, flags=re.IGNORECASE
+    )
+    # ─────────────────────────────────────────────────────────────────────────
 
     # ─── 3. Positive constraints ───
     extract_attributes(attr_text, entities)
@@ -114,7 +134,6 @@ def classify(utterance: str) -> ClassifiedResult:
     consolidate_entities(intent, entities, text)
 
     return ClassifiedResult(intent=intent, entities=entities, confidence=confidence)
-
 
 def _apply_question_mask(full_text: str, attr_text: str, entities: ExtractedEntities) -> str:
     """

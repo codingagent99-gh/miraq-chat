@@ -34,6 +34,47 @@ logger = get_logger("miraq_chat")
 
 
 # ══════════════════════════════════════════════════════════════
+# DATE PARSING HELPERS
+# ══════════════════════════════════════════════════════════════
+
+_MONTH_MAP = {
+    'jan': 1, 'january': 1,
+    'feb': 2, 'february': 2,
+    'mar': 3, 'march': 3,
+    'apr': 4, 'april': 4,
+    'may': 5,
+    'jun': 6, 'june': 6,
+    'jul': 7, 'july': 7,
+    'aug': 8, 'august': 8,
+    'sep': 9, 'september': 9,
+    'oct': 10, 'october': 10,
+    'nov': 11, 'november': 11,
+    'dec': 12, 'december': 12,
+}
+
+_MONTH_NAMES_PAT = (
+    r'(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|'
+    r'jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)'
+)
+
+
+def _parse_day_month(day_str: str, month_str: str, year_str: str = None) -> Optional[datetime]:
+    """Parse day + month-name string into a datetime. Defaults year to current."""
+    month_str = month_str.lower().strip()
+    month_num = None
+    for key, val in _MONTH_MAP.items():
+        if month_str.startswith(key):
+            month_num = val
+            break
+    if not month_num:
+        return None
+    year = int(year_str) if year_str else datetime.now().year
+    try:
+        return datetime(year, month_num, int(day_str))
+    except ValueError:
+        return None
+    
+# ══════════════════════════════════════════════════════════════
 # NEGATION / EXCLUSION EXTRACTION
 # ══════════════════════════════════════════════════════════════
 
@@ -620,7 +661,7 @@ def extract_time_range(text: str, entities: ExtractedEntities):
     text_lower = text.lower()
     now = datetime.now()
 
-    # Fast regexes — relative time
+    # ── Relative: "last/past N days/weeks/months/years" ──────────────────────
     m_rel = re.search(r'(?:last|past)\s+(\d+)\s+(day|week|month|year)s?', text_lower)
     if m_rel:
         amount = int(m_rel.group(1))
@@ -633,10 +674,11 @@ def extract_time_range(text: str, entities: ExtractedEntities):
             start = now - timedelta(days=amount * 30)
         else:
             start = now - timedelta(days=amount * 365)
-        entities.date_after = start.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-        entities.date_before = now.replace(hour=23, minute=59, second=59, microsecond=999999).isoformat()
+        entities.date_after  = start.replace(hour=0,  minute=0,  second=0,  microsecond=0).isoformat()
+        entities.date_before = now.replace(  hour=23, minute=59, second=59, microsecond=999999).isoformat()
         return
 
+    # ── "this week/month/year" ────────────────────────────────────────────────
     m_this = re.search(r'\b(?:this)\s+(week|month|year)\b', text_lower)
     if m_this:
         unit = m_this.group(1)
@@ -646,11 +688,46 @@ def extract_time_range(text: str, entities: ExtractedEntities):
             start = now.replace(day=1)
         else:
             start = now.replace(month=1, day=1)
-        entities.date_after = start.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-        entities.date_before = now.replace(hour=23, minute=59, second=59, microsecond=999999).isoformat()
+        entities.date_after  = start.replace(hour=0,  minute=0,  second=0,  microsecond=0).isoformat()
+        entities.date_before = now.replace(  hour=23, minute=59, second=59, microsecond=999999).isoformat()
         return
 
-    # Guard: only run dateparser if order-related
+    # ── "between 7 feb and 31 march" (month on both sides) ───────────────────
+    m_between = re.search(
+        rf'\bbetween\s+(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_NAMES_PAT})(?:\s+(\d{{4}}))?\s+'
+        rf'and\s+(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_NAMES_PAT})(?:\s+(\d{{4}}))?',
+        text_lower
+    )
+    if m_between:
+        d1, m1, y1 = m_between.group(1), m_between.group(2), m_between.group(3)
+        d2, m2, y2 = m_between.group(4), m_between.group(5), m_between.group(6)
+        start = _parse_day_month(d1, m1, y1)
+        end   = _parse_day_month(d2, m2, y2)
+        if start and end:
+            if end < start:
+                end = end.replace(year=end.year + 1)
+            entities.date_after  = start.replace(hour=0,  minute=0,  second=0,  microsecond=0).isoformat()
+            entities.date_before = end.replace(  hour=23, minute=59, second=59, microsecond=999999).isoformat()
+            return
+
+    # ── "between 6th and 7th dec" (shared month at end) ──────────────────────
+    m_between_shared = re.search(
+        rf'\bbetween\s+(\d{{1,2}})(?:st|nd|rd|th)?\s+and\s+(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_NAMES_PAT})(?:\s+(\d{{4}}))?',
+        text_lower
+    )
+    if m_between_shared:
+        d1  = m_between_shared.group(1)
+        d2  = m_between_shared.group(2)
+        mon = m_between_shared.group(3)
+        yr  = m_between_shared.group(4)
+        start = _parse_day_month(d1, mon, yr)
+        end   = _parse_day_month(d2, mon, yr)
+        if start and end:
+            entities.date_after  = start.replace(hour=0,  minute=0,  second=0,  microsecond=0).isoformat()
+            entities.date_before = end.replace(  hour=23, minute=59, second=59, microsecond=999999).isoformat()
+            return
+
+    # ── Guard: only run dateparser if order-related ───────────────────────────
     if not re.search(r'\b(order|orders|ordered|purchase|purchased|bought|buy|history)\b', text_lower):
         return
 
@@ -659,21 +736,19 @@ def extract_time_range(text: str, entities: ExtractedEntities):
 
     normalized = _normalize_fused_dates(text_lower)
 
-    # ── Strip tile/sample-size dimension patterns before dateparser ──
-    # e.g. 3"x3", 12"x24", 6x6, 4"x12" are misread as calendar dates
+    # Strip tile/sample-size dimension patterns before dateparser
     normalized = re.sub(r'\d+\s*["\']?\s*[xX×]\s*["\']?\d+\s*["\']?', ' ', normalized)
-    # Also strip isolated quoted-inch numbers like 3" or 12"
     normalized = re.sub(r'\b\d+\s*["\'](?!\s*(?:[xX×]|\d))', ' ', normalized)
     normalized = re.sub(r'\s+', ' ', normalized).strip()
 
     parsed = search_dates(normalized, settings={'PREFER_DATES_FROM': 'past', 'RETURN_AS_TIMEZONE_AWARE': False})
     if parsed:
-        extracted = parsed[0][1]
-        if extracted.tzinfo is not None:
-            extracted = extracted.replace(tzinfo=None)
-        entities.date_after = extracted.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-        entities.date_before = extracted.replace(hour=23, minute=59, second=59, microsecond=999999).isoformat()
-
+        dates = sorted(
+            p[1].replace(tzinfo=None) if p[1].tzinfo else p[1]
+            for p in parsed
+        )
+        entities.date_after  = dates[0].replace( hour=0,  minute=0,  second=0,  microsecond=0).isoformat()
+        entities.date_before = dates[-1].replace(hour=23, minute=59, second=59, microsecond=999999).isoformat()
 
 # ══════════════════════════════════════════════════════════════
 # CUSTOMER UPDATE / FETCH EXTRACTION
