@@ -517,11 +517,18 @@ def generate_suggestions(
     return suggestions
 
 def _resolve_user_placeholders(api_calls: List[WooAPICall], customer_id: int):
-    """Replace CURRENT_USER_ID / CURRENT_USER placeholders."""
+    """Replace CURRENT_USER_ID / CURRENT_USER placeholders in params and body."""
     for call in api_calls:
+        # Resolve in params (values are always strings in query params)
         for key, val in list(call.params.items()):
             if isinstance(val, str) and val in USER_PLACEHOLDERS:
                 call.params[key] = str(customer_id)
+
+        # Resolve in body (customer_id should be int in JSON body)
+        if isinstance(call.body, dict):
+            for key, val in list(call.body.items()):
+                if isinstance(val, str) and val in USER_PLACEHOLDERS:
+                    call.body[key] = customer_id
 
 
 def _format_order_date(date_created: str) -> str:
