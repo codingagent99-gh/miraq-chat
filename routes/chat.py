@@ -983,6 +983,7 @@ def chat():
             all_products_raw, order_data, api_responses, api_calls_to_execute = [], [], [], []
         else:
             role = user_context.get("role")
+            logger.info(f"build_api_calls: role={role}, customer_id={customer_id}")
             api_calls = build_api_calls(result, page, user_message=message, session_id=str(conversation.id), customer_id=customer_id, role=role)
             if customer_id:
                 _resolve_user_placeholders(api_calls, customer_id)
