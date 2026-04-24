@@ -24,7 +24,7 @@ from api_builder.filter_builder import build_advanced_filter_call
 logger = get_logger("miraq_chat")
 
 BASE = WOO_BASE_URL
-
+CUSTOM_API_BASE = CUSTOM_API_BASE_URL
 
 # ══════════════════════════════════════════════════════════════
 # VARIATION MATCHER
@@ -190,7 +190,7 @@ def _build_order_history(e, page, customer_id=None, role=None) -> list:
         if getattr(e, "date_after", None): body["after"] = e.date_after
         if getattr(e, "date_before", None): body["before"] = e.date_before
         return [WooAPICall(
-            method="POST", endpoint=f"{CUSTOM_API_BASE_URL}/orders",
+            method="POST", endpoint=f"{CUSTOM_API_BASE}/orders",
             params={}, body=body,
             description="CS rep order history",
             requires_resolution=["customer_id"],
