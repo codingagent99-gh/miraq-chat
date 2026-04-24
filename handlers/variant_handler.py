@@ -181,6 +181,32 @@ def handle_variant_selection(
 
         max_score = max((s for _, s in scores), default=0)
         matched = [var for var, s in scores if s == max_score] if max_score > 0 else all_variations
+
+        # ── Tiebreak / fallback: score matched set against prev_resolved ──────────
+        # If max_score==0 (all tied), or multiple tied, the current message alone
+        # can't distinguish variations. Use the accumulated resolved attributes to
+        # find the best match, so a wildcard axis as the final message (e.g. "Matte",
+        # "12x12") doesn't cause the wrong variation to be picked.
+        if len(matched) != 1 and prev_resolved:
+            resolved_scores = []
+            for var in matched:
+                var_opts = _get_safe_options(var.get("attributes", []))
+                rscore = 0
+                for res_key, res_val in prev_resolved.items():
+                    for var_attr_name, var_attr_val in var_opts.items():
+                        if (res_key.lower() == var_attr_name.lower()
+                                and res_val.lower() == var_attr_val.lower()):
+                            rscore += 50
+                resolved_scores.append((var, rscore))
+
+            best_rscore = max((s for _, s in resolved_scores), default=0)
+            if best_rscore > 0:
+                matched = [var for var, s in resolved_scores if s == best_rscore]
+                logger.info(
+                    f"Step 3.55: Tiebreak via prev_resolved | "
+                    f"best_rscore={best_rscore} | "
+                    f"matched={[v['id'] for v in matched]}"
+                )
         
         logger.debug(f"Step 3.55 Scoring: user_text_clean='{user_text_clean}'")
         logger.debug(f"Step 3.55 Scoring: max_score={max_score} | variations_tied_for_max={len(matched)}")

@@ -18,6 +18,7 @@ from app_config import (
     ORDER_CREATE_INTENTS,
     CLASSIFIER_PROVIDER_TAG,
     get_currency_symbol,
+    WOO_BASE_URL,
 )
 from core.actions import build_add_to_cart, build_open_checkout_panel, build_open_cart_panel
 from woo_client import woo_client
@@ -77,6 +78,65 @@ def _resolve_variation_slugs(resolved: dict, store_loader) -> list:
 
     return result
 
+def _build_cart_variation_payload(product_id, variation_id, resolved_attrs, store_loader):
+    if not variation_id or not product_id:
+        return _resolve_variation_slugs(resolved_attrs, store_loader)
+
+    try:
+        var_call = WooAPICall(
+            method="GET",
+            endpoint=f"{WOO_BASE_URL}/products/{product_id}/variations/{variation_id}",
+            params={},
+            description=f"Fetch variation {variation_id} for cart payload",
+        )
+        var_resp = woo_client.execute(var_call)
+        if not (var_resp.get("success") and isinstance(var_resp.get("data"), dict)):
+            raise ValueError("variation fetch failed")
+
+        var_attrs = var_resp["data"].get("attributes", [])
+
+        attr_terms = getattr(store_loader, "attributes", []) if store_loader else []
+        slug_lookup: dict = {}
+        for attr in attr_terms:
+            taxonomy = attr.get("taxonomy", "")
+            slug_lookup[taxonomy] = {
+                term["name"].lower(): term["slug"]
+                for term in attr.get("terms", [])
+            }
+
+        # Fixed axes — from the variation itself (always correct)
+        fixed = {}
+        result = []
+        for attr in var_attrs:
+            taxonomy = attr.get("slug", "")
+            option   = attr.get("option", "")
+            term_map = slug_lookup.get(taxonomy, {})
+            slug = term_map.get(
+                option.lower(),
+                re.sub(r"[^a-z0-9]+", "", option.lower()),
+            )
+            result.append({"attribute": taxonomy, "value": slug})
+            fixed[taxonomy] = True
+
+        # Wildcard axes — from user's resolved_attrs (cart item meta)
+        for label, display_value in resolved_attrs.items():
+            taxonomy = f"pa_{label.lower().replace(' ', '-')}"
+            if taxonomy in fixed:
+                continue
+            term_map = slug_lookup.get(taxonomy, {})
+            slug = term_map.get(
+                str(display_value).lower(),
+                re.sub(r"[^a-z0-9]+", "", str(display_value).lower()),
+            )
+            result.append({"attribute": taxonomy, "value": slug})
+
+        logger.info(f"Cart variation payload: {result}")
+        return result
+
+    except Exception as exc:
+        logger.warning(f"_build_cart_variation_payload fallback | error={exc}")
+        return _resolve_variation_slugs(resolved_attrs, store_loader)
+    
 def _maybe_attach_address_proposal(
     response_data: dict,
     message: str,
