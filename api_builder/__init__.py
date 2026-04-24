@@ -10,7 +10,7 @@ import re
 from typing import List, Optional
 
 from models import Intent, ClassifiedResult, WooAPICall, ExtractedEntities
-from app_config import WOO_BASE_URL, DEFAULT_PER_PAGE, DEFAULT_ORDER_PER_PAGE
+from app_config import WOO_BASE_URL, CUSTOM_API_BASE_URL, DEFAULT_PER_PAGE, DEFAULT_ORDER_PER_PAGE
 from config.store_config import TAG_SLUG_QUICK_SHIP
 from chat_logger import get_logger
 
@@ -88,6 +88,7 @@ def build_api_calls(
     user_message: str = "",
     session_id: str = "",
     customer_id: Optional[int] = None,
+    role=None
 ) -> List[WooAPICall]:
     """Build one or more WooCommerce API calls from classified result."""
     intent = result.intent
@@ -135,6 +136,10 @@ def build_api_calls(
             calls = builder(e, page, customer_id=customer_id)
         elif intent in (Intent.PRODUCT_SEARCH, Intent.FILTER_BY_ATTRIBUTE):
             calls = builder(e, page, user_message=user_message)
+        elif intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.HISTORICAL_SEARCH,
+                Intent.REORDER, Intent.ORDER_TRACKING, Intent.ORDER_STATUS,
+                Intent.ORDER_ITEM):
+            calls = builder(e, page, role=role)
         else:
             calls = builder(e, page)
 
@@ -162,7 +167,15 @@ def _build_greeting(e, page) -> list:
 
 # ─── Orders ───
 
-def _build_last_order(e, page) -> list:
+def _build_last_order(e, page, customer_id=None, role=None) -> list:
+    if role == 'cs_rep':
+        return [WooAPICall(
+            method="POST", endpoint=f"{CUSTOM_API_BASE}/orders",
+            params={}, body={"customer_id": "CURRENT_USER_ID", "page": 1, "per_page": 1},
+            description="CS rep last order",
+            requires_resolution=["customer_id"],
+        )]
+    
     return [WooAPICall(
         method="GET", endpoint=f"{BASE}/orders",
         params={"customer": "CURRENT_USER_ID", "per_page": 1, "orderby": "date", "order": "desc"},
@@ -171,7 +184,18 @@ def _build_last_order(e, page) -> list:
     )]
 
 
-def _build_order_history(e, page) -> list:
+def _build_order_history(e, page, customer_id=None, role=None) -> list:
+    if role == 'cs_rep':
+        body = {"customer_id": "CURRENT_USER_ID", "page": page, "per_page": e.order_count or DEFAULT_ORDER_PER_PAGE}
+        if getattr(e, "date_after", None): body["after"] = e.date_after
+        if getattr(e, "date_before", None): body["before"] = e.date_before
+        return [WooAPICall(
+            method="POST", endpoint=f"{CUSTOM_API_BASE_URL}/orders",
+            params={}, body=body,
+            description="CS rep order history",
+            requires_resolution=["customer_id"],
+        )]
+        
     count = e.order_count or DEFAULT_ORDER_PER_PAGE
     params = {"customer": "CURRENT_USER_ID", "per_page": count, "page": page, "orderby": "date", "order": "desc"}
     if getattr(e, "date_after", None):
@@ -183,7 +207,6 @@ def _build_order_history(e, page) -> list:
         method="GET", endpoint=f"{BASE}/orders", params=params,
         description=desc, requires_resolution=["customer_id"],
     )]
-
 
 def _build_reorder(e, page) -> list:
     if e.order_id:
@@ -199,7 +222,26 @@ def _build_reorder(e, page) -> list:
         requires_resolution=["customer_id", "reorder_step2"],
     )]
 
-def _build_historical_search(e, page) -> list:
+def _build_historical_search(e, page, customer_id=None, role=None) -> list:
+    if role == 'cs_rep':
+        body = {
+            "customer_id": "CURRENT_USER_ID",  # placeholder
+            "page":        page,
+            "per_page":    e.order_count or 20,
+        }
+        if getattr(e, "date_after", None):
+            body["after"] = e.date_after
+        if getattr(e, "date_before", None):
+            body["before"] = e.date_before
+        return [WooAPICall(
+            method      = "POST",
+            endpoint    = f"{CUSTOM_API_BASE}/orders",
+            params      = {},
+            body        = body,
+            description = "CS rep order history",
+            requires_resolution = ["customer_id"],
+        )]
+        
     params = {"customer": "CURRENT_USER_ID", "orderby": "date", "order": "desc"}
     if getattr(e, 'order_id', None):
         params["include"] = [e.order_id]
@@ -538,7 +580,7 @@ def _build_save_for_later(e, page) -> list:
     )]
 
 
-def _build_order_tracking(e, page) -> list:
+def _build_order_tracking(e, page, customer_id=None, role=None) -> list:
     if e.order_id:
         return [WooAPICall(
             method="GET", endpoint=f"{BASE}/orders/{e.order_id}", params={},

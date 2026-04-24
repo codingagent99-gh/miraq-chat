@@ -982,7 +982,8 @@ def chat():
             api_calls = []
             all_products_raw, order_data, api_responses, api_calls_to_execute = [], [], [], []
         else:
-            api_calls = build_api_calls(result, page, user_message=message, session_id=str(conversation.id), customer_id=customer_id)
+            role = user_context.get("role")
+            api_calls = build_api_calls(result, page, user_message=message, session_id=str(conversation.id), customer_id=customer_id, role=role)
             if customer_id:
                 _resolve_user_placeholders(api_calls, customer_id)
 
