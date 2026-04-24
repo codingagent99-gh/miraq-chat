@@ -54,7 +54,7 @@ def _resolve_variation_slugs(resolved: dict, store_loader) -> list:
       → [{"attribute": "pa_colors", "value": "apollobianco"},
          {"attribute": "pa_finish",  "value": "matte"}]
     """
-    attr_terms = getattr(store_loader, 'attributes', []) if store_loader else []
+    attr_terms = getattr(store_loader, 'all_attributes_raw', []) if store_loader else []
 
     # Build lookup: taxonomy → {display_name_lower: slug}
     slug_lookup: dict = {}
@@ -95,7 +95,7 @@ def _build_cart_variation_payload(product_id, variation_id, resolved_attrs, stor
 
         var_attrs = var_resp["data"].get("attributes", [])
 
-        attr_terms = getattr(store_loader, "attributes", []) if store_loader else []
+        attr_terms = getattr(store_loader, "all_attributes_raw", []) if store_loader else []
         slug_lookup: dict = {}
         for attr in attr_terms:
             taxonomy = attr.get("taxonomy", "")
