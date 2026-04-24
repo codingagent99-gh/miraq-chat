@@ -441,6 +441,8 @@ def _execute_api_calls(intent, api_calls, _resolve_variant):
             if isinstance(data, dict) and "products" in data:
                 _enrich(data["products"])
                 target.extend(data["products"])
+            elif isinstance(data, dict) and "orders" in data:   # ← add this
+                target.extend(data["orders"])
             elif isinstance(data, list):
                 _enrich(data)
                 target.extend(data)
