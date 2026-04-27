@@ -208,6 +208,23 @@ def _resolve_llm_api_base_url() -> str:
 
     return raw
 
+# Roles that use the custom orders API (POST /custom-api/v1/orders)
+# instead of the standard WooCommerce GET /wc/v3/orders endpoint.
+# Override via env var CUSTOM_ORDER_ROLES_JSON (JSON array).
+import json as _json
+
+def _load_custom_order_roles() -> frozenset:
+    raw = os.getenv("CUSTOM_ORDER_ROLES_JSON", "")
+    if raw:
+        try:
+            parsed = _json.loads(raw)
+            if isinstance(parsed, list):
+                return frozenset(parsed)
+        except Exception:
+            pass
+    return frozenset({"cs_rep", "project_manager", "cs_project_manager"})
+
+CUSTOM_ORDER_ROLES: frozenset = _load_custom_order_roles()
 
 LLM_API_BASE_URL: str = _resolve_llm_api_base_url()
 

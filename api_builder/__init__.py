@@ -10,7 +10,7 @@ import re
 from typing import List, Optional
 
 from models import Intent, ClassifiedResult, WooAPICall, ExtractedEntities
-from app_config import WOO_BASE_URL, CUSTOM_API_BASE_URL, DEFAULT_PER_PAGE, DEFAULT_ORDER_PER_PAGE
+from app_config import WOO_BASE_URL, CUSTOM_ORDER_ROLES, CUSTOM_API_BASE_URL, DEFAULT_PER_PAGE, DEFAULT_ORDER_PER_PAGE
 from config.store_config import TAG_SLUG_QUICK_SHIP
 from chat_logger import get_logger
 
@@ -168,7 +168,7 @@ def _build_greeting(e, page) -> list:
 # ─── Orders ───
 
 def _build_last_order(e, page, customer_id=None, role=None) -> list:
-    if role == 'cs_rep':
+    if role in CUSTOM_ORDER_ROLES:
         return [WooAPICall(
             method="POST", endpoint=f"{CUSTOM_API_BASE}/orders",
             params={}, body={"customer_id": "CURRENT_USER_ID", "page": 1, "per_page": 1},
@@ -185,7 +185,7 @@ def _build_last_order(e, page, customer_id=None, role=None) -> list:
 
 
 def _build_order_history(e, page, customer_id=None, role=None) -> list:
-    if role == 'cs_rep':
+    if role in CUSTOM_ORDER_ROLES:
         body = {"customer_id": "CURRENT_USER_ID", "page": page, "per_page": e.order_count or DEFAULT_ORDER_PER_PAGE}
         if getattr(e, "date_after", None): body["after"] = e.date_after
         if getattr(e, "date_before", None): body["before"] = e.date_before
@@ -223,7 +223,7 @@ def _build_reorder(e, page) -> list:
     )]
 
 def _build_historical_search(e, page, customer_id=None, role=None) -> list:
-    if role == 'cs_rep':
+    if role in CUSTOM_ORDER_ROLES:
         body = {
             "customer_id": "CURRENT_USER_ID",  # placeholder
             "page":        page,
@@ -570,8 +570,6 @@ def _build_coupon_inquiry(e, page) -> list:
     )]
 
 
-# ─── Account ───
-
 def _build_save_for_later(e, page) -> list:
     return [WooAPICall(
         method="POST", endpoint=f"{BASE}/wishlist",
@@ -579,21 +577,29 @@ def _build_save_for_later(e, page) -> list:
         description="Get customer wishlist",
     )]
 
-
 def _build_order_tracking(e, page, customer_id=None, role=None) -> list:
-    if e.order_id:
+    if role in CUSTOM_ORDER_ROLES:
         return [WooAPICall(
             method="GET", endpoint=f"{BASE}/orders/{e.order_id}", params={},
             description=f"Get order #{e.order_id} details",
         )]
+    
+    # ── non-CS users with a specific order_id should also fetch directly ──
+    if getattr(e, "order_id", None):
+        return [WooAPICall(
+            method="GET", endpoint=f"{BASE}/orders/{e.order_id}",
+            params={},
+            description=f"Get order #{e.order_id} details",
+        )]
+
     return [WooAPICall(
         method="GET", endpoint=f"{BASE}/orders",
         params={"customer": "CURRENT_USER_ID", "per_page": 5, "page": page,
                 "orderby": "date", "order": "desc"},
         description="List recent orders (no order ID provided)",
+        requires_resolution=["customer_id"],
     )]
-
-
+    
 def _build_place_order(e, page) -> list:
     search_term = e.product_name or e.order_item_name
     attr_filters = resolve_attr_filters(e.attributes)
