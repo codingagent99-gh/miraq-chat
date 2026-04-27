@@ -230,6 +230,38 @@ def get_session(session_id):
         
     return jsonify({"error": "Session not found"}), 404
 
+@app.route("/widget-config", methods=["GET"])
+def widget_config():
+    """
+    Proxy endpoint for widget logo/text config.
+    Keeps WooCommerce consumer keys off the frontend.
+    """
+    import requests as req
+    from app_config import WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET, CUSTOM_API_BASE_URL
+
+    try:
+        resp = req.get(
+            "https://wgc.net.in/wip/wp-json/wdget-logo-uploader/v1/data",
+            headers={
+                "X-Consumer-Key":    WOO_CONSUMER_KEY,
+                "X-Consumer-Secret": WOO_CONSUMER_SECRET,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return jsonify({
+            "image_url": data.get("image_url", ""),
+            "text":      data.get("text", ""),
+        })
+    except Exception as e:
+        logger = get_logger("miraq_chat")
+        logger.error(f"widget_config: Failed to fetch widget config: {e}")
+        return jsonify({
+            "image_url": "",
+            "text":      "",
+        }), 200  # Return empty gracefully so widget doesn't break
+
 
 # ═══════════════════════════════════════════
 # STARTUP

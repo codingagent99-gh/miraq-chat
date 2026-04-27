@@ -72,7 +72,7 @@ class WooClient:
                     api_call.endpoint,
                     params=params,
                     headers=custom_headers,
-                    timeout=30,
+                    timeout=45,
                 )
             else:
                 auth_params = {} if is_custom_api else {
