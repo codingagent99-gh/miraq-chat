@@ -119,5 +119,8 @@ def resolve_filter_clarification(message, user_context, pending_semantic):
 
     user_context.pop("pending_semantic_match", None)
 
-    bypass_intent = Intent.PRODUCT_SEARCH if getattr(entities, 'product_id', None) else Intent.FILTER_BY_ATTRIBUTE
+    if is_reject:
+        bypass_intent = Intent.PRODUCT_SEARCH
+    else:
+        bypass_intent = Intent.PRODUCT_SEARCH if getattr(entities, 'product_id', None) else Intent.FILTER_BY_ATTRIBUTE    
     return ClassifiedResult(intent=bypass_intent, entities=entities, confidence=0.98)

@@ -752,6 +752,8 @@ def chat():
         _skip_classification = False
         bypass_result = None
 
+        forced_search_match = re.match(r"(?i)^no\s*-\s*search\s*for\s*['\"](.*?)['\"]$", message)
+
         if current_flow_state == FlowState.AWAITING_FILTER_CLARIFICATION:
             pending_semantic = user_context.get("pending_semantic_match")
             if pending_semantic:
@@ -762,6 +764,18 @@ def chat():
                     conversation.context_data = user_context
                     bypass_result = clarification_result
                     _skip_classification = True
+                    
+        elif forced_search_match:
+            # Issue 2 Fix: Catch pagination/retry clicks that send the rejection string outside the flow state
+            extracted_term = forced_search_match.group(1)
+            logger.info(f"Intercepted explicit forced search string. Term: '{extracted_term}'")
+            bypass_entities = ExtractedEntities(search_term=extracted_term)
+            bypass_result = ClassifiedResult(
+                intent=Intent.PRODUCT_SEARCH,
+                entities=bypass_entities,
+                confidence=1.0
+            )
+            _skip_classification = True
 
         # ── Step 2: Conversation flow state machine ──
         flow_context = {
