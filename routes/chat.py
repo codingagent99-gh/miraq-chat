@@ -256,6 +256,12 @@ def _finalize_turn(
             _proposal_customer_id,
             current_flow_state=_proposal_flow_state,
         )
+        
+    combined_metadata = data.get("metadata", {}).copy()
+    combined_metadata["products"] = data.get("products", [])
+    combined_metadata["categories"] = data.get("categories", [])
+    combined_metadata["suggestions"] = data.get("suggestions", [])
+    combined_metadata["actions"] = data.get("actions", [])
 
     # 1. Save Bot Message
     bot_msg = Message(
@@ -263,7 +269,7 @@ def _finalize_turn(
         role="bot",
         content=data.get("bot_message", ""),
         intent=data.get("intent", ""),
-        metadata_json=data.get("metadata", {}),
+        metadata_json=combined_metadata, # Save the bundled data
     )
     db.session.add(bot_msg)
 
@@ -335,15 +341,30 @@ def get_chat_history():
         has_more = (offset + limit) < total_messages
 
         messages_query.reverse()
-
+        
         history = []
         for msg in messages_query:
-            history.append({
+            item = {
                 "role": msg.role,
                 "message": msg.content,
                 "intent": msg.intent,
                 "timestamp": msg.created_at.isoformat(),
-            })
+            }
+            
+            # ---> FIX HERE: Unpack the rich UI data for bot messages <---
+            if msg.role == "bot" and msg.metadata_json:
+                item["products"] = msg.metadata_json.get("products", [])
+                item["categories"] = msg.metadata_json.get("categories", [])
+                item["suggestions"] = msg.metadata_json.get("suggestions", [])
+                item["actions"] = msg.metadata_json.get("actions", [])
+                
+                # Separate the actual metadata from our bundled UI arrays
+                item["metadata"] = {
+                    k: v for k, v in msg.metadata_json.items() 
+                    if k not in ["products", "categories", "suggestions", "actions"]
+                }
+                
+            history.append(item)
 
         return jsonify({
             "messages": history,
