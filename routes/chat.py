@@ -1028,11 +1028,17 @@ def chat():
             all_products_raw, order_data, api_responses, api_calls_to_execute = _execute_api_calls(intent, api_calls, _resolve_variant)
 
             log_matched_products(all_products_raw, api_calls_to_execute)
+            
+            _LOCK_STATES = {
+                FlowState.AWAITING_VARIANT_SELECTION,
+                FlowState.AWAITING_CART_CONFIRMATION,
+                FlowState.AWAITING_QUANTITY,
+            }
 
             if all_products_raw:
                 first_prod = all_products_raw[0]
                 user_context["last_product"] = {"id": first_prod.get("id"), "name": first_prod.get("name")}
-                if current_flow_state != FlowState.AWAITING_VARIANT_SELECTION:
+                if current_flow_state not in _LOCK_STATES:
                     user_context["pending_product_id"] = first_prod.get("id")
                     user_context["pending_product_name"] = first_prod.get("name")
                     conversation.context_data = user_context

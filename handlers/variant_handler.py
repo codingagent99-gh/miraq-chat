@@ -98,18 +98,24 @@ def handle_variant_selection(
     if not _var_product_id:
         return None
     
+    # Paginate to get all variations
+    all_variations = []
+    page_num = 1
+    while True:
+        var_resp = woo_client.execute(WooAPICall(
+            method="GET",
+            endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}/variations",
+            params={"per_page": 100, "page": page_num, "status": "publish"},
+            description=f"Fetch variations for variant selection of '{_var_product_name}'",
+        ))
+        batch = var_resp.get("data", []) if var_resp.get("success") else []
+        all_variations.extend(batch)
+        if len(batch) < 100:
+            break
+        page_num += 1
+        
     # Fetch parent_raw early so we know the EXACT variation axes required
     parent_raw = {}
-    var_call = WooAPICall(
-        method="GET",
-        endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}/variations",
-        params={"per_page": 100, "status": "publish"},
-        description=f"Fetch variations for variant selection of '{_var_product_name}'",
-    )
-    var_resp = woo_client.execute(var_call)
-    _variations_loaded = var_resp.get("success") and isinstance(var_resp.get("data"), list)
-    if _variations_loaded:
-        all_variations = var_resp["data"]
     parent_call = WooAPICall(
         method="GET",
         endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}",
@@ -118,9 +124,6 @@ def handle_variant_selection(
     )
     parent_resp = woo_client.execute(parent_call)
     parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
-
-    if not _variations_loaded:
-        return None
 
     prev_resolved = user_context.get("resolved_attributes", {})
     # Extract ALL variation-capable attributes from the parent product
@@ -148,7 +151,17 @@ def handle_variant_selection(
             opt_for_exact = re.sub(r'[^\w\s]', ' ', opt_clean)
             opt_for_exact = re.sub(r'\s+', ' ', opt_for_exact).strip()
             
-            # Check padded string
+            
+            # ── Normalised check: handles curly/smart quotes (e.g. 8"X8" where " isn't stripped) ──
+            opt_normalised = re.sub(r'\s+', '', opt_for_exact)
+            msg_normalised  = re.sub(r'\s+', '', stripped_text)
+            if opt_normalised and re.search(
+                r'(?<![a-z0-9])' + re.escape(opt_normalised) + r'(?![a-z0-9])',
+                msg_normalised
+            ):
+                prev_resolved[nice_name] = opt
+
+            # ── Padded check: standard word-boundary match for space-delimited options ──
             if opt_for_exact and f" {opt_for_exact} " in msg_for_extraction:
                 prev_resolved[nice_name] = opt
             elif opt_clean == user_msg_clean.strip():
