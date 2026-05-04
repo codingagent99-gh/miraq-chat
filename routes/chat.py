@@ -562,7 +562,7 @@ def _build_final_response(
         bot_message = (
             f"{bot_message}\n\nWould you like to add **{product_name}** to your cart?"
         )
-        suggestions_list = ["Yes, add it", "No thanks", "Browse products"]
+        suggestions_list = ["Yes, add it", "No thanks"]
 
     else:
         next_flow_state = FlowState.IDLE.value
@@ -845,7 +845,7 @@ def chat():
                 "bot_message": f"Got it — add **{name}**{variant_suffix} ×{qty} to your cart?",
                 "intent":      "guided_flow",
                 "products":    [],
-                "suggestions": ["Yes, add it", "No thanks", "Browse products"],
+                "suggestions": ["Yes, add it", "No thanks"],
                 "session_id":  str(conversation.id),
                 "metadata": {
                     "flow_state":           FlowState.AWAITING_CART_CONFIRMATION.value,

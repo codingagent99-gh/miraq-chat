@@ -612,7 +612,7 @@ def handle_quick_order(
         "bot_message": cart_msg,
         "intent": "guided_flow",
         "products": [],
-        "suggestions": ["Yes, add it", "No thanks", "Browse products"],
+        "suggestions": ["Yes, add it", "No thanks"],
         "session_id": session_id,
         "metadata": {
             "pending_product_id": _order_product_id,

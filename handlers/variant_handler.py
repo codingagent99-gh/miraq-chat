@@ -308,7 +308,7 @@ def handle_variant_selection(
                     ),
                     "intent": "guided_flow",
                     "products": [],
-                    "suggestions": ["Yes, add it", "No thanks", "Show all variants"],
+                    "suggestions": ["Yes, add it", "No thanks"],
                     "session_id": session_id,
                     "metadata": {
                         "flow_state": FlowState.AWAITING_CART_CONFIRMATION.value,
@@ -357,7 +357,7 @@ def handle_variant_selection(
             "bot_message": cart_msg,
             "intent": "guided_flow",
             "products": [],
-            "suggestions": ["Yes, add it", "No thanks", "Browse products"],
+            "suggestions": ["Yes, add it", "No thanks"],
             "session_id": session_id,
             "metadata": {
                 "pending_product_id": _var_product_id,
@@ -761,7 +761,7 @@ def handle_variation_product(
                 f"Here's **{pending_name}**. ✅ In stock\n\n"
                 f"Would you like to add it to your cart?"
             )
-            suggestions = ["Yes, add it", "No thanks", "Show all variants"]
+            suggestions = ["Yes, add it", "No thanks"]
             next_flow_state = FlowState.AWAITING_CART_CONFIRMATION.value
             logger.info(
                 f"Step 3.7: Single variation fully resolved — "
@@ -1070,7 +1070,7 @@ def handle_quantity_and_variant_check(
                 ),
                 "intent": intent.value,
                 "products": products_formatted[:1],
-                "suggestions": ["Yes, add it", "No thanks", "Browse products"],
+                "suggestions": ["Yes, add it", "No thanks"],
                 "session_id": session_id,
                 "metadata": {
                     "flow_state":           FlowState.AWAITING_CART_CONFIRMATION.value,
