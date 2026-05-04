@@ -53,6 +53,33 @@ class _MillisecondFormatter(logging.Formatter):
         return super().formatTime(record, datefmt)
 
 
+class _DailyDirectoryHandler(logging.FileHandler):
+    """
+    File handler that rotates into a new YYYY-MM-DD subdirectory at midnight
+    without requiring a server restart.
+    """
+    def __init__(self, log_base_dir: Path, filename: str, **kwargs):
+        self._log_base_dir = log_base_dir
+        self._filename = filename
+        self._current_date = datetime.now().strftime("%Y-%m-%d")
+        log_file = self._make_log_file(self._current_date)
+        super().__init__(log_file, encoding="utf-8", **kwargs)
+
+    def _make_log_file(self, date_str: str) -> Path:
+        log_dir = self._log_base_dir / date_str
+        log_dir.mkdir(parents=True, exist_ok=True)
+        return log_dir / self._filename
+
+    def emit(self, record):
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today != self._current_date:
+            self.close()
+            self._current_date = today
+            self.baseFilename = str(self._make_log_file(today))
+            self.stream = self._open()
+        super().emit(record)
+
+
 def setup_logger(name: str = "miraq_chat", log_level: str = "INFO") -> logging.Logger:
     """
     Configure and return a logger with file and console handlers.
@@ -85,18 +112,14 @@ def setup_logger(name: str = "miraq_chat", log_level: str = "INFO") -> logging.L
     )
 
     # ── File Handler (daily rotation, absolute path) ──────────────────────
-    today = datetime.now().strftime("%Y-%m-%d")
-    log_dir = _LOG_BASE_DIR / today
     try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / "chat.txt"
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler = _DailyDirectoryHandler(_LOG_BASE_DIR, "chat.txt")
         file_handler.setLevel(logging.DEBUG)   # capture everything in file
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
     except OSError as exc:
         # Fall back gracefully — at least console logging will still work
-        print(f"[chat_logger] WARNING: Could not create log file at {log_dir}: {exc}")
+        print(f"[chat_logger] WARNING: Could not create log file: {exc}")
 
     # ── Console Handler ───────────────────────────────────────────────────
     console_handler = logging.StreamHandler()
@@ -104,7 +127,7 @@ def setup_logger(name: str = "miraq_chat", log_level: str = "INFO") -> logging.L
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    logger.debug(f"Logger '{name}' initialised | log_file={log_dir / 'chat.txt'} | level={log_level.upper()}")
+    logger.debug(f"Logger '{name}' initialised | level={log_level.upper()}")
     return logger
 
 
@@ -170,17 +193,13 @@ def get_api_logger() -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    log_dir = _LOG_BASE_DIR / today
     try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / "api.txt"
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler = _DailyDirectoryHandler(_LOG_BASE_DIR, "api.txt")
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
     except OSError as exc:
-        print(f"[chat_logger] WARNING: Could not create api log file at {log_dir}: {exc}")
+        print(f"[chat_logger] WARNING: Could not create api log file: {exc}")
 
     # Console: only show at WARNING+ by default to keep stdout clean
     console_handler = logging.StreamHandler()
