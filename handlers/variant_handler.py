@@ -1,11 +1,5 @@
 """
 handlers/variant_handler.py — Steps 3.55, 3.7, 5.5: Variant and variation handling.
-
-Step 3.55 — AWAITING_VARIANT_SELECTION: resolve variant from user response.
-Step 3.7  — Variation product: format parent + matching variations.
-Step 5.5  — Detect when variant/quantity is still needed for an order intent.
-
-Each public function returns a Flask response or None to fall through.
 """
 
 import time
@@ -40,14 +34,6 @@ logger = get_logger("miraq_chat")
 def _resolve_option_display_name(attr_name: str, option: str, store_loader) -> str:
     """
     Resolve a WooCommerce variation option value to its canonical display name.
-
-    The WC REST API returns `option` as a slug (e.g. "chip-card") OR as a display
-    name (e.g. "Chip Card") depending on WC version / config.
-
-    We derive the taxonomy slug from the attribute display name (e.g. "Sample Size"
-    → "pa_sample-size") and call store_loader.get_all_attribute_terms(), which goes
-    through attribute_by_slug → attribute_terms using consistent key types internally.
-    This avoids any int/str mismatch on attribute_id keys.
     """
     if not store_loader or not attr_name or not option:
         return option
@@ -65,11 +51,6 @@ def _resolve_option_display_name(attr_name: str, option: str, store_loader) -> s
 def _get_safe_options(attrs, store_loader=None):
     """
     Return {attribute_display_name: option_display_name} from variation attrs.
-
-    Accepts dict-format (pa_slug → value) and list-format (WC REST API variation
-    attributes).  When store_loader is supplied, option slugs are resolved to their
-    canonical display names via store_loader.get_all_attribute_terms() — no string
-    guessing or normalization, and no int/str key-type assumptions.
     """
     if isinstance(attrs, dict):
         return {k.replace("pa_", "").replace("-", " ").title(): str(v).replace("-", " ").title() for k, v in attrs.items() if v}
@@ -80,11 +61,85 @@ def _get_safe_options(attrs, store_loader=None):
                 continue
             name = a.get("name", "")
             option = a.get("option", "")
-            # Resolve slug → canonical display name via store data
             option = _resolve_option_display_name(name, option, store_loader)
             result[name] = option
         return result
     return {}
+
+
+def _slugify(s: str) -> str:
+    """
+    Normalise a display-name or WC attribute slug to a bare alphanumeric key
+    for fallback comparison purposes.
+    """
+    return re.sub(r'[^a-z0-9]+', '', str(s).lower())
+
+
+def _build_display_to_slug(store_loader) -> dict:
+    """
+    Build {taxonomy: {display_name_lower: slug}} from all_attributes_raw.
+
+    Example output:
+        {
+            "pa_sample-size": {"chip card": "chip-card", "4x4": "4x4"},
+            "pa_finish":       {"matte": "matte", "gloss": "gloss"},
+        }
+
+    This is the authoritative display-name → WC slug map loaded once at startup
+    from the custom all-attributes endpoint, making variation matching a direct
+    lookup rather than a heuristic comparison.
+    """
+    result: dict = {}
+    if not store_loader:
+        return result
+    for attr in getattr(store_loader, "all_attributes_raw", []):
+        taxonomy = attr.get("taxonomy", "")
+        if taxonomy:
+            result[taxonomy] = {
+                term["name"].lower(): term["slug"]
+                for term in attr.get("terms", [])
+            }
+    return result
+
+
+def _variation_matches_resolved(var: dict, prev_resolved: dict, display_to_slug: dict) -> bool:
+    """
+    Returns True when ALL resolved attributes match this variation.
+
+    Resolved attributes are stored as display names (e.g. "Chip Card").
+    WC REST API variation attributes carry option slugs (e.g. "chip-card").
+    display_to_slug converts display names → slugs for a direct comparison,
+    with a _slugify fallback for any taxonomy not in the lookup.
+    """
+    if not prev_resolved:
+        return True
+
+    # Build {taxonomy: option_slug} from variation attributes
+    var_attrs: dict = {}
+    for a in var.get("attributes", []):
+        if isinstance(a, dict):
+            name = a.get("name", "")
+            taxonomy = f"pa_{name.lower().replace(' ', '-')}"
+            var_attrs[taxonomy] = a.get("option", "")
+
+    for attr_label, display_val in prev_resolved.items():
+        taxonomy = f"pa_{attr_label.lower().replace(' ', '-')}"
+        actual_slug = var_attrs.get(taxonomy)
+        if actual_slug is None:
+            continue  # wildcard axis on this variation — skip
+
+        term_map = display_to_slug.get(taxonomy, {})
+        expected_slug = term_map.get(display_val.lower(), "")
+        if expected_slug:
+            if expected_slug != actual_slug:
+                return False
+        else:
+            # Fallback: slugify both sides (handles edge cases like '4"x4"' ↔ "4x4")
+            if _slugify(display_val) != _slugify(actual_slug):
+                return False
+
+    return True
+
 
 def handle_variant_selection(
     current_flow_state,
@@ -105,22 +160,17 @@ def handle_variant_selection(
 
     _ABANDON_INTENTS = {
         Intent.PRODUCT_LIST, Intent.CATEGORY_BROWSE,
-        Intent.CATEGORY_LIST, Intent.PRODUCT_QUICK_SHIP, 
+        Intent.CATEGORY_LIST, Intent.PRODUCT_QUICK_SHIP,
         Intent.GREETING,
     }
-    
-    # ── SMART CHECK: Are they searching for a completely different product? ──
+
     is_searching_new_product = False
-    
     if intent in (Intent.PRODUCT_SEARCH, Intent.FILTER_BY_ATTRIBUTE):
         new_id = getattr(entities, 'product_id', None)
         pending_id = user_context.get("pending_product_id")
-        
-        # If they found a new product, and it's NOT the one we are currently ordering -> Abandon
         if new_id and pending_id and new_id != pending_id:
             is_searching_new_product = True
 
-    # Now we only abandon if it's an explicit abandon intent OR they searched for a different product
     if current_flow_state == FlowState.AWAITING_VARIANT_SELECTION and (intent in _ABANDON_INTENTS or is_searching_new_product):
         logger.info(
             f"Step 3.55: Abandoning variant flow — new intent={intent.value} detected | "
@@ -142,7 +192,7 @@ def handle_variant_selection(
 
     if not _var_product_id:
         return None
-    
+
     # Paginate to get all variations
     all_variations = []
     page_num = 1
@@ -158,26 +208,29 @@ def handle_variant_selection(
         if len(batch) < 100:
             break
         page_num += 1
-        
-    # Fetch parent_raw early so we know the EXACT variation axes required
+
+    # Fetch parent product to know the exact variation axes required
     parent_raw = {}
-    parent_call = WooAPICall(
+    parent_resp = woo_client.execute(WooAPICall(
         method="GET",
         endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}",
         params={},
         description=f"Fetch parent product '{_var_product_name}'",
-    )
-    parent_resp = woo_client.execute(parent_call)
+    ))
     parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
 
-    # Load store_loader once for slug→display-name resolution in _get_safe_options
+    # Load store_loader once for slug→display-name resolution and the slug lookup
     _sl = None
     try:
         _sl = get_store_loader()
     except Exception:
         pass
 
+    # Build the authoritative display-name → slug map (used throughout this handler)
+    display_to_slug = _build_display_to_slug(_sl)
+
     prev_resolved = user_context.get("resolved_attributes", {})
+
     # Extract ALL variation-capable attributes from the parent product
     candidate_options = {}
     for attr in parent_raw.get("attributes", []):
@@ -188,23 +241,18 @@ def handle_variant_selection(
 
     user_msg_lower = message.lower()
     user_msg_clean = _STRIP_QUOTES_RE.sub('', user_msg_lower)
-    
-    # Extract regex outside the f-string for Python 3.10 compatibility
+
     stripped_text = re.sub(r'[^\w\s]', ' ', user_msg_clean)
     msg_for_extraction = f" {stripped_text} "
-    msg_for_extraction = re.sub(r'\s+', ' ', msg_for_extraction) # Collapse multiple spaces
-    
+    msg_for_extraction = re.sub(r'\s+', ' ', msg_for_extraction)
+
     # Catch newly spoken attributes from the user's message
     for nice_name, opts in candidate_options.items():
         for opt in opts:
             opt_clean = _STRIP_QUOTES_RE.sub('', opt.lower()).strip()
-            
-            # Strip punctuation from the option as well so they match perfectly
             opt_for_exact = re.sub(r'[^\w\s]', ' ', opt_clean)
             opt_for_exact = re.sub(r'\s+', ' ', opt_for_exact).strip()
-            
-            
-            # ── Normalised check: handles curly/smart quotes (e.g. 8"X8" where " isn't stripped) ──
+
             opt_normalised = re.sub(r'\s+', '', opt_for_exact)
             msg_normalised  = re.sub(r'\s+', '', stripped_text)
             if opt_normalised and re.search(
@@ -213,7 +261,6 @@ def handle_variant_selection(
             ):
                 prev_resolved[nice_name] = opt
 
-            # ── Padded check: standard word-boundary match for space-delimited options ──
             if opt_for_exact and f" {opt_for_exact} " in msg_for_extraction:
                 prev_resolved[nice_name] = opt
             elif opt_clean == user_msg_clean.strip():
@@ -223,90 +270,53 @@ def handle_variant_selection(
         user_text_lower = message.lower()
         user_text_clean = _STRIP_QUOTES_RE.sub('', user_text_lower)
         user_tokens = set(_TOKENIZE_RE.findall(user_text_clean))
-        
-        # Create a heavily stripped version for exact matching (removes commas, hyphens, etc.)
+
         text_for_exact = re.sub(r'[^\w\s]', ' ', user_text_clean)
-        
+
         scores = []
         for var in all_variations:
-            if not var.get("attributes"): continue  
+            if not var.get("attributes"): continue
             base_score = score_variation_against_text(var, user_text_clean, user_tokens)
-            
-            # Manually strip quotes and punctuation from DB options to catch dimensions
+
             opts = _get_safe_options(var.get("attributes", []), _sl)
             for opt_val in opts.values():
                 clean_opt = _STRIP_QUOTES_RE.sub('', opt_val.lower()).strip()
                 opt_for_exact = re.sub(r'[^\w\s]', ' ', clean_opt)
-                
-                # Pad with spaces to ensure word boundaries (so "12x12" doesn't falsely match "12x120")
                 if opt_for_exact and f" {opt_for_exact} " in f" {text_for_exact} ":
                     base_score += 100
-                    
+
             scores.append((var, base_score))
 
         max_score = max((s for _, s in scores), default=0)
         matched = [var for var, s in scores if s == max_score] if max_score > 0 else all_variations
 
-        # ── Tiebreak / fallback: score matched set against prev_resolved ──────────
-        # If max_score==0 (all tied), or multiple tied, the current message alone
-        # can't distinguish variations. Use the accumulated resolved attributes to
-        # find the best match, so a wildcard axis as the final message (e.g. "Matte",
-        # "12x12") doesn't cause the wrong variation to be picked.
-        if len(matched) != 1 and prev_resolved:
-            resolved_scores = []
-            for var in matched:
-                var_opts = _get_safe_options(var.get("attributes", []), _sl)
-                rscore = 0
-                for res_key, res_val in prev_resolved.items():
-                    for var_attr_name, var_attr_val in var_opts.items():
-                        if (res_key.lower() == var_attr_name.lower()
-                                and res_val.lower() == var_attr_val.lower()):
-                            rscore += 50
-                resolved_scores.append((var, rscore))
-
-            best_rscore = max((s for _, s in resolved_scores), default=0)
-            if best_rscore > 0:
-                matched = [var for var, s in resolved_scores if s == best_rscore]
-                logger.info(
-                    f"Step 3.55: Tiebreak via prev_resolved | "
-                    f"best_rscore={best_rscore} | "
-                    f"matched={[v['id'] for v in matched]}"
-                )
-        
         logger.debug(f"Step 3.55 Scoring: user_text_clean='{user_text_clean}'")
         logger.debug(f"Step 3.55 Scoring: max_score={max_score} | variations_tied_for_max={len(matched)}")
         if len(matched) < 5:
             logger.debug(f"Step 3.55 Scoring: Matched variants = {[v['id'] for v in matched]}")
 
-        # ── Final safety pass: if still tied after tiebreak, do a direct full-attribute
-        # comparison against prev_resolved.  With attribute_terms resolving slugs to
-        # display names, this should rarely trigger — but guards against genuine
-        # catalog ambiguity (two variations sharing all resolved axes).
-        if len(matched) > 1 and prev_resolved:
-            exact_matches = []
-            for var in matched:
-                var_opts = _get_safe_options(var.get("attributes", []), _sl)
-                if all(
-                    any(
-                        res_key.lower() == var_attr.lower()
-                        and res_val.lower() == var_val.lower()
-                        for var_attr, var_val in var_opts.items()
-                    )
-                    for res_key, res_val in prev_resolved.items()
-                ):
-                    exact_matches.append(var)
-
-            if len(exact_matches) == 1:
+        # ── Tiebreak: direct slug-based lookup against prev_resolved ──────────
+        # The display_to_slug map converts "Chip Card" → "chip-card" so we can
+        # compare directly against the WC API's option slugs.  No scoring
+        # heuristics needed once we have the authoritative name→slug mapping.
+        if len(matched) != 1 and prev_resolved:
+            direct = [v for v in matched if _variation_matches_resolved(v, prev_resolved, display_to_slug)]
+            if direct:
+                matched = direct
                 logger.info(
-                    f"Step 3.55: Final exact-match pass resolved tie → variation_id={exact_matches[0]['id']}"
+                    f"Step 3.55: Slug-based tiebreak | "
+                    f"matched_count={len(matched)} | ids={[v['id'] for v in matched]}"
                 )
-                matched = exact_matches
-            elif len(exact_matches) > 1:
-                logger.warning(
-                    f"Step 3.55: Final exact-match pass still ambiguous → "
-                    f"candidates={[v['id'] for v in exact_matches]}"
-                )
-                matched = exact_matches
+
+        # ── Final pass: search all_variations (catches scoring edge-cases) ────
+        if len(matched) > 1 and prev_resolved:
+            all_direct = [v for v in all_variations if _variation_matches_resolved(v, prev_resolved, display_to_slug)]
+            if all_direct:
+                if len(all_direct) == 1:
+                    logger.info(f"Step 3.55: Final slug-match resolved tie → variation_id={all_direct[0]['id']}")
+                else:
+                    logger.warning(f"Step 3.55: Final slug-match still ambiguous → candidates={[v['id'] for v in all_direct]}")
+                matched = all_direct
 
     else:
         matched = _filter_variations_by_entities(all_variations, entities)
@@ -323,7 +333,7 @@ def handle_variant_selection(
             if text_matched and len(text_matched) < len(candidates):
                 matched = text_matched
 
-    # Check if all REQUIRED wildcard/variation axes have been resolved!
+    # Check if all REQUIRED wildcard/variation axes have been resolved
     missing_required = []
     resolved_keys_lower = {k.lower() for k in prev_resolved.keys()}
     for nice_name in candidate_options.keys():
@@ -366,15 +376,13 @@ def handle_variant_selection(
             or _resolved_variation.get("regular_price")
             or ""
         )
-        
+
         user_context["resolved_attributes"] = prev_resolved
 
         if not _var_quantity:
             _price_line = f"\n**Unit Price:** {get_currency_symbol()}{_variant_price}" if _variant_price else ""
             elapsed = time.time() - start_time
 
-            # ── If this flow originated from a cart/browse action (not an order
-            # intent), go back to cart confirmation so the user can choose.
             _pending_action = user_context.get("pending_action", "order")
 
             if _pending_action == "cart":
@@ -403,8 +411,7 @@ def handle_variant_selection(
                     "flow_state": FlowState.AWAITING_CART_CONFIRMATION.value,
                     "pagination": default_pagination(page),
                 }), 200
-                
-            # Order flow — ask for quantity
+
             return jsonify({
                 "success": True,
                 "bot_message": (
@@ -429,7 +436,7 @@ def handle_variant_selection(
                 "flow_state": FlowState.AWAITING_QUANTITY.value,
                 "pagination": default_pagination(page),
             }), 200
-        
+
         quantity = _var_quantity or 1
         variant_suffix = f" ({_variant_label})" if _variant_label else ""
         cart_msg = f"Got it — add **{_var_product_name}**{variant_suffix} ×{quantity} to your cart?"
@@ -453,17 +460,14 @@ def handle_variant_selection(
             "flow_state": FlowState.AWAITING_CART_CONFIRMATION.value,
             "pagination": default_pagination(page),
         }), 200
-            
+
     # ── Fallback: Need to ask for missing info ──
     resolved_attributes = dict(prev_resolved) if prev_resolved else {}
-    
+
     if not is_fully_resolved:
-        # 🚀 UPDATE: Pass all_variations so wildcard axes are merged perfectly
-        prompt_msg = build_variant_prompt(parent_raw, _var_product_name, resolved_attributes, all_variations)
-        # If we have a generic variation matched, we shouldn't say "Sorry I couldn't find that exact variant"
+        prompt_msg = build_variant_prompt(parent_raw, _var_product_name, resolved_attributes, all_variations, display_to_slug)
         prompt_msg = prompt_msg.replace("Sorry, I couldn't find that exact variant. ", "")
     elif len(matched) > 1:
-        # Traditional Ambiguity Handling
         attr_values_all = {}
         for v in matched:
             if v.get("stock_status") == "outofstock" or v.get("in_stock") is False:
@@ -471,10 +475,9 @@ def handle_variant_selection(
             for name, opt in _get_safe_options(v.get("attributes", []), _sl).items():
                 if name and opt:
                     attr_values_all.setdefault(name, set()).add(opt)
-        
+
         _already_resolved = {k.lower() for k in resolved_attributes}
-        
-        # Supplement with parent-level wildcard options for ambiguity resolution
+
         for attr in parent_raw.get("attributes", []):
             if isinstance(attr, dict) and attr.get("variation") is True:
                 name = attr.get("name", "")
@@ -493,7 +496,7 @@ def handle_variant_selection(
             for k, v in attr_values_all.items()
             if len(v) > 1 and k.lower() not in _already_resolved
         }
-        
+
         if ambiguous:
             lines = [f"Great, I found **{_var_product_name}** in your selected options! I just need a bit more info:\n"]
             for attr_name, options in ambiguous.items():
@@ -511,15 +514,13 @@ def handle_variant_selection(
                 + "\n\nWhich one would you like?"
             )
     else:
-        # Pass all_variations
-        prompt_msg = build_variant_prompt(parent_raw, _var_product_name, resolved_attributes, all_variations)
+        prompt_msg = build_variant_prompt(parent_raw, _var_product_name, resolved_attributes, all_variations, display_to_slug)
         if len(all_variations) > 0:
             prompt_msg = "Sorry, I couldn't find that exact variant. " + prompt_msg
-            
+
     user_context["resolved_attributes"] = resolved_attributes
 
-    # Build structured variant options for the frontend picker UI
-    _variant_options = _compute_variant_options(parent_raw, resolved_attributes, all_variations)
+    _variant_options = _compute_variant_options(parent_raw, resolved_attributes, all_variations, display_to_slug)
 
     elapsed = time.time() - start_time
     return jsonify({
@@ -542,6 +543,7 @@ def handle_variant_selection(
         "pagination": default_pagination(page),
     }), 200
 
+
 def handle_variation_product(
     intent,
     entities,
@@ -552,7 +554,6 @@ def handle_variation_product(
     session_id,
     page,
     start_time,
-    # ── New params for cart confirmation flow ──
     user_context=None,
     conversation=None,
 ):
@@ -570,6 +571,8 @@ def handle_variation_product(
         _sl = get_store_loader()
     except Exception:
         pass
+
+    display_to_slug = _build_display_to_slug(_sl)
 
     parent_product_raw = None
     variations_raw = []
@@ -620,11 +623,9 @@ def handle_variation_product(
 
     has_attributes = bool(entities.attributes)
 
-    # ── Resolved variation tracking (new) ──
-    resolved_variation = None   # set when we narrow to exactly one variant
-    matched_variation = None    # kept for metadata compat
+    resolved_variation = None
+    matched_variation = None
 
-    # ── Product list assembly ──
     if intent == Intent.PRODUCT_ATTRIBUTE_INFO:
         products = [parent_formatted]
         logger.info("Step 3.7: Attribute Info requested. Returning ONLY parent product card.")
@@ -645,8 +646,6 @@ def handle_variation_product(
                 variation_products = [format_variation(v, parent_product_raw) for v in filtered_vars]
 
         else:
-            # PRODUCT_VARIATIONS / PRODUCT_SEARCH with attributes
-            # ── Try exact match first before falling back to filtered list ──
             matched_variation = match_variation_to_entities(variations_raw, entities)
             if matched_variation:
                 logger.info(
@@ -660,7 +659,6 @@ def handle_variation_product(
                 if not filtered_vars and variations_raw:
                     start = (page - 1) * DEFAULT_PER_PAGE
                     filtered_vars = variations_raw[start: start + DEFAULT_PER_PAGE]
-                # If filtering still yields exactly one, treat as resolved
                 if len(filtered_vars) == 1:
                     resolved_variation = filtered_vars[0]
                     logger.info(
@@ -685,7 +683,6 @@ def handle_variation_product(
     else:
         products = [parent_formatted]
 
-    # ── Bot message ──
     should_show_summary = (
         intent == Intent.PRODUCT_ATTRIBUTE_INFO
         or (intent == Intent.PRODUCT_VARIATIONS and not has_attributes)
@@ -772,15 +769,11 @@ def handle_variation_product(
                 f"and doesn't come in multiple variations. Here's the item:"
             )
 
-    # ── Cart confirmation override when single variation resolved ──
     next_flow_state = FlowState.IDLE.value
     suggestions = generate_suggestions(intent, entities, products)
 
     if resolved_variation and user_context is not None and conversation is not None:
 
-        # ── parent_product_raw from advanced search has stripped attributes.
-        # Check if variation flags are present; if not, fetch the full product
-        # so all_variation_axes is correctly populated before the wildcard check.
         has_variation_flags = any(
             isinstance(attr, dict) and "variation" in attr
             for attr in parent_product_raw.get("attributes", [])
@@ -802,10 +795,6 @@ def handle_variation_product(
                     _full_parent_resp.get("data", {}).get("attributes", [])
                 )
 
-        # ── Wildcard detection ─────────────────────────────────────────────────
-        # WooCommerce requires ALL variation axes in the cart payload, even when a
-        # variation only defines a subset (leaving others as wildcards).
-        # Detect missing axes and ask the user before going to cart confirmation.
         var_attrs = _get_safe_options(resolved_variation.get("attributes", []), _sl)
         all_variation_axes = {
             attr.get("name", "").replace("pa_", "").replace("-", " ").title()
@@ -815,7 +804,6 @@ def handle_variation_product(
         missing_axes = all_variation_axes - set(var_attrs.keys())
 
         if missing_axes:
-            # ── Partial match: collect remaining axes first ────────────────────
             logger.info(
                 f"Step 3.7: Variation {resolved_variation.get('id')} is wildcard — "
                 f"missing axes: {missing_axes} — → AWAITING_VARIANT_SELECTION"
@@ -823,18 +811,17 @@ def handle_variation_product(
             user_context["pending_product_id"]   = parent_product_raw.get("id")
             user_context["pending_variation_id"] = resolved_variation.get("id")
             user_context["pending_product_name"] = parent_formatted["name"]
-            user_context["resolved_attributes"]  = var_attrs  # e.g. {"Colors": "VIRGINIA Angora"}
+            user_context["resolved_attributes"]  = var_attrs
             conversation.context_data = user_context
             flag_modified(conversation, "context_data")
 
             bot_message = build_variant_prompt(
-                parent_product_raw, parent_formatted["name"], var_attrs, variations_raw
+                parent_product_raw, parent_formatted["name"], var_attrs, variations_raw, display_to_slug
             )
             suggestions = ["Cancel"]
             next_flow_state = FlowState.AWAITING_VARIANT_SELECTION.value
 
         else:
-            # ── Fully specified: go to cart confirmation ───────────────────────
             variation_name = (
                 resolved_variation.get("variation_label")
                 or " / ".join(var_attrs.values())
@@ -876,7 +863,6 @@ def handle_variation_product(
     else:
         pagination = build_pagination(page, api_responses, api_calls_to_execute)
 
-    # ── Metadata ──
     elapsed = time.time() - start_time
     metadata = {
         "confidence": round(confidence, 2),
@@ -914,6 +900,7 @@ def handle_variation_product(
         "flow_state":  next_flow_state,
     }), 200
 
+
 def handle_quantity_and_variant_check(
     intent,
     entities,
@@ -938,6 +925,8 @@ def handle_quantity_and_variant_check(
     except Exception:
         pass
 
+    display_to_slug = _build_display_to_slug(_sl)
+
     products_formatted = []
     for p in all_products_raw:
         if not p.get("parent_id"):
@@ -951,9 +940,8 @@ def handle_quantity_and_variant_check(
     if not products_formatted:
         return None
 
-    product = products_formatted[0]  # initial candidate
+    product = products_formatted[0]
 
-    # Guard: verify the result actually matches what the user asked for
     _requested_name = getattr(entities, 'order_item_name', None) or getattr(entities, 'product_name', None)
     if _requested_name and products_formatted:
         _req_lower = _requested_name.lower()
@@ -988,14 +976,13 @@ def handle_quantity_and_variant_check(
                 "flow_state": FlowState.IDLE.value,
                 "pagination": default_pagination(page),
             }), 200
-    
+
     logger.info(
         f"🛑 DEBUG STEP 5.5 | Product: {product.get('name')} | "
         f"Type: {product.get('type')} | "
         f"Variations Count: {len(product.get('variations', []))}"
     )
-    
-    # ── OUT OF STOCK INTERCEPT ──
+
     if product.get("stock_status") == "outofstock":
         elapsed = time.time() - start_time
         return jsonify({
@@ -1012,19 +999,18 @@ def handle_quantity_and_variant_check(
             "flow_state": FlowState.IDLE.value,
             "pagination": default_pagination(page),
         }), 200
-        
-    # Pre-fetch full attributes for the prompt if the custom API stripped them!
+
     _raw_for_prompt = {}
     _variations_for_cache = []
     if product.get("type") == "variable" or product.get("variations"):
         _raw_for_prompt = next((p for p in all_products_raw if not p.get("parent_id")), {})
-        
+
         has_full_options = False
         for pa in _raw_for_prompt.get("attributes", []):
             if isinstance(pa, dict) and pa.get("options"):
                 has_full_options = True
                 break
-                
+
         if not has_full_options:
             logger.info(f"Step 5.5: Parent attributes missing options. Fetching full product {product.get('id')} from Woo API.")
             parent_call = WooAPICall(
@@ -1036,16 +1022,14 @@ def handle_quantity_and_variant_check(
             parent_resp = woo_client.execute(parent_call)
             if parent_resp.get("success"):
                 _raw_for_prompt["attributes"] = parent_resp.get("data", {}).get("attributes", [])
-                
+
         _variations_for_cache = _raw_for_prompt.get("variations", [])
 
-    # No quantity yet
     if not entities.quantity:
         if product.get("type") == "variable" or product.get("variations"):
             _raw_for_prompt = next((p for p in all_products_raw if not p.get("parent_id")), {})
             _variations_for_cache = _raw_for_prompt.get("variations", [])
-            
-            # --- FAST TRACK: EXACT VARIANT RESOLVED BY API ---
+
             if len(_variations_for_cache) == 1:
                 _resolved_var = _variations_for_cache[0]
                 if _resolved_var.get("stock_status") == "outofstock" or _resolved_var.get("in_stock") is False:
@@ -1064,11 +1048,11 @@ def handle_quantity_and_variant_check(
                         "flow_state": FlowState.IDLE.value,
                         "pagination": default_pagination(page),
                     }), 200
-                    
+
                 _var_price = _resolved_var.get("sale_price") or _resolved_var.get("price") or _resolved_var.get("regular_price") or ""
                 _price_line = f"\n**Unit Price:** {get_currency_symbol()}{_var_price}" if _var_price else ""
                 _var_label = " / ".join(_get_safe_options(_resolved_var.get("attributes", []), _sl).values())
-                
+
                 elapsed = time.time() - start_time
                 return jsonify({
                     "success": True,
@@ -1094,11 +1078,9 @@ def handle_quantity_and_variant_check(
                     "pagination": default_pagination(page),
                 }), 200
 
-            # --- NORMAL: NEEDS VARIANT SELECTION ---
             from handlers.chat_utils import build_variant_prompt, _compute_variant_options
-            # Pass _variations_for_cache
-            prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache)
-            _variant_options = _compute_variant_options(_raw_for_prompt, getattr(entities, 'attributes', {}), _variations_for_cache)
+            prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug)
+            _variant_options = _compute_variant_options(_raw_for_prompt, getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug)
             elapsed = time.time() - start_time
             return jsonify({
                 "success": True,
@@ -1136,15 +1118,12 @@ def handle_quantity_and_variant_check(
             "pagination": default_pagination(page),
         }), 200
 
-    # Quantity known but variable product not yet resolved
     if entities.quantity and not order_data and (product.get("type") == "variable" or product.get("variations")):
 
-        # --- FAST TRACK: QUANTITY AND VARIANT BOTH RESOLVED → cart confirmation ---
         if len(_variations_for_cache) == 1:
             _resolved_var = _variations_for_cache[0]
             if _resolved_var.get("stock_status") == "outofstock" or _resolved_var.get("in_stock") is False:
                 elapsed = time.time() - start_time
-                
                 return jsonify({
                     "success": True,
                     "bot_message": "I'm sorry, but that specific variant is currently out of stock! 😔",
@@ -1184,10 +1163,9 @@ def handle_quantity_and_variant_check(
                 "pagination": default_pagination(page),
             }), 200
 
-        # --- NORMAL: NEEDS VARIANT SELECTION ---
         from handlers.chat_utils import build_variant_prompt, _compute_variant_options
-        prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache)
-        _variant_options = _compute_variant_options(_raw_for_prompt, getattr(entities, 'attributes', {}), _variations_for_cache)
+        prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug)
+        _variant_options = _compute_variant_options(_raw_for_prompt, getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug)
         elapsed = time.time() - start_time
         return jsonify({
             "success": True,

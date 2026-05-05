@@ -104,18 +104,19 @@ def _build_cart_variation_payload(product_id, variation_id, resolved_attrs, stor
                 for term in attr.get("terms", [])
             }
 
-        # Fixed axes — from the variation itself (always correct)
+        # Fixed axes — built directly from the variation's own attributes.
+        # The WC REST API returns `option` as the correct slug for global
+        # attributes (pa_ prefixed), so we use it as-is rather than
+        # attempting a lossy re-derivation through the term_map.
+        # Taxonomy is derived from the attribute display name because WC does
+        # NOT include a `slug` field in variation attribute objects.
         fixed = {}
         result = []
         for attr in var_attrs:
-            taxonomy = attr.get("slug", "")
-            option   = attr.get("option", "")
-            term_map = slug_lookup.get(taxonomy, {})
-            slug = term_map.get(
-                option.lower(),
-                re.sub(r"[^a-z0-9]+", "", option.lower()),
-            )
-            result.append({"attribute": taxonomy, "value": slug})
+            attr_name = attr.get("name", "")
+            taxonomy  = f"pa_{attr_name.lower().replace(' ', '-')}"
+            option    = attr.get("option", "")   # already the correct WC slug
+            result.append({"attribute": taxonomy, "value": option})
             fixed[taxonomy] = True
 
         # Wildcard axes — from user's resolved_attrs (cart item meta)
@@ -871,7 +872,7 @@ def chat():
             qty   = user_context.get("pending_quantity") or 1
             name  = user_context.get("pending_product_name", "item")
             resolved = user_context.get("resolved_attributes") or {}
-            variation_attributes = _resolve_variation_slugs(resolved, get_store_loader())
+            variation_attributes = _build_cart_variation_payload(pid, vid, resolved, get_store_loader())
 
             if pid:
                 elapsed = round((time.time() - start_time) * 1000)

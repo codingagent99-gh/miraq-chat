@@ -158,10 +158,8 @@ def build_out_of_stock_response(product_name: str, product_raw: dict, intent, se
     
     elapsed = time.time() - start_time
     
-    # Dynamically build a foolproof suggestion based on the product's category
     suggestions = ["Browse all categories"]
     if product_raw and product_raw.get("categories"):
-        # WooCommerce categories can be dicts or strings depending on the endpoint format
         first_cat = product_raw["categories"][0]
         cat_name = first_cat.get("name", "") if isinstance(first_cat, dict) else first_cat
         if cat_name:
@@ -182,10 +180,12 @@ def build_out_of_stock_response(product_name: str, product_raw: dict, intent, se
         "pagination": default_pagination(page),
     }), 200
 
+
 def _compute_variant_options(
     parent_raw: dict,
     resolved_attributes: dict = None,
     variations_list: list = None,
+    display_to_slug: dict = None,  # {taxonomy: {display_name_lower: slug}}
 ) -> dict:
     """
     Core computation shared by build_variant_prompt and the API response builder.
@@ -197,6 +197,11 @@ def _compute_variant_options(
     - Axes WITH explicit parent options → use parent options only (source of truth).
     - Axes WITHOUT parent options (wildcard "Any") → scan variation records instead,
       filtered to those consistent with already-resolved attributes.
+
+    display_to_slug: pre-built {taxonomy: {display_name_lower: slug}} from
+    all_attributes_raw.  When supplied, _matches_resolved compares resolved
+    display names against variation option slugs correctly rather than doing a
+    lossy string comparison.
     """
     import logging
     log = logging.getLogger("miraq_chat")
@@ -223,29 +228,54 @@ def _compute_variant_options(
             if opts:
                 parent_defined_axes.add(nice_name.lower())
                 missing_attrs[nice_name] = set(opts)
-            # Empty opts → wildcard axis; handled by variation scan below
 
     # ── STEP 2: Variation scan (wildcard axes only) ──
     variations = variations_list if variations_list is not None else parent_raw.get("variations", [])
     log.info(f"build_variant_prompt: Scanning {len(variations)} variations for product")
 
     def _matches_resolved(var: dict) -> bool:
+        """
+        Returns True when the variation is consistent with all already-resolved
+        attributes.
+
+        WC REST API stores variation attribute values as slugs (e.g. "chip-card")
+        while resolved_attributes holds display names (e.g. "Chip Card") as shown
+        to the user.  When display_to_slug is available we convert the display name
+        to its canonical slug before comparing — no string-normalisation guessing.
+        Falls back to a slugified comparison when the taxonomy isn't in the lookup.
+        """
         if not resolved:
             return True
+
         v_attrs = var.get("attributes", {})
+        # Build {nice_name_lower: option_slug} from variation
         var_map: dict = {}
         if isinstance(v_attrs, list):
             for a in v_attrs:
                 if isinstance(a, dict):
-                    var_map[a.get("name", "").lower()] = a.get("option", "").lower()
+                    var_map[a.get("name", "").lower()] = a.get("option", "")
         elif isinstance(v_attrs, dict):
             for k, v in v_attrs.items():
                 nice = k.replace("pa_", "").replace("-", " ").title().lower()
-                var_map[nice] = str(v).lower()
+                var_map[nice] = str(v)
+
         for res_key, res_val in resolved.items():
-            stored = var_map.get(res_key.lower())
-            if stored is not None and stored != res_val.lower():
+            actual_slug = var_map.get(res_key.lower())
+            if actual_slug is None:
+                continue  # axis not present on this variation (wildcard) — skip
+
+            if display_to_slug:
+                taxonomy = f"pa_{res_key.lower().replace(' ', '-')}"
+                term_map = display_to_slug.get(taxonomy, {})
+                expected_slug = term_map.get(res_val.lower(), "")
+                if expected_slug:
+                    if expected_slug != actual_slug:
+                        return False
+                    continue
+            # Fallback: slugify both sides (strips hyphens, quotes, spaces)
+            if re.sub(r'[^a-z0-9]+', '', res_val.lower()) != re.sub(r'[^a-z0-9]+', '', actual_slug.lower()):
                 return False
+
         return True
 
     filtered = [v for v in variations if isinstance(v, dict) and _matches_resolved(v)]
@@ -257,7 +287,7 @@ def _compute_variant_options(
     for v in filtered:
         v_attrs = v.get("attributes", {})
 
-        if isinstance(v_attrs, dict):  # custom flat-dict format
+        if isinstance(v_attrs, dict):
             for k, val in v_attrs.items():
                 if not val:
                     continue
@@ -266,7 +296,7 @@ def _compute_variant_options(
                     continue
                 missing_attrs.setdefault(nice_name, set()).add(val)
 
-        elif isinstance(v_attrs, list):  # standard WC list-of-dicts format
+        elif isinstance(v_attrs, list):
             for a in v_attrs:
                 name = a.get("name", "")
                 val = a.get("option", "")
@@ -282,7 +312,6 @@ def _compute_variant_options(
 
     log.info(f"build_variant_prompt: Extracted attributes = {missing_attrs}")
 
-    # Clean and sort every axis → list of strings (all options, no truncation)
     result: dict = {}
     for axis, vals in missing_attrs.items():
         cleaned = sorted({str(v).replace("-", " ").title() for v in vals})
@@ -297,9 +326,12 @@ def build_variant_prompt(
     product_name: str,
     resolved_attributes: dict = None,
     variations_list: list = None,
+    display_to_slug: dict = None,  # passed through to _compute_variant_options
 ) -> str:
     """Builds a friendly markdown prompt listing the available variation options."""
-    options = _compute_variant_options(parent_raw, resolved_attributes, variations_list)
+    options = _compute_variant_options(
+        parent_raw, resolved_attributes, variations_list, display_to_slug
+    )
 
     if not options:
         return (
@@ -325,34 +357,24 @@ def score_variation_against_text(variation: dict, user_text_clean: str, user_tok
     attrs = variation.get("attributes", [])
     
     # ── FORMAT 1: Custom API (Flat Dictionary) ──
-    # Example: {"pa_colors": "waterfall-havana", "pa_finish": "matte"}
     if isinstance(attrs, dict):
         for key, val in attrs.items():
             if not val: continue
-            
-            # Clean up the value (e.g. "waterfall-havana" -> "waterfall havana")
             opt_clean = str(val).replace("-", " ").lower()
-            
-            # Exact phrase match gets high score
             if opt_clean in user_text_clean:
                 score += 10
             else:
-                # Partial token overlap gets partial score
                 opt_tokens = set(opt_clean.split())
                 overlap = opt_tokens & user_tokens
                 score += len(overlap)
 
     # ── FORMAT 2: Standard WooCommerce (List of Dicts) ──
-    # Example: [{"name": "Color", "option": "Havana"}]
     elif isinstance(attrs, list):
         for attr in attrs:
             if not isinstance(attr, dict): continue
-            
             opt = attr.get("option", "")
             if not opt: continue
-            
             opt_clean = str(opt).replace("-", " ").lower()
-            
             if opt_clean in user_text_clean:
                 score += 10
             else:
