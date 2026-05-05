@@ -189,52 +189,94 @@ def build_variant_prompt(parent_raw: dict, product_name: str, resolved_attribute
     
     resolved = resolved_attributes or {}
     resolved_keys_lower = {k.lower() for k in resolved.keys()}
-    
+
     missing_attrs = {}
-    
-    # ── METHOD 1: Deduce options directly from the variations array ──
+
+    # ── STEP 1: Build the authoritative options from the PARENT first ──
+    # The parent's options list is the single source of truth — it mirrors exactly
+    # what the WooCommerce frontend exposes to shoppers.  Variation records can
+    # carry stale / mismatched attribute values (e.g. pa_sample-size = 8"x8" on a
+    # variation even though the parent only defines 4"x4" and Chip Card for that
+    # axis).  Trusting the parent avoids surfacing phantom options.
+    #
+    # Axes WITH parent options  → use parent options only (like the website does).
+    # Axes WITHOUT parent options → wildcard "Any" axis; must be resolved from
+    #                               variation records instead (METHOD 1 below).
+    parent_defined_axes = set()   # nice_names that the parent covers
+    attributes = parent_raw.get("attributes", [])
+    if isinstance(attributes, list):
+        for attr in attributes:
+            if not (isinstance(attr, dict) and attr.get("variation") is True):
+                continue
+            name = attr.get("name", "")
+            nice_name = name.replace("pa_", "").replace("-", " ").title() if name.startswith("pa_") else name.title()
+            if not nice_name or nice_name.lower() in resolved_keys_lower:
+                continue
+            opts = [str(o).strip() for o in attr.get("options", []) if str(o).strip()]
+            if opts:
+                # Parent has explicit options → use them, ignore variation records
+                parent_defined_axes.add(nice_name.lower())
+                missing_attrs[nice_name] = set(opts)
+            # If opts is empty the axis is a wildcard → handled by METHOD 1 below
+
+    # ── METHOD 1: Scan variation records ONLY for wildcard axes ──
+    # Only runs for axes the parent left blank ("Any").  Pre-filtered to
+    # variations that are consistent with already-resolved attributes so we
+    # never show options that don't exist for the current combination.
     variations = variations_list if variations_list is not None else parent_raw.get("variations", [])
     log.info(f"build_variant_prompt: Scanning {len(variations)} variations for {product_name}")
-    
-    for v in variations:
-        if not isinstance(v, dict):
-            continue
+
+    def _matches_resolved(var: dict) -> bool:
+        if not resolved:
+            return True
+        v_attrs = var.get("attributes", {})
+        var_map: dict = {}
+        if isinstance(v_attrs, list):
+            for a in v_attrs:
+                if isinstance(a, dict):
+                    var_map[a.get("name", "").lower()] = a.get("option", "").lower()
+        elif isinstance(v_attrs, dict):
+            for k, v in v_attrs.items():
+                nice = k.replace("pa_", "").replace("-", " ").title().lower()
+                var_map[nice] = str(v).lower()
+        for res_key, res_val in resolved.items():
+            stored = var_map.get(res_key.lower())
+            if stored is not None and stored != res_val.lower():
+                return False
+        return True
+
+    filtered_variations = [v for v in variations if isinstance(v, dict) and _matches_resolved(v)]
+    log.info(
+        f"build_variant_prompt: {len(filtered_variations)}/{len(variations)} variations "
+        f"match resolved={list(resolved.keys())}"
+    )
+
+    for v in filtered_variations:
         v_attrs = v.get("attributes", {})
-        
-        # Custom API format
+
+        # Custom API format (flat dict)
         if isinstance(v_attrs, dict):
             for k, val in v_attrs.items():
-                if not val: continue
+                if not val:
+                    continue
                 nice_name = k.replace("pa_", "").replace("-", " ").title()
-                if nice_name.lower() not in resolved_keys_lower:
-                    missing_attrs.setdefault(nice_name, set()).add(val)
-                    
-        # Standard WC fallback
+                # Skip axes the parent already covers
+                if nice_name.lower() in resolved_keys_lower or nice_name.lower() in parent_defined_axes:
+                    continue
+                missing_attrs.setdefault(nice_name, set()).add(val)
+
+        # Standard WC format (list of dicts)
         elif isinstance(v_attrs, list):
             for a in v_attrs:
                 name = a.get("name", "")
                 val = a.get("option", "")
-                if name and val and name.lower() not in resolved_keys_lower:
-                    missing_attrs.setdefault(name, set()).add(val)
-
-    # ── METHOD 2: Supplement with parent-level "Any" variation axes ──
-    # ALWAYS run this to fill in axes that WooCommerce left blank ("") on variations!
-    attributes = parent_raw.get("attributes", [])
-    if isinstance(attributes, list):
-        for attr in attributes:
-            if isinstance(attr, dict) and attr.get("variation") is True:
-                name = attr.get("name", "")
+                if not (name and val):
+                    continue
                 nice_name = name.replace("pa_", "").replace("-", " ").title() if name.startswith("pa_") else name.title()
-                
-                if nice_name and nice_name.lower() not in resolved_keys_lower:
-                    opts = attr.get("options", [])
-                    if opts:
-                        # Merge parent options to fill the gaps
-                        if nice_name not in missing_attrs:
-                            missing_attrs[nice_name] = set()
-                        for o in opts:
-                            if str(o).strip():
-                                missing_attrs[nice_name].add(str(o).strip())
+                # Skip axes the parent already covers
+                if nice_name.lower() in resolved_keys_lower or nice_name.lower() in parent_defined_axes:
+                    continue
+                missing_attrs.setdefault(nice_name, set()).add(val)
 
     log.info(f"build_variant_prompt: Extracted attributes = {missing_attrs}")
 
