@@ -24,6 +24,7 @@ from handlers.chat_utils import (
     default_pagination,
     build_pagination,
     build_variant_prompt,
+    _compute_variant_options,
     score_variation_against_text,
     _STRIP_QUOTES_RE,
     _TOKENIZE_RE,
@@ -436,6 +437,9 @@ def handle_variant_selection(
             
     user_context["resolved_attributes"] = resolved_attributes
 
+    # Build structured variant options for the frontend picker UI
+    _variant_options = _compute_variant_options(parent_raw, resolved_attributes, all_variations)
+
     elapsed = time.time() - start_time
     return jsonify({
         "success": True,
@@ -443,6 +447,7 @@ def handle_variant_selection(
         "intent": "guided_flow",
         "products": [],
         "suggestions": ["Cancel Order"],
+        "variant_options": _variant_options,
         "session_id": session_id,
         "metadata": {
             "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
@@ -997,9 +1002,10 @@ def handle_quantity_and_variant_check(
                 }), 200
 
             # --- NORMAL: NEEDS VARIANT SELECTION ---
-            from handlers.chat_utils import build_variant_prompt
+            from handlers.chat_utils import build_variant_prompt, _compute_variant_options
             # Pass _variations_for_cache
             prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache)
+            _variant_options = _compute_variant_options(_raw_for_prompt, getattr(entities, 'attributes', {}), _variations_for_cache)
             elapsed = time.time() - start_time
             return jsonify({
                 "success": True,
@@ -1007,6 +1013,7 @@ def handle_quantity_and_variant_check(
                 "intent": intent.value,
                 "products": products_formatted[:1],
                 "suggestions": ["Cancel Order"],
+                "variant_options": _variant_options,
                 "session_id": session_id,
                 "metadata": {
                     "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
@@ -1085,8 +1092,9 @@ def handle_quantity_and_variant_check(
             }), 200
 
         # --- NORMAL: NEEDS VARIANT SELECTION ---
-        from handlers.chat_utils import build_variant_prompt
+        from handlers.chat_utils import build_variant_prompt, _compute_variant_options
         prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache)
+        _variant_options = _compute_variant_options(_raw_for_prompt, getattr(entities, 'attributes', {}), _variations_for_cache)
         elapsed = time.time() - start_time
         return jsonify({
             "success": True,
@@ -1094,6 +1102,7 @@ def handle_quantity_and_variant_check(
             "intent": intent.value,
             "products": products_formatted[:1],
             "suggestions": ["Cancel Order"],
+            "variant_options": _variant_options,
             "session_id": session_id,
             "metadata": {
                 "flow_state":           FlowState.AWAITING_VARIANT_SELECTION.value,

@@ -182,49 +182,52 @@ def build_out_of_stock_response(product_name: str, product_raw: dict, intent, se
         "pagination": default_pagination(page),
     }), 200
 
-def build_variant_prompt(parent_raw: dict, product_name: str, resolved_attributes: dict = None, variations_list: list = None) -> str:
-    """Builds a friendly prompt listing the available variation options."""
+def _compute_variant_options(
+    parent_raw: dict,
+    resolved_attributes: dict = None,
+    variations_list: list = None,
+) -> dict:
+    """
+    Core computation shared by build_variant_prompt and the API response builder.
+
+    Returns a dict of unresolved variation axes → sorted list of available options.
+    Example: {"Colors": ["CORAL Argento", ...], "Finish": ["Anti-Slip", ...]}
+
+    Rules (mirrors WooCommerce frontend behaviour):
+    - Axes WITH explicit parent options → use parent options only (source of truth).
+    - Axes WITHOUT parent options (wildcard "Any") → scan variation records instead,
+      filtered to those consistent with already-resolved attributes.
+    """
     import logging
     log = logging.getLogger("miraq_chat")
-    
+
     resolved = resolved_attributes or {}
     resolved_keys_lower = {k.lower() for k in resolved.keys()}
+    missing_attrs: dict = {}
 
-    missing_attrs = {}
-
-    # ── STEP 1: Build the authoritative options from the PARENT first ──
-    # The parent's options list is the single source of truth — it mirrors exactly
-    # what the WooCommerce frontend exposes to shoppers.  Variation records can
-    # carry stale / mismatched attribute values (e.g. pa_sample-size = 8"x8" on a
-    # variation even though the parent only defines 4"x4" and Chip Card for that
-    # axis).  Trusting the parent avoids surfacing phantom options.
-    #
-    # Axes WITH parent options  → use parent options only (like the website does).
-    # Axes WITHOUT parent options → wildcard "Any" axis; must be resolved from
-    #                               variation records instead (METHOD 1 below).
-    parent_defined_axes = set()   # nice_names that the parent covers
+    # ── STEP 1: Parent options (authoritative for non-wildcard axes) ──
+    parent_defined_axes: set = set()
     attributes = parent_raw.get("attributes", [])
     if isinstance(attributes, list):
         for attr in attributes:
             if not (isinstance(attr, dict) and attr.get("variation") is True):
                 continue
             name = attr.get("name", "")
-            nice_name = name.replace("pa_", "").replace("-", " ").title() if name.startswith("pa_") else name.title()
+            nice_name = (
+                name.replace("pa_", "").replace("-", " ").title()
+                if name.startswith("pa_") else name.title()
+            )
             if not nice_name or nice_name.lower() in resolved_keys_lower:
                 continue
             opts = [str(o).strip() for o in attr.get("options", []) if str(o).strip()]
             if opts:
-                # Parent has explicit options → use them, ignore variation records
                 parent_defined_axes.add(nice_name.lower())
                 missing_attrs[nice_name] = set(opts)
-            # If opts is empty the axis is a wildcard → handled by METHOD 1 below
+            # Empty opts → wildcard axis; handled by variation scan below
 
-    # ── METHOD 1: Scan variation records ONLY for wildcard axes ──
-    # Only runs for axes the parent left blank ("Any").  Pre-filtered to
-    # variations that are consistent with already-resolved attributes so we
-    # never show options that don't exist for the current combination.
+    # ── STEP 2: Variation scan (wildcard axes only) ──
     variations = variations_list if variations_list is not None else parent_raw.get("variations", [])
-    log.info(f"build_variant_prompt: Scanning {len(variations)} variations for {product_name}")
+    log.info(f"build_variant_prompt: Scanning {len(variations)} variations for product")
 
     def _matches_resolved(var: dict) -> bool:
         if not resolved:
@@ -245,58 +248,71 @@ def build_variant_prompt(parent_raw: dict, product_name: str, resolved_attribute
                 return False
         return True
 
-    filtered_variations = [v for v in variations if isinstance(v, dict) and _matches_resolved(v)]
+    filtered = [v for v in variations if isinstance(v, dict) and _matches_resolved(v)]
     log.info(
-        f"build_variant_prompt: {len(filtered_variations)}/{len(variations)} variations "
+        f"build_variant_prompt: {len(filtered)}/{len(variations)} variations "
         f"match resolved={list(resolved.keys())}"
     )
 
-    for v in filtered_variations:
+    for v in filtered:
         v_attrs = v.get("attributes", {})
 
-        # Custom API format (flat dict)
-        if isinstance(v_attrs, dict):
+        if isinstance(v_attrs, dict):  # custom flat-dict format
             for k, val in v_attrs.items():
                 if not val:
                     continue
                 nice_name = k.replace("pa_", "").replace("-", " ").title()
-                # Skip axes the parent already covers
                 if nice_name.lower() in resolved_keys_lower or nice_name.lower() in parent_defined_axes:
                     continue
                 missing_attrs.setdefault(nice_name, set()).add(val)
 
-        # Standard WC format (list of dicts)
-        elif isinstance(v_attrs, list):
+        elif isinstance(v_attrs, list):  # standard WC list-of-dicts format
             for a in v_attrs:
                 name = a.get("name", "")
                 val = a.get("option", "")
                 if not (name and val):
                     continue
-                nice_name = name.replace("pa_", "").replace("-", " ").title() if name.startswith("pa_") else name.title()
-                # Skip axes the parent already covers
+                nice_name = (
+                    name.replace("pa_", "").replace("-", " ").title()
+                    if name.startswith("pa_") else name.title()
+                )
                 if nice_name.lower() in resolved_keys_lower or nice_name.lower() in parent_defined_axes:
                     continue
                 missing_attrs.setdefault(nice_name, set()).add(val)
 
     log.info(f"build_variant_prompt: Extracted attributes = {missing_attrs}")
 
-    # Clean up the values into nice, readable strings
-    for k, v in missing_attrs.items():
-        if isinstance(v, set):
-            cleaned_vals = [val.replace("-", " ").title() for val in v]
-            missing_attrs[k] = sorted(list(set(cleaned_vals)))
+    # Clean and sort every axis → list of strings (all options, no truncation)
+    result: dict = {}
+    for axis, vals in missing_attrs.items():
+        cleaned = sorted({str(v).replace("-", " ").title() for v in vals})
+        if cleaned:
+            result[axis] = cleaned
 
-    if not missing_attrs:
-        return f"I'd love to order **{product_name}** for you! Which variant would you like? Please specify your options."
+    return result
 
-    msg = f"I'd love to order **{product_name}** for you! To make sure I get the right one, please choose from the following options:\n\n"
-    for name, options in missing_attrs.items():
-        if options:
-            display_opts = options[:8]
-            opts_str = ", ".join(display_opts)
-            if len(options) > 8:
-                opts_str += f", and {len(options) - 8} more..."
-            msg += f"• **{name}:** {opts_str}\n"
+
+def build_variant_prompt(
+    parent_raw: dict,
+    product_name: str,
+    resolved_attributes: dict = None,
+    variations_list: list = None,
+) -> str:
+    """Builds a friendly markdown prompt listing the available variation options."""
+    options = _compute_variant_options(parent_raw, resolved_attributes, variations_list)
+
+    if not options:
+        return (
+            f"I'd love to order **{product_name}** for you! "
+            "Which variant would you like? Please specify your options."
+        )
+
+    msg = (
+        f"I'd love to order **{product_name}** for you! "
+        "To make sure I get the right one, please choose from the following options:\n\n"
+    )
+    for axis, opts in options.items():
+        msg += f"• **{axis}:** {', '.join(opts)}\n"
 
     return msg
 
