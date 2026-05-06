@@ -635,3 +635,49 @@ class TestVariantFlowTermination:
                 f"Expected awaiting_cart_confirmation, got {resp_json['flow_state']}"
             )
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# Smoke test: EcommerceClient abstraction
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestEcommerceClientAbstraction:
+    """Verify that WooClient satisfies the EcommerceClient interface."""
+
+    def test_woo_client_is_ecommerce_client(self):
+        """WooClient must be a concrete subclass of EcommerceClient."""
+        from ecommerce_client import EcommerceClient
+        from woo_client import WooClient
+
+        assert issubclass(WooClient, EcommerceClient), (
+            "WooClient must inherit from EcommerceClient"
+        )
+
+    def test_woo_client_instance_is_ecommerce_client(self):
+        """A WooClient instance must pass isinstance(obj, EcommerceClient)."""
+        from ecommerce_client import EcommerceClient
+        from woo_client import WooClient
+
+        client = WooClient()
+        assert isinstance(client, EcommerceClient), (
+            "WooClient() instance must be an EcommerceClient"
+        )
+
+    def test_get_ecommerce_client_returns_ecommerce_client(self):
+        """get_ecommerce_client() factory must return an EcommerceClient."""
+        from ecommerce_client import EcommerceClient, get_ecommerce_client
+
+        client = get_ecommerce_client()
+        assert isinstance(client, EcommerceClient), (
+            "get_ecommerce_client() must return an EcommerceClient instance"
+        )
+
+    def test_get_ecommerce_client_unknown_backend_raises(self, monkeypatch):
+        """get_ecommerce_client() must raise ValueError for unknown backends."""
+        # Import before patching so module caching does not affect behaviour;
+        # get_ecommerce_client() reads os.getenv at call time, so monkeypatching
+        # the env var before the call is sufficient for proper isolation.
+        from ecommerce_client import get_ecommerce_client
+        monkeypatch.setenv("ECOMMERCE_BACKEND", "shopify_unknown_test")
+        with pytest.raises(ValueError, match="ECOMMERCE_BACKEND"):
+            get_ecommerce_client()
+

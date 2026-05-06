@@ -5,6 +5,7 @@ WooCommerce API client for executing API calls.
 from typing import List
 import requests as http_requests
 
+from ecommerce_client import EcommerceClient
 from models import WooAPICall
 from app_config import WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET, BROWSER_HEADERS
 from chat_logger import get_logger, get_api_logger, sanitize_url
@@ -13,7 +14,7 @@ logger = get_logger("miraq_chat")
 api_logger = get_api_logger()
 
 
-class WooClient:
+class WooClient(EcommerceClient):
     """Executes WooCommerce API calls with browser UA + query-string auth."""
 
     def __init__(self):
