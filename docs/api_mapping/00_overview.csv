@@ -1,0 +1,6 @@
+Aspect,WooCommerce,Shopify
+Admin API Auth,Query-string: ?consumer_key=ck_xxx&consumer_secret=cs_xxx,Header: X-Shopify-Access-Token: {token}
+Custom Plugin API Auth,"Headers: X-Consumer-Key, X-Consumer-Secret",No equivalent — replace with Shopify Admin API token or custom app credentials
+Base URL,{WP_BASE}/wp-json/wc/v3,https://{store}.myshopify.com/admin/api/{version}
+Store/Cart API Base URL,{WP_BASE}/wp-json/wc/store/v1,Storefront API: https://{store}.myshopify.com (AJAX) or GraphQL Storefront API
+Pagination,"?per_page=100&page=N, reads X-WP-TotalPages header","?limit=250, cursor via Link response header (page_info token)"

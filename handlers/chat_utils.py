@@ -5,11 +5,12 @@ handlers/chat_utils.py — Shared helper functions used across chat handlers.
 import re
 
 from flask import jsonify
-from app_config import WOO_BASE_URL, DEFAULT_PER_PAGE, get_currency_symbol
+from app_config import DEFAULT_PER_PAGE, get_currency_symbol
 from models import WooAPICall
 from woo_client import woo_client
 from conversation_flow import FlowState
 from chat_logger import get_logger
+from ecommerce import endpoints
 
 logger = get_logger("miraq_chat")
 
@@ -88,10 +89,9 @@ def fetch_unit_price(product_id, variation_id=None) -> str:
     """Fetch the unit price for a product or variation. Returns price string or 'N/A'."""
     try:
         if variation_id and product_id:
-            call = WooAPICall(
-                method="GET",
-                endpoint=f"{WOO_BASE_URL}/products/{product_id}/variations/{variation_id}",
-                params={},
+            call = endpoints.fetch_variant(
+                product_id=product_id,
+                variant_id=variation_id,
                 description=f"Fetch variation {variation_id} price",
             )
             resp = woo_client.execute(call)
@@ -99,10 +99,8 @@ def fetch_unit_price(product_id, variation_id=None) -> str:
                 d = resp["data"]
                 return d.get("sale_price") or d.get("price") or d.get("regular_price") or "N/A"
         elif product_id:
-            call = WooAPICall(
-                method="GET",
-                endpoint=f"{WOO_BASE_URL}/products/{product_id}",
-                params={},
+            call = endpoints.fetch_product(
+                product_id=product_id,
                 description=f"Fetch product {product_id} price",
             )
             resp = woo_client.execute(call)

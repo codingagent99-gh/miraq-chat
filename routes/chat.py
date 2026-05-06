@@ -18,7 +18,6 @@ from app_config import (
     ORDER_CREATE_INTENTS,
     CLASSIFIER_PROVIDER_TAG,
     get_currency_symbol,
-    WOO_BASE_URL,
 )
 from core.actions import build_add_to_cart, build_open_checkout_panel, build_open_cart_panel
 from woo_client import woo_client
@@ -29,6 +28,7 @@ from api_builder import build_api_calls
 from conversation_flow import FlowState, handle_flow_state
 from chat_logger import get_logger, sanitize_log_string
 from store_registry import get_store_loader
+from ecommerce import endpoints
 
 from handlers.chat_utils import default_pagination, build_pagination, format_order_for_frontend
 from handlers.flow_handler import handle_flow
@@ -83,13 +83,11 @@ def _build_cart_variation_payload(product_id, variation_id, resolved_attrs, stor
         return _resolve_variation_slugs(resolved_attrs, store_loader)
 
     try:
-        var_call = WooAPICall(
-            method="GET",
-            endpoint=f"{WOO_BASE_URL}/products/{product_id}/variations/{variation_id}",
-            params={},
+        var_resp = woo_client.execute(endpoints.fetch_variant(
+            product_id=product_id,
+            variant_id=variation_id,
             description=f"Fetch variation {variation_id} for cart payload",
-        )
-        var_resp = woo_client.execute(var_call)
+        ))
         if not (var_resp.get("success") and isinstance(var_resp.get("data"), dict)):
             raise ValueError("variation fetch failed")
 
@@ -170,16 +168,11 @@ def _maybe_attach_address_proposal(
         # Fetch the customer's saved billing/shipping for the "existing_on_file" field
         existing = None
         try:
-            from app_config import WOO_BASE_URL
-            from models import WooAPICall
             from woo_client import woo_client as _woo
-            cust_call = WooAPICall(
-                method="GET",
-                endpoint=f"{WOO_BASE_URL}/customers/{customer_id}",
-                params={},
+            cust_resp = _woo.execute(endpoints.fetch_customer(
+                customer_id=customer_id,
                 description="Fetch customer address for PROPOSE_CHECKOUT_ADDRESS",
-            )
-            cust_resp = _woo.execute(cust_call)
+            ))
             if cust_resp.get("success") and isinstance(cust_resp.get("data"), dict):
                 _billing  = cust_resp["data"].get("billing", {})
                 _shipping = cust_resp["data"].get("shipping", {})
