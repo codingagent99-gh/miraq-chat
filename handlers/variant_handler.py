@@ -132,7 +132,10 @@ def _variation_matches_resolved(var: dict, prev_resolved: dict, display_to_slug:
         expected_slug = term_map.get(display_val.lower(), "")
         if expected_slug:
             if expected_slug != actual_slug:
-                return False
+                # WC sometimes returns display names instead of slugs for some variations;
+                # fall back to slugified comparison before rejecting
+                if _slugify(expected_slug) != _slugify(actual_slug):
+                    return False
         else:
             # Fallback: slugify both sides (handles edge cases like '4"x4"' ↔ "4x4")
             if _slugify(display_val) != _slugify(actual_slug):
