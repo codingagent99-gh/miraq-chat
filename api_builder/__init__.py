@@ -65,6 +65,8 @@ def _normalize_variation_attrs(variation: dict) -> dict:
     raw = variation.get("attributes", {})
     if isinstance(raw, dict):
         for k, v in raw.items():
+            # Normalize WooCommerce variation attribute keys. Three input formats:
+            #   attribute_pa_color → color  |  attribute_color → color  |  pa_color → color
             ck = k.removeprefix("attribute_pa_").removeprefix("attribute_").removeprefix("pa_").replace("-", " ").strip().lower()
             cv = str(v).replace("-", " ").strip().lower()
             result[ck] = cv

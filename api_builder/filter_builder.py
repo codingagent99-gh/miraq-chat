@@ -130,7 +130,8 @@ def build_advanced_filter_call(
         body.pop("stock_status", None)
         body.pop("filters", None)
     elif search_term:
-        if conditions and any("field_type" not in c for c in conditions):
+        has_taxonomy_conditions = conditions and any("field_type" not in c for c in conditions)
+        if has_taxonomy_conditions:
             logger.info(f"Ignored leftover search_term='{search_term}' — taxonomy filters are present, relying on them.")
         else:
             # This should not happen if callers are routing correctly.

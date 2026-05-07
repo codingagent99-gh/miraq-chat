@@ -305,6 +305,8 @@ def _filter_variations_by_entities(
         var_attrs = {}
         if isinstance(raw_attrs, dict):
             for k, v in raw_attrs.items():
+                # Normalize WooCommerce variation attribute keys. Three input formats:
+                #   attribute_pa_color → color  |  attribute_color → color  |  pa_color → color
                 clean_k = k.removeprefix("attribute_pa_").removeprefix("attribute_").removeprefix("pa_").replace("-", " ").strip().lower()
                 clean_v = str(v).replace("-", " ").strip().lower()
                 var_attrs[clean_k] = clean_v

@@ -31,7 +31,7 @@ ALLOWED_FILES = {
 }
 
 # Pattern: constructing a pa_* string dynamically
-FORBIDDEN_PATTERN = re.compile(r'f"pa_\{|\'pa_\'\s*\+|"pa_"\s*\+|\.replace\("pa_"|\.replace\(\'pa_\'')
+FORBIDDEN_PATTERN = re.compile(r"""f["']pa_\{|['"]pa_['"]\s*\+|\.replace\(["']pa_["']""")
 
 
 def _python_files():
