@@ -196,6 +196,6 @@ def _resolve_attribute_taxonomy(attr_key: str, l) -> str:
                 return taxonomy
     logger.warning(
         f"Deprecated attribute filter key '{attr_key}' detected; expected neutral attr_key. "
-        "Treating key as legacy taxonomy."
+        "Treating key as legacy taxonomy (example neutral key: 'color', not 'pa_color')."
     )
     return attr_key
