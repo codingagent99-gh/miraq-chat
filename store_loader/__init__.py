@@ -14,6 +14,7 @@ import requests
 from typing import List, Dict, Optional
 
 from chat_logger import get_logger
+from models.catalog import CatalogAttribute, CatalogCategory, CatalogTag
 from store_loader.config import (
     WOO_BASE_URL, CUSTOM_API_BASE_URL,
     WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET,
@@ -120,7 +121,10 @@ class StoreLoader(StoreQueryMixin):
         self.variation_detail_cache = BoundedVariationCache(max_size=200, ttl=3600)
         self.attribute_by_slug: Dict[str, Dict] = {}
         self.attribute_by_id: Dict[int, Dict] = {}
+        self.attribute_by_key: Dict[str, CatalogAttribute] = {}
         self.tag_by_name_lower: Dict[str, Dict] = {}
+        self.category_by_key: Dict[str, CatalogCategory] = {}
+        self.tag_by_key: Dict[str, CatalogTag] = {}
         self.currency_symbol: str = "$"
 
         # State
@@ -259,6 +263,23 @@ class StoreLoader(StoreQueryMixin):
                 )
         if len(self.category_keywords) == 0:
             reasons.append("0 category keywords generated")
+
+        if len(self.attribute_by_key) != len(self.attribute_by_slug):
+            logger.warning(
+                f"Phase 4a: attribute_by_key ({len(self.attribute_by_key)}) "
+                f"≠ attribute_by_slug ({len(self.attribute_by_slug)}) — investigate"
+            )
+        if len(self.category_by_key) != len(self.category_by_slug):
+            logger.warning(
+                f"Phase 4a: category_by_key ({len(self.category_by_key)}) "
+                f"≠ category_by_slug ({len(self.category_by_slug)}) — investigate"
+            )
+        if len(self.tag_by_key) != len(self.tag_by_slug):
+            logger.warning(
+                f"Phase 4a: tag_by_key ({len(self.tag_by_key)}) "
+                f"≠ tag_by_slug ({len(self.tag_by_slug)}) — investigate"
+            )
+
         self._degraded = len(reasons) > 0
         self._degraded_reasons = reasons
 

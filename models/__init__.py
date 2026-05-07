@@ -21,3 +21,11 @@ from models.domain import (  # noqa: F401
     WooAPICall,
     ClassifiedResult,
 )
+
+# ── Catalog models (Phase 4a) ──
+from models.catalog import (  # noqa: F401
+    CatalogAttribute,
+    CatalogAttributeTerm,
+    CatalogCategory,
+    CatalogTag,
+)
