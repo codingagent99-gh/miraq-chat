@@ -116,6 +116,17 @@ class EcommerceEndpoints(Protocol):
         """Row 4.4 — Advanced product search via custom plugin (custom_plugin surface)."""
         ...
 
+    def build_cart_variation_payload(
+        self,
+        *,
+        product_id: int,
+        variant_id: Optional[int],
+        resolved_attrs: Dict[str, str],
+        store_loader,
+    ) -> List[Dict[str, str]]:
+        """Build backend-specific cart-line payload for add-to-cart actions."""
+        ...
+
     # ── Orders ──────────────────────────────────────────────────────────────
 
     def list_customer_orders(

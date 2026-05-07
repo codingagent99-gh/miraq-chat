@@ -17,9 +17,14 @@ All parsers include a ``_raw`` key with the original response so callers can
 access any Woo-specific field that has not yet been normalized.
 """
 
+import re
 from typing import Dict, List, Optional
 
+from chat_logger import get_logger
 from models import WooAPICall
+from woo_client import woo_client
+
+logger = get_logger("miraq_chat")
 
 
 # ── Address normalization helper ────────────────────────────────────────────
@@ -223,6 +228,71 @@ class WooEndpoints:
             description=description or "Advanced product filter",
             requires_resolution=requires_resolution or [],
         )
+
+    def build_cart_variation_payload(
+        self,
+        *,
+        product_id: int,
+        variant_id: Optional[int],
+        resolved_attrs: Dict[str, str],
+        store_loader,
+    ) -> List[Dict[str, str]]:
+        """Build Woo variation payload for cart-add actions."""
+
+        def _taxonomy_for(attr_key: str) -> str:
+            attr = store_loader.resolve_attribute(attr_key) if store_loader else None
+            taxonomy = attr.backend_ref.get("taxonomy") if attr and attr.backend_ref else None
+            return taxonomy or f"pa_{str(attr_key).lower().replace(' ', '-')}"
+
+        def _slug_for(attr_key: str, value: str) -> str:
+            term = (
+                store_loader.resolve_attribute_term(attr_key, value)
+                if store_loader else None
+            )
+            slug = term.backend_ref.get("slug") if term and term.backend_ref else None
+            return slug or re.sub(r"[^a-z0-9]+", "", str(value).lower())
+
+        def _resolved_payload() -> List[Dict[str, str]]:
+            return [
+                {"attribute": _taxonomy_for(attr_key), "value": _slug_for(attr_key, display_value)}
+                for attr_key, display_value in (resolved_attrs or {}).items()
+            ]
+
+        if not variant_id or not product_id:
+            return _resolved_payload()
+
+        try:
+            var_resp = woo_client.execute(self.fetch_variant(
+                product_id=product_id,
+                variant_id=variant_id,
+                description=f"Fetch variation {variant_id} for cart payload",
+            ))
+            if not (var_resp.get("success") and isinstance(var_resp.get("data"), dict)):
+                raise ValueError("variation fetch failed")
+
+            var_attrs = var_resp["data"].get("attributes", [])
+            fixed: set[str] = set()
+            result: List[Dict[str, str]] = []
+
+            if isinstance(var_attrs, list):
+                for attr in var_attrs:
+                    if not isinstance(attr, dict):
+                        continue
+                    attr_name = attr.get("name", "")
+                    taxonomy = _taxonomy_for(attr_name)
+                    option = str(attr.get("option", ""))
+                    result.append({"attribute": taxonomy, "value": option})
+                    fixed.add(taxonomy)
+
+            for attr_key, display_value in (resolved_attrs or {}).items():
+                taxonomy = _taxonomy_for(attr_key)
+                if taxonomy in fixed:
+                    continue
+                result.append({"attribute": taxonomy, "value": _slug_for(attr_key, display_value)})
+            return result
+        except Exception as exc:
+            logger.warning(f"build_cart_variation_payload fallback | error={exc}")
+            return _resolved_payload()
 
     # ── Orders ──────────────────────────────────────────────────────────────
 
