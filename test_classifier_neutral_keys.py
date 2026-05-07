@@ -106,6 +106,10 @@ def _run_extractors(query: str) -> ExtractedEntities:
     return entities
 
 
+def _normalize_attr_key_for_loader(attr_key: str) -> str:
+    return attr_key.replace(" ", "-")
+
+
 @pytest.mark.parametrize(
     ("query", "expected_attrs"),
     [
@@ -126,7 +130,7 @@ def test_classifier_attribute_keys_remain_loader_resolvable_and_legacy_compatibl
 
     assert entities.attributes == expected_attrs
     for attr_key in entities.attributes:
-        assert attr_key.replace(" ", "-") in loader.attribute_by_key
+        assert _normalize_attr_key_for_loader(attr_key) in loader.attribute_by_key
 
 
 @pytest.mark.parametrize(
@@ -147,14 +151,12 @@ def test_classifier_tag_and_category_keys_match_neutral_indexes(loader, query):
         assert category_key in loader.category_by_key
 
 
-def test_classifier_falls_back_to_legacy_attribute_derivation_when_neutral_lookup_misses(loader):
+def test_fallback_to_legacy_attribute_when_neutral_lookup_fails(loader, monkeypatch):
     entities = ExtractedEntities()
     term = {"id": 5, "slug": "12-x-12", "name": "12x12"}
-    original_resolve_attribute = loader.resolve_attribute
-    original_debug = extractors_module.logger.debug
     debug_calls = []
-    loader.resolve_attribute = lambda _key: None
-    extractors_module.logger.debug = lambda *args, **kwargs: debug_calls.append(args)
+    monkeypatch.setattr(loader, "resolve_attribute", lambda _key: None)
+    monkeypatch.setattr(extractors_module.logger, "debug", lambda *args, **kwargs: debug_calls.append(args))
 
     _resolve_attribute_or_tag(
         entities=entities,
@@ -168,7 +170,5 @@ def test_classifier_falls_back_to_legacy_attribute_derivation_when_neutral_looku
         matched_pattern="12x12",
     )
 
-    loader.resolve_attribute = original_resolve_attribute
-    extractors_module.logger.debug = original_debug
     assert entities.attributes == {"tile size": "12-x-12"}
     assert any("resolve_attribute failed" in msg[0] for msg in debug_calls)

@@ -474,6 +474,8 @@ def _resolve_attribute_or_tag(
         entities.attr_tag_or_pairs.append({
             "tag_slug": _resolve_tag_key_with_fallback(loader, covering_tag_slug),
             "attr_taxonomy": taxonomy,
+            # Prefer matching by human term name for neutral resolution, but keep
+            # WooCommerce slug fallback so output strings remain identical for current consumers.
             "attr_term": _resolve_attr_term_key_with_fallback(
                 loader,
                 taxonomy,
