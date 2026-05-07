@@ -1,3 +1,5 @@
+import pytest
+
 from models import ExtractedEntities
 from models.catalog import CatalogAttribute, CatalogAttributeTerm
 from formatters import format_variation
@@ -35,37 +37,30 @@ class _FixtureLoader:
         return None
 
 
-def test_search_context_uses_resolved_attribute_label_and_term_name():
-    set_store_loader(_FixtureLoader())
-    entities = ExtractedEntities(attributes={"color": "red"})
+@pytest.fixture
+def fixture_loader():
+    loader = _FixtureLoader()
+    set_store_loader(loader)
+    yield loader
+    set_store_loader(None)
 
-    try:
-        result = _build_search_context_string(entities)
-    finally:
-        set_store_loader(None)
+
+def test_search_context_uses_resolved_attribute_label_and_term_name(fixture_loader):
+    entities = ExtractedEntities(attributes={"color": "red"})
+    result = _build_search_context_string(entities)
 
     assert "Color: **Red**" in result
 
 
-def test_search_context_falls_back_for_unresolvable_attribute_key():
-    set_store_loader(_FixtureLoader())
+def test_search_context_falls_back_for_unresolvable_attribute_key(fixture_loader):
     entities = ExtractedEntities(attributes={"tile-size": "extra-large"})
-
-    try:
-        result = _build_search_context_string(entities)
-    finally:
-        set_store_loader(None)
+    result = _build_search_context_string(entities)
 
     assert "Tile Size: **Extra Large**" in result
 
 
-def test_format_variation_uses_resolved_attribute_label_and_term_name():
-    set_store_loader(_FixtureLoader())
+def test_format_variation_uses_resolved_attribute_label_and_term_name(fixture_loader):
     raw_variation = {"id": 101, "attributes": {"pa_color": "red"}, "stock_status": "instock"}
-
-    try:
-        formatted = format_variation(raw_variation, parent={"id": 1, "name": "Sample"})
-    finally:
-        set_store_loader(None)
+    formatted = format_variation(raw_variation, parent={"id": 1, "name": "Sample"})
 
     assert formatted["attributes"] == [{"name": "Color", "option": "Red"}]

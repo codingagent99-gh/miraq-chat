@@ -8,9 +8,12 @@ from typing import List
 from models import ExtractedEntities
 from store_registry import get_store_loader
 
+_SECONDARY_ATTRIBUTE_SUFFIX = " 2"
+
 
 def _attribute_key_candidates(attr_key: str) -> list[str]:
-    key = str(attr_key or "").replace("attribute_", "").replace(" 2", "").strip().lower()
+    # Some parser flows emit synthetic fallback keys like "colors 2".
+    key = str(attr_key or "").replace("attribute_", "").replace(_SECONDARY_ATTRIBUTE_SUFFIX, "").strip().lower()
     if key.startswith("pa_"):
         key = key[3:]
     candidates = [key]
@@ -33,7 +36,7 @@ def _resolve_attribute_label(attr_key: str) -> str:
             if attr and attr.label:
                 return attr.label
 
-    fallback = str(attr_key or "").replace("attribute_", "").replace(" 2", "").replace("pa_", "")
+    fallback = str(attr_key or "").replace("attribute_", "").replace(_SECONDARY_ATTRIBUTE_SUFFIX, "").replace("pa_", "")
     return fallback.replace("-", " ").title()
 
 

@@ -9,9 +9,12 @@ from models import Intent, ExtractedEntities, WooAPICall
 from app_config import MAX_DISPLAYED_ITEMS, USER_PLACEHOLDERS, DEFAULT_PAYMENT_METHOD_TITLE, get_currency_symbol
 from store_registry import get_store_loader
 
+_SECONDARY_ATTRIBUTE_SUFFIX = " 2"
+
 
 def _attribute_key_candidates(attr_key: str) -> list[str]:
-    key = str(attr_key or "").replace("attribute_", "").replace(" 2", "").strip().lower()
+    # Some parser flows emit synthetic fallback keys like "colors 2".
+    key = str(attr_key or "").replace("attribute_", "").replace(_SECONDARY_ATTRIBUTE_SUFFIX, "").strip().lower()
     if key.startswith("pa_"):
         key = key[3:]
     candidates = [key]
@@ -34,7 +37,7 @@ def _resolve_attribute_label(attr_key: str) -> str:
             if attr and attr.label:
                 return attr.label
 
-    return str(attr_key or "").replace(" 2", "").replace("-", " ").replace("pa_", "").title()
+    return str(attr_key or "").replace(_SECONDARY_ATTRIBUTE_SUFFIX, "").replace("-", " ").replace("pa_", "").title()
 
 
 def _resolve_attribute_term_name(attr_key: str, term_value) -> str:
