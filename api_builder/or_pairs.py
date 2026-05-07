@@ -31,7 +31,7 @@ def resolve_or_pair(pair: OrPair) -> OrPair:
             attr_term=pair.get("attr_term"),
         )
 
-    attr_key = pair.attr_key or (pair.attr_taxonomy.removeprefix("pa_") if pair.attr_taxonomy else "")
+    attr_key = pair.attr_key or (pair.attr_taxonomy.removeprefix("pa_") if pair.attr_taxonomy else None)
     taxonomy = pair.attr_taxonomy or ""
     term = pair.attr_term or ""
 
@@ -55,7 +55,7 @@ def resolve_or_pair(pair: OrPair) -> OrPair:
     return OrPair(
         tag_slug=pair.tag_slug,
         cat_slugs=list(pair.cat_slugs),
-        attr_key=attr_key or None,
+        attr_key=attr_key,
         attr_taxonomy=taxonomy,
         attr_term=term_slug,
     )
