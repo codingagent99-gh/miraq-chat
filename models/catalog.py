@@ -20,6 +20,9 @@ class CatalogAttributeTerm:
     key: str
     name: str
     count: int = 0
+    # Intentionally mutable opaque backend blob.
+    # Woo: {"slug": "red", "id": 42}
+    # Shopify (future): {"value": "Red"}
     backend_ref: dict = field(default_factory=dict)
 
 
@@ -30,6 +33,9 @@ class CatalogAttribute:
     key: str
     label: str
     terms: tuple[CatalogAttributeTerm, ...] = ()
+    # Intentionally mutable opaque backend blob.
+    # Woo: {"taxonomy": "pa_color", "id": 17, "attribute_name": "color"}
+    # Shopify (future): {"option_name": "Color"}
     backend_ref: dict = field(default_factory=dict)
 
 
@@ -41,6 +47,9 @@ class CatalogCategory:
     name: str
     parent_key: Optional[str] = None
     count: int = 0
+    # Intentionally mutable opaque backend blob.
+    # Woo: {"id": 7, "slug": "wall-tiles", "parent_id": 0}
+    # Shopify (future): {"collection_gid": "gid://..."}
     backend_ref: dict = field(default_factory=dict)
 
 
@@ -51,4 +60,5 @@ class CatalogTag:
     key: str
     name: str
     count: int = 0
+    # Intentionally mutable opaque backend blob.
     backend_ref: dict = field(default_factory=dict)
