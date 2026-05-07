@@ -6,8 +6,8 @@ import time
 import re
 from flask import jsonify
 
-from app_config import DEFAULT_PER_PAGE, WOO_BASE_URL, CLASSIFIER_PROVIDER_TAG, get_currency_symbol
-from models import Intent, WooAPICall
+from app_config import DEFAULT_PER_PAGE, CLASSIFIER_PROVIDER_TAG, get_currency_symbol
+from models import Intent
 from woo_client import woo_client
 from formatters import format_product, format_variation, _filter_variations_by_entities
 from response_generator import generate_bot_message, generate_suggestions
@@ -27,6 +27,7 @@ from api_builder import match_variation_to_entities
 from datetime import datetime, timezone
 from sqlalchemy.orm.attributes import flag_modified
 from store_registry import get_store_loader
+from ecommerce import endpoints
 
 logger = get_logger("miraq_chat")
 
@@ -52,15 +53,23 @@ def _get_safe_options(attrs, store_loader=None):
     """
     Return {attribute_display_name: option_display_name} from variation attrs.
     """
+    if isinstance(attrs, dict) and all(isinstance(v, str) for v in attrs.values()):
+        # Normalized variants already expose the backend-neutral {name: value}
+        # mapping, but we still run the values through the display-name
+        # resolver so this path stays consistent with the list-based fallback.
+        return {
+            str(k): _resolve_option_display_name(str(k), str(v), store_loader)
+            for k, v in attrs.items() if v
+        }
     if isinstance(attrs, dict):
         return {k.replace("pa_", "").replace("-", " ").title(): str(v).replace("-", " ").title() for k, v in attrs.items() if v}
     elif isinstance(attrs, list):
         result = {}
         for a in attrs:
-            if not isinstance(a, dict) or not a.get("name") or not a.get("option"):
+            if not isinstance(a, dict) or not a.get("name") or not a.get("value"):
                 continue
             name = a.get("name", "")
-            option = a.get("option", "")
+            option = a.get("value", "")
             option = _resolve_option_display_name(name, option, store_loader)
             result[name] = option
         return result
@@ -114,13 +123,10 @@ def _variation_matches_resolved(var: dict, prev_resolved: dict, display_to_slug:
     if not prev_resolved:
         return True
 
-    # Build {taxonomy: option_slug} from variation attributes
-    var_attrs: dict = {}
-    for a in var.get("attributes", []):
-        if isinstance(a, dict):
-            name = a.get("name", "")
-            taxonomy = f"pa_{name.lower().replace(' ', '-')}"
-            var_attrs[taxonomy] = a.get("option", "")
+    var_attrs = {
+        f"pa_{name.lower().replace(' ', '-')}": value
+        for name, value in _get_safe_options(var.get("options") or var.get("attributes", []), None).items()
+    }
 
     for attr_label, display_val in prev_resolved.items():
         taxonomy = f"pa_{attr_label.lower().replace(' ', '-')}"
@@ -200,10 +206,11 @@ def handle_variant_selection(
     all_variations = []
     page_num = 1
     while True:
-        var_resp = woo_client.execute(WooAPICall(
-            method="GET",
-            endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}/variations",
-            params={"per_page": 100, "page": page_num, "status": "publish"},
+        var_resp = woo_client.execute(endpoints.list_variants(
+            _var_product_id,
+            page=page_num,
+            per_page=100,
+            status="publish",
             description=f"Fetch variations for variant selection of '{_var_product_name}'",
         ))
         batch = var_resp.get("data", []) if var_resp.get("success") else []
@@ -214,12 +221,7 @@ def handle_variant_selection(
 
     # Fetch parent product to know the exact variation axes required
     parent_raw = {}
-    parent_resp = woo_client.execute(WooAPICall(
-        method="GET",
-        endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}",
-        params={},
-        description=f"Fetch parent product '{_var_product_name}'",
-    ))
+    parent_resp = woo_client.execute(endpoints.fetch_product(_var_product_id, description=f"Fetch parent product '{_var_product_name}'"))
     parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
 
     # Load store_loader once for slug→display-name resolution and the slug lookup
@@ -351,7 +353,7 @@ def handle_variant_selection(
         logger.info(f"Step 3.55: Resolved to variation_id={_resolved_variation_id}")
         user_context["pending_variation_id"] = _resolved_variation_id
 
-        if _resolved_variation.get("stock_status") == "outofstock" or _resolved_variation.get("in_stock") is False:
+        if _resolved_variation.get("in_stock") is False:
             elapsed = time.time() - start_time
             return jsonify({
                 "success": True,
@@ -373,12 +375,7 @@ def handle_variant_selection(
 
         _variant_label = " / ".join(prev_resolved.values())
 
-        _variant_price = (
-            _resolved_variation.get("sale_price")
-            or _resolved_variation.get("price")
-            or _resolved_variation.get("regular_price")
-            or ""
-        )
+        _variant_price = _resolved_variation.get("price") or ""
 
         user_context["resolved_attributes"] = prev_resolved
 
@@ -473,7 +470,7 @@ def handle_variant_selection(
     elif len(matched) > 1:
         attr_values_all = {}
         for v in matched:
-            if v.get("stock_status") == "outofstock" or v.get("in_stock") is False:
+            if v.get("in_stock") is False:
                 continue
             for name, opt in _get_safe_options(v.get("attributes", []), _sl).items():
                 if name and opt:
@@ -700,11 +697,9 @@ def handle_variation_product(
 
         if not has_full_options:
             logger.info(f"Step 3.7: Parent attributes missing options. Fetching full product {entities.product_id}.")
-            parent_call = WooAPICall(
-                method="GET",
-                endpoint=f"{WOO_BASE_URL}/products/{entities.product_id}",
-                params={},
-                description=f"Fetch full parent product attributes for '{parent_formatted['name']}'"
+            parent_call = endpoints.fetch_product(
+                entities.product_id,
+                description=f"Fetch full parent product attributes for '{parent_formatted['name']}'",
             )
             parent_resp = woo_client.execute(parent_call)
             if parent_resp.get("success"):
@@ -786,10 +781,8 @@ def handle_variation_product(
                 f"Step 3.7: parent attributes missing variation flags — "
                 f"fetching full product {parent_product_raw.get('id')} for wildcard validation."
             )
-            _full_parent_call = WooAPICall(
-                method="GET",
-                endpoint=f"{WOO_BASE_URL}/products/{parent_product_raw.get('id')}",
-                params={},
+            _full_parent_call = endpoints.fetch_product(
+                parent_product_raw.get("id"),
                 description="Fetch full parent product attributes for wildcard check",
             )
             _full_parent_resp = woo_client.execute(_full_parent_call)
@@ -881,11 +874,7 @@ def handle_variation_product(
         **(
             {
                 "matched_variation_id": matched_variation.get("id"),
-                "matched_variation_price": (
-                    matched_variation.get("sale_price")
-                    or matched_variation.get("price")
-                    or matched_variation.get("regular_price")
-                ),
+                "matched_variation_price": matched_variation.get("price"),
             }
             if matched_variation else {}
         ),
@@ -986,7 +975,7 @@ def handle_quantity_and_variant_check(
         f"Variations Count: {len(product.get('variations', []))}"
     )
 
-    if product.get("stock_status") == "outofstock":
+    if product.get("in_stock") is False:
         elapsed = time.time() - start_time
         return jsonify({
             "success": True,
@@ -1016,11 +1005,9 @@ def handle_quantity_and_variant_check(
 
         if not has_full_options:
             logger.info(f"Step 5.5: Parent attributes missing options. Fetching full product {product.get('id')} from Woo API.")
-            parent_call = WooAPICall(
-                method="GET",
-                endpoint=f"{WOO_BASE_URL}/products/{product.get('id')}",
-                params={},
-                description=f"Fetch full parent product attributes for '{product['name']}'"
+            parent_call = endpoints.fetch_product(
+                product.get("id"),
+                description=f"Fetch full parent product attributes for '{product['name']}'",
             )
             parent_resp = woo_client.execute(parent_call)
             if parent_resp.get("success"):
@@ -1035,7 +1022,7 @@ def handle_quantity_and_variant_check(
 
             if len(_variations_for_cache) == 1:
                 _resolved_var = _variations_for_cache[0]
-                if _resolved_var.get("stock_status") == "outofstock" or _resolved_var.get("in_stock") is False:
+                if _resolved_var.get("in_stock") is False:
                     elapsed = time.time() - start_time
                     return jsonify({
                         "success": True,
@@ -1052,7 +1039,7 @@ def handle_quantity_and_variant_check(
                         "pagination": default_pagination(page),
                     }), 200
 
-                _var_price = _resolved_var.get("sale_price") or _resolved_var.get("price") or _resolved_var.get("regular_price") or ""
+                _var_price = _resolved_var.get("price") or ""
                 _price_line = f"\n**Unit Price:** {get_currency_symbol()}{_var_price}" if _var_price else ""
                 _var_label = " / ".join(_get_safe_options(_resolved_var.get("attributes", []), _sl).values())
 
@@ -1125,7 +1112,7 @@ def handle_quantity_and_variant_check(
 
         if len(_variations_for_cache) == 1:
             _resolved_var = _variations_for_cache[0]
-            if _resolved_var.get("stock_status") == "outofstock" or _resolved_var.get("in_stock") is False:
+            if _resolved_var.get("in_stock") is False:
                 elapsed = time.time() - start_time
                 return jsonify({
                     "success": True,

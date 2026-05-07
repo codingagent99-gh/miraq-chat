@@ -6,11 +6,40 @@ from typing import List
 import requests as http_requests
 
 from models import WooAPICall
-from app_config import WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET, BROWSER_HEADERS
+from app_config import (
+    WOO_CONSUMER_KEY,
+    WOO_CONSUMER_SECRET,
+    BROWSER_HEADERS,
+    WOO_BASE_URL,
+    CUSTOM_API_BASE_URL,
+)
 from chat_logger import get_logger, get_api_logger, sanitize_url
 
 logger = get_logger("miraq_chat")
 api_logger = get_api_logger()
+
+_REDACTED_LOG_FIELDS = {
+    "consumer_key",
+    "consumer_secret",
+    "email",
+    "phone",
+    "address_1",
+    "address_2",
+    "postcode",
+    "first_name",
+    "last_name",
+}
+
+
+def _sanitize_log_payload(value):
+    if isinstance(value, dict):
+        return {
+            key: ("***" if key in _REDACTED_LOG_FIELDS else _sanitize_log_payload(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_log_payload(item) for item in value]
+    return value
 
 
 class WooClient:
@@ -22,11 +51,13 @@ class WooClient:
 
     def execute(self, api_call: WooAPICall) -> dict:
         """Execute a single API call and return raw response."""
-        params = dict(api_call.params)
+        from ecommerce.woo_adapters import normalize_response
 
-        # Only add auth params for standard WooCommerce API, not for custom API
-        is_custom_api = "/custom-api/" in api_call.endpoint
-        if not is_custom_api:
+        params = dict(api_call.params)
+        base_url = CUSTOM_API_BASE_URL if api_call.surface == "custom_plugin" else WOO_BASE_URL
+        endpoint_url = api_call.endpoint if api_call.endpoint.startswith("http") else f"{base_url.rstrip('/')}/{api_call.endpoint.lstrip('/')}"
+
+        if api_call.surface != "custom_plugin":
             params["consumer_key"] = WOO_CONSUMER_KEY
             params["consumer_secret"] = WOO_CONSUMER_SECRET
 
@@ -34,9 +65,9 @@ class WooClient:
         import time as _time
 
         # Sanitize endpoint for logging
-        sanitized_endpoint = sanitize_url(api_call.endpoint)
+        sanitized_endpoint = sanitize_url(endpoint_url)
         endpoint_short = sanitized_endpoint.split("/")[-1]  # e.g. "products-advanced-new"
-        safe_params = {k: v for k, v in params.items() if k not in ("consumer_key", "consumer_secret")}
+        safe_params = _sanitize_log_payload(dict(api_call.params))
 
         # ── REQUEST: log full details to api.txt ──────────────────────────────
         context = ""
@@ -49,9 +80,9 @@ class WooClient:
             )
         else:
             try:
-                body_str = _json.dumps(api_call.body, separators=(",", ":"))
+                body_str = _json.dumps(_sanitize_log_payload(api_call.body), separators=(",", ":"))
             except Exception:
-                body_str = str(api_call.body)
+                body_str = str(_sanitize_log_payload(api_call.body))
             api_logger.info(
                 f"REQUEST {api_call.method} {sanitized_endpoint} | body={body_str}{context}"
             )
@@ -66,27 +97,27 @@ class WooClient:
                 custom_headers = {
                     "X-Consumer-Key":    WOO_CONSUMER_KEY,
                     "X-Consumer-Secret": WOO_CONSUMER_SECRET,
-                } if is_custom_api else {}
+                } if api_call.surface == "custom_plugin" else {}
 
                 resp = self.session.get(
-                    api_call.endpoint,
+                    endpoint_url,
                     params=params,
                     headers=custom_headers,
                     timeout=45,
                 )
             else:
-                auth_params = {} if is_custom_api else {
+                auth_params = {} if api_call.surface == "custom_plugin" else {
                     "consumer_key": WOO_CONSUMER_KEY,
                     "consumer_secret": WOO_CONSUMER_SECRET,
                 }
                 custom_headers = {
                     "X-Consumer-Key":    WOO_CONSUMER_KEY,
                     "X-Consumer-Secret": WOO_CONSUMER_SECRET,
-                } if is_custom_api else {}
+                } if api_call.surface == "custom_plugin" else {}
 
                 resp = self.session.request(
                     method=api_call.method,
-                    url=api_call.endpoint,
+                    url=endpoint_url,
                     params=auth_params,
                     json=api_call.body,
                     headers=custom_headers,
@@ -129,19 +160,13 @@ class WooClient:
                 f"count={len(items)} | time_ms={_elapsed_ms}"
             )
 
-            if isinstance(data, dict) and "products" in data:
-                return {
-                    "success": True,
-                    "data": data.get("products", []),
-                    "total": str(data.get("total", "")) or None,
-                    "total_pages": str(data.get("pages", "")) or None,
-                }
+            normalized_data, total, total_pages = normalize_response(api_call.operation, data, resp.headers)
 
             return {
                 "success": True,
-                "data": data,
-                "total": resp.headers.get("X-WP-Total"),
-                "total_pages": resp.headers.get("X-WP-TotalPages"),
+                "data": normalized_data,
+                "total": total,
+                "total_pages": total_pages,
             }
 
         except Exception as e:

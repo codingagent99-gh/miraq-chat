@@ -35,3 +35,18 @@ User Utterance → Classifier → Entity Extraction → API Builder → WooComme
 ```
 https://wgc.net.in/hn/wp-json/wc/v3/
 ```
+
+## Ecommerce endpoint normalization
+
+The WooCommerce boundary now lives under `ecommerce/`.
+
+| Endpoint | Normalized response shape |
+|---|---|
+| `fetch_product` / `products_advanced` | `id`, `name`, `type`, `price`, `original_price`, `in_stock`, `stock_quantity`, `options`, `variant_ids`, `_raw` |
+| `fetch_variant` / `list_variants` | `id`, `price`, `original_price`, `in_stock`, `options`, `variation_label`, `_raw` |
+| `fetch_order` / `list_customer_orders` / `create_order` | `id`, `number`, `status`, `currency_symbol`, `total`, `payment_method_label`, `created_at`, `paid_at`, `line_items`, `billing_address`, `shipping_address`, `_raw` |
+| `fetch_customer` / `update_customer` | `id`, `first_name`, `last_name`, `email`, `default_address`, `addresses`, `_raw` |
+
+Notes:
+- `_raw` preserves the original Woo payload as an escape hatch for the Shopify migration.
+- Phase 4 pagination remains deferred; list calls still use the existing page/per-page flow.

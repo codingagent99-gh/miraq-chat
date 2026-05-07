@@ -13,20 +13,19 @@ import time
 from flask import jsonify
 
 from app_config import (
-    WOO_BASE_URL,
     DEFAULT_PAYMENT_METHOD,
     DEFAULT_PAYMENT_METHOD_TITLE,
-    CUSTOM_API_BASE_URL,
     DEFAULT_PER_PAGE,
     DEFAULT_ORDER_PER_PAGE
 )
 
-from models import Intent, WooAPICall
+from models import Intent
 from woo_client import woo_client
 from formatters import format_product
 from response_generator import format_order_detail
 from conversation_flow import FlowState
 from chat_logger import get_logger, sanitize_log_string
+from ecommerce import endpoints
 from handlers.chat_utils import (
     default_pagination,
     build_variant_prompt,
@@ -82,7 +81,7 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
     for o in order_data:
         for item in o.get("line_items", []):
             pid = item.get("product_id")
-            vid = item.get("variation_id")
+            vid = item.get("variant_id")
             if pid:
                 past_product_ids.append(pid)
                 if vid:
@@ -193,11 +192,11 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
             for var in p["variations"]:
                 if var.get("id") == ordered_vid:
                     # Extract the variation attributes (e.g., "Charcoal / 12x24")
-                    var_attrs = var.get("attributes", {})
+                    var_attrs = var.get("options") or var.get("attributes", {})
                     if isinstance(var_attrs, dict):
                         var_suffix = " / ".join(str(v) for v in var_attrs.values() if v)
                     elif isinstance(var_attrs, list):
-                        var_suffix = " / ".join(str(a.get("option", "")) for a in var_attrs if isinstance(a, dict) and a.get("option"))
+                        var_suffix = " / ".join(str(a.get("value", "")) for a in var_attrs if isinstance(a, dict) and a.get("value"))
                     break
         
         product_name = fp.get('name', 'Product')
@@ -300,12 +299,9 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
     product_ids = [item["product_id"] for item in source_line_items if item.get("product_id")]
     
     if product_ids:
-        stock_call = WooAPICall(
-            method="POST",
-            endpoint=f"{CUSTOM_API_BASE_URL}/products-advanced-new",
-            params={},
-            body={"ids": product_ids, "per_page": len(product_ids)},
-            description="Check stock status for reorder items"
+        stock_call = endpoints.products_advanced(
+            {"ids": product_ids, "per_page": len(product_ids)},
+            description="Check stock status for reorder items",
         )
         stock_resp = woo_client.execute(stock_call)
         
@@ -317,14 +313,14 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
             # Map product AND variation IDs to their current live stock status
             stock_map = {}
             for p in current_products:
-                stock_map[p["id"]] = p.get("stock_status", "instock")
+                stock_map[p["id"]] = p.get("in_stock", True)
                 for var in p.get("variations", []):
-                    stock_map[var["id"]] = var.get("stock_status", "instock")
+                    stock_map[var["id"]] = var.get("in_stock", True)
                     
             # Check every item in the past order against the live stock map
             for item in source_line_items:
-                check_id = item.get("variation_id") or item.get("product_id")
-                if stock_map.get(check_id) == "outofstock":
+                check_id = item.get("variant_id") or item.get("product_id")
+                if stock_map.get(check_id) is False:
                     out_of_stock_items.append(item.get("name", "An item"))
                     
         if out_of_stock_items:
@@ -353,7 +349,7 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
         {
             "product_id": item["product_id"],
             "quantity": item.get("quantity", 1),
-            **({"variation_id": item["variation_id"]} if item.get("variation_id") else {}),
+            **({"variant_id": item["variant_id"]} if item.get("variant_id") else {}),
         }
         for item in source_line_items
         if item.get("product_id")
@@ -362,15 +358,12 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
     if not new_line_items:
         return None
 
-    reorder_call = WooAPICall(
-        method="POST",
-        endpoint=f"{WOO_BASE_URL}/orders",
-        params={},
-        body={
+    reorder_call = endpoints.create_order(
+        {
             "status": "processing",
             "customer_id": customer_id,
             "payment_method": DEFAULT_PAYMENT_METHOD,
-            "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
+            "payment_method_label": DEFAULT_PAYMENT_METHOD_TITLE,
             "set_paid": False,
             "line_items": new_line_items,
         },
@@ -398,12 +391,7 @@ def handle_order_detail(current_flow_state, customer_id, user_context, session_i
     if not _detail_order_id:
         return None
 
-    detail_call = WooAPICall(
-        method="GET",
-        endpoint=f"{WOO_BASE_URL}/orders/{_detail_order_id}",
-        params={},
-        description=f"Fetch order #{_detail_order_id} detail",
-    )
+    detail_call = endpoints.fetch_order(_detail_order_id, description=f"Fetch order #{_detail_order_id} detail")
     detail_resp = woo_client.execute(detail_call)
     elapsed = time.time() - start_time
 
@@ -465,9 +453,10 @@ def handle_quick_order(
         _injected = {
             "id": _order_product_id,
             "name": _order_product_name,
-            "price": "", "regular_price": "", "sale_price": "",
+            "price": "",
+            "original_price": None,
             "slug": "", "sku": "", "permalink": "",
-            "on_sale": False, "stock_status": "instock",
+            "on_sale": False, "in_stock": True,
             "total_sales": 0, "description": "", "short_description": "",
             "images": [], "categories": [], "tags": [], "attributes": [],
             "variations": [], "type": "simple",
@@ -485,7 +474,7 @@ def handle_quick_order(
         return None
     
     # ── OUT OF STOCK INTERCEPT ──
-    if _order_product_raw and _order_product_raw.get("stock_status") == "outofstock":
+    if _order_product_raw and _order_product_raw.get("in_stock") is False:
         elapsed = time.time() - start_time
         from formatters import format_product
         return jsonify({
@@ -543,10 +532,11 @@ def handle_quick_order(
                 all_variations = _prefetched_variations
                 logger.info(f"Step 3.6: Using {len(all_variations)} pre-fetched variations")
             else:
-                var_call = WooAPICall(
-                    method="GET",
-                    endpoint=f"{WOO_BASE_URL}/products/{_order_product_id}/variations",
-                    params={"per_page": 100, "status": "publish"},
+                var_call = endpoints.list_variants(
+                    _order_product_id,
+                    page=1,
+                    per_page=100,
+                    status="publish",
                     description=f"Fetch variations for order resolution of '{_order_product_name}'",
                 )
                 var_resp = woo_client.execute(var_call)
@@ -561,7 +551,7 @@ def handle_quick_order(
                     logger.info(f"Step 3.6: Attributes matched {len(matched)} variations, asking user")
                     if len(matched) > 1 and len(matched) < len(all_variations):
                         variation_labels = [
-                            " / ".join(a.get("option", "") for a in v.get("attributes", []) if a.get("option"))
+                            " / ".join(str(val) for val in (v.get("options") or {}).values() if val)
                             for v in matched
                         ]
                         prompt_msg = (
@@ -597,10 +587,12 @@ def handle_quick_order(
     quantity = entities.quantity or 1
     variant_label = ""
     if _order_variation_id and _order_product_raw:
-        attrs = (_order_product_raw or {}).get("attributes", [])
-        if isinstance(attrs, list):
+        attrs = (_order_product_raw or {}).get("options") or (_order_product_raw or {}).get("attributes", [])
+        if isinstance(attrs, dict):
+            variant_label = " / ".join(str(v) for v in attrs.values() if v)
+        elif isinstance(attrs, list):
             variant_label = " / ".join(
-                a.get("option", "") for a in attrs if isinstance(a, dict) and a.get("option")
+                str(a.get("value", "")) for a in attrs if isinstance(a, dict) and a.get("value")
             )
 
     variant_suffix = f" ({variant_label})" if variant_label else ""

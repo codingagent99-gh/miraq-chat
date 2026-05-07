@@ -11,7 +11,7 @@ to work without any import changes across the codebase.
 
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Literal
 
 
 # ══════════════════════════════════════════════════════════════
@@ -273,7 +273,8 @@ class WooAPICall:
     body: Optional[dict] = None
     description: str = ""
     requires_resolution: List[str] = field(default_factory=list)
-    is_custom_api: bool = False
+    surface: Literal["admin", "custom_plugin"] = "admin"
+    operation: str = ""
     user_message: str = ""
     session_id: str = ""
 
