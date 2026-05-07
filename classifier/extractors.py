@@ -33,6 +33,74 @@ except ImportError:
 logger = get_logger("miraq_chat")
 
 
+def _legacy_attr_key_from_taxonomy(taxonomy: str) -> str:
+    return taxonomy.replace("pa_", "").replace("-", " ")
+
+
+def _resolve_attr_key_with_fallback(loader, taxonomy: str, fallback_key: str) -> str:
+    neutral_key = taxonomy.removeprefix("pa_").lower().strip()
+    if loader and neutral_key and hasattr(loader, "resolve_attribute"):
+        attr = loader.resolve_attribute(neutral_key)
+        if attr and getattr(attr, "key", ""):
+            # Phase 4b.1 keeps legacy "hyphen -> space" output for consumer safety.
+            return attr.key.replace("-", " ")
+        logger.debug(
+            "Classifier: resolve_attribute failed for taxonomy '%s' (neutral_key='%s'); using legacy key '%s'",
+            taxonomy,
+            neutral_key,
+            fallback_key,
+        )
+    return fallback_key
+
+
+def _resolve_attr_term_key_with_fallback(loader, taxonomy: str, raw_value: str, fallback_value: str) -> str:
+    neutral_key = taxonomy.removeprefix("pa_").lower().strip()
+    if loader and neutral_key and hasattr(loader, "resolve_attribute") and hasattr(loader, "resolve_attribute_term"):
+        attr = loader.resolve_attribute(neutral_key)
+        if not attr:
+            logger.debug(
+                "Classifier: resolve_attribute failed for taxonomy '%s' while resolving term '%s'; using legacy value '%s'",
+                taxonomy,
+                raw_value,
+                fallback_value,
+            )
+            return fallback_value
+        term = loader.resolve_attribute_term(attr.key, raw_value)
+        if term and getattr(term, "key", ""):
+            return term.key
+        logger.debug(
+            "Classifier: resolve_attribute_term failed for attr_key '%s' and raw '%s'; using legacy value '%s'",
+            attr.key,
+            raw_value,
+            fallback_value,
+        )
+    return fallback_value
+
+
+def _resolve_tag_key_with_fallback(loader, fallback_slug: str) -> str:
+    if loader and fallback_slug and hasattr(loader, "resolve_tag"):
+        tag = loader.resolve_tag(fallback_slug)
+        if tag and getattr(tag, "key", ""):
+            return tag.key
+        logger.debug(
+            "Classifier: resolve_tag failed for slug '%s'; using legacy slug",
+            fallback_slug,
+        )
+    return fallback_slug
+
+
+def _resolve_category_key_with_fallback(loader, fallback_slug: str) -> str:
+    if loader and fallback_slug and hasattr(loader, "resolve_category"):
+        cat = loader.resolve_category(fallback_slug)
+        if cat and getattr(cat, "key", ""):
+            return cat.key
+        logger.debug(
+            "Classifier: resolve_category failed for slug '%s'; using legacy slug",
+            fallback_slug,
+        )
+    return fallback_slug
+
+
 # ══════════════════════════════════════════════════════════════
 # DATE PARSING HELPERS
 # ══════════════════════════════════════════════════════════════
@@ -131,10 +199,12 @@ def extract_exclusions(text: str, entities: ExtractedEntities) -> str:
                             if not hasattr(entities, 'excluded_attributes'):
                                 entities.excluded_attributes = {}
                             tax = attr.get("taxonomy")
+                            term_slug = term.get("slug", "")
+                            term_key = _resolve_attr_term_key_with_fallback(loader, tax, phrase, term_slug)
                             if tax not in entities.excluded_attributes:
                                 entities.excluded_attributes[tax] = []
-                            if term.get("slug", "") not in entities.excluded_attributes[tax]:
-                                entities.excluded_attributes[tax].append(term.get("slug", ""))
+                            if term_key not in entities.excluded_attributes[tax]:
+                                entities.excluded_attributes[tax].append(term_key)
                             resolved = True
                             break
                     if resolved:
@@ -239,10 +309,10 @@ def extract_category(text: str, entities: ExtractedEntities) -> str:
 
     if linked_children:
         for child in linked_children:
-            entities.target_category_slugs.add(child.get("slug"))
+            entities.target_category_slugs.add(_resolve_category_key_with_fallback(loader, child.get("slug")))
     else:
         for cat in extracted_cats:
-            entities.target_category_slugs.add(cat.get("slug"))
+            entities.target_category_slugs.add(_resolve_category_key_with_fallback(loader, cat.get("slug")))
 
     return text
 
@@ -306,13 +376,16 @@ def _try_origin_match(text: str, entities, loader, taxonomy: str) -> bool:
             tag_ids = loader.get_tag_ids_for_keyword(normalized)
             if not tag_ids:
                 tag_ids = loader.get_tag_ids_for_keyword(f"made in {normalized}")
-            term_slug = loader.get_attribute_term_slug(taxonomy, normalized) or normalized
-            entities.attributes[taxonomy.replace("pa_", "").replace("-", " ")] = term_slug
+            legacy_attr_key = _legacy_attr_key_from_taxonomy(taxonomy)
+            attr_key = _resolve_attr_key_with_fallback(loader, taxonomy, legacy_attr_key)
+            legacy_term_slug = loader.get_attribute_term_slug(taxonomy, normalized) or normalized
+            term_key = _resolve_attr_term_key_with_fallback(loader, taxonomy, normalized, legacy_term_slug)
+            entities.attributes[attr_key] = term_key
             entities.tag_ids.extend(tag_ids)
             for tid in tag_ids:
                 tag = loader.tag_by_id.get(tid)
                 if tag:
-                    entities.tag_slugs.append(tag["slug"])
+                    entities.tag_slugs.append(_resolve_tag_key_with_fallback(loader, tag["slug"]))
             return True
     return False
 
@@ -396,15 +469,27 @@ def _resolve_attribute_or_tag(
     if exact_tag_matched and not _has_product_ctx:
         if covering_tag_id not in entities.tag_ids:
             entities.tag_ids.append(covering_tag_id)
-            entities.tag_slugs.append(covering_tag_slug)
+            entities.tag_slugs.append(_resolve_tag_key_with_fallback(loader, covering_tag_slug))
     elif covered_by_tag and not _has_product_ctx:
         entities.attr_tag_or_pairs.append({
-            "tag_slug": covering_tag_slug,
+            "tag_slug": _resolve_tag_key_with_fallback(loader, covering_tag_slug),
             "attr_taxonomy": taxonomy,
-            "attr_term": term.get("slug", term.get("name", "")),
+            "attr_term": _resolve_attr_term_key_with_fallback(
+                loader,
+                taxonomy,
+                term.get("name", term.get("slug", "")),
+                term.get("slug", term.get("name", "")),
+            ),
         })
     else:
-        entities.attributes[label] = term.get("slug", term.get("name", ""))
+        attr_key = _resolve_attr_key_with_fallback(loader, taxonomy, label)
+        term_key = _resolve_attr_term_key_with_fallback(
+            loader,
+            taxonomy,
+            term.get("name", term.get("slug", "")),
+            term.get("slug", term.get("name", "")),
+        )
+        entities.attributes[attr_key] = term_key
         entities.attribute_slug = taxonomy
         entities.attribute_term_ids = [term["id"]]
 
@@ -448,7 +533,7 @@ def extract_tag(text: str, entities: ExtractedEntities) -> str:
         )
         if not is_subset:
             entities.tag_ids.append(tag["id"])
-            entities.tag_slugs.append(tag["slug"])
+            entities.tag_slugs.append(_resolve_tag_key_with_fallback(loader, tag["slug"]))
 
     return masked_text
 
@@ -549,7 +634,7 @@ def extract_collection_year(text: str, entities: ExtractedEntities):
             for tid in tag_ids:
                 tag = loader.tag_by_id.get(tid)
                 if tag:
-                    entities.tag_slugs.append(tag["slug"])
+                    entities.tag_slugs.append(_resolve_tag_key_with_fallback(loader, tag["slug"]))
 
 
 def extract_stock_status(text: str, entities: ExtractedEntities):
