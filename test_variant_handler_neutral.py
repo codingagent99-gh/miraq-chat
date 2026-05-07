@@ -9,6 +9,9 @@ from store_registry import set_store_loader
 class _FixtureLoader:
     def __init__(self, taxonomy_overrides=None):
         taxonomy_overrides = taxonomy_overrides or {}
+        color_taxonomy = taxonomy_overrides.get("color", "pa_color")
+        size_taxonomy = taxonomy_overrides.get("size", "pa_size")
+        finish_taxonomy = taxonomy_overrides.get("finish", "pa_finish")
         self.attribute_by_key = {
             "color": CatalogAttribute(
                 key="color",
@@ -17,7 +20,7 @@ class _FixtureLoader:
                     CatalogAttributeTerm(key="red", name="red", backend_ref={"slug": "red"}),
                     CatalogAttributeTerm(key="blue", name="blue", backend_ref={"slug": "blue"}),
                 ),
-                backend_ref={"taxonomy": taxonomy_overrides.get("color", "pa_color")} if taxonomy_overrides.get("color", "pa_color") is not None else {},
+                backend_ref={"taxonomy": color_taxonomy} if color_taxonomy is not None else {},
             ),
             "size": CatalogAttribute(
                 key="size",
@@ -28,7 +31,7 @@ class _FixtureLoader:
                     CatalogAttributeTerm(key="12-x-12", name="12 x 12", backend_ref={"slug": "12-x-12"}),
                     CatalogAttributeTerm(key="24-x-24", name="24 x 24", backend_ref={"slug": "24-x-24"}),
                 ),
-                backend_ref={"taxonomy": taxonomy_overrides.get("size", "pa_size")} if taxonomy_overrides.get("size", "pa_size") is not None else {},
+                backend_ref={"taxonomy": size_taxonomy} if size_taxonomy is not None else {},
             ),
             "finish": CatalogAttribute(
                 key="finish",
@@ -37,7 +40,7 @@ class _FixtureLoader:
                     CatalogAttributeTerm(key="matte", name="matte", backend_ref={"slug": "matte"}),
                     CatalogAttributeTerm(key="gloss", name="gloss", backend_ref={"slug": "gloss"}),
                 ),
-                backend_ref={"taxonomy": taxonomy_overrides.get("finish", "pa_finish")} if taxonomy_overrides.get("finish", "pa_finish") is not None else {},
+                backend_ref={"taxonomy": finish_taxonomy} if finish_taxonomy is not None else {},
             ),
         }
 

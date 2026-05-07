@@ -172,10 +172,10 @@ def _variation_matches_resolved_neutral(
 
         actual_slug = None
         taxonomy = ""
-        for alias in dict.fromkeys(alias for alias in aliases if alias):
-            if alias in var_map:
-                actual_slug = var_map[alias]
-                taxonomy = var_taxonomies.get(alias, "")
+        for candidate_alias in dict.fromkeys(alias for alias in aliases if alias):
+            if candidate_alias in var_map:
+                actual_slug = var_map[candidate_alias]
+                taxonomy = var_taxonomies.get(candidate_alias, "")
                 break
 
         if actual_slug is None:
