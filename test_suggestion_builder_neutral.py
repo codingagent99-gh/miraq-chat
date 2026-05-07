@@ -4,7 +4,7 @@ from store_loader.lookup_builder import build_all_lookups
 from store_loader.queries import StoreQueryMixin
 
 
-class _FixtureLoader(StoreQueryMixin):
+class MockStoreLoader(StoreQueryMixin):
     def __init__(self):
         self.all_attributes_raw = [
             {
@@ -57,7 +57,7 @@ class _FixtureLoader(StoreQueryMixin):
 
 
 def _build_loader():
-    loader = _FixtureLoader()
+    loader = MockStoreLoader()
     build_all_lookups(loader)
     return loader
 

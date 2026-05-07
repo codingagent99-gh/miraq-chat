@@ -245,6 +245,7 @@ class StoreQueryMixin:
         return [t["name"] for t in candidates[:limit]]
 
     def get_sibling_attribute_terms_neutral(self, attr_key: str, failed_term: str, limit: int = 3) -> List[str]:
+        """Return sibling display names for a neutral attribute key, excluding failed_term."""
         attr = self.resolve_attribute(attr_key)
         if not attr:
             return []
