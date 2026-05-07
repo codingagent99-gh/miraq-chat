@@ -10,11 +10,46 @@ Relative paths are used throughout (e.g. ``/orders`` rather than the full URL).
 ``surface`` field:
   - ``"admin"``        → ``WOO_BASE_URL``       (e.g. {WP_BASE}/wp-json/wc/v3)
   - ``"custom_plugin"``→ ``CUSTOM_API_BASE_URL`` (e.g. {WP_BASE}/wp-json/custom-api/v1)
+
+Each ``fetch_*`` / ``list_*`` call constructor is paired with a ``parse_*`` method
+that normalizes the raw WooCommerce response dict into a backend-neutral shape.
+All parsers include a ``_raw`` key with the original response so callers can
+access any Woo-specific field that has not yet been normalized.
 """
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from models import WooAPICall
+
+
+# ── Address normalization helper ────────────────────────────────────────────
+
+def _normalize_woo_address(addr: dict) -> dict:
+    """Normalize a WooCommerce address sub-dict to the backend-neutral shape.
+
+    WooCommerce address dicts already use the neutral key names
+    (``address_1``, ``postcode``, etc.).  A future Shopify parser will remap
+    ``address1`` → ``address_1``, ``zip`` → ``postcode``, etc. before calling
+    a similar helper so callers always receive the same shape.
+
+    Returns:
+        {
+            "address_1": str,
+            "address_2": str,
+            "city": str,
+            "state": str,
+            "postcode": str,
+            "country": str,
+        }
+    """
+    return {
+        "address_1": addr.get("address_1", ""),
+        "address_2": addr.get("address_2", ""),
+        "city": addr.get("city", ""),
+        "state": addr.get("state", ""),
+        "postcode": addr.get("postcode", ""),
+        "country": addr.get("country", ""),
+    }
 
 
 class WooEndpoints:
@@ -416,3 +451,208 @@ class WooEndpoints:
             description=description or "CS rep order list",
             requires_resolution=requires_resolution or [],
         )
+
+    # ── Response parsers ────────────────────────────────────────────────────
+    # Each parser takes the raw ``woo_client.execute(...).get("data")`` dict
+    # (or list) and returns a backend-neutral dict (or list of dicts).
+    # Every result includes ``_raw`` with the original response so callers can
+    # access any not-yet-normalized WooCommerce-specific field during migration.
+
+    def parse_product(self, response: dict) -> dict:
+        """Normalize a WooCommerce product response into a backend-neutral dict.
+
+        Args:
+            response: Raw product dict from ``woo_client.execute(...).get("data") or {}``.
+
+        Returns:
+            {
+                "id": int | None,
+                "price": str,       # sale_price if set, else price, else regular_price
+                "in_stock": bool,   # True when stock_status == "instock"
+                "_raw": dict,       # original response for migration safety
+            }
+        """
+        price = (
+            response.get("sale_price")
+            or response.get("price")
+            or response.get("regular_price")
+            or ""
+        )
+        return {
+            "id": response.get("id"),
+            "price": price,
+            "in_stock": response.get("stock_status") == "instock",
+            "_raw": response,
+        }
+
+    def parse_variant(self, response: dict) -> dict:
+        """Normalize a WooCommerce variation response into a backend-neutral dict.
+
+        Args:
+            response: Raw variation dict from ``woo_client.execute(...).get("data") or {}``,
+                      or an individual item from a variations list.
+
+        Returns:
+            {
+                "id": int | None,
+                "price": str,           # sale_price if set, else price, else regular_price
+                "options": dict,        # {attribute_name: option_value}
+                "in_stock": bool,       # True when stock_status == "instock"
+                "_raw": dict,           # original response for migration safety
+            }
+        """
+        price = (
+            response.get("sale_price")
+            or response.get("price")
+            or response.get("regular_price")
+            or ""
+        )
+
+        # Build options dict — WooCommerce variations carry a list of attribute dicts
+        # [{"name": "Color", "option": "Red"}, ...] or a flat {name: value} dict
+        # (custom-plugin format).
+        options: Dict[str, str] = {}
+        attrs = response.get("attributes", [])
+        if isinstance(attrs, list):
+            for attr in attrs:
+                if isinstance(attr, dict) and attr.get("name") and attr.get("option"):
+                    options[attr["name"]] = attr["option"]
+        elif isinstance(attrs, dict):
+            options = {k: v for k, v in attrs.items() if v}
+
+        return {
+            "id": response.get("id"),
+            "price": price,
+            "options": options,
+            "in_stock": response.get("stock_status") == "instock",
+            "_raw": response,
+        }
+
+    def parse_list_variants(self, response: list) -> List[dict]:
+        """Normalize a WooCommerce variations list into backend-neutral dicts.
+
+        Args:
+            response: Raw list from ``woo_client.execute(...).get("data") or []``.
+
+        Returns:
+            List of dicts, each in the same shape as ``parse_variant``.
+        """
+        if not isinstance(response, list):
+            return []
+        return [self.parse_variant(item) for item in response if isinstance(item, dict)]
+
+    def parse_order(self, response: dict) -> dict:
+        """Normalize a WooCommerce order response into a backend-neutral dict.
+
+        WooCommerce uses a single ``status`` string.  A future Shopify parser
+        will derive an equivalent string from ``financial_status`` +
+        ``fulfillment_status`` so callers receive the same shape.
+
+        Address sub-dicts (``billing`` / ``shipping``) are normalized to the
+        six-key neutral shape via ``_normalize_woo_address``.  Callers that
+        need WooCommerce-specific address fields (e.g. ``billing.first_name``,
+        ``billing.email``) should read them from ``_raw["billing"]``.
+
+        Args:
+            response: Raw order dict from ``woo_client.execute(...).get("data") or {}``.
+
+        Returns:
+            {
+                "id": int | None,
+                "status": str,
+                "billing_address": dict,   # neutral 6-key address shape
+                "shipping_address": dict,  # neutral 6-key address shape
+                "_raw": dict,              # original response for migration safety
+            }
+        """
+        return {
+            "id": response.get("id"),
+            "status": response.get("status", ""),
+            "billing_address": _normalize_woo_address(response.get("billing", {})),
+            "shipping_address": _normalize_woo_address(response.get("shipping", {})),
+            "_raw": response,
+        }
+
+    def parse_customer(self, response: dict) -> dict:
+        """Normalize a WooCommerce customer response into a backend-neutral dict.
+
+        WooCommerce stores address information in two separate ``billing`` and
+        ``shipping`` blocks.  The neutral shape uses ``default_address`` (the
+        billing address) and ``addresses`` (a list containing both addresses,
+        deduplicated when they are identical).
+
+        A future Shopify parser will map ``default_address`` and ``addresses[]``
+        from Shopify's native format into the same shape.
+
+        Callers that need WooCommerce-specific address fields (e.g.
+        ``billing.first_name``, ``billing.phone``) should read them from
+        ``_raw["billing"]``.
+
+        Args:
+            response: Raw customer dict from ``woo_client.execute(...).get("data") or {}``.
+
+        Returns:
+            {
+                "id": int | None,
+                "first_name": str,
+                "last_name": str,
+                "email": str,
+                "default_address": dict,   # neutral 6-key shape (billing)
+                "addresses": list[dict],   # [billing] or [billing, shipping] if different
+                "_raw": dict,              # original response for migration safety
+            }
+        """
+        billing = _normalize_woo_address(response.get("billing", {}))
+        shipping = _normalize_woo_address(response.get("shipping", {}))
+
+        # Include shipping only when it differs from billing and is non-empty
+        addresses = [billing]
+        if shipping != billing and any(shipping.values()):
+            addresses.append(shipping)
+
+        return {
+            "id": response.get("id"),
+            "first_name": response.get("first_name", ""),
+            "last_name": response.get("last_name", ""),
+            "email": response.get("email", ""),
+            "default_address": billing,
+            "addresses": addresses,
+            "_raw": response,
+        }
+
+    def parse_list_published_products(self, response: list) -> List[dict]:
+        """Normalize a WooCommerce published-products list into backend-neutral dicts.
+
+        WooCommerce expresses stock availability as ``stock_status == "instock"``.
+        A future Shopify parser will derive the same ``in_stock: bool`` from
+        ``inventory_quantity > 0`` so callers receive an identical shape.
+
+        Args:
+            response: Raw list from ``woo_client.execute(...).get("data") or []``.
+
+        Returns:
+            List of dicts:
+            {
+                "id": int | None,
+                "price": str,       # sale_price if set, else price, else regular_price
+                "in_stock": bool,   # True when stock_status == "instock"
+                "_raw": dict,       # original item for migration safety
+            }
+        """
+        if not isinstance(response, list):
+            return []
+        return [
+            {
+                "id": item.get("id"),
+                "price": (
+                    item.get("sale_price")
+                    or item.get("price")
+                    or item.get("regular_price")
+                    or ""
+                ),
+                "in_stock": item.get("stock_status") == "instock",
+                "_raw": item,
+            }
+            for item in response
+            if isinstance(item, dict)
+        ]

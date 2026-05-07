@@ -96,8 +96,8 @@ def fetch_unit_price(product_id, variation_id=None) -> str:
             )
             resp = woo_client.execute(call)
             if resp.get("success") and isinstance(resp.get("data"), dict):
-                d = resp["data"]
-                return d.get("sale_price") or d.get("price") or d.get("regular_price") or "N/A"
+                variant = endpoints.parse_variant(resp["data"])
+                return variant["price"] or "N/A"
         elif product_id:
             call = endpoints.fetch_product(
                 product_id=product_id,
@@ -105,8 +105,8 @@ def fetch_unit_price(product_id, variation_id=None) -> str:
             )
             resp = woo_client.execute(call)
             if resp.get("success") and isinstance(resp.get("data"), dict):
-                d = resp["data"]
-                return d.get("sale_price") or d.get("price") or d.get("regular_price") or "N/A"
+                product = endpoints.parse_product(resp["data"])
+                return product["price"] or "N/A"
     except Exception as exc:
         logger.warning(f"fetch_unit_price failed | error={exc}")
     return "N/A"

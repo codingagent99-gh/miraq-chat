@@ -373,12 +373,7 @@ def handle_variant_selection(
 
         _variant_label = " / ".join(prev_resolved.values())
 
-        _variant_price = (
-            _resolved_variation.get("sale_price")
-            or _resolved_variation.get("price")
-            or _resolved_variation.get("regular_price")
-            or ""
-        )
+        _variant_price = endpoints.parse_variant(_resolved_variation)["price"]
 
         user_context["resolved_attributes"] = prev_resolved
 
@@ -875,11 +870,7 @@ def handle_variation_product(
         **(
             {
                 "matched_variation_id": matched_variation.get("id"),
-                "matched_variation_price": (
-                    matched_variation.get("sale_price")
-                    or matched_variation.get("price")
-                    or matched_variation.get("regular_price")
-                ),
+                "matched_variation_price": endpoints.parse_variant(matched_variation)["price"],
             }
             if matched_variation else {}
         ),
@@ -1043,7 +1034,7 @@ def handle_quantity_and_variant_check(
                         "pagination": default_pagination(page),
                     }), 200
 
-                _var_price = _resolved_var.get("sale_price") or _resolved_var.get("price") or _resolved_var.get("regular_price") or ""
+                _var_price = endpoints.parse_variant(_resolved_var)["price"]
                 _price_line = f"\n**Unit Price:** {get_currency_symbol()}{_var_price}" if _var_price else ""
                 _var_label = " / ".join(_get_safe_options(_resolved_var.get("attributes", []), _sl).values())
 
