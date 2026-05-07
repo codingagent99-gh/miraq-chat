@@ -19,6 +19,9 @@ from handlers.chat_utils import (
     build_pagination,
     build_variant_prompt,
     _compute_variant_options,
+    _attribute_display_name,
+    _resolve_attribute_term_name,
+    _variation_matches_resolved_neutral,
     score_variation_against_text,
     _STRIP_QUOTES_RE,
     _TOKENIZE_RE,
@@ -39,11 +42,9 @@ def _resolve_option_display_name(attr_name: str, option: str, store_loader) -> s
     if not store_loader or not attr_name or not option:
         return option
     try:
-        taxonomy = f"pa_{attr_name.lower().replace(' ', '-')}"
-        terms = store_loader.get_all_attribute_terms(taxonomy)
-        for term in terms:
-            if term.get("slug") == option or term.get("name") == option:
-                return term.get("name", option)
+        display_name = _resolve_attribute_term_name(attr_name, option, store_loader)
+        if display_name:
+            return display_name
     except Exception:
         pass
     return option
@@ -54,7 +55,11 @@ def _get_safe_options(attrs, store_loader=None):
     Return {attribute_display_name: option_display_name} from variation attrs.
     """
     if isinstance(attrs, dict):
-        return {k.replace("pa_", "").replace("-", " ").title(): str(v).replace("-", " ").title() for k, v in attrs.items() if v}
+        return {
+            _attribute_display_name(k, store_loader): _resolve_option_display_name(k, str(v), store_loader).replace("-", " ").title()
+            for k, v in attrs.items()
+            if v
+        }
     elif isinstance(attrs, list):
         result = {}
         for a in attrs:
@@ -93,12 +98,13 @@ def _build_display_to_slug(store_loader) -> dict:
     result: dict = {}
     if not store_loader:
         return result
-    for attr in getattr(store_loader, "all_attributes_raw", []):
-        taxonomy = attr.get("taxonomy", "")
+    for attr in getattr(store_loader, "attribute_by_key", {}).values():
+        taxonomy = getattr(attr, "backend_ref", {}).get("taxonomy") or getattr(attr, "key", "")
         if taxonomy:
             result[taxonomy] = {
-                term["name"].lower(): term["slug"]
-                for term in attr.get("terms", [])
+                term.name.lower(): (getattr(term, "backend_ref", {}).get("slug") or term.key)
+                for term in getattr(attr, "terms", [])
+                if getattr(term, "name", "")
             }
     return result
 
@@ -112,37 +118,11 @@ def _variation_matches_resolved(var: dict, prev_resolved: dict, display_to_slug:
     display_to_slug converts display names → slugs for a direct comparison,
     with a _slugify fallback for any taxonomy not in the lookup.
     """
-    if not prev_resolved:
-        return True
-
-    # Build {taxonomy: option_slug} from variation attributes
-    var_attrs: dict = {}
-    for a in var.get("attributes", []):
-        if isinstance(a, dict):
-            name = a.get("name", "")
-            taxonomy = f"pa_{name.lower().replace(' ', '-')}"
-            var_attrs[taxonomy] = a.get("option", "")
-
-    for attr_label, display_val in prev_resolved.items():
-        taxonomy = f"pa_{attr_label.lower().replace(' ', '-')}"
-        actual_slug = var_attrs.get(taxonomy)
-        if actual_slug is None:
-            continue  # wildcard axis on this variation — skip
-
-        term_map = display_to_slug.get(taxonomy, {})
-        expected_slug = term_map.get(display_val.lower(), "")
-        if expected_slug:
-            if expected_slug != actual_slug:
-                # WC sometimes returns display names instead of slugs for some variations;
-                # fall back to slugified comparison before rejecting
-                if _slugify(expected_slug) != _slugify(actual_slug):
-                    return False
-        else:
-            # Fallback: slugify both sides (handles edge cases like '4"x4"' ↔ "4x4")
-            if _slugify(display_val) != _slugify(actual_slug):
-                return False
-
-    return True
+    try:
+        store_loader = get_store_loader()
+    except Exception:
+        store_loader = None
+    return _variation_matches_resolved_neutral(var, prev_resolved, display_to_slug, store_loader)
 
 
 def handle_variant_selection(
@@ -239,7 +219,7 @@ def handle_variant_selection(
     for attr in parent_raw.get("attributes", []):
         if attr.get("variation"):
             name = attr.get("name", "")
-            nice_name = name.replace("pa_", "").replace("-", " ").title() if name.startswith("pa_") else name.title()
+            nice_name = _attribute_display_name(name, _sl)
             candidate_options[nice_name] = set(str(o) for o in attr.get("options", []) if str(o).strip())
 
     user_msg_lower = message.lower()
@@ -479,7 +459,7 @@ def handle_variant_selection(
         for attr in parent_raw.get("attributes", []):
             if isinstance(attr, dict) and attr.get("variation") is True:
                 name = attr.get("name", "")
-                nice_name = name.replace("pa_", "").replace("-", " ").title() if name.startswith("pa_") else name.title()
+                nice_name = _attribute_display_name(name, _sl)
                 if nice_name and nice_name.lower() not in _already_resolved:
                     opts = attr.get("options", [])
                     if opts:
@@ -706,7 +686,7 @@ def handle_variation_product(
         attr_values = {}
         for pa in parent_product_raw.get("attributes", []):
             if isinstance(pa, dict) and pa.get("name"):
-                pa_name = pa.get("name").replace("pa_", "").replace("-", " ").title()
+                pa_name = _attribute_display_name(pa.get("name"), _sl)
                 if pa_name not in attr_values:
                     attr_values[pa_name] = set()
                 for opt in pa.get("options", []):
@@ -789,7 +769,7 @@ def handle_variation_product(
 
         var_attrs = _get_safe_options(resolved_variation.get("attributes", []), _sl)
         all_variation_axes = {
-            attr.get("name", "").replace("pa_", "").replace("-", " ").title()
+            _attribute_display_name(attr.get("name", ""), _sl)
             for attr in parent_product_raw.get("attributes", [])
             if isinstance(attr, dict) and attr.get("variation")
         }

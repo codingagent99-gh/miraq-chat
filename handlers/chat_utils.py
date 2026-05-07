@@ -11,12 +11,190 @@ from woo_client import woo_client
 from conversation_flow import FlowState
 from chat_logger import get_logger
 from ecommerce import endpoints
+from store_registry import get_store_loader
 
 logger = get_logger("miraq_chat")
 
 _TOKEN_OVERLAP_THRESHOLD = 0.5
 _STRIP_QUOTES_RE = re.compile(r'["\'\u201c\u201d\u2018\u2019]')
 _TOKENIZE_RE = re.compile(r'[\w/]+')
+
+
+def _attribute_key_candidates(attr_name: str) -> list[str]:
+    key = str(attr_name or "").strip().lower().replace("_", "-")
+    if key.startswith("attribute_"):
+        key = key[len("attribute_"):]
+    if key.startswith("pa_"):
+        key = key[3:]
+    candidates = [key]
+    if " " in key:
+        candidates.append(key.replace(" ", "-"))
+    if "-" in key:
+        candidates.append(key.replace("-", " "))
+    return [candidate for candidate in dict.fromkeys(candidates) if candidate]
+
+
+def _get_store_loader_safe():
+    try:
+        return get_store_loader()
+    except Exception:
+        return None
+
+
+def _resolve_catalog_attribute(attr_name: str, store_loader=None):
+    loader = store_loader if store_loader is not None else _get_store_loader_safe()
+    if not loader or not hasattr(loader, "resolve_attribute"):
+        return None
+    for candidate in _attribute_key_candidates(attr_name):
+        attr = loader.resolve_attribute(candidate)
+        if attr:
+            return attr
+    return None
+
+
+def _fallback_attribute_display_name(attr_name: str) -> str:
+    raw = str(attr_name or "").strip()
+    if raw.startswith("pa_"):
+        raw = raw[3:]
+    return raw.replace("-", " ").replace("_", " ").title()
+
+
+def _attribute_display_name(attr_name: str, store_loader=None) -> str:
+    attr = _resolve_catalog_attribute(attr_name, store_loader)
+    if attr and getattr(attr, "label", None):
+        return attr.label
+    return _fallback_attribute_display_name(attr_name)
+
+
+def _resolve_attribute_term_name(attr_name: str, raw_value, store_loader=None) -> str:
+    value = str(raw_value or "")
+    if not value:
+        return ""
+    loader = store_loader if store_loader is not None else _get_store_loader_safe()
+    attr = _resolve_catalog_attribute(attr_name, loader)
+    if loader and attr and hasattr(loader, "resolve_attribute_term"):
+        term = loader.resolve_attribute_term(attr.key, value)
+        if term and getattr(term, "name", None):
+            return term.name
+    return value
+
+
+def _normalize_attribute_lookup_name(attr_name: str) -> str:
+    raw = str(attr_name or "").strip().lower().replace("_", " ")
+    if raw.startswith("pa_"):
+        raw = raw[3:]
+    return re.sub(r"\s+", " ", raw.replace("-", " ")).strip()
+
+
+def _resolve_display_to_slug_key(attr_name: str, display_to_slug: dict = None, store_loader=None) -> str:
+    attr = _resolve_catalog_attribute(attr_name, store_loader)
+    if attr:
+        taxonomy = getattr(attr, "backend_ref", {}).get("taxonomy")
+        if taxonomy:
+            return taxonomy
+        if attr.key:
+            return attr.key
+
+    raw = str(attr_name or "").strip()
+    if not raw:
+        return ""
+    if not display_to_slug:
+        return raw.lower()
+    if raw in display_to_slug:
+        return raw
+    raw_lower = raw.lower()
+    if raw_lower in display_to_slug:
+        return raw_lower
+
+    normalized = _normalize_attribute_lookup_name(raw)
+    for key in display_to_slug.keys():
+        if _normalize_attribute_lookup_name(key) == normalized:
+            return key
+    return raw_lower
+
+
+def _variation_matches_resolved_neutral(
+    var: dict,
+    resolved_attributes: dict,
+    display_to_slug: dict = None,
+    store_loader=None,
+) -> bool:
+    if not resolved_attributes:
+        return True
+
+    loader = store_loader if store_loader is not None else _get_store_loader_safe()
+    v_attrs = var.get("attributes", {})
+    var_map: dict = {}
+    var_taxonomies: dict = {}
+
+    def _remember_option(attr_name, option_value):
+        option = str(option_value or "")
+        if not option:
+            return
+
+        taxonomy = _resolve_display_to_slug_key(attr_name, display_to_slug, loader)
+        attr = _resolve_catalog_attribute(attr_name, loader)
+        aliases = {str(attr_name or "").lower().strip()}
+        if attr:
+            aliases.update({
+                str(attr.key or "").lower().strip(),
+                str(attr.label or "").lower().strip(),
+            })
+        else:
+            aliases.add(_fallback_attribute_display_name(attr_name).lower())
+
+        for alias in aliases:
+            if alias:
+                var_map[alias] = option
+                if taxonomy:
+                    var_taxonomies[alias] = taxonomy
+
+    if isinstance(v_attrs, list):
+        for attr in v_attrs:
+            if isinstance(attr, dict):
+                _remember_option(attr.get("name", ""), attr.get("option", ""))
+    elif isinstance(v_attrs, dict):
+        for key, value in v_attrs.items():
+            _remember_option(key, value)
+
+    for res_key, res_val in resolved_attributes.items():
+        attr = _resolve_catalog_attribute(res_key, loader)
+        aliases = []
+        if attr:
+            aliases.extend([
+                str(attr.label or "").lower().strip(),
+                str(attr.key or "").lower().strip(),
+            ])
+        aliases.extend([
+            str(res_key or "").lower().strip(),
+            _fallback_attribute_display_name(res_key).lower(),
+        ])
+
+        actual_slug = None
+        taxonomy = ""
+        for alias in dict.fromkeys(alias for alias in aliases if alias):
+            if alias in var_map:
+                actual_slug = var_map[alias]
+                taxonomy = var_taxonomies.get(alias, "")
+                break
+
+        if actual_slug is None:
+            continue
+
+        if display_to_slug:
+            taxonomy = taxonomy or _resolve_display_to_slug_key(res_key, display_to_slug, loader)
+            term_map = display_to_slug.get(taxonomy, {})
+            expected_slug = term_map.get(str(res_val).lower(), "")
+            if expected_slug:
+                if expected_slug != actual_slug:
+                    if re.sub(r'[^a-z0-9]+', '', expected_slug.lower()) != re.sub(r'[^a-z0-9]+', '', actual_slug.lower()):
+                        return False
+                continue
+
+        if re.sub(r'[^a-z0-9]+', '', str(res_val).lower()) != re.sub(r'[^a-z0-9]+', '', str(actual_slug).lower()):
+            return False
+
+    return True
 
 
 def default_pagination(page: int = 1) -> dict:
@@ -207,6 +385,7 @@ def _compute_variant_options(
     resolved = resolved_attributes or {}
     resolved_keys_lower = {k.lower() for k in resolved.keys()}
     missing_attrs: dict = {}
+    store_loader = _get_store_loader_safe()
 
     # ── STEP 1: Parent options (authoritative for non-wildcard axes) ──
     parent_defined_axes: set = set()
@@ -216,13 +395,14 @@ def _compute_variant_options(
             if not (isinstance(attr, dict) and attr.get("variation") is True):
                 continue
             name = attr.get("name", "")
-            nice_name = (
-                name.replace("pa_", "").replace("-", " ").title()
-                if name.startswith("pa_") else name.title()
-            )
+            nice_name = _attribute_display_name(name, store_loader)
             if not nice_name or nice_name.lower() in resolved_keys_lower:
                 continue
-            opts = [str(o).strip() for o in attr.get("options", []) if str(o).strip()]
+            opts = [
+                _resolve_attribute_term_name(name, o, store_loader).strip()
+                for o in attr.get("options", [])
+                if str(o).strip()
+            ]
             if opts:
                 parent_defined_axes.add(nice_name.lower())
                 missing_attrs[nice_name] = set(opts)
@@ -232,49 +412,7 @@ def _compute_variant_options(
     log.info(f"build_variant_prompt: Scanning {len(variations)} variations for product")
 
     def _matches_resolved(var: dict) -> bool:
-        """
-        Returns True when the variation is consistent with all already-resolved
-        attributes.
-
-        WC REST API stores variation attribute values as slugs (e.g. "chip-card")
-        while resolved_attributes holds display names (e.g. "Chip Card") as shown
-        to the user.  When display_to_slug is available we convert the display name
-        to its canonical slug before comparing — no string-normalisation guessing.
-        Falls back to a slugified comparison when the taxonomy isn't in the lookup.
-        """
-        if not resolved:
-            return True
-
-        v_attrs = var.get("attributes", {})
-        # Build {nice_name_lower: option_slug} from variation
-        var_map: dict = {}
-        if isinstance(v_attrs, list):
-            for a in v_attrs:
-                if isinstance(a, dict):
-                    var_map[a.get("name", "").lower()] = a.get("option", "")
-        elif isinstance(v_attrs, dict):
-            for k, v in v_attrs.items():
-                nice = k.replace("pa_", "").replace("-", " ").title().lower()
-                var_map[nice] = str(v)
-
-        for res_key, res_val in resolved.items():
-            actual_slug = var_map.get(res_key.lower())
-            if actual_slug is None:
-                continue  # axis not present on this variation (wildcard) — skip
-
-            if display_to_slug:
-                taxonomy = f"pa_{res_key.lower().replace(' ', '-')}"
-                term_map = display_to_slug.get(taxonomy, {})
-                expected_slug = term_map.get(res_val.lower(), "")
-                if expected_slug:
-                    if expected_slug != actual_slug:
-                        return False
-                    continue
-            # Fallback: slugify both sides (strips hyphens, quotes, spaces)
-            if re.sub(r'[^a-z0-9]+', '', res_val.lower()) != re.sub(r'[^a-z0-9]+', '', actual_slug.lower()):
-                return False
-
-        return True
+        return _variation_matches_resolved_neutral(var, resolved, display_to_slug, store_loader)
 
     filtered = [v for v in variations if isinstance(v, dict) and _matches_resolved(v)]
     log.info(
@@ -289,10 +427,11 @@ def _compute_variant_options(
             for k, val in v_attrs.items():
                 if not val:
                     continue
-                nice_name = k.replace("pa_", "").replace("-", " ").title()
+                nice_name = _attribute_display_name(k, store_loader)
                 if nice_name.lower() in resolved_keys_lower or nice_name.lower() in parent_defined_axes:
                     continue
-                missing_attrs.setdefault(nice_name, set()).add(val)
+                display_value = _resolve_attribute_term_name(k, val, store_loader)
+                missing_attrs.setdefault(nice_name, set()).add(display_value)
 
         elif isinstance(v_attrs, list):
             for a in v_attrs:
@@ -300,13 +439,11 @@ def _compute_variant_options(
                 val = a.get("option", "")
                 if not (name and val):
                     continue
-                nice_name = (
-                    name.replace("pa_", "").replace("-", " ").title()
-                    if name.startswith("pa_") else name.title()
-                )
+                nice_name = _attribute_display_name(name, store_loader)
                 if nice_name.lower() in resolved_keys_lower or nice_name.lower() in parent_defined_axes:
                     continue
-                missing_attrs.setdefault(nice_name, set()).add(val)
+                display_value = _resolve_attribute_term_name(name, val, store_loader)
+                missing_attrs.setdefault(nice_name, set()).add(display_value)
 
     log.info(f"build_variant_prompt: Extracted attributes = {missing_attrs}")
 
