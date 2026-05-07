@@ -2,15 +2,21 @@
 ecommerce/endpoints.py — Protocol declaring the interface every e-commerce
 backend module must implement.
 
-Each function returns a ``WooAPICall`` ready to be passed to
-``woo_client.execute()``.  The protocol covers only *call construction*; response
-shape normalisation is deferred to Phase 3.
+Each ``fetch_*`` / ``list_*`` function returns a ``WooAPICall`` ready to be
+passed to ``woo_client.execute()``.  Each is paired with a ``parse_*`` method
+that normalizes the raw response from ``woo_client.execute()`` into a
+backend-neutral dict so callers remain portable across WooCommerce, Shopify,
+and any future backend.
+
+All parsers include a ``_raw`` key with the original response as a migration
+safety valve — callers can read any not-yet-normalized backend-specific field
+from ``_raw[...]``.
 
 A future ``shopify_endpoints.py`` is a drop-in if it provides a class that
 satisfies this Protocol.
 """
 
-from typing import List, Optional, Protocol
+from typing import Dict, List, Optional, Protocol
 
 from models import WooAPICall
 
@@ -240,4 +246,60 @@ class EcommerceEndpoints(Protocol):
         requires_resolution: Optional[List[str]] = None,
     ) -> WooAPICall:
         """List orders via custom plugin (CS-rep role path; custom_plugin surface)."""
+        ...
+
+    # ── Response parsers ────────────────────────────────────────────────────
+    # Each parser takes the raw ``woo_client.execute(...).get("data")`` value
+    # and returns a backend-neutral dict (or list of dicts).  Every result
+    # includes a ``_raw`` key with the original response so callers can access
+    # any not-yet-normalized backend-specific field.
+
+    def parse_product(self, response: dict) -> dict:
+        """Normalise a single product response into a backend-neutral dict.
+
+        Returns at minimum: ``{"id", "price": str, "in_stock": bool, "_raw"}``.
+        """
+        ...
+
+    def parse_variant(self, response: dict) -> dict:
+        """Normalise a single variant/variation response into a backend-neutral dict.
+
+        Returns at minimum:
+        ``{"id", "price": str, "options": dict[str, str], "in_stock": bool, "_raw"}``.
+        """
+        ...
+
+    def parse_list_variants(self, response: list) -> List[dict]:
+        """Normalise a variants/variations list into backend-neutral dicts.
+
+        Returns a list where each item is in the same shape as ``parse_variant``.
+        """
+        ...
+
+    def parse_order(self, response: dict) -> dict:
+        """Normalise a single order response into a backend-neutral dict.
+
+        Returns at minimum:
+        ``{"id", "status": str, "billing_address": dict, "shipping_address": dict, "_raw"}``.
+        Address dicts use the neutral six-key shape:
+        ``{"address_1", "address_2", "city", "state", "postcode", "country"}``.
+        """
+        ...
+
+    def parse_customer(self, response: dict) -> dict:
+        """Normalise a single customer response into a backend-neutral dict.
+
+        Returns at minimum:
+        ``{"id", "first_name", "last_name", "email",
+           "default_address": dict, "addresses": list[dict], "_raw"}``.
+        Address dicts use the neutral six-key shape.
+        """
+        ...
+
+    def parse_list_published_products(self, response: list) -> List[dict]:
+        """Normalise a published-products list into backend-neutral dicts.
+
+        Returns a list where each item contains at minimum:
+        ``{"id", "price": str, "in_stock": bool, "_raw"}``.
+        """
         ...
