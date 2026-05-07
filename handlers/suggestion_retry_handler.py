@@ -32,16 +32,16 @@ def handle_suggestion_retry(body, message, session_id, customer_id, page, start_
     # Category
     cat_slug = suggestion_retry.get("category_slug", "")
     if cat_slug and loader:
-        cat_entry = loader.category_by_slug.get(cat_slug)
-        if cat_entry:
-            sr_entities.category_name = cat_entry["name"]
-            sr_entities.category_id = cat_entry["id"]
+        cat_obj = loader.resolve_category(cat_slug)
+        if cat_obj:
+            sr_entities.category_name = cat_obj.name
+            sr_entities.category_id = cat_obj.backend_ref.get("id")
 
     for extra_slug in (suggestion_retry.get("extra_category_slugs") or []):
         if loader:
-            extra_entry = loader.category_by_slug.get(extra_slug)
-            if extra_entry:
-                sr_entities.extra_category_ids.append(extra_entry["id"])
+            extra_obj = loader.resolve_category(extra_slug)
+            if extra_obj:
+                sr_entities.extra_category_ids.append(extra_obj.backend_ref.get("id"))
 
     # Tags
     for tslug in (suggestion_retry.get("tag_slugs") or []):

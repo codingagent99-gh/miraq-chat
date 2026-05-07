@@ -65,7 +65,7 @@ def _normalize_variation_attrs(variation: dict) -> dict:
     raw = variation.get("attributes", {})
     if isinstance(raw, dict):
         for k, v in raw.items():
-            ck = k.replace("attribute_", "").replace("pa_", "").replace("-", " ").strip().lower()
+            ck = k.removeprefix("attribute_pa_").removeprefix("attribute_").removeprefix("pa_").replace("-", " ").strip().lower()
             cv = str(v).replace("-", " ").strip().lower()
             result[ck] = cv
     elif isinstance(raw, list):

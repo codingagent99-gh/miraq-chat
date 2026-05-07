@@ -34,7 +34,7 @@ logger = get_logger("miraq_chat")
 
 
 def _legacy_attr_key_from_taxonomy(taxonomy: str) -> str:
-    return taxonomy.replace("pa_", "").replace("-", " ")
+    return taxonomy.removeprefix("pa_").replace("-", " ")
 
 
 def _resolve_attr_key_with_fallback(loader, taxonomy: str, fallback_key: str) -> str:
@@ -175,7 +175,11 @@ def extract_exclusions(text: str, entities: ExtractedEntities) -> str:
             for candidate in [phrase] + phrase.split():
                 if len(candidate) < 3:
                     continue
-                tag_entry = loader.tag_by_name_lower.get(candidate) or loader.tag_by_slug.get(candidate.replace(" ", "-"))
+                tag_entry = loader.tag_by_name_lower.get(candidate)
+                if not tag_entry:
+                    tag_obj = loader.resolve_tag(candidate.replace(" ", "-"))
+                    if tag_obj:
+                        tag_entry = {"slug": tag_obj.key, "id": tag_obj.backend_ref.get("id")}
                 if tag_entry and tag_entry.get("slug"):
                     slug = tag_entry["slug"]
                     if slug not in entities.excluded_tags and slug not in entities.tag_slugs:
@@ -184,9 +188,10 @@ def extract_exclusions(text: str, entities: ExtractedEntities) -> str:
                     break
 
             if not resolved:
-                cat = loader.category_by_name_lower.get(phrase) or (
-                    loader.category_by_id.get(loader.get_category_id(phrase)) if loader.get_category_id(phrase) else None
-                )
+                cat = loader.category_by_name_lower.get(phrase)
+                if not cat:
+                    cat_id = loader.category_keywords.get(phrase)
+                    cat = loader.category_by_id.get(cat_id) if cat_id else None
                 if cat and cat.get("slug") and cat["slug"] != "uncategorized":
                     if cat["slug"] not in entities.excluded_categories:
                         entities.excluded_categories.append(cat["slug"])
@@ -268,23 +273,23 @@ def extract_product_name(text: str, entities: ExtractedEntities):
 def extract_category(text: str, entities: ExtractedEntities) -> str:
     """Extract category matches from text using the store catalog."""
     loader = get_store_loader()
-    if not loader or not loader.category_by_slug:
+    if not loader or not loader.category_by_key:
         return text
 
     extracted_cats = []
     longest_match = ""
 
-    for slug, cat in loader.category_by_slug.items():
-        name_lower = cat.get("name", "").lower().strip()
-        if len(name_lower) < 3 or cat.get("count", 0) == 0:
+    for slug, cat_obj in loader.category_by_key.items():
+        name_lower = cat_obj.name.lower().strip()
+        if len(name_lower) < 3 or cat_obj.count == 0:
             continue
         pattern = create_flexible_pattern(name_lower)
         try:
             if re.search(pattern, text, re.IGNORECASE):
                 if len(name_lower) > len(longest_match):
                     longest_match = name_lower
-                    entities.category_name = cat.get("name")
-                extracted_cats.append(cat)
+                    entities.category_name = cat_obj.name
+                extracted_cats.append({"name": cat_obj.name, "slug": cat_obj.key, "count": cat_obj.count, "id": cat_obj.backend_ref.get("id"), "parent": cat_obj.backend_ref.get("parent_id", 0)})
         except re.error:
             pass
 
@@ -378,8 +383,7 @@ def _try_origin_match(text: str, entities, loader, taxonomy: str) -> bool:
                 tag_ids = loader.get_tag_ids_for_keyword(f"made in {normalized}")
             legacy_attr_key = _legacy_attr_key_from_taxonomy(taxonomy)
             attr_key = _resolve_attr_key_with_fallback(loader, taxonomy, legacy_attr_key)
-            legacy_term_slug = loader.get_attribute_term_slug(taxonomy, normalized) or normalized
-            term_key = _resolve_attr_term_key_with_fallback(loader, taxonomy, normalized, legacy_term_slug)
+            term_key = _resolve_attr_term_key_with_fallback(loader, taxonomy, normalized, normalized)
             entities.attributes[attr_key] = term_key
             entities.tag_ids.extend(tag_ids)
             for tid in tag_ids:
@@ -548,9 +552,9 @@ def _build_cat_base_words(entities, loader) -> set:
         all_cat_names.append(entities.category_name.lower())
     if hasattr(entities, 'target_category_slugs'):
         for slug in entities.target_category_slugs:
-            cat = loader.category_by_slug.get(slug)
-            if cat and cat.get("name"):
-                all_cat_names.append(cat["name"].lower())
+            cat_obj = loader.resolve_category(slug)
+            if cat_obj and cat_obj.name:
+                all_cat_names.append(cat_obj.name.lower())
     for cname in all_cat_names:
         cat_base_words.add(cname)
         if cname.endswith("s") and len(cname) > 3:

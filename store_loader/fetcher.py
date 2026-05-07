@@ -85,14 +85,11 @@ def dump_lookups_for_debugging(loader):
     try:
         dump_data = {
             "store_generic_terms": list(loader._store_generic_terms) if loader._store_generic_terms else [],
-            "attribute_by_slug": loader.attribute_by_slug,
             "attribute_by_id": loader.attribute_by_id,
-            "attribute_terms": loader.attribute_terms,
             "category_by_id": loader.category_by_id,
             "category_by_name_lower": loader.category_by_name_lower,
             "category_keywords": loader.category_keywords,
             "tag_by_id": loader.tag_by_id,
-            "tag_by_slug": loader.tag_by_slug,
             "tag_by_name_lower": loader.tag_by_name_lower,
             "product_by_name_lower": loader.product_by_name_lower,
             "product_name_tokens": loader.product_name_tokens,

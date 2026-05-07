@@ -31,38 +31,6 @@ class StoreQueryMixin:
 
     # ─── Category queries ───
 
-    def get_category_id(self, keyword: str) -> Optional[int]:
-        keyword = keyword.lower().strip()
-
-        if keyword in self.category_by_name_lower:
-            entry = self.category_by_name_lower[keyword]
-            if entry.get("count", 0) > 0:
-                return entry["id"]
-
-        if keyword in self.category_by_slug:
-            entry = self.category_by_slug[keyword]
-            if entry.get("count", 0) > 0:
-                return entry["id"]
-
-        if keyword in self.category_keywords:
-            return self.category_keywords[keyword]
-
-        for name_lower, entry in self.category_by_name_lower.items():
-            if keyword in name_lower or name_lower in keyword:
-                if entry["count"] > 0:
-                    return entry["id"]
-
-        keyword_words = set(keyword.split())
-        best_id = None
-        best_count = 0
-        for name_lower, entry in self.category_by_name_lower.items():
-            name_words = set(name_lower.split())
-            overlap = keyword_words & name_words
-            if overlap and entry["count"] > best_count:
-                best_id = entry["id"]
-                best_count = entry["count"]
-        return best_id
-
     def get_category_slug(self, category_id: int) -> Optional[str]:
         entry = self.category_by_id.get(category_id)
         return entry["slug"] if entry else None
@@ -145,8 +113,8 @@ class StoreQueryMixin:
 
         stop_words = self._store_generic_terms.copy()
         stop_words.update({"sample", "samples", "product", "item", "size", "sizes"})
-        for attr in self.attribute_by_slug.values():
-            attr_name = attr.get("name", "").lower().strip()
+        for attr in self.attribute_by_key.values():
+            attr_name = attr.label.lower().strip()
             stop_words.add(attr_name)
             stop_words.update(attr_name.split())
 
@@ -161,88 +129,9 @@ class StoreQueryMixin:
 
     # ─── Attribute queries ───
 
-    def get_attribute_id(self, slug: str) -> Optional[int]:
-        entry = self.attribute_by_slug.get(slug)
-        return entry["id"] if entry else None
-
     def get_attribute_slug(self, attr_id: int) -> Optional[str]:
         entry = self.attribute_by_id.get(attr_id)
         return entry["slug"] if entry else None
-
-    def get_attribute_term_ids(self, attr_slug: str, user_value: str) -> List[int]:
-        attr = self.attribute_by_slug.get(attr_slug)
-        if not attr:
-            return []
-        terms = self.attribute_terms.get(attr["id"], [])
-        if not terms:
-            return []
-
-        needle = re.sub(r'[\"\'`]', '', user_value.lower().strip())
-        exact, partial = [], []
-
-        for term in terms:
-            term_name = term.get("name", "").lower()
-            term_slug = term.get("slug", "").lower()
-            term_clean = re.sub(r'[\"\'`]', '', term_name).strip()
-
-            if term_clean == needle or term_slug == needle:
-                exact.append(term["id"])
-            else:
-                needle_clean = re.sub(r'[^\dxX]', '', needle).lower()
-                term_clean_raw = re.sub(r'[^\dxX]', '', term_name).lower()
-                if needle_clean and term_clean_raw:
-                    if re.search(rf'(?<!\d){re.escape(needle_clean)}(?!\d)', term_clean_raw):
-                        partial.append(term["id"])
-                else:
-                    if needle in term_clean or term_clean in needle:
-                        partial.append(term["id"])
-
-        return exact if exact else partial
-
-    def get_attribute_term_slug(self, attr_slug: str, user_value: str) -> str:
-        attr = self.attribute_by_slug.get(attr_slug)
-        if not attr:
-            return ""
-        terms = self.attribute_terms.get(attr["id"], [])
-        needle = re.sub(r'[\"\'`]', '', user_value.lower().strip())
-
-        exact_slug = ""
-        partial_slug = ""
-        for term in terms:
-            term_name = term.get("name", "").lower()
-            term_slug = term.get("slug", "").lower()
-            term_clean = re.sub(r'[\"\'`]', '', term_name).strip()
-
-            if term_clean == needle or term_slug == needle:
-                return term.get("slug", "")
-
-            if not partial_slug:
-                needle_clean = re.sub(r'[^\dxX]', '', needle).lower()
-                term_clean_raw = re.sub(r'[^\dxX]', '', term_name).lower()
-                if needle_clean and term_clean_raw:
-                    if re.search(rf'(?<!\d){re.escape(needle_clean)}(?!\d)', term_clean_raw):
-                        partial_slug = term.get("slug", "")
-                else:
-                    if needle in term_clean or term_clean in needle:
-                        partial_slug = term.get("slug", "")
-
-        return partial_slug
-
-    def get_all_attribute_terms(self, attr_slug: str) -> List[Dict]:
-        attr = self.attribute_by_slug.get(attr_slug)
-        if not attr:
-            return []
-        return self.attribute_terms.get(attr["id"], [])
-
-    def get_sibling_attribute_terms(self, attr_slug: str, failed_term: str, limit: int = 3) -> List[str]:
-        attr = self.attribute_by_slug.get(attr_slug)
-        if not attr:
-            return []
-        terms = self.attribute_terms.get(attr["id"], [])
-        failed_lower = failed_term.lower().strip()
-        candidates = [t for t in terms if t.get("name", "").lower().strip() != failed_lower]
-        candidates.sort(key=lambda x: x.get("count", 0), reverse=True)
-        return [t["name"] for t in candidates[:limit]]
 
     def get_sibling_attribute_terms_neutral(self, attr_key: str, failed_term: str, limit: int = 3) -> List[str]:
         """Return sibling display names for a neutral attribute key, excluding failed_term."""
@@ -282,8 +171,8 @@ class StoreQueryMixin:
     # ─── Tag queries ───
 
     def get_tag_id_by_slug(self, slug: str) -> Optional[int]:
-        entry = self.tag_by_slug.get(slug)
-        return entry["id"] if entry else None
+        tag_obj = self.resolve_tag(slug)
+        return tag_obj.backend_ref.get("id") if tag_obj else None
 
     def get_tag_ids_for_keyword(self, keyword: str) -> List[int]:
         needle = keyword.lower().strip()
@@ -306,18 +195,19 @@ class StoreQueryMixin:
         needle_words = set(slug.split("-")) - {""}
         candidates = []
 
-        for tag_slug, tag in self.tag_by_slug.items():
-            if tag_slug == slug or tag.get("count", 0) == 0:
+        for tag_slug, tag_obj in self.tag_by_key.items():
+            if tag_slug == slug or tag_obj.count == 0:
                 continue
             tag_words = set(tag_slug.split("-")) - {""}
             score = 0
             if tag_slug.startswith(slug + "-") or tag_slug == slug:
-                score = 100 + tag.get("count", 0)
+                score = 100 + tag_obj.count
             elif needle_words and needle_words & tag_words:
                 overlap = len(needle_words & tag_words) / max(len(needle_words), 1)
-                score = int(overlap * 50) + tag.get("count", 0)
+                score = int(overlap * 50) + tag_obj.count
             if score > 0:
-                candidates.append((score, tag))
+                tag_dict = {"id": tag_obj.backend_ref.get("id"), "name": tag_obj.name, "slug": tag_obj.key, "count": tag_obj.count}
+                candidates.append((score, tag_dict))
 
         candidates.sort(key=lambda x: x[0], reverse=True)
         return [t for _, t in candidates[:limit]]
@@ -370,7 +260,7 @@ class StoreQueryMixin:
                 "products": len(self.products),
                 "expected_products": self._expected_product_count,
                 "category_keywords": len(self.category_keywords),
-                "attribute_terms": sum(len(v) for v in self.attribute_terms.values()),
+                "attribute_terms": sum(len(a.terms) for a in self.attribute_by_key.values()),
                 "variation_cache_size": len(self.variation_detail_cache),
                 "semantic_vectors": len(self.semantic_keys) if self.semantic_keys else 0,
             },

@@ -16,6 +16,9 @@ from chat_logger import get_logger
 from api_builder.query_tree import (
     make_condition,
     make_or_group,
+    make_price_condition,
+    make_stock_condition,
+    make_search_condition,
     serialize_query,
     merge_cross_taxonomy_overlaps,
 )
@@ -43,11 +46,10 @@ def _group_categories(cat_slugs: list) -> dict:
 
     for slug in cat_slugs:
         parent_key = slug  # default: each slug is its own group
-        if l and l.category_by_slug:
-            cat = l.category_by_slug.get(slug)
-            if cat:
-                parent_id = cat.get("parent", 0)
-                parent_key = str(parent_id) if parent_id else slug
+        if l and l.category_by_key:
+            cat_obj = l.resolve_category(slug)
+            if cat_obj:
+                parent_key = cat_obj.parent_key if cat_obj.parent_key else slug
 
         groups.setdefault(parent_key, []).append(slug)
 
@@ -110,21 +112,25 @@ def build_advanced_filter_call(
     # ── 8. Cross-taxonomy overlap merge ──
     conditions = merge_cross_taxonomy_overlaps(conditions)
 
-    # ── Serialize ──
-    body = serialize_query(conditions, page, per_page, min_price=min_price, max_price=max_price)
-
+    # ── Prepend special-field leaves ──
+    # These are routed by serialize_query to the right top-level body fields.
     if in_stock is True:
-        body["stock_status"] = "instock"
+        conditions = [make_stock_condition("instock")] + conditions
     elif in_stock is False:
-        body["stock_status"] = "outofstock"
+        conditions = [make_stock_condition("outofstock")] + conditions
+
+    if min_price is not None or max_price is not None:
+        conditions = [make_price_condition(min_price=min_price, max_price=max_price)] + conditions
+
+    # ── Serialize ──
+    body = serialize_query(conditions, page, per_page)
 
     if product_id:
         body["ids"] = [product_id]
         body.pop("stock_status", None)
         body.pop("filters", None)
-    # In build_advanced_filter_call, replace the elif search_term block:
     elif search_term:
-        if conditions:
+        if conditions and any("field_type" not in c for c in conditions):
             logger.info(f"Ignored leftover search_term='{search_term}' — taxonomy filters are present, relying on them.")
         else:
             # This should not happen if callers are routing correctly.
