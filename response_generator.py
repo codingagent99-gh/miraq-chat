@@ -7,6 +7,87 @@ from datetime import datetime
 
 from models import Intent, ExtractedEntities, WooAPICall
 from app_config import MAX_DISPLAYED_ITEMS, USER_PLACEHOLDERS, DEFAULT_PAYMENT_METHOD_TITLE, get_currency_symbol
+from store_registry import get_store_loader
+
+
+def _attribute_key_candidates(attr_key: str) -> list[str]:
+    key = str(attr_key or "").replace("attribute_", "").replace(" 2", "").strip().lower()
+    if key.startswith("pa_"):
+        key = key[3:]
+    candidates = [key]
+    if " " in key:
+        candidates.append(key.replace(" ", "-"))
+    if "-" in key:
+        candidates.append(key.replace("-", " "))
+    return [c for c in dict.fromkeys(candidates) if c]
+
+
+def _resolve_attribute_label(attr_key: str) -> str:
+    try:
+        loader = get_store_loader()
+    except Exception:
+        loader = None
+
+    if loader:
+        for candidate in _attribute_key_candidates(attr_key):
+            attr = loader.resolve_attribute(candidate)
+            if attr and attr.label:
+                return attr.label
+
+    return str(attr_key or "").replace(" 2", "").replace("-", " ").replace("pa_", "").title()
+
+
+def _resolve_attribute_term_name(attr_key: str, term_value) -> str:
+    raw_value = str(term_value or "")
+    if not raw_value:
+        return ""
+
+    try:
+        loader = get_store_loader()
+    except Exception:
+        loader = None
+
+    if loader:
+        for candidate in _attribute_key_candidates(attr_key):
+            term = loader.resolve_attribute_term(candidate, raw_value)
+            if term and term.name:
+                return term.name
+
+    return raw_value.replace("-", " ").title()
+
+
+def _resolve_tag_name(tag_key: str) -> str:
+    try:
+        loader = get_store_loader()
+    except Exception:
+        loader = None
+
+    if loader and tag_key:
+        tag = loader.resolve_tag(str(tag_key).lower().strip())
+        if tag and tag.name:
+            return tag.name
+    return str(tag_key or "").replace("-", " ").title()
+
+
+def _resolve_category_name(category_key: str) -> str:
+    try:
+        loader = get_store_loader()
+    except Exception:
+        loader = None
+
+    if loader and category_key:
+        category = loader.resolve_category(str(category_key).lower().strip())
+        if category and category.name:
+            return category.name
+    return str(category_key or "").replace("-", " ").title()
+
+
+def _build_attribute_value_summary(attributes: dict) -> str:
+    values = []
+    for attr_key, attr_val in (attributes or {}).items():
+        if attr_val:
+            values.append(_resolve_attribute_term_name(attr_key, attr_val))
+    return " / ".join(values)
 
 def _build_search_context_string(entities: ExtractedEntities) -> str:
     """Builds a human-readable string of the exact entities the bot searched for."""
@@ -21,12 +102,12 @@ def _build_search_context_string(entities: ExtractedEntities) -> str:
     if getattr(entities, 'attributes', None):
         for attr_name, attr_val in entities.attributes.items():
             if not attr_val: continue
-            clean_name = attr_name.replace(" 2", "").replace("-", " ").replace("pa_", "").title()
-            clean_val = str(attr_val).replace("-", " ").title()
+            clean_name = _resolve_attribute_label(attr_name)
+            clean_val = _resolve_attribute_term_name(attr_name, attr_val)
             desc_parts.append(f"{clean_name}: **{clean_val}**")
             
     if getattr(entities, 'tag_slugs', None):
-        clean_tags = [t.replace("-", " ").title() for t in entities.tag_slugs]
+        clean_tags = [_resolve_tag_name(t) for t in entities.tag_slugs]
         if len(clean_tags) == 1:
             tag_str = clean_tags[0]
         else:
@@ -41,27 +122,27 @@ def _build_search_context_string(entities: ExtractedEntities) -> str:
                 clean = " ".join(w.capitalize() for w in display.split())
             else:
                 # Fallback: reconstruct from term slug
-                clean = pair.get("attr_term", "").replace("-", " ").title()
+                clean = _resolve_attribute_term_name(pair.get("attr_taxonomy", ""), pair.get("attr_term", ""))
             taxonomy = pair.get("attr_taxonomy", "")
-            label = taxonomy.replace("pa_", "").replace("-", " ").title() if taxonomy else "Filter"
+            label = _resolve_attribute_label(taxonomy) if taxonomy else "Filter"
             desc_parts.append(f"{label}: **{clean}**")
 
     # EXCLUSIONS
     if getattr(entities, 'excluded_tags', None):
         for tag in entities.excluded_tags:
-            clean_tag = tag.replace("-", " ").title()
+            clean_tag = _resolve_tag_name(tag)
             desc_parts.append(f"Excluding Tag: **{clean_tag}**")
             
     if getattr(entities, 'excluded_categories', None):
         for cat in entities.excluded_categories:
-            clean_cat = cat.replace("-", " ").title()
+            clean_cat = _resolve_category_name(cat)
             desc_parts.append(f"Excluding Category: **{clean_cat}**")
             
     if getattr(entities, 'excluded_attributes', None):
         for attr_name, attr_vals in entities.excluded_attributes.items():
-            clean_name = attr_name.replace(" 2", "").replace("-", " ").replace("pa_", "").title()
+            clean_name = _resolve_attribute_label(attr_name)
             for val in attr_vals:
-                clean_val = str(val).replace("-", " ").title()
+                clean_val = _resolve_attribute_term_name(attr_name, val)
                 desc_parts.append(f"Excluding {clean_name}: **{clean_val}**")
             
     return " · ".join(desc_parts)
@@ -260,7 +341,7 @@ def generate_bot_message(
 
         # If they asked for a specific product AND specific attributes (e.g. Ansel in Charcoal)
         if entities.product_name and entities.attributes:
-            attr_desc = " / ".join(filter(None, entities.attributes.values())).title()
+            attr_desc = _build_attribute_value_summary(entities.attributes)
             return (
                 f"I couldn't find **{entities.product_name}** matching **{attr_desc}**. 😕\n\n"
                 f"Try asking: *'What variations does {entities.product_name} come in?'* to see all available options."
@@ -309,7 +390,7 @@ def generate_bot_message(
 
         # If we have specific attributes or stock filters, show the FILTERED specific view!
         if has_attributes or has_stock_filter:
-            attr_desc = " / ".join(filter(None, entities.attributes.values())).title()
+            attr_desc = _build_attribute_value_summary(entities.attributes)
             if has_stock_filter:
                 stock_desc = "In Stock" if entities.in_stock else "Out of Stock"
                 attr_desc = f"{attr_desc} ({stock_desc})" if attr_desc else stock_desc
