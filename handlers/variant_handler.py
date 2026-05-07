@@ -55,8 +55,12 @@ def _get_safe_options(attrs, store_loader=None):
     """
     if isinstance(attrs, dict) and all(isinstance(v, str) for v in attrs.values()):
         # Normalized variants already expose the backend-neutral {name: value}
-        # mapping, so we can return immediately without rebuilding it.
-        return {str(k): str(v) for k, v in attrs.items() if v}
+        # mapping, but we still run the values through the display-name
+        # resolver so this path stays consistent with the list-based fallback.
+        return {
+            str(k): _resolve_option_display_name(str(k), str(v), store_loader)
+            for k, v in attrs.items() if v
+        }
     if isinstance(attrs, dict):
         return {k.replace("pa_", "").replace("-", " ").title(): str(v).replace("-", " ").title() for k, v in attrs.items() if v}
     elif isinstance(attrs, list):

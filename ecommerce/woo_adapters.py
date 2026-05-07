@@ -54,7 +54,7 @@ def normalize_address(raw: dict | None) -> dict:
 
 
 def _address_has_content(address: dict) -> bool:
-    return any(address.get(key) for key in ("address_1", "city", "postcode", "phone"))
+    return any(address.get(key) for key in ("address_1", "address_2", "city", "state", "postcode", "phone"))
 
 
 def _dedupe_addresses(addresses: Iterable[dict]) -> list[dict]:
@@ -317,7 +317,7 @@ def _normalize_items(items: list, normalizer) -> list:
 def _normalize_order_payload(payload: dict) -> dict:
     line_items = []
     for item in payload.get("line_items", []):
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or not item.get("product_id"):
             continue
         line_items.append({
             "product_id": item.get("product_id"),
