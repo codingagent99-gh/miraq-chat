@@ -5,6 +5,9 @@ from typing import Iterable
 
 
 def _pick_price(raw: dict) -> str:
+    # Keep the public contract backend-neutral by always surfacing the current
+    # sellable price first. Woo exposes sale_price separately, while Shopify
+    # commonly exposes the current variant/product price directly.
     for key in ("sale_price", "price", "regular_price"):
         value = raw.get(key)
         if value not in (None, ""):
@@ -319,6 +322,8 @@ def _normalize_order_payload(payload: dict) -> dict:
         line_items.append({
             "product_id": item.get("product_id"),
             "quantity": item.get("quantity", 1),
+            # The neutral payload uses variant_id; Woo's create-order API still
+            # expects the legacy variation_id field on each line item.
             **({"variation_id": item.get("variant_id")} if item.get("variant_id") else {}),
         })
 

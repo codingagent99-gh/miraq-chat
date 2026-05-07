@@ -601,9 +601,12 @@ def _handle_customer_intents(
 
         display = {}
         for field_key in entities.customer_fields_requested:
-            if field_key.startswith(("billing.", "shipping.")):
+            if field_key.startswith("billing."):
                 _, key = field_key.split(".", 1)
-                display[field_key] = customer_raw.get("default_address", {}).get(key)
+                display[field_key] = customer_raw.get("billing_address", {}).get(key)
+            elif field_key.startswith("shipping."):
+                _, key = field_key.split(".", 1)
+                display[field_key] = customer_raw.get("shipping_address", {}).get(key)
             elif field_key == "full_name":
                 display["name"] = f"{customer_raw.get('first_name', '')} {customer_raw.get('last_name', '')}".strip()
             elif field_key == "phone":

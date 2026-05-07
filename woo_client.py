@@ -18,6 +18,29 @@ from chat_logger import get_logger, get_api_logger, sanitize_url
 logger = get_logger("miraq_chat")
 api_logger = get_api_logger()
 
+_REDACTED_LOG_FIELDS = {
+    "consumer_key",
+    "consumer_secret",
+    "email",
+    "phone",
+    "address_1",
+    "address_2",
+    "postcode",
+    "first_name",
+    "last_name",
+}
+
+
+def _sanitize_log_payload(value):
+    if isinstance(value, dict):
+        return {
+            key: ("***" if key in _REDACTED_LOG_FIELDS else _sanitize_log_payload(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_log_payload(item) for item in value]
+    return value
+
 
 class WooClient:
     """Executes WooCommerce API calls with browser UA + query-string auth."""
@@ -44,7 +67,7 @@ class WooClient:
         # Sanitize endpoint for logging
         sanitized_endpoint = sanitize_url(endpoint_url)
         endpoint_short = sanitized_endpoint.split("/")[-1]  # e.g. "products-advanced-new"
-        safe_params = {k: v for k, v in params.items() if k not in ("consumer_key", "consumer_secret")}
+        safe_params = _sanitize_log_payload(dict(api_call.params))
 
         # ── REQUEST: log full details to api.txt ──────────────────────────────
         context = ""
@@ -57,9 +80,9 @@ class WooClient:
             )
         else:
             try:
-                body_str = _json.dumps(api_call.body, separators=(",", ":"))
+                body_str = _json.dumps(_sanitize_log_payload(api_call.body), separators=(",", ":"))
             except Exception:
-                body_str = str(api_call.body)
+                body_str = str(_sanitize_log_payload(api_call.body))
             api_logger.info(
                 f"REQUEST {api_call.method} {sanitized_endpoint} | body={body_str}{context}"
             )
