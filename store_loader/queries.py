@@ -244,6 +244,16 @@ class StoreQueryMixin:
         candidates.sort(key=lambda x: x.get("count", 0), reverse=True)
         return [t["name"] for t in candidates[:limit]]
 
+    def get_sibling_attribute_terms_neutral(self, attr_key: str, failed_term: str, limit: int = 3) -> List[str]:
+        """Return sibling display names for a neutral attribute key, excluding failed_term."""
+        attr = self.resolve_attribute(attr_key)
+        if not attr:
+            return []
+        failed_lower = failed_term.lower().strip()
+        candidates = [t for t in attr.terms if t.name.lower().strip() != failed_lower]
+        candidates.sort(key=lambda x: x.count, reverse=True)
+        return [t.name for t in candidates[:limit]]
+
     # ─── Neutral catalog queries (Phase 4a — preferred for new code) ───
 
     def resolve_attribute(self, key: str) -> Optional[CatalogAttribute]:
