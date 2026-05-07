@@ -18,17 +18,13 @@ class _FixtureLoader(StoreQueryMixin):
         self.categories = categories
         self.tags = tags
         self.products = products
-        self.attribute_terms = {}
         self._category_synonyms = {}
         self._store_generic_terms = set()
 
-        self.attribute_by_slug = {}
         self.attribute_by_id = {}
-        self.category_by_slug = {}
         self.category_by_id = {}
         self.category_by_name_lower = {}
         self.category_slugs_by_name = {}
-        self.tag_by_slug = {}
         self.tag_by_id = {}
         self.tag_by_name_lower = {}
         self.product_by_name_lower = {}
@@ -102,11 +98,11 @@ def test_neutral_indexes_and_queries_dual_populated():
     color = loader.attribute_by_key["color"]
     assert color.label == "Color"
     assert color.backend_ref["taxonomy"] == "pa_color"
-    assert color.backend_ref["id"] == loader.attribute_by_slug["pa_color"]["id"]
+    assert color.backend_ref["id"] == loader.attribute_by_id[17]["id"]
     assert [t.key for t in color.terms] == ["red", "blue"]
 
-    assert loader.category_by_key["wall-tiles"].backend_ref["id"] == loader.category_by_slug["wall-tiles"]["id"]
-    assert loader.tag_by_key["quick-ship"].backend_ref["id"] == loader.tag_by_slug["quick-ship"]["id"]
+    assert loader.category_by_key["wall-tiles"].backend_ref["id"] == loader.category_by_id[7]["id"]
+    assert loader.tag_by_key["quick-ship"].backend_ref["id"] == loader.tag_by_id[501]["id"]
 
     assert loader.resolve_attribute("color") == color
     assert loader.resolve_attribute_term("color", "red").name == "Red"
@@ -114,9 +110,9 @@ def test_neutral_indexes_and_queries_dual_populated():
     assert loader.resolve_category("wall-tiles").name == "Wall Tiles"
     assert loader.resolve_tag("quick-ship").name == "Quick Ship"
 
-    assert len(loader.attribute_by_key) == len(loader.attribute_by_slug)
-    assert len(loader.category_by_key) == len(loader.category_by_slug)
-    assert len(loader.tag_by_key) == len(loader.tag_by_slug)
+    assert len(loader.attribute_by_key) == 1
+    assert len(loader.category_by_key) == 2
+    assert len(loader.tag_by_key) == 2
 
 
 def test_attribute_without_pa_prefix_uses_attribute_name_fallback():

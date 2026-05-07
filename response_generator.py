@@ -37,7 +37,7 @@ def _resolve_attribute_label(attr_key: str) -> str:
             if attr and attr.label:
                 return attr.label
 
-    return str(attr_key or "").replace(_SECONDARY_ATTRIBUTE_SUFFIX, "").replace("-", " ").replace("pa_", "").title()
+    return str(attr_key or "").replace(_SECONDARY_ATTRIBUTE_SUFFIX, "").replace("-", " ").title()
 
 
 def _resolve_attribute_term_name(attr_key: str, term_value) -> str:

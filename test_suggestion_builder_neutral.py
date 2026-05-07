@@ -34,17 +34,13 @@ class MockStoreLoader(StoreQueryMixin):
         self.categories = []
         self.tags = []
         self.products = []
-        self.attribute_terms = {}
         self._category_synonyms = {}
         self._store_generic_terms = set()
 
-        self.attribute_by_slug = {}
         self.attribute_by_id = {}
-        self.category_by_slug = {}
         self.category_by_id = {}
         self.category_by_name_lower = {}
         self.category_slugs_by_name = {}
-        self.tag_by_slug = {}
         self.tag_by_id = {}
         self.tag_by_name_lower = {}
         self.product_by_name_lower = {}

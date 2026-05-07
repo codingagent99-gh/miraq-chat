@@ -166,13 +166,10 @@ def build_all_lookups(loader):
     loader._store_generic_terms = build_store_generic_terms(loader.categories)
 
     # Reset
-    loader.attribute_by_slug = {}
     loader.attribute_by_id = {}
-    loader.category_by_slug = {}
     loader.category_by_id = {}
     loader.category_by_name_lower = {}
     loader.category_slugs_by_name = {}
-    loader.tag_by_slug = {}
     loader.tag_by_id = {}
     loader.tag_by_name_lower = {}
     loader.product_by_name_lower = {}
@@ -191,9 +188,7 @@ def build_all_lookups(loader):
                 "name": attr.get("attribute_label") or attr.get("name") or attr.get("attribute_name") or "",
                 "slug": taxonomy_slug,
             }
-            loader.attribute_by_slug[taxonomy_slug] = entry
             loader.attribute_by_id[attr_id] = entry
-            loader.attribute_terms[attr_id] = attr.get("terms", [])
 
     # Categories
     for cat in loader.categories:
@@ -201,7 +196,6 @@ def build_all_lookups(loader):
         name_lower = cat.get("name", "").lower()
         entry = {"id": cat_id, "name": cat["name"], "slug": cat.get("slug", ""), "count": cat.get("count", 0)}
         loader.category_by_id[cat_id] = entry
-        loader.category_by_slug[entry["slug"]] = entry
         loader.category_by_name_lower[name_lower] = entry
         if name_lower not in loader.category_slugs_by_name:
             loader.category_slugs_by_name[name_lower] = []
@@ -218,7 +212,6 @@ def build_all_lookups(loader):
         name_lower = tag.get("name", "").lower()
         entry = {"id": tag["id"], "name": tag["name"], "slug": tag["slug"], "count": tag.get("count", 0)}
         loader.tag_by_id[tag["id"]] = entry
-        loader.tag_by_slug[tag["slug"]] = entry
         loader.tag_by_name_lower[name_lower] = entry
 
     # Neutral catalog indexes (Phase 4a; additive, dual-populated with legacy Woo indexes)
