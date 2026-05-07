@@ -97,8 +97,10 @@ def build_advanced_filter_call(
 
     # ── 6. Attributes (exclude) ──
     if excluded_attributes:
-        for taxonomy, slug_list in excluded_attributes.items():
+        l = loader()
+        for attr_key, slug_list in excluded_attributes.items():
             if slug_list:
+                taxonomy = _resolve_attribute_taxonomy(attr_key, l)
                 conditions.append(make_condition(taxonomy, slug_list, "NOT IN"))
 
     # ── 7. Attributes (include) ──
@@ -148,21 +150,28 @@ def build_advanced_filter_call(
 # ─── Private helpers ───
 
 def _build_attribute_conditions(attributes: dict, l) -> list:
-    """Convert {taxonomy: comma_terms} into query conditions, grouping shared values with OR."""
+    """Convert {attr_key: comma_terms} into query conditions, grouping shared values with OR."""
     value_groups: dict[str, list] = {}
-    for taxonomy, terms_value in attributes.items():
+    for attr_key, terms_value in attributes.items():
         raw = terms_value if isinstance(terms_value, str) else ",".join(terms_value)
         key = raw.lower().strip()
-        value_groups.setdefault(key, []).append(taxonomy)
+        value_groups.setdefault(key, []).append(attr_key)
 
     conditions = []
-    for val_key, taxonomies in value_groups.items():
+    for val_key, attr_keys in value_groups.items():
         raw_terms = [t.strip() for t in val_key.split(",") if t.strip()]
         or_conditions = []
-        for taxonomy in taxonomies:
+        for attr_key in attr_keys:
+            taxonomy = _resolve_attribute_taxonomy(attr_key, l)
             slug_list = []
             for raw_term in raw_terms:
-                term_slug = get_attribute_term_slug(taxonomy, raw_term) if l else None
+                term_slug = None
+                if l:
+                    term = l.resolve_attribute_term(attr_key, raw_term)
+                    if term:
+                        term_slug = term.backend_ref.get("slug")
+                    if not term_slug:
+                        term_slug = get_attribute_term_slug(taxonomy, raw_term)
                 if term_slug:
                     slug_list.append(term_slug)
                 else:
@@ -176,3 +185,17 @@ def _build_attribute_conditions(attributes: dict, l) -> list:
             conditions.append(make_or_group(or_conditions))
 
     return conditions
+
+
+def _resolve_attribute_taxonomy(attr_key: str, l) -> str:
+    if l:
+        attribute = l.resolve_attribute(attr_key)
+        if attribute:
+            taxonomy = attribute.backend_ref.get("taxonomy")
+            if taxonomy:
+                return taxonomy
+    logger.warning(
+        f"Deprecated attribute filter key '{attr_key}' detected; expected neutral attr_key. "
+        "Treating key as legacy taxonomy."
+    )
+    return attr_key
