@@ -10,7 +10,7 @@ import json
 from typing import List, Optional
 
 from models import WooAPICall
-from app_config import CUSTOM_API_BASE_URL, DEFAULT_PER_PAGE
+from app_config import DEFAULT_PER_PAGE
 from chat_logger import get_logger
 
 from api_builder.query_tree import (
@@ -31,8 +31,6 @@ from api_builder.store_helpers import (
 )
 
 logger = get_logger("miraq_chat")
-
-CUSTOM_API_BASE = CUSTOM_API_BASE_URL
 
 def _group_categories(cat_slugs: list) -> dict:
     """
@@ -138,11 +136,11 @@ def build_advanced_filter_call(
 
     return WooAPICall(
         method="POST",
-        endpoint=f"{CUSTOM_API_BASE}/products-advanced-new",
+        endpoint="/products-advanced-new",
         params={},
         body=body,
         description=description or "Advanced product filter",
-        is_custom_api=True,
+        surface="custom_plugin",
         requires_resolution=requires_resolution or [],
     )
 

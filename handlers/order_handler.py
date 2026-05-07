@@ -13,10 +13,8 @@ import time
 from flask import jsonify
 
 from app_config import (
-    WOO_BASE_URL,
     DEFAULT_PAYMENT_METHOD,
     DEFAULT_PAYMENT_METHOD_TITLE,
-    CUSTOM_API_BASE_URL,
     DEFAULT_PER_PAGE,
     DEFAULT_ORDER_PER_PAGE
 )
@@ -31,6 +29,7 @@ from handlers.chat_utils import (
     default_pagination,
     build_variant_prompt,
 )
+from ecommerce import endpoints
 
 logger = get_logger("miraq_chat")
 
@@ -300,12 +299,9 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
     product_ids = [item["product_id"] for item in source_line_items if item.get("product_id")]
     
     if product_ids:
-        stock_call = WooAPICall(
-            method="POST",
-            endpoint=f"{CUSTOM_API_BASE_URL}/products-advanced-new",
-            params={},
-            body={"ids": product_ids, "per_page": len(product_ids)},
-            description="Check stock status for reorder items"
+        stock_call = endpoints.check_stock(
+            product_ids=product_ids,
+            description="Check stock status for reorder items",
         )
         stock_resp = woo_client.execute(stock_call)
         
@@ -362,11 +358,8 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
     if not new_line_items:
         return None
 
-    reorder_call = WooAPICall(
-        method="POST",
-        endpoint=f"{WOO_BASE_URL}/orders",
-        params={},
-        body={
+    reorder_call = endpoints.create_order(
+        payload={
             "status": "processing",
             "customer_id": customer_id,
             "payment_method": DEFAULT_PAYMENT_METHOD,
@@ -398,10 +391,8 @@ def handle_order_detail(current_flow_state, customer_id, user_context, session_i
     if not _detail_order_id:
         return None
 
-    detail_call = WooAPICall(
-        method="GET",
-        endpoint=f"{WOO_BASE_URL}/orders/{_detail_order_id}",
-        params={},
+    detail_call = endpoints.fetch_order(
+        order_id=_detail_order_id,
         description=f"Fetch order #{_detail_order_id} detail",
     )
     detail_resp = woo_client.execute(detail_call)
@@ -543,10 +534,10 @@ def handle_quick_order(
                 all_variations = _prefetched_variations
                 logger.info(f"Step 3.6: Using {len(all_variations)} pre-fetched variations")
             else:
-                var_call = WooAPICall(
-                    method="GET",
-                    endpoint=f"{WOO_BASE_URL}/products/{_order_product_id}/variations",
-                    params={"per_page": 100, "status": "publish"},
+                var_call = endpoints.list_variants(
+                    product_id=_order_product_id,
+                    per_page=100,
+                    status="publish",
                     description=f"Fetch variations for order resolution of '{_order_product_name}'",
                 )
                 var_resp = woo_client.execute(var_call)

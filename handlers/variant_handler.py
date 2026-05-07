@@ -6,7 +6,7 @@ import time
 import re
 from flask import jsonify
 
-from app_config import DEFAULT_PER_PAGE, WOO_BASE_URL, CLASSIFIER_PROVIDER_TAG, get_currency_symbol
+from app_config import DEFAULT_PER_PAGE, CLASSIFIER_PROVIDER_TAG, get_currency_symbol
 from models import Intent, WooAPICall
 from woo_client import woo_client
 from formatters import format_product, format_variation, _filter_variations_by_entities
@@ -27,6 +27,7 @@ from api_builder import match_variation_to_entities
 from datetime import datetime, timezone
 from sqlalchemy.orm.attributes import flag_modified
 from store_registry import get_store_loader
+from ecommerce import endpoints
 
 logger = get_logger("miraq_chat")
 
@@ -200,10 +201,11 @@ def handle_variant_selection(
     all_variations = []
     page_num = 1
     while True:
-        var_resp = woo_client.execute(WooAPICall(
-            method="GET",
-            endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}/variations",
-            params={"per_page": 100, "page": page_num, "status": "publish"},
+        var_resp = woo_client.execute(endpoints.list_variants(
+            product_id=_var_product_id,
+            page=page_num,
+            per_page=100,
+            status="publish",
             description=f"Fetch variations for variant selection of '{_var_product_name}'",
         ))
         batch = var_resp.get("data", []) if var_resp.get("success") else []
@@ -214,10 +216,8 @@ def handle_variant_selection(
 
     # Fetch parent product to know the exact variation axes required
     parent_raw = {}
-    parent_resp = woo_client.execute(WooAPICall(
-        method="GET",
-        endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}",
-        params={},
+    parent_resp = woo_client.execute(endpoints.fetch_product(
+        product_id=_var_product_id,
         description=f"Fetch parent product '{_var_product_name}'",
     ))
     parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
@@ -700,13 +700,10 @@ def handle_variation_product(
 
         if not has_full_options:
             logger.info(f"Step 3.7: Parent attributes missing options. Fetching full product {entities.product_id}.")
-            parent_call = WooAPICall(
-                method="GET",
-                endpoint=f"{WOO_BASE_URL}/products/{entities.product_id}",
-                params={},
-                description=f"Fetch full parent product attributes for '{parent_formatted['name']}'"
-            )
-            parent_resp = woo_client.execute(parent_call)
+            parent_resp = woo_client.execute(endpoints.fetch_product(
+                product_id=entities.product_id,
+                description=f"Fetch full parent product attributes for '{parent_formatted['name']}'",
+            ))
             if parent_resp.get("success"):
                 full_parent_data = parent_resp.get("data", {})
                 parent_product_raw["attributes"] = full_parent_data.get("attributes", [])
@@ -786,13 +783,10 @@ def handle_variation_product(
                 f"Step 3.7: parent attributes missing variation flags — "
                 f"fetching full product {parent_product_raw.get('id')} for wildcard validation."
             )
-            _full_parent_call = WooAPICall(
-                method="GET",
-                endpoint=f"{WOO_BASE_URL}/products/{parent_product_raw.get('id')}",
-                params={},
+            _full_parent_resp = woo_client.execute(endpoints.fetch_product(
+                product_id=parent_product_raw.get('id'),
                 description="Fetch full parent product attributes for wildcard check",
-            )
-            _full_parent_resp = woo_client.execute(_full_parent_call)
+            ))
             if _full_parent_resp.get("success"):
                 parent_product_raw["attributes"] = (
                     _full_parent_resp.get("data", {}).get("attributes", [])
@@ -1016,13 +1010,10 @@ def handle_quantity_and_variant_check(
 
         if not has_full_options:
             logger.info(f"Step 5.5: Parent attributes missing options. Fetching full product {product.get('id')} from Woo API.")
-            parent_call = WooAPICall(
-                method="GET",
-                endpoint=f"{WOO_BASE_URL}/products/{product.get('id')}",
-                params={},
-                description=f"Fetch full parent product attributes for '{product['name']}'"
-            )
-            parent_resp = woo_client.execute(parent_call)
+            parent_resp = woo_client.execute(endpoints.fetch_product(
+                product_id=product.get('id'),
+                description=f"Fetch full parent product attributes for '{product['name']}'",
+            ))
             if parent_resp.get("success"):
                 _raw_for_prompt["attributes"] = parent_resp.get("data", {}).get("attributes", [])
 
