@@ -121,9 +121,9 @@ class EcommerceEndpoints(Protocol):
         *,
         product_id: int,
         variant_id: Optional[int],
-        resolved_attrs: dict[str, str],
+        resolved_attrs: Dict[str, str],
         store_loader,
-    ) -> dict:
+    ) -> List[Dict[str, str]]:
         """Build backend-specific cart-line payload for add-to-cart actions."""
         ...
 

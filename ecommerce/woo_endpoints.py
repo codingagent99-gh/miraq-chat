@@ -20,8 +20,11 @@ access any Woo-specific field that has not yet been normalized.
 import re
 from typing import Dict, List, Optional
 
+from chat_logger import get_logger
 from models import WooAPICall
 from woo_client import woo_client
+
+logger = get_logger("miraq_chat")
 
 
 # ── Address normalization helper ────────────────────────────────────────────
@@ -231,9 +234,9 @@ class WooEndpoints:
         *,
         product_id: int,
         variant_id: Optional[int],
-        resolved_attrs: dict[str, str],
+        resolved_attrs: Dict[str, str],
         store_loader,
-    ) -> dict:
+    ) -> List[Dict[str, str]]:
         """Build Woo variation payload for cart-add actions."""
 
         def _taxonomy_for(attr_key: str) -> str:
@@ -249,7 +252,7 @@ class WooEndpoints:
             slug = term.backend_ref.get("slug") if term and term.backend_ref else None
             return slug or re.sub(r"[^a-z0-9]+", "", str(value).lower())
 
-        def _resolved_payload() -> list[dict[str, str]]:
+        def _resolved_payload() -> List[Dict[str, str]]:
             return [
                 {"attribute": _taxonomy_for(attr_key), "value": _slug_for(attr_key, display_value)}
                 for attr_key, display_value in (resolved_attrs or {}).items()
@@ -269,7 +272,7 @@ class WooEndpoints:
 
             var_attrs = var_resp["data"].get("attributes", [])
             fixed: set[str] = set()
-            result: list[dict[str, str]] = []
+            result: List[Dict[str, str]] = []
 
             if isinstance(var_attrs, list):
                 for attr in var_attrs:
@@ -280,11 +283,6 @@ class WooEndpoints:
                     option = str(attr.get("option", ""))
                     result.append({"attribute": taxonomy, "value": option})
                     fixed.add(taxonomy)
-            elif isinstance(var_attrs, dict):
-                for attr_key, option in var_attrs.items():
-                    taxonomy = _taxonomy_for(attr_key)
-                    result.append({"attribute": taxonomy, "value": str(option)})
-                    fixed.add(taxonomy)
 
             for attr_key, display_value in (resolved_attrs or {}).items():
                 taxonomy = _taxonomy_for(attr_key)
@@ -292,7 +290,8 @@ class WooEndpoints:
                     continue
                 result.append({"attribute": taxonomy, "value": _slug_for(attr_key, display_value)})
             return result
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"build_cart_variation_payload fallback | error={exc}")
             return _resolved_payload()
 
     # ── Orders ──────────────────────────────────────────────────────────────
