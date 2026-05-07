@@ -12,6 +12,12 @@ from typing import List, Dict, Optional
 
 from config.store_config import TAG_SLUG_QUICK_SHIP, TAG_SLUG_CHIP_CARD
 from chat_logger import get_logger
+from models.catalog import (
+    CatalogAttribute,
+    CatalogAttributeTerm,
+    CatalogCategory,
+    CatalogTag,
+)
 from store_loader.config import DEV_CACHE_ENABLED
 
 logger = get_logger("miraq_chat")
@@ -237,6 +243,31 @@ class StoreQueryMixin:
         candidates = [t for t in terms if t.get("name", "").lower().strip() != failed_lower]
         candidates.sort(key=lambda x: x.get("count", 0), reverse=True)
         return [t["name"] for t in candidates[:limit]]
+
+    # ─── Neutral catalog queries (Phase 4a — preferred for new code) ───
+
+    def resolve_attribute(self, key: str) -> Optional[CatalogAttribute]:
+        """Look up an attribute by its neutral key (e.g. 'color')."""
+        return self.attribute_by_key.get(key.lower().strip())
+
+    def resolve_attribute_term(self, attr_key: str, term_key_or_name: str) -> Optional[CatalogAttributeTerm]:
+        """Look up an attribute term by attr_key + (term key OR display name, case-insensitive)."""
+        attr = self.resolve_attribute(attr_key)
+        if not attr:
+            return None
+        needle = term_key_or_name.lower().strip()
+        for term in attr.terms:
+            if term.key.lower() == needle or term.name.lower() == needle:
+                return term
+        return None
+
+    def resolve_category(self, key: str) -> Optional[CatalogCategory]:
+        """Look up a category by its neutral key (slug)."""
+        return self.category_by_key.get(key.lower().strip())
+
+    def resolve_tag(self, key: str) -> Optional[CatalogTag]:
+        """Look up a tag by its neutral key (slug)."""
+        return self.tag_by_key.get(key.lower().strip())
 
     # ─── Tag queries ───
 

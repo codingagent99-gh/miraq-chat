@@ -150,6 +150,28 @@ are promoted to the neutral shape.
 | `parse_customer(response)` | `fetch_customer` | `default_address: dict`, `addresses: list[dict]` |
 | `parse_list_published_products(response)` | `list_published_products` | `price: str`, `in_stock: bool` per item |
 
+### Neutral catalog representation (Phase 4a — in progress)
+
+`models/catalog.py` defines `CatalogAttribute`, `CatalogAttributeTerm`,
+`CatalogCategory`, and `CatalogTag` — the canonical in-memory shape for
+catalog data, populated by `store_loader/lookup_builder.py` alongside the
+existing Woo-shaped indexes.
+
+Consumers should prefer:
+  - `loader.attribute_by_key` / `category_by_key` / `tag_by_key`
+  - `loader.resolve_attribute(key)` / `resolve_attribute_term(attr_key, value)`
+  - `loader.resolve_category(key)` / `resolve_tag(key)`
+
+…over the legacy `attribute_by_slug` / `category_by_slug` / `tag_by_slug`
+indexes, which will be removed in Phase 4c after all consumers are migrated
+in Phases 4b.1–4b.8.
+
+The `backend_ref` field on each catalog type is **opaque** to consumers.
+Only `ecommerce/woo_endpoints.py` (and future `ecommerce/shopify_endpoints.py`)
+should read its contents — that's where backend-specific identifiers (Woo's
+`pa_*` taxonomy strings, integer IDs; Shopify's GIDs) get translated into
+outgoing API calls.
+
 Summary of exposed functions:
 
 | Function | CSV row | Surface |

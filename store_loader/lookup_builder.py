@@ -12,6 +12,12 @@ from collections import Counter
 from typing import Dict, List
 
 from chat_logger import get_logger
+from models.catalog import (
+    CatalogAttribute,
+    CatalogAttributeTerm,
+    CatalogCategory,
+    CatalogTag,
+)
 
 logger = get_logger("miraq_chat")
 
@@ -214,6 +220,79 @@ def build_all_lookups(loader):
         loader.tag_by_id[tag["id"]] = entry
         loader.tag_by_slug[tag["slug"]] = entry
         loader.tag_by_name_lower[name_lower] = entry
+
+    # Neutral catalog indexes (Phase 4a; additive, dual-populated with legacy Woo indexes)
+    loader.attribute_by_key = {}
+    loader.category_by_key = {}
+    loader.tag_by_key = {}
+
+    for attr in loader.all_attributes_raw or []:
+        taxonomy = attr.get("taxonomy", "")
+        key = taxonomy.removeprefix("pa_") or attr.get("attribute_name", "").lower()
+        if not key:
+            continue
+
+        label = (
+            attr.get("attribute_label")
+            or attr.get("name")
+            or attr.get("attribute_name")
+            or key.title()
+        )
+        terms = tuple(
+            CatalogAttributeTerm(
+                key=term.get("slug", ""),
+                name=term.get("name", ""),
+                count=term.get("count", 0),
+                backend_ref={"slug": term.get("slug", ""), "id": term.get("id")},
+            )
+            for term in attr.get("terms", [])
+            if term.get("slug")
+        )
+        loader.attribute_by_key[key] = CatalogAttribute(
+            key=key,
+            label=label,
+            terms=terms,
+            backend_ref={
+                "taxonomy": taxonomy,
+                "id": attr.get("attribute_id"),
+                "attribute_name": attr.get("attribute_name", ""),
+            },
+        )
+
+    for cat in loader.categories:
+        key = cat.get("slug", "")
+        if not key:
+            continue
+
+        parent_key = None
+        parent_id = cat.get("parent", 0)
+        if parent_id:
+            parent_entry = loader.category_by_id.get(parent_id)
+            if parent_entry and parent_entry.get("slug"):
+                parent_key = parent_entry["slug"]
+
+        loader.category_by_key[key] = CatalogCategory(
+            key=key,
+            name=cat.get("name", ""),
+            parent_key=parent_key,
+            count=cat.get("count", 0),
+            backend_ref={
+                "id": cat.get("id"),
+                "slug": key,
+                "parent_id": cat.get("parent", 0),
+            },
+        )
+
+    for tag in loader.tags:
+        key = tag.get("slug", "")
+        if not key:
+            continue
+        loader.tag_by_key[key] = CatalogTag(
+            key=key,
+            name=tag.get("name", ""),
+            count=tag.get("count", 0),
+            backend_ref={"id": tag.get("id"), "slug": key},
+        )
 
     # Products
     for product in loader.products:
