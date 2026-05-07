@@ -79,14 +79,14 @@ def simulate_single_term(term: str) -> dict:
                     attr = loader.resolve_attribute(attr_key)
                 except Exception:
                     attr = None
-            label = attr.label if attr else attr_key.title()
+            label = getattr(attr, "label", attr_key.title()) if attr else attr_key.title()
             term = None
             if attr and hasattr(loader, "resolve_attribute_term"):
                 try:
                     term = loader.resolve_attribute_term(attr_key, term_key)
                 except Exception:
                     term = None
-            display_term = term.name if term else term_key
+            display_term = getattr(term, "name", term_key) if term else term_key
             add_loc(term_key, f"Attr ({label}) [{display_term}]", "Attribute")
             
     if entities.tag_slugs:
