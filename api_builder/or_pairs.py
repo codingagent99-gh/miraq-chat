@@ -2,8 +2,8 @@
 api_builder/or_pairs.py — Builds OR-group conditions from OrPair objects.
 
 Single source of truth for:
-  1. Resolving attr_taxonomy labels → pa_* slugs
-  2. Resolving attr_term human names → WooCommerce term slugs
+  1. Resolving neutral attribute keys → Woo pa_* taxonomies
+  2. Resolving neutral attr_term values → WooCommerce term slugs
   3. Producing the final OR-group condition node
   4. Collecting tag/category slugs that are "covered" by OR pairs
      (so the main builder can skip them from standalone conditions)
@@ -12,11 +12,7 @@ Single source of truth for:
 from typing import List, Set, Tuple
 from models import OrPair
 from api_builder.query_tree import make_condition, make_or_group
-from api_builder.store_helpers import (
-    attr_slug_for_label,
-    get_attribute_term_slug,
-    loader,
-)
+from api_builder.store_helpers import loader
 
 def resolve_or_pair(pair: OrPair) -> OrPair:
     """
@@ -30,30 +26,36 @@ def resolve_or_pair(pair: OrPair) -> OrPair:
         pair = OrPair(
             tag_slug=pair.get("tag_slug"),
             cat_slugs=list(pair.get("cat_slugs") or []),
+            attr_key=pair.get("attr_key"),
             attr_taxonomy=pair.get("attr_taxonomy"),
             attr_term=pair.get("attr_term"),
         )
 
+    attr_key = pair.attr_key or (pair.attr_taxonomy.removeprefix("pa_") if pair.attr_taxonomy else None)
     taxonomy = pair.attr_taxonomy or ""
     term = pair.attr_term or ""
-
-    # Resolve label → pa_* slug if needed
-    if taxonomy and not taxonomy.startswith("pa_"):
-        resolved = attr_slug_for_label(taxonomy)
-        if resolved:
-            taxonomy = resolved
 
     # Resolve human term → WooCommerce slug
     term_slug = term.lower().replace(" ", "-") if term else ""
     l = loader()
-    if taxonomy and term and l:
-        fetched = get_attribute_term_slug(taxonomy, term)
-        if fetched:
-            term_slug = fetched
+    if l and attr_key:
+        attr = l.resolve_attribute(attr_key)
+        if attr:
+            taxonomy = attr.backend_ref.get("taxonomy", "") or taxonomy
+
+            if term:
+                resolved_term = l.resolve_attribute_term(attr_key, term)
+                if resolved_term:
+                    term_slug = (
+                        resolved_term.backend_ref.get("slug")
+                        or resolved_term.key
+                        or term_slug
+                    )
 
     return OrPair(
         tag_slug=pair.tag_slug,
         cat_slugs=list(pair.cat_slugs),
+        attr_key=attr_key,
         attr_taxonomy=taxonomy,
         attr_term=term_slug,
     )
