@@ -11,14 +11,13 @@ from flask import Blueprint, request, jsonify
 from models import db, Conversation, Message, Intent
 from sqlalchemy.orm.attributes import flag_modified
 import re
-from models import ExtractedEntities, ClassifiedResult, WooAPICall
+from models import ExtractedEntities, ClassifiedResult
 from app_config import (
     ORDER_INTENTS,
     CART_INTENTS,
     ORDER_CREATE_INTENTS,
     CLASSIFIER_PROVIDER_TAG,
     get_currency_symbol,
-    WOO_BASE_URL,
 )
 from core.actions import build_add_to_cart, build_open_checkout_panel, build_open_cart_panel
 from woo_client import woo_client
@@ -29,6 +28,7 @@ from api_builder import build_api_calls
 from conversation_flow import FlowState, handle_flow_state
 from chat_logger import get_logger, sanitize_log_string
 from store_registry import get_store_loader
+from ecommerce import endpoints
 
 from handlers.chat_utils import default_pagination, build_pagination, format_order_for_frontend
 from handlers.flow_handler import handle_flow
@@ -83,17 +83,12 @@ def _build_cart_variation_payload(product_id, variation_id, resolved_attrs, stor
         return _resolve_variation_slugs(resolved_attrs, store_loader)
 
     try:
-        var_call = WooAPICall(
-            method="GET",
-            endpoint=f"{WOO_BASE_URL}/products/{product_id}/variations/{variation_id}",
-            params={},
-            description=f"Fetch variation {variation_id} for cart payload",
-        )
+        var_call = endpoints.fetch_variant(product_id, variation_id, description=f"Fetch variation {variation_id} for cart payload")
         var_resp = woo_client.execute(var_call)
         if not (var_resp.get("success") and isinstance(var_resp.get("data"), dict)):
             raise ValueError("variation fetch failed")
 
-        var_attrs = var_resp["data"].get("attributes", [])
+        var_attrs = var_resp["data"].get("options", {})
 
         attr_terms = getattr(store_loader, "all_attributes_raw", []) if store_loader else []
         slug_lookup: dict = {}
@@ -112,10 +107,8 @@ def _build_cart_variation_payload(product_id, variation_id, resolved_attrs, stor
         # NOT include a `slug` field in variation attribute objects.
         fixed = {}
         result = []
-        for attr in var_attrs:
-            attr_name = attr.get("name", "")
+        for attr_name, option in var_attrs.items():
             taxonomy  = f"pa_{attr_name.lower().replace(' ', '-')}"
-            option    = attr.get("option", "")   # already the correct WC slug
             result.append({"attribute": taxonomy, "value": option})
             fixed[taxonomy] = True
 
@@ -170,19 +163,12 @@ def _maybe_attach_address_proposal(
         # Fetch the customer's saved billing/shipping for the "existing_on_file" field
         existing = None
         try:
-            from app_config import WOO_BASE_URL
-            from models import WooAPICall
             from woo_client import woo_client as _woo
-            cust_call = WooAPICall(
-                method="GET",
-                endpoint=f"{WOO_BASE_URL}/customers/{customer_id}",
-                params={},
-                description="Fetch customer address for PROPOSE_CHECKOUT_ADDRESS",
-            )
+            cust_call = endpoints.fetch_customer(customer_id, description="Fetch customer address for PROPOSE_CHECKOUT_ADDRESS")
             cust_resp = _woo.execute(cust_call)
             if cust_resp.get("success") and isinstance(cust_resp.get("data"), dict):
-                _billing  = cust_resp["data"].get("billing", {})
-                _shipping = cust_resp["data"].get("shipping", {})
+                _billing  = cust_resp["data"].get("billing_address", {})
+                _shipping = cust_resp["data"].get("shipping_address", {})
                 existing  = _shipping if (_shipping.get("address_1") or _shipping.get("city")) else (
                     _billing if (_billing.get("address_1") or _billing.get("city")) else None
                 )
@@ -442,7 +428,7 @@ def _execute_api_calls(intent, api_calls, _resolve_variant):
         return [], [], [], []
 
     if intent in ORDER_CREATE_INTENTS:
-        api_calls_to_execute = [c for c in api_calls if not (c.method == "POST" and "/orders" in c.endpoint)]
+        api_calls_to_execute = [c for c in api_calls if not (c.method == "POST" and c.operation == "create_order")]
     else:
         api_calls_to_execute = api_calls
 
@@ -615,11 +601,13 @@ def _handle_customer_intents(
 
         display = {}
         for field_key in entities.customer_fields_requested:
-            if "." in field_key:
-                section, key = field_key.split(".", 1)
-                display[field_key] = customer_raw.get(section, {}).get(key)
+            if field_key.startswith(("billing.", "shipping.")):
+                _, key = field_key.split(".", 1)
+                display[field_key] = customer_raw.get("default_address", {}).get(key)
             elif field_key == "full_name":
                 display["name"] = f"{customer_raw.get('first_name', '')} {customer_raw.get('last_name', '')}".strip()
+            elif field_key == "phone":
+                display[field_key] = customer_raw.get("default_address", {}).get("phone")
             else:
                 display[field_key] = customer_raw.get(field_key)
 
@@ -641,7 +629,7 @@ def _handle_customer_intents(
         elapsed = int((time.time() - start_time) * 1000)
         update_success = False
         for _api_call, _api_resp in zip(api_calls_to_execute, api_responses):
-            if _api_call.method == "PUT" and "/customers/" in _api_call.endpoint:
+            if _api_call.method == "PUT" and _api_call.operation == "update_customer":
                 update_success = _api_resp.get("success", False)
                 break
         _update_signal = [{"success": update_success}]

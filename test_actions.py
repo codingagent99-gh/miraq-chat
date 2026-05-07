@@ -413,7 +413,7 @@ class TestHandleQuickOrderToCartConfirm:
                 "id": 99,
                 "name": "Aura Tile",
                 "type": product_type,
-                "stock_status": "instock",
+                "in_stock": True,
                 "attributes": [],
                 "variations": [],
             }
@@ -525,7 +525,10 @@ class TestAddressProposal:
             with patch("routes.chat.woo_client") as mock_woo:
                 mock_woo.execute.return_value = {
                     "success": True,
-                    "data": {"billing": {}, "shipping": {"address_1": "456 Old Rd", "city": "London"}},
+                    "data": {
+                        "billing_address": {},
+                        "shipping_address": {"address_1": "456 Old Rd", "city": "London"},
+                    },
                 }
                 rc._maybe_attach_address_proposal(
                     response_data,
@@ -602,14 +605,24 @@ class TestVariantFlowTermination:
             # and the user picked a valid variant by ID (variation_id already resolved)
             variation_raw = {
                 "id": 55,
-                "attributes": [{"name": "Color", "option": "Blue"}],
+                "attributes": [{"name": "Color", "value": "Blue"}],
+                "options": {"Color": "Blue"},
                 "price": "29.99",
-                "stock_status": "instock",
+                "in_stock": True,
+            }
+
+            parent_raw = {
+                "id": 10,
+                "name": "Aura Tile",
+                "attributes": [{"name": "Color", "options": ["Blue"], "variation": True}],
             }
 
             # Mock the woo_client call to return the variation
             with patch("handlers.variant_handler.woo_client") as mock_woo:
-                mock_woo.execute.return_value = {"success": True, "data": variation_raw}
+                mock_woo.execute.side_effect = [
+                    {"success": True, "data": [variation_raw]},
+                    {"success": True, "data": parent_raw},
+                ]
 
                 resp = handle_variant_selection(
                     current_flow_state=FlowState.AWAITING_VARIANT_SELECTION,
@@ -634,4 +647,3 @@ class TestVariantFlowTermination:
             assert resp_json["flow_state"] == "awaiting_cart_confirmation", (
                 f"Expected awaiting_cart_confirmation, got {resp_json['flow_state']}"
             )
-

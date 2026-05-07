@@ -60,36 +60,24 @@ def format_product(raw: dict) -> dict:
             tag_names.append(t)
 
     price = _safe_float(raw.get("price", ""))
-    regular_price = _safe_float(raw.get("regular_price", ""))
-    sale_price_raw = raw.get("sale_price", "")
-    sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
-    
-    # ── SMART STOCK CHECK ──
-    raw_status = raw.get("stock_status", "instock")
-    is_in_stock = (raw_status != "outofstock")
-    
+    original_price = _safe_float(raw.get("original_price", raw.get("regular_price", "")))
+    is_in_stock = raw.get("in_stock") if isinstance(raw.get("in_stock"), bool) else True
     if raw.get("type") == "variable" and not is_in_stock:
         variations = raw.get("variations", [])
         if variations:
-            is_in_stock = any(
-                isinstance(v, dict) and (v.get("stock_status") == "instock" or v.get("in_stock") is True) 
-                for v in variations
-            )
-    # ── HONEST DATA: Pass exactly what the API reports ──
+            is_in_stock = any(isinstance(v, dict) and v.get("in_stock") is True for v in variations)
     is_on_sale = raw.get("on_sale", False)
 
     return {
         "id": raw.get("id"),
         "name": raw.get("name"),
         "in_stock": is_in_stock, 
-        "stock_status": raw_status,
         "slug":          raw.get("slug", ""),
         "sku":           raw.get("sku", ""),
         "permalink":     raw.get("permalink", ""),
         "type":          raw.get("type", "simple"),
         "price":         price,
-        "regular_price": regular_price,
-        "sale_price":    sale_price,
+        "original_price": original_price,
         "on_sale":       is_on_sale,
         "categories":    cat_names,
         "tags":          tag_names,
@@ -126,13 +114,9 @@ def format_custom_product(raw: dict) -> dict:
         elif isinstance(t, str) and t:
             tag_names.append(t)
     price = _safe_float(raw.get("price", ""))
-    regular_price = _safe_float(raw.get("regular_price") or raw.get("regular", ""))
-    sale_price_raw = raw.get("sale_price", "") or raw.get("sale", "")
-    sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
-    
-    # ── HONEST DATA ──
-    is_in_stock = raw.get("stock_status") == "instock"
-    is_on_sale = bool(sale_price_raw and sale_price_raw != "")
+    original_price = _safe_float(raw.get("original_price") or raw.get("regular_price") or raw.get("regular", ""))
+    is_in_stock = raw.get("in_stock") if isinstance(raw.get("in_stock"), bool) else True
+    is_on_sale = bool(raw.get("on_sale") or original_price)
 
     # Attributes come as {slug: {...}} — convert to [{name, options}]
     attributes_dict = raw.get("attributes", {})
@@ -155,8 +139,7 @@ def format_custom_product(raw: dict) -> dict:
         "permalink":     raw.get("permalink", ""),
         "type":          "variable" if raw.get("variations") else raw.get("type", "simple"),
         "price":         price,
-        "regular_price": regular_price,
-        "sale_price":    sale_price,
+        "original_price": original_price,
         "on_sale":       is_on_sale,
         "in_stock":      is_in_stock,
         "categories":    cat_names,
@@ -169,12 +152,8 @@ def format_custom_product(raw: dict) -> dict:
 def format_variation(raw: dict, parent: dict = None) -> dict:
     """Convert a raw WooCommerce variation to clean response format."""
     price = _safe_float(raw.get("price", ""))
-    regular_price = _safe_float(raw.get("regular_price", ""))
-    sale_price_raw = raw.get("sale_price", "")
-    sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
-
-    # ── HONEST DATA ──
-    is_in_stock = raw.get("stock_status") == "instock"
+    original_price = _safe_float(raw.get("original_price", raw.get("regular_price", "")))
+    is_in_stock = raw.get("in_stock") if isinstance(raw.get("in_stock"), bool) else True
     is_on_sale = raw.get("on_sale", False)
 
     attrs_raw = raw.get("attributes", [])
@@ -188,12 +167,12 @@ def format_variation(raw: dict, parent: dict = None) -> dict:
                 clean_name = k.replace("pa_", "").replace("-", " ").title()
                 # Convert "ansel-warm-white" -> "Ansel Warm White"
                 clean_option = v.replace("-", " ").title()
-                attrs.append({"name": clean_name, "option": clean_option})
+                attrs.append({"name": clean_name, "value": clean_option})
     else:
         attrs = attrs_raw
         
     attr_label = " / ".join(
-        a.get("option", "") for a in attrs if a.get("option")
+        a.get("value", a.get("option", "")) for a in attrs if a.get("value", a.get("option"))
     )
     parent_name = parent.get("name", "") if parent else ""
     name = f"{parent_name} — {attr_label}" if attr_label else parent_name
@@ -209,8 +188,7 @@ def format_variation(raw: dict, parent: dict = None) -> dict:
         "permalink":       parent.get("permalink", "") if parent else "",
         "type":            "variation",
         "price":           price,
-        "regular_price":   regular_price,
-        "sale_price":      sale_price,
+        "original_price":  original_price,
         "on_sale":         is_on_sale,
         "in_stock":        is_in_stock,
         "images":          [image_url] if image_url else (parent.get("images", []) if parent else []),
@@ -260,7 +238,7 @@ def _filter_variations_by_entities(
         elif isinstance(raw_attrs, list):
             for a in raw_attrs:
                 clean_k = a.get("name", "").replace("-", " ").strip().lower()
-                clean_v = a.get("option", "").replace("-", " ").strip().lower()
+                clean_v = str(a.get("value", a.get("option", ""))).replace("-", " ").strip().lower()
                 var_attrs[clean_k] = clean_v
 
         # Check if it matches ALL filter categories (AND logic across attributes)

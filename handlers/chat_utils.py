@@ -5,11 +5,11 @@ handlers/chat_utils.py — Shared helper functions used across chat handlers.
 import re
 
 from flask import jsonify
-from app_config import WOO_BASE_URL, DEFAULT_PER_PAGE, get_currency_symbol
-from models import WooAPICall
+from app_config import DEFAULT_PER_PAGE, get_currency_symbol
 from woo_client import woo_client
 from conversation_flow import FlowState
 from chat_logger import get_logger
+from ecommerce import endpoints
 
 logger = get_logger("miraq_chat")
 
@@ -88,27 +88,17 @@ def fetch_unit_price(product_id, variation_id=None) -> str:
     """Fetch the unit price for a product or variation. Returns price string or 'N/A'."""
     try:
         if variation_id and product_id:
-            call = WooAPICall(
-                method="GET",
-                endpoint=f"{WOO_BASE_URL}/products/{product_id}/variations/{variation_id}",
-                params={},
-                description=f"Fetch variation {variation_id} price",
-            )
+            call = endpoints.fetch_variant(product_id, variation_id, description=f"Fetch variation {variation_id} price")
             resp = woo_client.execute(call)
             if resp.get("success") and isinstance(resp.get("data"), dict):
                 d = resp["data"]
-                return d.get("sale_price") or d.get("price") or d.get("regular_price") or "N/A"
+                return d.get("price") or "N/A"
         elif product_id:
-            call = WooAPICall(
-                method="GET",
-                endpoint=f"{WOO_BASE_URL}/products/{product_id}",
-                params={},
-                description=f"Fetch product {product_id} price",
-            )
+            call = endpoints.fetch_product(product_id, description=f"Fetch product {product_id} price")
             resp = woo_client.execute(call)
             if resp.get("success") and isinstance(resp.get("data"), dict):
                 d = resp["data"]
-                return d.get("sale_price") or d.get("price") or d.get("regular_price") or "N/A"
+                return d.get("price") or "N/A"
     except Exception as exc:
         logger.warning(f"fetch_unit_price failed | error={exc}")
     return "N/A"
@@ -140,13 +130,13 @@ def format_order_for_frontend(order: dict) -> dict:
         "total": total,
         "subtotal": order.get("subtotal", "0"),
         "shipping_total": order.get("shipping_total", "0"),
-        "date_created": order.get("date_created", ""),
-        "date_paid": order.get("date_paid"),
-        "payment_method": order.get("payment_method_title", ""),
+        "date_created": order.get("created_at", ""),
+        "date_paid": order.get("paid_at"),
+        "payment_method": order.get("payment_method_label", ""),
         "items": items,
         "item_count": len(items),
-        "shipping": order.get("shipping", {}),
-        "billing": order.get("billing", {}),
+        "shipping": order.get("shipping_address", {}),
+        "billing": order.get("billing_address", {}),
     }
 
 def build_out_of_stock_response(product_name: str, product_raw: dict, intent, session_id: str, page: int, start_time: float):
@@ -247,13 +237,13 @@ def _compute_variant_options(
         if not resolved:
             return True
 
-        v_attrs = var.get("attributes", {})
+        v_attrs = var.get("options") or var.get("attributes", {})
         # Build {nice_name_lower: option_slug} from variation
         var_map: dict = {}
         if isinstance(v_attrs, list):
             for a in v_attrs:
                 if isinstance(a, dict):
-                    var_map[a.get("name", "").lower()] = a.get("option", "")
+                    var_map[a.get("name", "").lower()] = a.get("value", "")
         elif isinstance(v_attrs, dict):
             for k, v in v_attrs.items():
                 nice = k.replace("pa_", "").replace("-", " ").title().lower()
@@ -285,7 +275,7 @@ def _compute_variant_options(
     )
 
     for v in filtered:
-        v_attrs = v.get("attributes", {})
+        v_attrs = v.get("options") or v.get("attributes", {})
 
         if isinstance(v_attrs, dict):
             for k, val in v_attrs.items():
@@ -299,7 +289,7 @@ def _compute_variant_options(
         elif isinstance(v_attrs, list):
             for a in v_attrs:
                 name = a.get("name", "")
-                val = a.get("option", "")
+                val = a.get("value", "")
                 if not (name and val):
                     continue
                 nice_name = (
@@ -354,7 +344,7 @@ def score_variation_against_text(variation: dict, user_text_clean: str, user_tok
     Handles both standard WooCommerce attribute lists and flat custom API dicts.
     """
     score = 0
-    attrs = variation.get("attributes", [])
+    attrs = variation.get("options") or variation.get("attributes", [])
     
     # ── FORMAT 1: Custom API (Flat Dictionary) ──
     if isinstance(attrs, dict):
@@ -372,7 +362,7 @@ def score_variation_against_text(variation: dict, user_text_clean: str, user_tok
     elif isinstance(attrs, list):
         for attr in attrs:
             if not isinstance(attr, dict): continue
-            opt = attr.get("option", "")
+            opt = attr.get("value", "")
             if not opt: continue
             opt_clean = str(opt).replace("-", " ").lower()
             if opt_clean in user_text_clean:

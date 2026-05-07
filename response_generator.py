@@ -123,7 +123,7 @@ def generate_bot_message(
             order_number = order.get("number", str(order_id))
             status = order.get("status", "unknown").title()
             total = order.get("total", "0")
-            date_created = order.get("date_created", "")
+            date_created = order.get("created_at", "")
 
             msg = f"📦 **Your Last Order** (#{order_number})\n\n"
             msg += f"**Status:** {status}\n"
@@ -297,14 +297,14 @@ def generate_bot_message(
                 if isinstance(v["attributes"], dict):
                     label = " / ".join(str(val) for val in v["attributes"].values() if val)
                 elif isinstance(v["attributes"], list):
-                    label = " / ".join(str(a.get("option", "")) for a in v["attributes"] if a.get("option"))
+                    label = " / ".join(str(a.get("value", a.get("option", ""))) for a in v["attributes"] if a.get("value", a.get("option")))
             return label.strip().title() or f"Variation #{v.get('id', '')}"
 
         # Filter variations natively if stock status was requested
         if has_stock_filter:
             variations = [
                 v for v in variations 
-                if v.get("in_stock", v.get("stock_status") == "instock") == entities.in_stock
+                if v.get("in_stock", True) == entities.in_stock
             ]
 
         # If we have specific attributes or stock filters, show the FILTERED specific view!
@@ -329,7 +329,7 @@ def generate_bot_message(
                 price_val = float(v.get("price") or 0)
                 price_str = f"{CS}{price_val:.2f}" if price_val > 0 else ""
                 
-                stock = "✅ In stock" if v.get("in_stock", v.get("stock_status") == "instock") else "❌ Out of stock"
+                stock = "✅ In stock" if v.get("in_stock", True) else "❌ Out of stock"
                 
                 line = f"• **{label}**"
                 if price_str:
@@ -383,8 +383,8 @@ def generate_bot_message(
         
         if p.get("price", 0) > 0:
             msg += f"💰 Price: {CS}{p['price']:.2f}\n"
-        if p.get("on_sale") and p.get("sale_price") and float(p.get("sale_price", 0)) > 0:
-            msg += f"🏷️ Sale Price: {CS}{p['sale_price']:.2f}\n"
+        if p.get("on_sale") and p.get("price") and float(p.get("price", 0)) > 0:
+            msg += f"🏷️ Sale Price: {CS}{p['price']:.2f}\n"
         if p.get("short_description"):
             msg += f"\n{p['short_description']}\n"
             
@@ -619,7 +619,7 @@ def _generate_attribute_info_message(products: List[dict], entities: ExtractedEn
     def _in_stock_for(target: str):
         in_stock_opts = set()
         for v in variations:
-            if v.get('in_stock') or v.get('stock_status') == 'instock':
+            if v.get('in_stock'):
                 for a in v.get('attributes', []):
                     if target in a.get('name', '').lower():
                         opt = a.get('option', '')
@@ -684,8 +684,8 @@ def format_order_detail(order: dict) -> str:
     currency = order.get("currency_symbol") or CS
     total = order.get("total", "0")
     subtotal = order.get("subtotal", "")
-    date_created = order.get("date_created", "")
-    payment_method = order.get("payment_method_title", "N/A")
+    date_created = order.get("created_at", "")
+    payment_method = order.get("payment_method_label", "N/A")
 
     STATUS_EMOJI = {
         "pending": "⏳", "processing": "🔄", "on-hold": "⏸️",
@@ -700,7 +700,7 @@ def format_order_detail(order: dict) -> str:
     msg += f"**Payment:** {payment_method}\n"
 
     # Shipping address
-    shipping = order.get("shipping", {})
+    shipping = order.get("shipping_address", {})
     if shipping and (shipping.get("address_1") or shipping.get("city")):
         addr_parts = [p for p in [
             shipping.get("first_name", "") + " " + shipping.get("last_name", ""),

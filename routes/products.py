@@ -5,10 +5,9 @@ Product API routes — dedicated REST endpoints for product detail lookup.
 import logging
 from flask import Blueprint, jsonify
 
-from app_config import WOO_BASE_URL
 from woo_client import woo_client
-from models import WooAPICall
-from formatters import format_product, format_custom_product
+from formatters import format_product
+from ecommerce import endpoints
 
 logger = logging.getLogger("miraq_chat")
 
@@ -21,14 +20,7 @@ def get_product(product_id: int):
     in the same clean format used by the chat endpoint.
     """
 
-    base_url = WOO_BASE_URL.rstrip("/")
-
-    api_call = WooAPICall(
-        method="GET",
-        endpoint=f"{base_url}/products/{product_id}",
-        params={},
-        description=f"REST: Fetch product id={product_id}",
-    )
+    api_call = endpoints.fetch_product(product_id, description=f"REST: Fetch product id={product_id}")
 
     result = woo_client.execute(api_call)
 
@@ -50,15 +42,9 @@ def get_product(product_id: int):
             "error": "Product not found",
         }), 404
 
-    # WC API returns a dict for single-product lookup
     if isinstance(raw, list):
         raw = raw[0]
-
-    # Format using the existing formatter
-    if "featured_image" in raw:
-        product = format_custom_product(raw)
-    else:
-        product = format_product(raw)
+    product = format_product(raw)
 
     # ── Enrich with detail fields not in the compact formatter ──
     product["description"] = _clean_html(raw.get("description", ""))
@@ -68,7 +54,6 @@ def get_product(product_id: int):
     product["weight"] = raw.get("weight", "")
     product["dimensions"] = raw.get("dimensions", {})
     product["total_sales"] = raw.get("total_sales", 0)
-    product["stock_status"] = raw.get("stock_status", "")
     product["stock_quantity"] = raw.get("stock_quantity")
 
     return jsonify({
