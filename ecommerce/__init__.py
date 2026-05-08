@@ -11,11 +11,17 @@ Usage::
     call = endpoints.fetch_product(product_id=123)
     result = woo_client.execute(call)
 
+    # OR for Shopify product queries:
+    from api_builder.shopify_executor import ShopifyQueryExecutor
+    executor = ShopifyQueryExecutor(store_loader)
+    result   = executor.execute(conditions, page=1, per_page=20)
+
 Adding a new backend
 --------------------
-1. Create ``ecommerce/shopify_endpoints.py`` with a class that satisfies
-   ``EcommerceEndpoints`` (same method signatures).
-2. Add a branch below: ``elif _BACKEND == "shopify": ...``
+1. Create ``ecommerce/<name>_endpoints.py`` satisfying ``EcommerceEndpoints``.
+2. Add ``elif _BACKEND == "<name>": ...`` in ``get_endpoints()`` below.
+3. If the backend needs an in-memory executor, create
+   ``api_builder/<name>_executor.py`` implementing ``QueryExecutor``.
 
 No other files need to change.
 """
@@ -32,13 +38,18 @@ def get_endpoints() -> EcommerceEndpoints:
     misconfiguration is detected at startup rather than at the first API call.
     """
     backend = os.getenv("ECOMMERCE_BACKEND", "woocommerce").lower()
+
     if backend == "woocommerce":
         from ecommerce.woo_endpoints import WooEndpoints
         return WooEndpoints()
+
+    if backend == "shopify":
+        from ecommerce.shopify_endpoints import ShopifyEndpoints
+        return ShopifyEndpoints()
+
     raise ValueError(
         f"Unknown ECOMMERCE_BACKEND={backend!r}. "
-        "Supported values: 'woocommerce'. "
-        "To add Shopify support, create ecommerce/shopify_endpoints.py."
+        "Supported values: 'woocommerce', 'shopify'."
     )
 
 
