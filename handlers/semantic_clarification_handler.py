@@ -101,14 +101,14 @@ def build_semantic_clarification(
                 bot_message = f"I don't have an exact match for '{primary_semantics[0]['user_text']}'. Did you mean to **EXCLUDE** {suggested_names[0]}?"
                 suggestion_buttons.append(f"Yes - exclude {suggested_names[0]}")
             else:
-                bot_message = f"I don't have an exact match for '{primary_semantics[0]['user_text']}', but I do have **{suggested_names[0]}**. Would you like to use that filter?"
+                bot_message = f"I don't have an exact match for '{primary_semantics[0]['user_text']}', but I do have **{suggested_names[0]}**."
                 suggestion_buttons.append(f"Yes - use {suggested_names[0]}")
             suggestion_buttons.append(f"No - search for '{primary_semantics[0]['user_text']}'")
             if has_strong_filters:
                 suggestion_buttons.append("Skip - use my current filters")
         else:
             joined_names = " and ".join(suggested_names)
-            bot_message = f"I don't have exact matches, but I found **{joined_names}**. Would you like to apply these filters?"
+            bot_message = f"I don't have exact matches, but I found **{joined_names}**."
             suggestion_buttons.append("Yes - use these filters")
             suggestion_buttons.append("No - use my original text")
             if has_strong_filters:

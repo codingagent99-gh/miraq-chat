@@ -94,7 +94,6 @@ def handle_empty_results(
         _no_results_msg = (
             f"I couldn't find any **{_term} {_cat.lower()}** in our catalog. "
             f"We may not carry that specific type. "
-            f"Would you like to browse all **{_cat}** instead, or try a different search?"
         )
         logger.info(
             f"Step 3.8: Unrecognized search_term='{_term}' returned 0 results — "
@@ -192,7 +191,6 @@ def handle_empty_results(
             else:
                 suggestion_msg = (
                     f"I couldn't find any **{_cat}** matching your search. "
-                    f"Would you like to browse all **{_cat}** instead?"
                 )
             logger.info("Step 3.8: LLM retry produced no suggestion — using fallback no-results message")
 

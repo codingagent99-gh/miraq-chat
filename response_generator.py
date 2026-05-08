@@ -170,12 +170,10 @@ def generate_bot_message(
                 if intent == Intent.ORDER_HISTORY:
                     return (
                         f"📭 You don't have any orders from {period}.\n\n"
-                        "Would you like to see your full order history instead?"
                     )
                 elif intent == Intent.LAST_ORDER:
                     return (
                         f"📭 No orders found from {period}.\n\n"
-                        "Would you like to see your most recent order overall?"
                     )
             # No date filter → user likely not logged in
             if intent == Intent.LAST_ORDER:

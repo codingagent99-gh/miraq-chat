@@ -966,7 +966,7 @@ def handle_quantity_and_variant_check(
                 "success": True,
                 "bot_message": (
                     f"I couldn't find **{_requested_name}** in our catalog. "
-                    "Could you double-check the product name, or would you like to browse the catalog?"
+                    "Could you double-check the product name?"
                 ),
                 "intent": intent.value,
                 "products": [],
