@@ -208,7 +208,7 @@ def _build_order_history(e, page, customer_id=None, role=None) -> list:
         description=desc, requires_resolution=["customer_id"],
     )]
 
-def _build_reorder(e, page) -> list:
+def _build_reorder(e, page, role=None) -> list:
     if e.order_id:
         return [WooAPICall(
             method="GET", endpoint=f"{BASE}/orders/{e.order_id}", params={},
