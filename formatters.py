@@ -66,7 +66,8 @@ def format_product(raw: dict) -> dict:
     
     # ── SMART STOCK CHECK ──
     raw_status = raw.get("stock_status", "instock")
-    is_in_stock = (raw_status != "outofstock")
+    purchasable = raw.get("purchasable", True)  # False when all variations are OOS
+    is_in_stock = (raw_status != "outofstock") and purchasable
     
     if raw.get("type") == "variable" and not is_in_stock:
         variations = raw.get("variations", [])
@@ -131,7 +132,7 @@ def format_custom_product(raw: dict) -> dict:
     sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
     
     # ── HONEST DATA ──
-    is_in_stock = raw.get("stock_status") == "instock"
+    is_in_stock = raw.get("stock_status") == "instock" and raw.get("purchasable", True)
     is_on_sale = bool(sale_price_raw and sale_price_raw != "")
 
     # Attributes come as {slug: {...}} — convert to [{name, options}]
@@ -174,7 +175,7 @@ def format_variation(raw: dict, parent: dict = None) -> dict:
     sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
 
     # ── HONEST DATA ──
-    is_in_stock = raw.get("stock_status") == "instock"
+    is_in_stock = raw.get("stock_status") == "instock" and raw.get("purchasable", True)
     is_on_sale = raw.get("on_sale", False)
 
     attrs_raw = raw.get("attributes", [])
