@@ -731,6 +731,20 @@ def extract_time_range(text: str, entities: ExtractedEntities):
     if not re.search(r'\b(order|orders|ordered|purchase|purchased|bought|buy|history)\b', text_lower):
         return
 
+    # ── "recent/latest/new" — vague recency, no specific date ────────────────
+    # dateparser misreads "recent" as a concrete past date (e.g. 6 days ago).
+    # These words mean "show me the latest ones" — let orderby=date,desc handle
+    # it without any date window.
+    if re.search(r'\b(recent|latest|newest|new|last few)\b', text_lower):
+        # Only bail if there's no explicit time anchor alongside it
+        # (e.g. "most recent orders this month" should still parse "this month")
+        if not re.search(
+            r'\b(today|yesterday|week|month|year|january|february|march|april|'
+            r'may|june|july|august|september|october|november|december|\d{4}|\d+\s*days?)\b',
+            text_lower
+        ):
+            return
+
     if not DATEPARSER_AVAILABLE:
         return
 
