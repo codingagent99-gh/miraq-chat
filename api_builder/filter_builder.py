@@ -123,14 +123,14 @@ def build_advanced_filter_call(
     # ── Serialize ──
     body = serialize_query(conditions, page, per_page)
 
-    # NOTE: product_id and search_term body mutations are intentionally absent.
-    #   - product_id: handled by WooQueryExecutor.execute() (body["ids"]) and
-    #                 by ShopifyQueryExecutor.execute() (in-memory id filter).
-    #   - search_term: WooQueryExecutor logs a warning; ShopifyQueryExecutor
-    #                  reads body["search"] if a make_search_condition node
-    #                  was included in conditions by the caller.
-    #   Keeping this logic in the executor layer avoids double-application
-    #   for Woo and ensures Shopify callers work without special-casing.
+    # product_id: inject as body["ids"] so both WooQueryExecutor (which reads
+    # body["ids"]) and ShopifyQueryExecutor (which checks body["ids"] for its
+    # in-memory filter) can use it. When product_id is present, stock/filter
+    # conditions are irrelevant — clear them to avoid cross-contamination.
+    if product_id:
+        body["ids"] = [product_id]
+        body.pop("stock_status", None)
+        body.pop("filters", None)
 
     logger.debug(f"api_builder: Advanced filter body: {json.dumps(body)}")
 

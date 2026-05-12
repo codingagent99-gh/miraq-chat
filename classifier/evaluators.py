@@ -247,6 +247,20 @@ class CatalogSearchEvaluator(IntentEvaluator):
             return Intent.PRODUCT_BY_TAG, 0.88
         if re.search(r"\b(show|list|get|see)\b.*\b(more|all)\b.*\bproducts?\b", text):
             return Intent.PRODUCT_LIST, 0.87
+
+        # A resolved product_id with no other filters means the user named a
+        # specific product — route to PRODUCT_DETAIL so build_api_calls uses
+        # _build_product_detail (which passes product_id correctly) instead of
+        # falling through to _build_fallback (which lost its product_id/
+        # search_term body injection in the Shopify refactor).
+        if entities.product_id:
+            return Intent.PRODUCT_DETAIL, 0.90
+
+        # Unresolved name (no product_id yet) — route to PRODUCT_SEARCH so the
+        # name is used as a search term rather than hitting the fallback path.
+        if entities.product_name:
+            return Intent.PRODUCT_SEARCH, 0.85
+
         return None, 0.0
 
 

@@ -682,11 +682,13 @@ def _build_checkout(e, page) -> list:
 
 def _build_fallback(e, page, intent, user_message: str = "") -> list:
     search = e.product_name or e.search_term or next(iter(e.attributes.values()), None)
-    if search:
-        logger.warning(f"api_builder: No calls for intent={intent.value} — fallback | search={search!r}")
+    if search or e.product_id:
+        logger.warning(f"api_builder: No calls for intent={intent.value} — fallback | search={search!r} | product_id={e.product_id}")
         return [build_advanced_filter_call(
-            search_term=search, page=page,
-            description=f"Fallback search: '{search}'",
+            product_id=e.product_id,
+            search_term=search if not e.product_id else None,
+            page=page,
+            description=f"Fallback search: '{search or e.product_id}'",
         )]
     logger.warning(
         f"api_builder: No calls for intent={intent.value} and NO search terms. "
