@@ -642,11 +642,19 @@ def handle_variation_product(
                     f"attrs={[a.get('option') for a in matched_variation.get('attributes', [])]}"
                 )
                 resolved_variation = matched_variation
-                variation_products = [format_variation(matched_variation, parent_product_raw)]
+                _fv = format_variation(matched_variation, parent_product_raw)
+                if matched_variation.get("url"):
+                    _fv["permalink"] = matched_variation["url"]
+                variation_products = [_fv]
             else:
                 logger.info("Step 3.7: match_variation_to_entities found no match — falling back to filtered list")
                 filtered_vars = _filter_variations_by_entities(variations_raw, entities)
-                variation_products = [format_variation(v, parent_product_raw) for v in filtered_vars]
+                variation_products = []
+                for v in filtered_vars:
+                    fv = format_variation(v, parent_product_raw)
+                    if v.get("url"):
+                        fv["permalink"] = v["url"]
+                    variation_products.append(fv)
 
         else:
             matched_variation = match_variation_to_entities(variations_raw, entities)
@@ -656,7 +664,10 @@ def handle_variation_product(
                     f"for intent={intent.value}"
                 )
                 resolved_variation = matched_variation
-                variation_products = [format_variation(matched_variation, parent_product_raw)]
+                _fv = format_variation(matched_variation, parent_product_raw)
+                if matched_variation.get("url"):
+                    _fv["permalink"] = matched_variation["url"]
+                variation_products = [_fv]
             else:
                 filtered_vars = _filter_variations_by_entities(variations_raw, entities)
                 if not filtered_vars and variations_raw:
@@ -668,17 +679,27 @@ def handle_variation_product(
                         f"Step 3.7: Filter narrowed to single variation "
                         f"id={resolved_variation.get('id')}"
                     )
-                variation_products = [format_variation(v, parent_product_raw) for v in filtered_vars]
+                variation_products = []
+                for v in filtered_vars:
+                    fv = format_variation(v, parent_product_raw)
+                    if v.get("url"):
+                        fv["permalink"] = v["url"]
+                    variation_products.append(fv)
 
-        products = [parent_formatted] + variation_products
+        products = variation_products
 
     elif variations_raw:
         total_variations = len(variations_raw)
         start = (page - 1) * DEFAULT_PER_PAGE
         end = start + DEFAULT_PER_PAGE
         page_slice = variations_raw[start:end]
-        variation_products = [format_variation(v, parent_product_raw) for v in page_slice]
-        products = [parent_formatted] + variation_products
+        variation_products = []
+        for v in page_slice:
+            formatted = format_variation(v, parent_product_raw)
+            if v.get("url"):                     
+                formatted["permalink"] = v["url"]
+            variation_products.append(formatted)
+        products = variation_products
         logger.info(
             f"Step 3.7: No attribute filter — returning {len(variation_products)} of "
             f"{total_variations} variations (page {page})"
@@ -876,7 +897,7 @@ def handle_variation_product(
         "intent_raw": intent.value,
         "entities": _entities_to_dict(entities),
         "variations_found": len(variations_raw),
-        "variations_matched": len(products) - 1 if variations_raw else 0,
+        "variations_matched": len(products) if variations_raw else 0,
         "category_mismatch": bool(category_mismatch_msg),
         **(
             {

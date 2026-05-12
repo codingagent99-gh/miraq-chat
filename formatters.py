@@ -198,22 +198,33 @@ def format_variation(raw: dict, parent: dict = None) -> dict:
     parent_name = parent.get("name", "") if parent else ""
     name = f"{parent_name} — {attr_label}" if attr_label else parent_name
 
-    images = raw.get("image", {})
-    image_url = images.get("src", "") if isinstance(images, dict) else ""
+    # WooCommerce full variation API: singular "image" dict with "src"
+    wc_image = raw.get("image", {})
+    wc_image_url = wc_image.get("src", "") if isinstance(wc_image, dict) else ""
+
+    # Custom compact API: "images" as a flat list of URLs (needs backend to populate)
+    custom_images = raw.get("images", [])
+    if isinstance(custom_images, list) and custom_images:
+        var_images = [img if isinstance(img, str) else img.get("src", "") for img in custom_images]
+        var_images = [i for i in var_images if i]
+    elif wc_image_url:
+        var_images = [wc_image_url]
+    else:
+        var_images = parent.get("images", []) if parent else []
 
     return {
         "id":              raw.get("id"),
         "parent_id":       raw.get("parent_id") or (parent.get("id") if parent else None),
         "name":            name,
         "sku":             raw.get("sku", ""),
-        "permalink":       parent.get("permalink", "") if parent else "",
+        "permalink":       raw.get("url") or (parent.get("permalink", "") if parent else ""),
         "type":            "variation",
         "price":           price,
         "regular_price":   regular_price,
         "sale_price":      sale_price,
         "on_sale":         is_on_sale,
         "in_stock":        is_in_stock,
-        "images":          [image_url] if image_url else (parent.get("images", []) if parent else []),
+        "images":          var_images,
         "attributes":      attrs,
         "variation_label": attr_label,
     }
@@ -254,7 +265,9 @@ def _filter_variations_by_entities(
         var_attrs = {}
         if isinstance(raw_attrs, dict):
             for k, v in raw_attrs.items():
-                clean_k = k.replace("attribute_", "").replace("pa_", "").replace("-", " ").strip().lower()
+                # Normalize WooCommerce variation attribute keys. Three input formats:
+                #   attribute_pa_color → color  |  attribute_color → color  |  pa_color → color
+                clean_k = k.removeprefix("attribute_pa_").removeprefix("attribute_").removeprefix("pa_").replace("-", " ").strip().lower()
                 clean_v = str(v).replace("-", " ").strip().lower()
                 var_attrs[clean_k] = clean_v
         elif isinstance(raw_attrs, list):
