@@ -384,7 +384,6 @@ def _build_product_list(e, page) -> list:
         description=f"List products (Product ID: {e.product_id}, Name: {e.product_name})",
     )]
 
-
 def _build_product_search(e, page, user_message: str = "") -> list:
     attr_filters = resolve_attr_filters(e.attributes)
     active_or_pairs = list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else []
@@ -393,20 +392,27 @@ def _build_product_search(e, page, user_message: str = "") -> list:
     if not actual_search and not e.tag_slugs and not e.target_category_slugs and not attr_filters and not e.product_id and not active_or_pairs:
         actual_search = user_message
 
+    # When a specific product_id is resolved, the endpoint finds that product
+    # on page 1 of the product list — always. Passing page=2 moves past it
+    # and returns nothing. Instead, keep the product query on page=1 and pass
+    # variation_page for variation-level pagination.
+    product_page = 1 if e.product_id else page
+    variation_page = page if (e.product_id and page > 1) else None
+
     return [build_advanced_filter_call(
         tags=list(e.tag_slugs) if e.tag_slugs else None,
         categories=e.target_category_slugs,
         attributes=attr_filters,
         or_pairs=active_or_pairs,
-        page=page,
+        page=product_page,
+        variation_page=variation_page,
         description=f"Advanced product search: '{actual_search}'",
         in_stock=e.in_stock,
         search_term=actual_search,
         product_id=e.product_id,
         **_common_exclusion_kwargs(e),
     )]
-
-
+    
 def _build_product_detail(e, page) -> list:
     return [build_advanced_filter_call(
         product_id=e.product_id,
