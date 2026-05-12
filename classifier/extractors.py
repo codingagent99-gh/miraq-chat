@@ -731,22 +731,28 @@ def extract_time_range(text: str, entities: ExtractedEntities):
     if not re.search(r'\b(order|orders|ordered|purchase|purchased|bought|buy|history)\b', text_lower):
         return
 
-    # ── "recent/latest/new" — vague recency, no specific date ────────────────
-    # dateparser misreads "recent" as a concrete past date (e.g. 6 days ago).
-    # These words mean "show me the latest ones" — let orderby=date,desc handle
-    # it without any date window.
-    if re.search(r'\b(recent|latest|newest|new|last few)\b', text_lower):
-        # Only bail if there's no explicit time anchor alongside it
-        # (e.g. "most recent orders this month" should still parse "this month")
-        if not re.search(
-            r'\b(today|yesterday|week|month|year|january|february|march|april|'
-            r'may|june|july|august|september|october|november|december|\d{4}|\d+\s*days?)\b',
-            text_lower
-        ):
-            return
+    # ── Guard: skip dateparser if there are no real date tokens in the text ──
+    # search_dates() is too aggressive — it hallucinates dates from common
+    # words ("my" → "May", "recent" → a past date). Only proceed if the text
+    # contains something that actually looks like a date reference.
+    _has_date_token = re.search(
+        r'\b(today|yesterday|'
+        r'january|february|march|april|june|july|august|'
+        r'september|october|november|december|'
+        r'jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec|'
+        r'\d{4}|'                          # year like 2025
+        r'\d+\s*(?:st|nd|rd|th)|'         # ordinal like 6th
+        r'\d+\s*days?|'
+        r'\d+\s*weeks?|'
+        r'\d+\s*months?)\b',
+        text_lower
+    )
+    if not _has_date_token:
+        return
 
     if not DATEPARSER_AVAILABLE:
         return
+    # ... rest unchanged
 
     normalized = _normalize_fused_dates(text_lower)
 
