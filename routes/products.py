@@ -78,14 +78,8 @@ def get_product(product_id: int):
 
 @products_bp.route("/products/<int:product_id>/similar", methods=["GET"])
 def get_similar_products(product_id: int):
-    """
-    Returns cross-sell products ("Pairing It With") if available,
-    falling back to related products ("You May Also Like").
-    Fetches all similar products in a single WC API call via ?include=
-    """
     base_url = WOO_BASE_URL.rstrip("/")
 
-    # Step 1: fetch the source product to get cross_sell_ids / related_ids
     api_call = WooAPICall(
         method="GET",
         endpoint=f"{base_url}/products/{product_id}",
@@ -103,16 +97,34 @@ def get_similar_products(product_id: int):
     if isinstance(raw, list):
         raw = raw[0]
 
+    # ── If this is a variation, fetch the parent instead ──
+    if raw.get("type") == "variation" and raw.get("parent_id"):
+        parent_call = WooAPICall(
+            method="GET",
+            endpoint=f"{base_url}/products/{raw['parent_id']}",
+            params={},
+            description=f"REST: Fetch parent id={raw['parent_id']} for similar lookup",
+        )
+        parent_result = woo_client.execute(parent_call)
+        if parent_result.get("success") and parent_result.get("data"):
+            raw = parent_result["data"]
+            if isinstance(raw, list):
+                raw = raw[0]
+
     cross_sell_ids = raw.get("cross_sell_ids") or []
+    upsell_ids     = raw.get("upsell_ids") or []
     related_ids    = raw.get("related_ids") or []
 
-    source_ids = cross_sell_ids if cross_sell_ids else related_ids
-    source     = "cross_sell" if cross_sell_ids else "related"
+    if cross_sell_ids:
+        source_ids, source = cross_sell_ids, "cross_sell"
+    elif upsell_ids:
+        source_ids, source = upsell_ids, "related"
+    else:
+        source_ids, source = related_ids, "related"
 
     if not source_ids:
         return jsonify({"success": True, "products": [], "source": source}), 200
 
-    # Step 2: fetch all similar products in one request using ?include=
     bulk_call = WooAPICall(
         method="GET",
         endpoint=f"{base_url}/products",
