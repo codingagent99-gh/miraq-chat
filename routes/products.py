@@ -76,6 +76,63 @@ def get_product(product_id: int):
         "product": product,
     }), 200
 
+@products_bp.route("/products/<int:product_id>/similar", methods=["GET"])
+def get_similar_products(product_id: int):
+    """
+    Returns cross-sell products ("Pairing It With") if available,
+    falling back to related products ("You May Also Like").
+    Fetches all similar products in a single WC API call via ?include=
+    """
+    base_url = WOO_BASE_URL.rstrip("/")
+
+    # Step 1: fetch the source product to get cross_sell_ids / related_ids
+    api_call = WooAPICall(
+        method="GET",
+        endpoint=f"{base_url}/products/{product_id}",
+        params={},
+        description=f"REST: Fetch product id={product_id} for similar lookup",
+    )
+    result = woo_client.execute(api_call)
+
+    if not result.get("success"):
+        return jsonify({"success": False, "error": "WooCommerce API Request Failed"}), 502
+
+    raw = result.get("data")
+    if not raw:
+        return jsonify({"success": False, "error": "Product not found"}), 404
+    if isinstance(raw, list):
+        raw = raw[0]
+
+    cross_sell_ids = raw.get("cross_sell_ids") or []
+    related_ids    = raw.get("related_ids") or []
+
+    source_ids = cross_sell_ids if cross_sell_ids else related_ids
+    source     = "cross_sell" if cross_sell_ids else "related"
+
+    if not source_ids:
+        return jsonify({"success": True, "products": [], "source": source}), 200
+
+    # Step 2: fetch all similar products in one request using ?include=
+    bulk_call = WooAPICall(
+        method="GET",
+        endpoint=f"{base_url}/products",
+        params={"include": ",".join(str(i) for i in source_ids), "per_page": len(source_ids)},
+        description=f"REST: Fetch similar products for id={product_id}",
+    )
+    bulk_result = woo_client.execute(bulk_call)
+
+    if not bulk_result.get("success"):
+        return jsonify({"success": False, "error": "Failed to fetch similar products"}), 502
+
+    items = bulk_result.get("data") or []
+    products = []
+    for item in items:
+        if "featured_image" in item:
+            products.append(format_custom_product(item))
+        else:
+            products.append(format_product(item))
+
+    return jsonify({"success": True, "products": products, "source": source}), 200
 
 def _clean_html(html: str) -> str:
     """Strip HTML tags."""
