@@ -83,6 +83,7 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
             actions     = [build_add_to_cart(
                 product_id   = product_id,
                 quantity     = qty,
+                name         = name,
                 variation_id = variation_id,
             )],
         )
