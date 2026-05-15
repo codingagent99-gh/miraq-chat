@@ -76,10 +76,20 @@ def get_product(product_id: int):
         "product": product,
     }), 200
 
+
 @products_bp.route("/products/<int:product_id>/similar", methods=["GET"])
 def get_similar_products(product_id: int):
+    """
+    Returns similar products for a given product ID.
+    Priority:
+      1. _recommended_products meta  → "Pairing It With"
+      2. upsell_ids                  → "You May Also Like"
+      3. related_ids                 → "You May Also Like"
+    If the product is a variation, fetches the parent first.
+    """
     base_url = WOO_BASE_URL.rstrip("/")
 
+    # Step 1: fetch the product
     api_call = WooAPICall(
         method="GET",
         endpoint=f"{base_url}/products/{product_id}",
@@ -89,6 +99,7 @@ def get_similar_products(product_id: int):
     result = woo_client.execute(api_call)
 
     if not result.get("success"):
+        logger.error(f"WooCommerce API failed for similar lookup, product {product_id}")
         return jsonify({"success": False, "error": "WooCommerce API Request Failed"}), 502
 
     raw = result.get("data")
@@ -97,7 +108,7 @@ def get_similar_products(product_id: int):
     if isinstance(raw, list):
         raw = raw[0]
 
-    # ── If this is a variation, fetch the parent instead ──
+    # Step 2: if variation, fetch parent instead — variations never carry relationship IDs
     if raw.get("type") == "variation" and raw.get("parent_id"):
         parent_call = WooAPICall(
             method="GET",
@@ -111,29 +122,42 @@ def get_similar_products(product_id: int):
             if isinstance(raw, list):
                 raw = raw[0]
 
-    cross_sell_ids = raw.get("cross_sell_ids") or []
-    upsell_ids     = raw.get("upsell_ids") or []
-    related_ids    = raw.get("related_ids") or []
+    # Step 3: resolve IDs using priority chain
+    meta_data = raw.get("meta_data") or []
+    recommended_ids = []
+    for meta in meta_data:
+        if meta.get("key") == "_recommended_products":
+            val = meta.get("value") or []
+            recommended_ids = [int(i) for i in val if str(i).isdigit()]
+            break
 
-    if cross_sell_ids:
-        source_ids, source = cross_sell_ids, "cross_sell"
+    upsell_ids  = raw.get("upsell_ids") or []
+    related_ids = raw.get("related_ids") or []
+
+    if recommended_ids:
+        source_ids, source = recommended_ids, "cross_sell"   # → "Pairing It With"
     elif upsell_ids:
-        source_ids, source = upsell_ids, "related"
+        source_ids, source = upsell_ids, "related"           # → "You May Also Like"
     else:
-        source_ids, source = related_ids, "related"
+        source_ids, source = related_ids, "related"          # → "You May Also Like"
 
     if not source_ids:
         return jsonify({"success": True, "products": [], "source": source}), 200
 
+    # Step 4: fetch all similar products in one request using ?include=
     bulk_call = WooAPICall(
         method="GET",
         endpoint=f"{base_url}/products",
-        params={"include": ",".join(str(i) for i in source_ids), "per_page": len(source_ids)},
+        params={
+            "include": ",".join(str(i) for i in source_ids),
+            "per_page": len(source_ids),
+        },
         description=f"REST: Fetch similar products for id={product_id}",
     )
     bulk_result = woo_client.execute(bulk_call)
 
     if not bulk_result.get("success"):
+        logger.error(f"Failed to fetch similar products for id={product_id}")
         return jsonify({"success": False, "error": "Failed to fetch similar products"}), 502
 
     items = bulk_result.get("data") or []
@@ -145,6 +169,7 @@ def get_similar_products(product_id: int):
             products.append(format_product(item))
 
     return jsonify({"success": True, "products": products, "source": source}), 200
+
 
 def _clean_html(html: str) -> str:
     """Strip HTML tags."""
