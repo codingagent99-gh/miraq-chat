@@ -879,6 +879,7 @@ def chat():
                 actions = [build_add_to_cart(
                     product_id   = pid,
                     quantity     = qty,
+                    name         = name,
                     variation_id = vid,
                     variation    = variation_attributes,
                 )]
