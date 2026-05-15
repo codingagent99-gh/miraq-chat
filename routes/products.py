@@ -3,11 +3,11 @@ Product API routes — dedicated REST endpoints for product detail lookup.
 """
 
 import logging
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, request as flask_request
 
 from app_config import WOO_BASE_URL
 from woo_client import woo_client
-from models import WooAPICall
+from models import db, Conversation, Message, WooAPICall
 from formatters import format_product, format_custom_product
 
 logger = logging.getLogger("miraq_chat")
@@ -77,6 +77,45 @@ def get_product(product_id: int):
     }), 200
 
 
+@products_bp.route("/products/similar/save", methods=["POST"])
+def save_similar_message():
+    """
+    Persists a "Show Similar Products" bot message to the DB so it
+    survives page reloads, exactly like _finalize_turn does for chat messages.
+    Body: { session_id, text, products, source }
+    """
+    import uuid as _uuid
+    body = flask_request.get_json(silent=True) or {}
+
+    session_id = body.get("session_id")
+    text       = body.get("text", "")
+    products   = body.get("products", [])
+
+    if not session_id:
+        return jsonify({"success": False, "error": "session_id required"}), 400
+
+    try:
+        session_uuid = _uuid.UUID(session_id)
+    except ValueError:
+        return jsonify({"success": False, "error": "invalid session_id"}), 400
+
+    conversation = Conversation.query.get(session_uuid)
+    if not conversation:
+        return jsonify({"success": False, "error": "conversation not found"}), 404
+
+    msg = Message(
+        conversation_id=conversation.id,
+        role="bot",
+        content=text,
+        intent="similar_products",
+        metadata_json={"products": products},
+    )
+    db.session.add(msg)
+    db.session.commit()
+
+    return jsonify({"success": True}), 200
+
+
 @products_bp.route("/products/<int:product_id>/similar", methods=["GET"])
 def get_similar_products(product_id: int):
     """
@@ -108,7 +147,7 @@ def get_similar_products(product_id: int):
     if isinstance(raw, list):
         raw = raw[0]
 
-    # Step 2: if variation, fetch parent instead — variations never carry relationship IDs
+    # Step 2: if variation, fetch parent instead
     if raw.get("type") == "variation" and raw.get("parent_id"):
         parent_call = WooAPICall(
             method="GET",
@@ -135,16 +174,16 @@ def get_similar_products(product_id: int):
     related_ids = raw.get("related_ids") or []
 
     if recommended_ids:
-        source_ids, source = recommended_ids, "cross_sell"   # → "Pairing It With"
+        source_ids, source = recommended_ids, "cross_sell"
     elif upsell_ids:
-        source_ids, source = upsell_ids, "related"           # → "You May Also Like"
+        source_ids, source = upsell_ids, "related"
     else:
-        source_ids, source = related_ids, "related"          # → "You May Also Like"
+        source_ids, source = related_ids, "related"
 
     if not source_ids:
         return jsonify({"success": True, "products": [], "source": source}), 200
 
-    # Step 4: fetch all similar products in one request using ?include=
+    # Step 4: fetch all similar products in one request
     bulk_call = WooAPICall(
         method="GET",
         endpoint=f"{base_url}/products",
