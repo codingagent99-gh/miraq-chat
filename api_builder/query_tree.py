@@ -5,6 +5,7 @@ WooCommerce advanced filter API.
 Responsible for:
   - Creating condition nodes (IN / NOT IN)
   - Creating OR groups
+  - Creating special-field leaf nodes (price, stock, search)
   - Serializing the tree into the POST body format
   - Cross-taxonomy overlap merging
 """
@@ -29,6 +30,21 @@ def make_or_group(conditions: list) -> dict:
     return {"relation": "OR", "conditions": conditions}
 
 
+def make_price_condition(min_price=None, max_price=None) -> dict:
+    """A price-range leaf node."""
+    return {"field_type": "price", "min": min_price, "max": max_price}
+
+
+def make_stock_condition(stock_status: str) -> dict:
+    """A stock-status leaf node."""
+    return {"field_type": "stock_status", "value": stock_status}
+
+
+def make_search_condition(search_term: str) -> dict:
+    """A free-text search leaf node."""
+    return {"field_type": "search", "value": search_term}
+
+
 # ─── Serialization ───
 
 def serialize_condition(condition: dict) -> dict:
@@ -49,24 +65,39 @@ def serialize_query(
     conditions: list,
     page: int,
     per_page: int,
-    min_price: float = None,
-    max_price: float = None,
 ) -> dict:
-    """Serialize a list of condition nodes to the POST body format."""
+    """Serialize a list of condition nodes to the POST body format.
+
+    Conditions may include special field_type leaves:
+      - {"field_type": "price", "min": ..., "max": ...}  → body["price"]
+      - {"field_type": "stock_status", "value": ...}     → body["stock_status"]
+      - {"field_type": "search", "value": ...}           → body["search"]
+    All other conditions are routed into body["filters"].
+    """
     body = {"page": page, "per_page": per_page}
 
-    if min_price is not None or max_price is not None:
-        price = {}
-        if min_price is not None:
-            price["min"] = min_price
-        if max_price is not None:
-            price["max"] = max_price
-        body["price"] = price
+    taxonomy_conditions = []
+    for cond in conditions:
+        ft = cond.get("field_type")
+        if ft == "price":
+            price = {}
+            if cond.get("min") is not None:
+                price["min"] = cond["min"]
+            if cond.get("max") is not None:
+                price["max"] = cond["max"]
+            if price:
+                body["price"] = price
+        elif ft == "stock_status":
+            body["stock_status"] = cond["value"]
+        elif ft == "search":
+            body["search"] = cond["value"]
+        else:
+            taxonomy_conditions.append(cond)
 
-    if conditions:
+    if taxonomy_conditions:
         body["filters"] = {
             "relation": "AND",
-            "conditions": [serialize_condition(c) for c in conditions],
+            "conditions": [serialize_condition(c) for c in taxonomy_conditions],
         }
 
     return body

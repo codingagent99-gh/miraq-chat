@@ -5,6 +5,7 @@ from chat_logger import get_logger
 from classifier import classify
 from classifier.utils import normalize_for_tag_compare
 from api_builder import build_api_calls
+from store_registry import get_store_loader
 
 logger = get_logger("miraq_admin")
 TEST_FILE_PATH = os.path.join(os.path.dirname(__file__), "test_queries.txt")
@@ -20,7 +21,24 @@ def _serialize_entities(entities) -> dict:
                 clean_dict[key] = list(value)
             # Convert any inner custom objects (like OR pairs) safely
             elif isinstance(value, list) and len(value) > 0 and not isinstance(value[0], (str, int, float, bool)):
-                clean_dict[key] = [dict(v) if hasattr(v, '__dict__') else v for v in value]
+                serialized_list = [dict(v) if hasattr(v, '__dict__') else v for v in value]
+                if key == "attr_tag_or_pairs":
+                    normalized_pairs = []
+                    for pair in serialized_list:
+                        if not isinstance(pair, dict):
+                            normalized_pairs.append(pair)
+                            continue
+                        normalized = dict(pair)
+                        attr_key = (
+                            pair.get("attr_key")
+                            or pair.get("attr_taxonomy", "").removeprefix("pa_")
+                            or "unknown"
+                        )
+                        normalized["attr_key"] = attr_key
+                        normalized_pairs.append(normalized)
+                    clean_dict[key] = normalized_pairs
+                else:
+                    clean_dict[key] = serialized_list
             else:
                 clean_dict[key] = value
     return clean_dict
@@ -29,6 +47,7 @@ def simulate_single_term(term: str) -> dict:
     result = classify(term)
     entities = result.entities
     intent = result.intent
+    loader = get_store_loader()
     
     groups = defaultdict(set)
     all_locations = set()
@@ -53,8 +72,22 @@ def simulate_single_term(term: str) -> dict:
         add_loc(cat_name, f"Category [{slugs}]", "Category")
         
     if entities.attributes:
-        for attr_label, attr_slug in entities.attributes.items():
-            add_loc(attr_slug, f"Attr ({attr_label.title()}) [{attr_slug}]", "Attribute")
+        for attr_key, term_key in entities.attributes.items():
+            attr = None
+            if loader and hasattr(loader, "resolve_attribute"):
+                try:
+                    attr = loader.resolve_attribute(attr_key)
+                except Exception:
+                    attr = None
+            label = getattr(attr, "label", None) or attr_key.title()
+            term = None
+            if attr and hasattr(loader, "resolve_attribute_term"):
+                try:
+                    term = loader.resolve_attribute_term(attr_key, term_key)
+                except Exception:
+                    term = None
+            display_term = getattr(term, "name", None) or term_key
+            add_loc(term_key, f"Attr ({label}) [{display_term}]", "Attribute")
             
     if entities.tag_slugs:
         for t_slug in entities.tag_slugs:

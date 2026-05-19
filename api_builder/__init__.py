@@ -10,7 +10,7 @@ import re
 from typing import List, Optional
 
 from models import Intent, ClassifiedResult, WooAPICall, ExtractedEntities
-from app_config import WOO_BASE_URL, CUSTOM_ORDER_ROLES, CUSTOM_API_BASE_URL, DEFAULT_PER_PAGE, DEFAULT_ORDER_PER_PAGE
+from app_config import CUSTOM_ORDER_ROLES, DEFAULT_PER_PAGE, DEFAULT_ORDER_PER_PAGE
 from config.store_config import TAG_SLUG_QUICK_SHIP
 from chat_logger import get_logger
 
@@ -20,11 +20,9 @@ from api_builder.store_helpers import (
     resolve_attr_filters,
 )
 from api_builder.filter_builder import build_advanced_filter_call
+from ecommerce import endpoints
 
 logger = get_logger("miraq_chat")
-
-BASE = WOO_BASE_URL
-CUSTOM_API_BASE = CUSTOM_API_BASE_URL
 
 # ══════════════════════════════════════════════════════════════
 # VARIATION MATCHER
@@ -67,7 +65,9 @@ def _normalize_variation_attrs(variation: dict) -> dict:
     raw = variation.get("attributes", {})
     if isinstance(raw, dict):
         for k, v in raw.items():
-            ck = k.replace("attribute_", "").replace("pa_", "").replace("-", " ").strip().lower()
+            # Normalize WooCommerce variation attribute keys. Three input formats:
+            #   attribute_pa_color → color  |  attribute_color → color  |  pa_color → color
+            ck = k.removeprefix("attribute_pa_").removeprefix("attribute_").removeprefix("pa_").replace("-", " ").strip().lower()
             cv = str(v).replace("-", " ").strip().lower()
             result[ck] = cv
     elif isinstance(raw, list):
@@ -134,7 +134,8 @@ def build_api_calls(
         # Builders that need customer_id or user_message get them via kwargs
         if intent == Intent.UPDATE_CUSTOMER:
             calls = builder(e, page, customer_id=customer_id)
-        elif intent in (Intent.PRODUCT_SEARCH, Intent.FILTER_BY_ATTRIBUTE):
+        # in build_api_calls dispatcher:
+        elif intent in (Intent.PRODUCT_SEARCH, Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_DETAIL):
             calls = builder(e, page, user_message=user_message)
         elif intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.HISTORICAL_SEARCH,
                 Intent.REORDER, Intent.ORDER_TRACKING, Intent.ORDER_STATUS,
@@ -169,16 +170,16 @@ def _build_greeting(e, page) -> list:
 
 def _build_last_order(e, page, customer_id=None, role=None) -> list:
     if role in CUSTOM_ORDER_ROLES:
-        return [WooAPICall(
-            method="POST", endpoint=f"{CUSTOM_API_BASE}/orders",
-            params={}, body={"customer_id": "CURRENT_USER_ID", "page": 1, "per_page": 1},
+        return [endpoints.list_cs_orders(
+            body={"customer_id": "CURRENT_USER_ID", "page": 1, "per_page": 1},
             description="CS rep last order",
             requires_resolution=["customer_id"],
         )]
-    
-    return [WooAPICall(
-        method="GET", endpoint=f"{BASE}/orders",
-        params={"customer": "CURRENT_USER_ID", "per_page": 1, "orderby": "date", "order": "desc"},
+
+    return [endpoints.list_customer_orders(
+        customer_id="CURRENT_USER_ID",
+        page=1,
+        per_page=1,
         description="Get the customer's most recent order",
         requires_resolution=["customer_id"],
     )]
@@ -189,35 +190,39 @@ def _build_order_history(e, page, customer_id=None, role=None) -> list:
         body = {"customer_id": "CURRENT_USER_ID", "page": page, "per_page": e.order_count or DEFAULT_ORDER_PER_PAGE}
         if getattr(e, "date_after", None): body["after"] = e.date_after
         if getattr(e, "date_before", None): body["before"] = e.date_before
-        return [WooAPICall(
-            method="POST", endpoint=f"{CUSTOM_API_BASE}/orders",
-            params={}, body=body,
+        return [endpoints.list_cs_orders(
+            body=body,
             description="CS rep order history",
             requires_resolution=["customer_id"],
         )]
-        
+
     count = e.order_count or DEFAULT_ORDER_PER_PAGE
-    params = {"customer": "CURRENT_USER_ID", "per_page": count, "page": page, "orderby": "date", "order": "desc"}
+    extra = {}
     if getattr(e, "date_after", None):
-        params["after"] = e.date_after
+        extra["after"] = e.date_after
     if getattr(e, "date_before", None):
-        params["before"] = e.date_before
+        extra["before"] = e.date_before
     desc = f"Get customer orders{' after ' + e.date_after[:10] if getattr(e, 'date_after', None) else ' (last ' + str(count) + ')'}"
-    return [WooAPICall(
-        method="GET", endpoint=f"{BASE}/orders", params=params,
-        description=desc, requires_resolution=["customer_id"],
+    return [endpoints.list_customer_orders(
+        customer_id="CURRENT_USER_ID",
+        page=page,
+        per_page=count,
+        description=desc,
+        requires_resolution=["customer_id"],
+        **extra,
     )]
 
 def _build_reorder(e, page, role=None) -> list:
     if e.order_id:
-        return [WooAPICall(
-            method="GET", endpoint=f"{BASE}/orders/{e.order_id}", params={},
+        return [endpoints.fetch_order(
+            order_id=e.order_id,
             description=f"Fetch order #{e.order_id} for reorder (step 1)",
             requires_resolution=["reorder_step2"],
         )]
-    return [WooAPICall(
-        method="GET", endpoint=f"{BASE}/orders",
-        params={"customer": "CURRENT_USER_ID", "per_page": 1, "orderby": "date", "order": "desc"},
+    return [endpoints.list_customer_orders(
+        customer_id="CURRENT_USER_ID",
+        page=1,
+        per_page=1,
         description="Fetch last order for reorder (step 1)",
         requires_resolution=["customer_id", "reorder_step2"],
     )]
@@ -225,7 +230,7 @@ def _build_reorder(e, page, role=None) -> list:
 def _build_historical_search(e, page, customer_id=None, role=None) -> list:
     if role in CUSTOM_ORDER_ROLES:
         body = {
-            "customer_id": "CURRENT_USER_ID",  # placeholder
+            "customer_id": "CURRENT_USER_ID",
             "page":        page,
             "per_page":    e.order_count or 20,
         }
@@ -233,32 +238,28 @@ def _build_historical_search(e, page, customer_id=None, role=None) -> list:
             body["after"] = e.date_after
         if getattr(e, "date_before", None):
             body["before"] = e.date_before
-        return [WooAPICall(
-            method      = "POST",
-            endpoint    = f"{CUSTOM_API_BASE}/orders",
-            params      = {},
-            body        = body,
-            description = "CS rep order history",
-            requires_resolution = ["customer_id"],
+        return [endpoints.list_cs_orders(
+            body=body,
+            description="CS rep order history",
+            requires_resolution=["customer_id"],
         )]
-        
-    params = {"customer": "CURRENT_USER_ID", "orderby": "date", "order": "desc"}
+
+    extra = {}
     if getattr(e, 'order_id', None):
-        params["include"] = [e.order_id]
-    elif getattr(e, 'order_count', None):
-        params["per_page"] = e.order_count
-    else:
-        params["per_page"] = 20
-
+        extra["include"] = [e.order_id]
+    extra["per_page"] = e.order_count if getattr(e, 'order_count', None) else 20
     if getattr(e, "date_after", None):
-        params["after"] = e.date_after
+        extra["after"] = e.date_after
     if getattr(e, "date_before", None):
-        params["before"] = e.date_before
+        extra["before"] = e.date_before
 
-    return [WooAPICall(
-        method="GET", endpoint=f"{BASE}/orders", params=params,
+    return [endpoints.list_customer_orders(
+        customer_id="CURRENT_USER_ID",
+        page=page,
+        per_page=extra.pop("per_page"),
         description="Fetch past orders to find a historical seed product",
         requires_resolution=["customer_id"],
+        **extra,
     )]
 
 
@@ -296,15 +297,10 @@ def _build_quick_order(e, page) -> list:
         # No taxonomy match — the custom filter endpoint will return garbage.
         # Fall back to standard WooCommerce text search.
         logger.info(f"_build_quick_order: No taxonomy signals for '{search_term}', falling back to WooCommerce text search")
-        return [WooAPICall(
-            method="GET",
-            endpoint=f"{BASE}/products",
-            params={
-                "search": search_term,
-                "per_page": DEFAULT_PER_PAGE,
-                "page": page,
-                "status": "publish",
-            },
+        return [endpoints.search_products(
+            search_term=search_term,
+            page=page,
+            per_page=DEFAULT_PER_PAGE,
             description=f"Text search for product '{search_term}' (quick order fallback)",
             requires_resolution=["create_order_from_product"],
         )]
@@ -323,10 +319,12 @@ def _build_quick_order(e, page) -> list:
 
 def _build_category_browse(e, page) -> list:
     if not e.target_category_slugs:
-        return [WooAPICall(
-            method="GET", endpoint=f"{BASE}/products/categories",
-            params={"per_page": 100, "page": page, "hide_empty": True, "orderby": "name", "order": "asc"},
+        return [endpoints.list_categories(
+            page=page,
+            per_page=100,
             description="List all product categories (no category specified)",
+            orderby="name",
+            order="asc",
         )]
 
     loader = _loader()
@@ -356,10 +354,12 @@ def _build_category_browse(e, page) -> list:
 
 
 def _build_category_list(e, page) -> list:
-    return [WooAPICall(
-        method="GET", endpoint=f"{BASE}/products/categories",
-        params={"per_page": 100, "page": page, "hide_empty": True, "orderby": "name", "order": "asc"},
+    return [endpoints.list_categories(
+        page=page,
+        per_page=100,
         description="List all product categories",
+        orderby="name",
+        order="asc",
     )]
 
 
@@ -412,13 +412,17 @@ def _build_product_search(e, page, user_message: str = "") -> list:
         product_id=e.product_id,
         **_common_exclusion_kwargs(e),
     )]
-    
-def _build_product_detail(e, page) -> list:
+
+
+def _build_product_detail(e, page, user_message: str = "") -> list:
+    search = e.product_name or (user_message if not e.product_id else None)
+    if not search and not e.product_id:
+        return []   # nothing to work with — let fallback handle it
     return [build_advanced_filter_call(
         product_id=e.product_id,
-        search_term=e.product_name if not e.product_id else None,
+        search_term=search,
         page=page,
-        description=f"Get details for product '{e.product_name}'",
+        description=f"Get details for product '{search}'",
     )]
 
 
@@ -464,14 +468,14 @@ def _build_related_products(e, page) -> list:
 
 def _build_product_catalog(e, page) -> list:
     return [
-        WooAPICall(
-            method="GET", endpoint=f"{BASE}/products/categories",
-            params={"per_page": 100, "page": page, "hide_empty": True},
+        endpoints.list_categories(
+            page=page,
+            per_page=100,
             description="Get all product categories",
         ),
-        WooAPICall(
-            method="GET", endpoint=f"{BASE}/products/tags",
-            params={"per_page": 100, "page": page, "hide_empty": True},
+        endpoints.list_tags(
+            page=page,
+            per_page=100,
             description="Get all product tags",
         ),
     ]
@@ -487,9 +491,8 @@ def _build_product_types(e, page) -> list:
             type_slug = attr.get("taxonomy")
             aid = _attr_id(type_slug) if type_slug else None
             if aid:
-                return [WooAPICall(
-                    method="GET", endpoint=f"{BASE}/products/attributes/{aid}/terms",
-                    params={"per_page": 100},
+                return [endpoints.list_attribute_terms(
+                    attribute_id=aid,
                     description="List all product types/visuals",
                 )]
             break
@@ -554,9 +557,9 @@ def _build_product_variations(e, page) -> list:
 # ─── Discounts ───
 
 def _build_discount_inquiry(e, page) -> list:
-    return [WooAPICall(
-        method="GET", endpoint=f"{BASE}/products",
-        params={"on_sale": "true", "per_page": DEFAULT_PER_PAGE, "page": page, "status": "publish"},
+    return [endpoints.list_products_on_sale(
+        page=page,
+        per_page=DEFAULT_PER_PAGE,
         description="List products on sale",
     )]
 
@@ -569,39 +572,37 @@ def _build_bulk_discount(e, page) -> list:
 
 
 def _build_coupon_inquiry(e, page) -> list:
-    return [WooAPICall(
-        method="GET", endpoint=f"{BASE}/coupons",
-        params={"per_page": DEFAULT_PER_PAGE, "page": page},
+    return [endpoints.list_coupons(
+        page=page,
+        per_page=DEFAULT_PER_PAGE,
         description="List available coupon codes",
     )]
 
 
 def _build_save_for_later(e, page) -> list:
-    return [WooAPICall(
-        method="POST", endpoint=f"{BASE}/wishlist",
-        params={"customer_id": "CURRENT_USER"},
+    return [endpoints.fetch_wishlist(
+        customer_id="CURRENT_USER",
         description="Get customer wishlist",
     )]
 
 def _build_order_tracking(e, page, customer_id=None, role=None) -> list:
     if role in CUSTOM_ORDER_ROLES:
-        return [WooAPICall(
-            method="GET", endpoint=f"{BASE}/orders/{e.order_id}", params={},
-            description=f"Get order #{e.order_id} details",
-        )]
-    
-    # ── non-CS users with a specific order_id should also fetch directly ──
-    if getattr(e, "order_id", None):
-        return [WooAPICall(
-            method="GET", endpoint=f"{BASE}/orders/{e.order_id}",
-            params={},
+        return [endpoints.fetch_order(
+            order_id=e.order_id,
             description=f"Get order #{e.order_id} details",
         )]
 
-    return [WooAPICall(
-        method="GET", endpoint=f"{BASE}/orders",
-        params={"customer": "CURRENT_USER_ID", "per_page": 5, "page": page,
-                "orderby": "date", "order": "desc"},
+    # ── non-CS users with a specific order_id should also fetch directly ──
+    if getattr(e, "order_id", None):
+        return [endpoints.fetch_order(
+            order_id=e.order_id,
+            description=f"Get order #{e.order_id} details",
+        )]
+
+    return [endpoints.list_customer_orders(
+        customer_id="CURRENT_USER_ID",
+        page=page,
+        per_page=5,
         description="List recent orders (no order ID provided)",
         requires_resolution=["customer_id"],
     )]
@@ -637,9 +638,9 @@ def _build_update_customer(e, page, customer_id: Optional[int] = None) -> list:
         logger.warning("api_builder: UPDATE_CUSTOMER payload empty after field filtering")
         return []
     logger.debug(f"api_builder: UPDATE_CUSTOMER | customer_id={customer_id} | keys={list(payload.keys())}")
-    return [WooAPICall(
-        method="PUT", endpoint=f"{BASE}/customers/{customer_id}",
-        params={}, body=payload,
+    return [endpoints.update_customer(
+        customer_id=customer_id,
+        payload=payload,
         description=f"Update customer id={customer_id} | fields={list(payload.keys())}",
     )]
     
@@ -681,11 +682,8 @@ def _build_checkout(e, page) -> list:
 
     logger.debug(f"api_builder: _build_checkout | {len(line_items)} line items")
 
-    return [WooAPICall(
-        method="POST",
-        endpoint=f"{BASE}/orders",
-        params={},
-        body=payload,
+    return [endpoints.create_order(
+        payload=payload,
         description=f"Create order for {len(line_items)} cart item(s)",
         requires_resolution=["customer_id"],
     )]
@@ -695,11 +693,13 @@ def _build_checkout(e, page) -> list:
 
 def _build_fallback(e, page, intent, user_message: str = "") -> list:
     search = e.product_name or e.search_term or next(iter(e.attributes.values()), None)
-    if search:
-        logger.warning(f"api_builder: No calls for intent={intent.value} — fallback | search={search!r}")
+    if search or e.product_id:
+        logger.warning(f"api_builder: No calls for intent={intent.value} — fallback | search={search!r} | product_id={e.product_id}")
         return [build_advanced_filter_call(
-            search_term=search, page=page,
-            description=f"Fallback search: '{search}'",
+            product_id=e.product_id,
+            search_term=search if not e.product_id else None,
+            page=page,
+            description=f"Fallback search: '{search or e.product_id}'",
         )]
     logger.warning(
         f"api_builder: No calls for intent={intent.value} and NO search terms. "

@@ -6,6 +6,57 @@ import re
 from typing import List
 
 from models import ExtractedEntities
+from store_registry import get_store_loader
+
+_SECONDARY_ATTRIBUTE_SUFFIX = " 2"
+
+
+def _attribute_key_candidates(attr_key: str) -> list[str]:
+    # Some parser flows emit synthetic fallback keys like "colors 2".
+    key = str(attr_key or "").replace("attribute_", "").replace(_SECONDARY_ATTRIBUTE_SUFFIX, "").strip().lower()
+    if key.startswith("pa_"):
+        key = key[3:]
+    candidates = [key]
+    if " " in key:
+        candidates.append(key.replace(" ", "-"))
+    if "-" in key:
+        candidates.append(key.replace("-", " "))
+    return [c for c in dict.fromkeys(candidates) if c]
+
+
+def _resolve_attribute_label(attr_key: str) -> str:
+    try:
+        loader = get_store_loader()
+    except Exception:
+        loader = None
+
+    if loader:
+        for candidate in _attribute_key_candidates(attr_key):
+            attr = loader.resolve_attribute(candidate)
+            if attr and attr.label:
+                return attr.label
+
+    fallback = str(attr_key or "").replace("attribute_", "").replace(_SECONDARY_ATTRIBUTE_SUFFIX, "")
+    return fallback.replace("-", " ").title()
+
+
+def _resolve_attribute_term_name(attr_key: str, term_value) -> str:
+    raw_value = str(term_value or "")
+    if not raw_value:
+        return ""
+
+    try:
+        loader = get_store_loader()
+    except Exception:
+        loader = None
+
+    if loader:
+        for candidate in _attribute_key_candidates(attr_key):
+            term = loader.resolve_attribute_term(candidate, raw_value)
+            if term and term.name:
+                return term.name
+
+    return raw_value.replace("-", " ").title()
 
 
 def format_category(raw: dict) -> dict:
@@ -145,7 +196,7 @@ def format_custom_product(raw: dict) -> dict:
         elif isinstance(attr_data, dict):
             options = attr_data.get("options", [])
             
-        name = slug.replace("pa_", "").replace("-", " ").title()
+        name = _resolve_attribute_label(slug)
         attributes.append({"name": name, "options": options})
 
     return {
@@ -186,9 +237,9 @@ def format_variation(raw: dict, parent: dict = None) -> dict:
         for k, v in attrs_raw.items():
             if v:
                 # Convert "pa_colors" -> "Colors"
-                clean_name = k.replace("pa_", "").replace("-", " ").title()
-                # Convert "ansel-warm-white" -> "Ansel Warm White"
-                clean_option = v.replace("-", " ").title()
+                clean_name = _resolve_attribute_label(k)
+                # Convert "ansel-warm-white" -> canonical term name when known
+                clean_option = _resolve_attribute_term_name(k, v)
                 attrs.append({"name": clean_name, "option": clean_option})
     else:
         attrs = attrs_raw

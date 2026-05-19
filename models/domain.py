@@ -11,7 +11,11 @@ to work without any import changes across the codebase.
 
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict
+from typing import Literal, Optional, List, Dict
+from chat_logger import get_logger
+
+
+logger = get_logger("miraq_chat")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -98,13 +102,19 @@ class OrPair:
     a tag, a category, or an attribute — wrap all candidates so the
     API matches any of them.
 
-    Example: "black" → tag "black-look" OR pa_colors2="black"
-      OrPair(tag_slug="black-look", attr_taxonomy="pa_colors2", attr_term="black")
+    Example: "black" → tag "black-look" OR Color="black"
+      OrPair(tag_slug="black-look", attr_key="color", attr_term="black")
     """
     tag_slug: Optional[str] = None
     cat_slugs: List[str] = field(default_factory=list)
-    attr_taxonomy: Optional[str] = None   # e.g. "pa_colors2"
-    attr_term: Optional[str] = None       # e.g. "black"
+    attr_key: Optional[str] = None        # e.g. "color"
+    attr_taxonomy: Optional[str] = None   # DEPRECATED alias for attr_key (e.g. "pa_color")
+    attr_term: Optional[str] = None       # neutral term key (e.g. "red")
+
+    def __post_init__(self):
+        if self.attr_taxonomy and not self.attr_key:
+            self.attr_key = self.attr_taxonomy.removeprefix("pa_")
+            logger.warning("OrPair.attr_taxonomy is deprecated; use attr_key")
 
     @property
     def branches(self) -> int:
@@ -114,7 +124,7 @@ class OrPair:
             count += 1
         if self.cat_slugs:
             count += 1
-        if self.attr_taxonomy and self.attr_term:
+        if (self.attr_key or self.attr_taxonomy) and self.attr_term:
             count += 1
         return count
 
@@ -234,6 +244,7 @@ class ExtractedEntities:
                 result.append(OrPair(
                     tag_slug=p.get("tag_slug"),
                     cat_slugs=p.get("cat_slugs", []),
+                    attr_key=p.get("attr_key"),
                     attr_taxonomy=p.get("attr_taxonomy"),
                     attr_term=p.get("attr_term"),
                 ))
@@ -273,7 +284,7 @@ class WooAPICall:
     body: Optional[dict] = None
     description: str = ""
     requires_resolution: List[str] = field(default_factory=list)
-    is_custom_api: bool = False
+    surface: Literal["admin", "custom_plugin"] = "admin"
     user_message: str = ""
     session_id: str = ""
 

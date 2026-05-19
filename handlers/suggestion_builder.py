@@ -118,25 +118,14 @@ def build_suggestions(entities, store_loader, limit: int = 3) -> List[Dict]:
     # ── 3. Sibling attribute suggestions ────────────────────────────────────
     # Attribute value produced 0 → suggest other values for same taxonomy.
     if current_attributes and len(suggestions) < limit:
-        attr_name_to_slug = {
-            "finish":      "pa_finish",
-            "visual":      "pa_visual",
-            "application": "pa_application",
-            "origin":      "pa_origin",
-            "edge":        "pa_edge",
-            "tile size":   "pa_tile-size",
-            "thickness":   "pa_thickness",
-        }
         for attr_name, attr_value in current_attributes.items():
             if len(suggestions) >= limit:
                 break
-            attr_slug = attr_name_to_slug.get(attr_name.lower())
-            if not attr_slug:
-                attr_slug = f"pa_{attr_name.lower().replace(' ', '-')}"
-                if not store_loader.attribute_by_slug.get(attr_slug):
-                    continue
-            siblings = store_loader.get_sibling_attribute_terms(
-                attr_slug, attr_value, limit=limit
+            attr = store_loader.resolve_attribute(attr_name)
+            if not attr:
+                continue
+            siblings = store_loader.get_sibling_attribute_terms_neutral(
+                attr.key, attr_value, limit=limit
             )
             for sibling_term in siblings:
                 if len(suggestions) >= limit:

@@ -6,7 +6,7 @@ from typing import List
 import requests as http_requests
 
 from models import WooAPICall
-from app_config import WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET, BROWSER_HEADERS
+from app_config import WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET, BROWSER_HEADERS, WOO_BASE_URL, CUSTOM_API_BASE_URL
 from chat_logger import get_logger, get_api_logger, sanitize_url
 
 logger = get_logger("miraq_chat")
@@ -24,8 +24,17 @@ class WooClient:
         """Execute a single API call and return raw response."""
         params = dict(api_call.params)
 
-        # Only add auth params for standard WooCommerce API, not for custom API
-        is_custom_api = "/custom-api/" in api_call.endpoint
+        # Determine auth surface from the surface field.
+        is_custom_api = api_call.surface == "custom_plugin"
+
+        # Resolve endpoint: if relative (no scheme), prepend the appropriate base URL.
+        endpoint = api_call.endpoint
+        if not endpoint.startswith("http"):
+            if is_custom_api:
+                endpoint = CUSTOM_API_BASE_URL.rstrip("/") + endpoint
+            else:
+                endpoint = WOO_BASE_URL.rstrip("/") + endpoint
+
         if not is_custom_api:
             params["consumer_key"] = WOO_CONSUMER_KEY
             params["consumer_secret"] = WOO_CONSUMER_SECRET
@@ -34,7 +43,7 @@ class WooClient:
         import time as _time
 
         # Sanitize endpoint for logging
-        sanitized_endpoint = sanitize_url(api_call.endpoint)
+        sanitized_endpoint = sanitize_url(endpoint)
         endpoint_short = sanitized_endpoint.split("/")[-1]  # e.g. "products-advanced-new"
         safe_params = {k: v for k, v in params.items() if k not in ("consumer_key", "consumer_secret")}
 
@@ -69,7 +78,7 @@ class WooClient:
                 } if is_custom_api else {}
 
                 resp = self.session.get(
-                    api_call.endpoint,
+                    endpoint,
                     params=params,
                     headers=custom_headers,
                     timeout=45,
@@ -86,7 +95,7 @@ class WooClient:
 
                 resp = self.session.request(
                     method=api_call.method,
-                    url=api_call.endpoint,
+                    url=endpoint,
                     params=auth_params,
                     json=api_call.body,
                     headers=custom_headers,

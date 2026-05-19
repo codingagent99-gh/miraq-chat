@@ -98,8 +98,8 @@ def _resolve_category_attribute_overlap(entities: ExtractedEntities):
 
     cat_tokens_map = {}
     for cat_slug in list(entities.target_category_slugs):
-        cat_obj = loader.category_by_slug.get(cat_slug) if loader else None
-        cat_name = cat_obj.get("name", "").lower() if cat_obj else cat_slug.replace("-", " ")
+        cat_obj = loader.resolve_category(cat_slug) if loader else None
+        cat_name = cat_obj.name.lower() if cat_obj else cat_slug.replace("-", " ")
         cat_tokens_map[cat_slug] = normalize_for_tag_compare(cat_name)
 
     for attr_label, attr_slug in list(entities.attributes.items()):
@@ -144,9 +144,9 @@ def _prune_tag_covered_attrs(entities: ExtractedEntities):
     exact_tag_tokens = []
     if loader:
         for tslug in entities.tag_slugs:
-            tag_obj = loader.tag_by_slug.get(tslug)
+            tag_obj = loader.resolve_tag(tslug)
             if tag_obj:
-                exact_tag_tokens.append(normalize_for_tag_compare(tag_obj.get("name", "")))
+                exact_tag_tokens.append(normalize_for_tag_compare(tag_obj.name))
 
     if not exact_tag_tokens:
         return
