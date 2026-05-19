@@ -16,6 +16,10 @@ from store_loader.config import (
 
 logger = get_logger("miraq_chat")
 
+# Delay (seconds) between top-level API calls at startup.
+# Keeps the burst rate low enough to avoid 429 on staging servers.
+_INTER_FETCH_DELAY = 1.5
+
 
 # ══════════════════════════════════════════════════════════════
 # LOCAL FILE I/O
@@ -103,6 +107,43 @@ def dump_lookups_for_debugging(loader):
 
 
 # ══════════════════════════════════════════════════════════════
+# RATE-LIMIT HELPERS
+# ══════════════════════════════════════════════════════════════
+
+def _wait_for_retry(resp, attempt: int, url: str):
+    """
+    Sleep before retrying a failed request.
+
+    - On 429: honour the server's Retry-After header if present,
+      otherwise back off with 10s * (attempt + 1).
+    - On other errors: exponential backoff (2^attempt seconds).
+    """
+    if resp is not None and resp.status_code == 429:
+        retry_after = resp.headers.get("Retry-After")
+        if retry_after:
+            try:
+                wait = float(retry_after)
+                logger.warning(
+                    f"StoreLoader: 429 on {url} — server asked to wait {wait}s "
+                    f"(attempt {attempt + 1})"
+                )
+                time.sleep(wait)
+                return
+            except ValueError:
+                pass
+        # No Retry-After header — use a generous fixed back-off
+        wait = 10 * (attempt + 1)
+        logger.warning(
+            f"StoreLoader: 429 on {url} — no Retry-After header, "
+            f"waiting {wait}s (attempt {attempt + 1})"
+        )
+        time.sleep(wait)
+    else:
+        wait = 2 ** attempt
+        time.sleep(wait)
+
+
+# ══════════════════════════════════════════════════════════════
 # LIVE API FETCHING
 # ══════════════════════════════════════════════════════════════
 
@@ -132,7 +173,7 @@ def fetch_all_pages(session, url: str, consumer_key: str, consumer_secret: str,
                 break
             except Exception:
                 if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
+                    _wait_for_retry(resp, attempt, url)
                 else:
                     logger.error(f"StoreLoader: All retries failed for {url} page {page}")
                     return all_items
@@ -144,6 +185,8 @@ def fetch_all_pages(session, url: str, consumer_key: str, consumer_secret: str,
         if page >= total_pages:
             break
         page += 1
+        # Small pause between pages to avoid triggering rate limits mid-fetch
+        time.sleep(0.5)
 
     return all_items
 
@@ -174,7 +217,7 @@ def fetch_all_pages_with_total(session, url: str, consumer_key: str, consumer_se
                 break
             except Exception:
                 if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
+                    _wait_for_retry(resp, attempt, url)
                 else:
                     return all_items, expected_total
 
@@ -194,6 +237,8 @@ def fetch_all_pages_with_total(session, url: str, consumer_key: str, consumer_se
         else:
             break
         page += 1
+        # Small pause between pages
+        time.sleep(0.5)
 
     return all_items, expected_total
 
@@ -226,10 +271,14 @@ def load_from_live_api(session, base_url: str, custom_api_base: str,
     """
     Fetch all store data from live WooCommerce API.
     Returns same dict shape as load_from_local_files().
+
+    Calls are spaced _INTER_FETCH_DELAY seconds apart to avoid
+    bursting the staging server's rate limiter.
     """
     logger.info("StoreLoader: 🌐 Fetching data from live WooCommerce API...")
 
     currency_symbol = fetch_currency_symbol(session, base_url, consumer_key, consumer_secret, timeout)
+    time.sleep(_INTER_FETCH_DELAY)
 
     # Attributes
     custom_attr_url = f"{custom_api_base}/all-attributes"
@@ -247,14 +296,23 @@ def load_from_live_api(session, base_url: str, custom_api_base: str,
         logger.error(f"StoreLoader: Failed to fetch attributes: {e}")
         all_attributes_raw = []
         attribute_terms = {}
+    time.sleep(_INTER_FETCH_DELAY)
 
     # Categories
     logger.info("StoreLoader: Fetching categories...")
-    categories = fetch_all_pages(session, f"{base_url}/products/categories", consumer_key, consumer_secret, {"hide_empty": True}, timeout)
+    categories = fetch_all_pages(
+        session, f"{base_url}/products/categories",
+        consumer_key, consumer_secret, {"hide_empty": True}, timeout,
+    )
+    time.sleep(_INTER_FETCH_DELAY)
 
     # Tags
     logger.info("StoreLoader: Fetching tags...")
-    tags = fetch_all_pages(session, f"{base_url}/products/tags", consumer_key, consumer_secret, {"hide_empty": True}, timeout)
+    tags = fetch_all_pages(
+        session, f"{base_url}/products/tags",
+        consumer_key, consumer_secret, {"hide_empty": True}, timeout,
+    )
+    time.sleep(_INTER_FETCH_DELAY)
 
     # Products
     logger.info("StoreLoader: Fetching products...")
