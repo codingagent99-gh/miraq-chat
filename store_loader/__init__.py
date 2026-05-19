@@ -14,6 +14,7 @@ import requests
 from typing import List, Dict, Optional
 
 from chat_logger import get_logger
+from models.catalog import CatalogAttribute, CatalogCategory, CatalogTag
 from store_loader.config import (
     WOO_BASE_URL, CUSTOM_API_BASE_URL,
     WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET,
@@ -99,16 +100,13 @@ class StoreLoader(StoreQueryMixin):
         self.categories: List[Dict] = []
         self.tags: List[Dict] = []
         self.attributes: List[Dict] = []
-        self.attribute_terms: Dict[int, List[Dict]] = {}
         self.products: List[Dict] = []
         self.all_attributes_raw: List[Dict] = []
 
         # Lookup indexes
-        self.category_by_slug: Dict[str, Dict] = {}
-        self.category_slugs_by_name: Dict[str, List[str]] = {}
         self.category_by_id: Dict[int, Dict] = {}
         self.category_by_name_lower: Dict[str, Dict] = {}
-        self.tag_by_slug: Dict[str, Dict] = {}
+        self.category_slugs_by_name: Dict[str, List[str]] = {}
         self.tag_by_id: Dict[int, Dict] = {}
         self.product_by_name_lower: Dict[str, Dict] = {}
         self.product_name_tokens: List[tuple] = []
@@ -118,9 +116,11 @@ class StoreLoader(StoreQueryMixin):
         self._category_synonyms: Dict[str, str] = self._load_category_synonyms()
         self.product_variation_schema: Dict[int, Dict] = {}
         self.variation_detail_cache = BoundedVariationCache(max_size=200, ttl=3600)
-        self.attribute_by_slug: Dict[str, Dict] = {}
         self.attribute_by_id: Dict[int, Dict] = {}
+        self.attribute_by_key: Dict[str, CatalogAttribute] = {}
         self.tag_by_name_lower: Dict[str, Dict] = {}
+        self.category_by_key: Dict[str, CatalogCategory] = {}
+        self.tag_by_key: Dict[str, CatalogTag] = {}
         self.currency_symbol: str = "$"
 
         # State
@@ -163,7 +163,6 @@ class StoreLoader(StoreQueryMixin):
                 self.tags = data["tags"]
                 self.products = data["products"]
                 self.all_attributes_raw = data["all_attributes_raw"]
-                self.attribute_terms = data.get("attribute_terms", {})
                 self.currency_symbol = data["currency_symbol"]
                 self._expected_product_count = data.get("expected_product_count")
 
@@ -259,13 +258,14 @@ class StoreLoader(StoreQueryMixin):
                 )
         if len(self.category_keywords) == 0:
             reasons.append("0 category keywords generated")
+
         self._degraded = len(reasons) > 0
         self._degraded_reasons = reasons
 
     def _log_load_summary(self):
         mode = "Local Dev Cache" if DEV_CACHE_ENABLED else "Live WooCommerce API"
         status = "⚠️ DEGRADED" if self._degraded else "✅ HEALTHY"
-        term_count = sum(len(terms) for terms in self.attribute_terms.values())
+        attr_count = sum(len(a.terms) for a in self.attribute_by_key.values())
         vector_count = len(self.semantic_keys) if self.semantic_keys else 0
 
         summary = [
@@ -275,7 +275,7 @@ class StoreLoader(StoreQueryMixin):
             f"  ├─ Products:   {len(self.products)}",
             f"  ├─ Categories: {len(self.categories)}",
             f"  ├─ Tags:       {len(self.tags)}",
-            f"  ├─ Attributes: {len(self.attribute_by_slug)} (with {term_count} terms)",
+            f"  ├─ Attributes: {len(self.attribute_by_key)} (with {attr_count} terms)",
             f"  ├─ Keywords:   {len(self.category_keywords)} (generated for search index)",
             f"  └─ Vectors:    {vector_count} (for semantic fallback)",
         ]

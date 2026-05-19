@@ -131,10 +131,11 @@ def phase2_nlp_merge(
 
     # Purge zero-count categories injected by classify()
     if loader and getattr(nlp_entities, 'target_category_slugs', None):
-        alive_slugs = {
-            s for s in nlp_entities.target_category_slugs
-            if loader.category_by_slug.get(s, {}).get("count", 0) > 0
-        }
+        alive_slugs = set()
+        for s in nlp_entities.target_category_slugs:
+            cat_obj = loader.resolve_category(s)
+            if cat_obj and cat_obj.count > 0:
+                alive_slugs.add(s)
         nlp_entities.target_category_slugs = alive_slugs
         if not alive_slugs:
             nlp_entities.category_name = None
@@ -336,9 +337,9 @@ def _auto_materialize(entities: ExtractedEntities):
                 entities.tag_slugs.append(slug)
                 l = get_store_loader()
                 if l:
-                    tag = l.tag_by_slug.get(slug)
-                    if tag:
-                        entities.tag_ids.append(tag["id"])
+                    tag_obj = l.resolve_tag(slug)
+                    if tag_obj:
+                        entities.tag_ids.append(tag_obj.backend_ref.get("id"))
             elif match_type == "attribute" and slug:
                 taxonomy = best.get("taxonomy", "")
                 if taxonomy and taxonomy not in entities.attributes:

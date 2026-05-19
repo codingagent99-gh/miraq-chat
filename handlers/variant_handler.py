@@ -6,7 +6,7 @@ import time
 import re
 from flask import jsonify
 
-from app_config import DEFAULT_PER_PAGE, WOO_BASE_URL, CLASSIFIER_PROVIDER_TAG, get_currency_symbol
+from app_config import DEFAULT_PER_PAGE, CLASSIFIER_PROVIDER_TAG, get_currency_symbol
 from models import Intent, WooAPICall
 from woo_client import woo_client
 from formatters import format_product, format_variation, _filter_variations_by_entities
@@ -19,6 +19,9 @@ from handlers.chat_utils import (
     build_pagination,
     build_variant_prompt,
     _compute_variant_options,
+    _attribute_display_name,
+    _resolve_attribute_term_name,
+    _variation_matches_resolved_neutral,
     score_variation_against_text,
     _STRIP_QUOTES_RE,
     _TOKENIZE_RE,
@@ -27,6 +30,7 @@ from api_builder import match_variation_to_entities
 from datetime import datetime, timezone
 from sqlalchemy.orm.attributes import flag_modified
 from store_registry import get_store_loader
+from ecommerce import endpoints
 
 logger = get_logger("miraq_chat")
 
@@ -38,11 +42,9 @@ def _resolve_option_display_name(attr_name: str, option: str, store_loader) -> s
     if not store_loader or not attr_name or not option:
         return option
     try:
-        taxonomy = f"pa_{attr_name.lower().replace(' ', '-')}"
-        terms = store_loader.get_all_attribute_terms(taxonomy)
-        for term in terms:
-            if term.get("slug") == option or term.get("name") == option:
-                return term.get("name", option)
+        display_name = _resolve_attribute_term_name(attr_name, option, store_loader)
+        if display_name:
+            return display_name
     except Exception:
         pass
     return option
@@ -53,7 +55,11 @@ def _get_safe_options(attrs, store_loader=None):
     Return {attribute_display_name: option_display_name} from variation attrs.
     """
     if isinstance(attrs, dict):
-        return {k.replace("pa_", "").replace("-", " ").title(): str(v).replace("-", " ").title() for k, v in attrs.items() if v}
+        return {
+            _attribute_display_name(k, store_loader): _resolve_option_display_name(k, str(v), store_loader).replace("-", " ").title()
+            for k, v in attrs.items()
+            if v
+        }
     elif isinstance(attrs, list):
         result = {}
         for a in attrs:
@@ -92,12 +98,13 @@ def _build_display_to_slug(store_loader) -> dict:
     result: dict = {}
     if not store_loader:
         return result
-    for attr in getattr(store_loader, "all_attributes_raw", []):
-        taxonomy = attr.get("taxonomy", "")
+    for attr in getattr(store_loader, "attribute_by_key", {}).values():
+        taxonomy = getattr(attr, "backend_ref", {}).get("taxonomy") or getattr(attr, "key", "")
         if taxonomy:
             result[taxonomy] = {
-                term["name"].lower(): term["slug"]
-                for term in attr.get("terms", [])
+                term.name.lower(): (getattr(term, "backend_ref", {}).get("slug") or term.key)
+                for term in getattr(attr, "terms", [])
+                if getattr(term, "name", "")
             }
     return result
 
@@ -111,37 +118,11 @@ def _variation_matches_resolved(var: dict, prev_resolved: dict, display_to_slug:
     display_to_slug converts display names → slugs for a direct comparison,
     with a _slugify fallback for any taxonomy not in the lookup.
     """
-    if not prev_resolved:
-        return True
-
-    # Build {taxonomy: option_slug} from variation attributes
-    var_attrs: dict = {}
-    for a in var.get("attributes", []):
-        if isinstance(a, dict):
-            name = a.get("name", "")
-            taxonomy = f"pa_{name.lower().replace(' ', '-')}"
-            var_attrs[taxonomy] = a.get("option", "")
-
-    for attr_label, display_val in prev_resolved.items():
-        taxonomy = f"pa_{attr_label.lower().replace(' ', '-')}"
-        actual_slug = var_attrs.get(taxonomy)
-        if actual_slug is None:
-            continue  # wildcard axis on this variation — skip
-
-        term_map = display_to_slug.get(taxonomy, {})
-        expected_slug = term_map.get(display_val.lower(), "")
-        if expected_slug:
-            if expected_slug != actual_slug:
-                # WC sometimes returns display names instead of slugs for some variations;
-                # fall back to slugified comparison before rejecting
-                if _slugify(expected_slug) != _slugify(actual_slug):
-                    return False
-        else:
-            # Fallback: slugify both sides (handles edge cases like '4"x4"' ↔ "4x4")
-            if _slugify(display_val) != _slugify(actual_slug):
-                return False
-
-    return True
+    try:
+        store_loader = get_store_loader()
+    except Exception:
+        store_loader = None
+    return _variation_matches_resolved_neutral(var, prev_resolved, display_to_slug, store_loader)
 
 
 def handle_variant_selection(
@@ -200,10 +181,11 @@ def handle_variant_selection(
     all_variations = []
     page_num = 1
     while True:
-        var_resp = woo_client.execute(WooAPICall(
-            method="GET",
-            endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}/variations",
-            params={"per_page": 100, "page": page_num, "status": "publish"},
+        var_resp = woo_client.execute(endpoints.list_variants(
+            product_id=_var_product_id,
+            page=page_num,
+            per_page=100,
+            status="publish",
             description=f"Fetch variations for variant selection of '{_var_product_name}'",
         ))
         batch = var_resp.get("data", []) if var_resp.get("success") else []
@@ -214,10 +196,8 @@ def handle_variant_selection(
 
     # Fetch parent product to know the exact variation axes required
     parent_raw = {}
-    parent_resp = woo_client.execute(WooAPICall(
-        method="GET",
-        endpoint=f"{WOO_BASE_URL}/products/{_var_product_id}",
-        params={},
+    parent_resp = woo_client.execute(endpoints.fetch_product(
+        product_id=_var_product_id,
         description=f"Fetch parent product '{_var_product_name}'",
     ))
     parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
@@ -239,7 +219,7 @@ def handle_variant_selection(
     for attr in parent_raw.get("attributes", []):
         if attr.get("variation"):
             name = attr.get("name", "")
-            nice_name = name.replace("pa_", "").replace("-", " ").title() if name.startswith("pa_") else name.title()
+            nice_name = _attribute_display_name(name, _sl)
             candidate_options[nice_name] = set(str(o) for o in attr.get("options", []) if str(o).strip())
 
     user_msg_lower = message.lower()
@@ -373,12 +353,7 @@ def handle_variant_selection(
 
         _variant_label = " / ".join(prev_resolved.values())
 
-        _variant_price = (
-            _resolved_variation.get("sale_price")
-            or _resolved_variation.get("price")
-            or _resolved_variation.get("regular_price")
-            or ""
-        )
+        _variant_price = endpoints.parse_variant(_resolved_variation)["price"]
 
         user_context["resolved_attributes"] = prev_resolved
 
@@ -484,7 +459,7 @@ def handle_variant_selection(
         for attr in parent_raw.get("attributes", []):
             if isinstance(attr, dict) and attr.get("variation") is True:
                 name = attr.get("name", "")
-                nice_name = name.replace("pa_", "").replace("-", " ").title() if name.startswith("pa_") else name.title()
+                nice_name = _attribute_display_name(name, _sl)
                 if nice_name and nice_name.lower() not in _already_resolved:
                     opts = attr.get("options", [])
                     if opts:
@@ -721,13 +696,10 @@ def handle_variation_product(
 
         if not has_full_options:
             logger.info(f"Step 3.7: Parent attributes missing options. Fetching full product {entities.product_id}.")
-            parent_call = WooAPICall(
-                method="GET",
-                endpoint=f"{WOO_BASE_URL}/products/{entities.product_id}",
-                params={},
-                description=f"Fetch full parent product attributes for '{parent_formatted['name']}'"
-            )
-            parent_resp = woo_client.execute(parent_call)
+            parent_resp = woo_client.execute(endpoints.fetch_product(
+                product_id=entities.product_id,
+                description=f"Fetch full parent product attributes for '{parent_formatted['name']}'",
+            ))
             if parent_resp.get("success"):
                 full_parent_data = parent_resp.get("data", {})
                 parent_product_raw["attributes"] = full_parent_data.get("attributes", [])
@@ -735,7 +707,7 @@ def handle_variation_product(
         attr_values = {}
         for pa in parent_product_raw.get("attributes", []):
             if isinstance(pa, dict) and pa.get("name"):
-                pa_name = pa.get("name").replace("pa_", "").replace("-", " ").title()
+                pa_name = _attribute_display_name(pa.get("name"), _sl)
                 if pa_name not in attr_values:
                     attr_values[pa_name] = set()
                 for opt in pa.get("options", []):
@@ -807,13 +779,10 @@ def handle_variation_product(
                 f"Step 3.7: parent attributes missing variation flags — "
                 f"fetching full product {parent_product_raw.get('id')} for wildcard validation."
             )
-            _full_parent_call = WooAPICall(
-                method="GET",
-                endpoint=f"{WOO_BASE_URL}/products/{parent_product_raw.get('id')}",
-                params={},
+            _full_parent_resp = woo_client.execute(endpoints.fetch_product(
+                product_id=parent_product_raw.get('id'),
                 description="Fetch full parent product attributes for wildcard check",
-            )
-            _full_parent_resp = woo_client.execute(_full_parent_call)
+            ))
             if _full_parent_resp.get("success"):
                 parent_product_raw["attributes"] = (
                     _full_parent_resp.get("data", {}).get("attributes", [])
@@ -821,7 +790,7 @@ def handle_variation_product(
 
         var_attrs = _get_safe_options(resolved_variation.get("attributes", []), _sl)
         all_variation_axes = {
-            attr.get("name", "").replace("pa_", "").replace("-", " ").title()
+            _attribute_display_name(attr.get("name", ""), _sl)
             for attr in parent_product_raw.get("attributes", [])
             if isinstance(attr, dict) and attr.get("variation")
         }
@@ -902,11 +871,7 @@ def handle_variation_product(
         **(
             {
                 "matched_variation_id": matched_variation.get("id"),
-                "matched_variation_price": (
-                    matched_variation.get("sale_price")
-                    or matched_variation.get("price")
-                    or matched_variation.get("regular_price")
-                ),
+                "matched_variation_price": endpoints.parse_variant(matched_variation)["price"],
             }
             if matched_variation else {}
         ),
@@ -1037,13 +1002,10 @@ def handle_quantity_and_variant_check(
 
         if not has_full_options:
             logger.info(f"Step 5.5: Parent attributes missing options. Fetching full product {product.get('id')} from Woo API.")
-            parent_call = WooAPICall(
-                method="GET",
-                endpoint=f"{WOO_BASE_URL}/products/{product.get('id')}",
-                params={},
-                description=f"Fetch full parent product attributes for '{product['name']}'"
-            )
-            parent_resp = woo_client.execute(parent_call)
+            parent_resp = woo_client.execute(endpoints.fetch_product(
+                product_id=product.get('id'),
+                description=f"Fetch full parent product attributes for '{product['name']}'",
+            ))
             if parent_resp.get("success"):
                 _raw_for_prompt["attributes"] = parent_resp.get("data", {}).get("attributes", [])
 
@@ -1073,7 +1035,7 @@ def handle_quantity_and_variant_check(
                         "pagination": default_pagination(page),
                     }), 200
 
-                _var_price = _resolved_var.get("sale_price") or _resolved_var.get("price") or _resolved_var.get("regular_price") or ""
+                _var_price = endpoints.parse_variant(_resolved_var)["price"]
                 _price_line = f"\n**Unit Price:** {get_currency_symbol()}{_var_price}" if _var_price else ""
                 _var_label = " / ".join(_get_safe_options(_resolved_var.get("attributes", []), _sl).values())
 

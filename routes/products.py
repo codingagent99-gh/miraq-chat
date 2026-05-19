@@ -5,10 +5,12 @@ Product API routes — dedicated REST endpoints for product detail lookup.
 import logging
 from flask import Blueprint, jsonify, request as flask_request
 
-from app_config import WOO_BASE_URL
 from woo_client import woo_client
+
 from models import db, Conversation, Message, WooAPICall
+
 from formatters import format_product, format_custom_product
+from ecommerce import endpoints
 
 logger = logging.getLogger("miraq_chat")
 
@@ -21,12 +23,8 @@ def get_product(product_id: int):
     in the same clean format used by the chat endpoint.
     """
 
-    base_url = WOO_BASE_URL.rstrip("/")
-
-    api_call = WooAPICall(
-        method="GET",
-        endpoint=f"{base_url}/products/{product_id}",
-        params={},
+    api_call = endpoints.fetch_product(
+        product_id=product_id,
         description=f"REST: Fetch product id={product_id}",
     )
 

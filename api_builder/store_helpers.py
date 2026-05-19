@@ -20,10 +20,21 @@ def tag_id(slug: str) -> Optional[int]:
     return l.get_tag_id_by_slug(slug) if l else None
 
 
-def attr_id(slug: str) -> Optional[int]:
-    """Get attribute ID by slug from live data."""
+def attr_id(taxonomy_slug: str) -> Optional[int]:
+    """Get attribute ID by WooCommerce taxonomy slug (e.g. 'pa_color')."""
     l = loader()
-    return l.get_attribute_id(slug) if l else None
+    if not l:
+        return None
+    # Try neutral key first (remove pa_ prefix)
+    key = taxonomy_slug.removeprefix("pa_")
+    attr = l.resolve_attribute(key)
+    if attr:
+        return attr.backend_ref.get("id")
+    # Fall back to scanning all attributes for exact taxonomy match
+    for a in l.attribute_by_key.values():
+        if a.backend_ref.get("taxonomy") == taxonomy_slug:
+            return a.backend_ref.get("id")
+    return None
 
 
 def category_slug(category_id: int) -> Optional[str]:
@@ -68,6 +79,11 @@ def resolve_attr_filters(attributes: dict) -> dict:
 
 
 def get_attribute_term_slug(taxonomy: str, raw_term: str) -> Optional[str]:
-    """Resolve a human term to a WooCommerce term slug."""
+    """Resolve a human term to a WooCommerce term slug via neutral attribute lookup."""
     l = loader()
-    return l.get_attribute_term_slug(taxonomy, raw_term) if l else None
+    if not l:
+        return None
+    # Convert taxonomy slug (e.g. 'pa_color') to neutral key
+    key = taxonomy.removeprefix("pa_")
+    term = l.resolve_attribute_term(key, raw_term)
+    return term.backend_ref.get("slug") if term else None

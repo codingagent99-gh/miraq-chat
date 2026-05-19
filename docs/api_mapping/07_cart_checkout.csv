@@ -1,0 +1,16 @@
+"NOTE: In WooCommerce, the backend never calls cart APIs directly — it returns actions[] and the frontend calls the Store API. The same architecture should be preserved on Shopify using the Storefront AJAX API or Storefront GraphQL API.
+GraphQL Storefront API endpoint: https://{store_name}.myshopify.com/api/2026-04/graphql.json",,,,,
+#,Purpose,WooCommerce Frontend Endpoint,WooCommerce Payload,Shopify Equivalent,Shopify Notes
+7.1,Add Item to Cart,POST /wc/store/v1/cart/add-item,"Nonce + cookie auth. Body: {id: product_id, quantity: int, variation?: [{attribute, value}]}","AJAX: POST /cart/add.js
+GraphQL: POST https://{store_name}.myshopify.com/api/2026-04/graphql.json
+Mutation: cartLinesAdd","AJAX body: {id: variant_id, quantity: int}. GraphQL: cartLinesAdd(cartId, lines:[{merchandiseId, quantity}])"
+7.2,View Cart,GET /wc/store/v1/cart,Browser session/nonce,"AJAX: GET /cart.js
+GraphQL: POST https://{store_name}.myshopify.com/api/2026-04/graphql.json
+Query: cart(id: $cartId)","Returns cart object with items[], total_price, etc."
+7.3,Remove Cart Item,DELETE /wc/store/v1/cart/items/{item_key},item_key from session context,"GraphQL: POST https://{store_name}.myshopify.com/api/2026-04/graphql.json
+Mutation: cartLinesRemove","GraphQL: cartLinesRemove(cartId, lineIds:[id])"
+7.4,Update Cart Item Quantity,PUT /wc/store/v1/cart/items/{item_key},Body: {quantity: int},"GraphQL: POST https://{store_name}.myshopify.com/api/2026-04/graphql.json
+Mutation: cartLinesUpdate","GraphQL: cartLinesUpdate(cartId, lines:[{id, quantity}])"
+7.5,Checkout,Opens /wc/store/v1/checkout or WooCommerce checkout page,No backend involvement,"Standard: Redirect to /checkout
+GraphQL: POST https://{store_name}.myshopify.com/api/2026-04/graphql.json
+Mutation: checkoutCreate",For headless: use checkoutCreate mutation with lineItems[]. For standard: redirect to Shopify hosted checkout URL.

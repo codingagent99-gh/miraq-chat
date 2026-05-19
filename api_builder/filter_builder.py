@@ -10,12 +10,15 @@ import json
 from typing import List, Optional
 
 from models import WooAPICall
-from app_config import CUSTOM_API_BASE_URL, DEFAULT_PER_PAGE
+from app_config import DEFAULT_PER_PAGE
 from chat_logger import get_logger
 
 from api_builder.query_tree import (
     make_condition,
     make_or_group,
+    make_price_condition,
+    make_stock_condition,
+    make_search_condition,
     serialize_query,
     merge_cross_taxonomy_overlaps,
 )
@@ -32,8 +35,6 @@ from api_builder.store_helpers import (
 
 logger = get_logger("miraq_chat")
 
-CUSTOM_API_BASE = CUSTOM_API_BASE_URL
-
 def _group_categories(cat_slugs: list) -> dict:
     """
     Group category slugs by their parent category.
@@ -45,11 +46,10 @@ def _group_categories(cat_slugs: list) -> dict:
 
     for slug in cat_slugs:
         parent_key = slug  # default: each slug is its own group
-        if l and l.category_by_slug:
-            cat = l.category_by_slug.get(slug)
-            if cat:
-                parent_id = cat.get("parent", 0)
-                parent_key = str(parent_id) if parent_id else slug
+        if l and l.category_by_key:
+            cat_obj = l.resolve_category(slug)
+            if cat_obj:
+                parent_key = cat_obj.parent_key if cat_obj.parent_key else slug
 
         groups.setdefault(parent_key, []).append(slug)
 
@@ -100,8 +100,10 @@ def build_advanced_filter_call(
 
     # ── 6. Attributes (exclude) ──
     if excluded_attributes:
-        for taxonomy, slug_list in excluded_attributes.items():
+        l = loader()
+        for attr_key, slug_list in excluded_attributes.items():
             if slug_list:
+                taxonomy = _resolve_attribute_taxonomy(attr_key, l)
                 conditions.append(make_condition(taxonomy, slug_list, "NOT IN"))
 
     # ── 7. Attributes (include) ──
@@ -111,23 +113,30 @@ def build_advanced_filter_call(
     # ── 8. Cross-taxonomy overlap merge ──
     conditions = merge_cross_taxonomy_overlaps(conditions)
 
-    # ── Serialize ──
-    body = serialize_query(conditions, page, per_page, min_price=min_price, max_price=max_price)
-
+    # ── Prepend special-field leaves ──
+    # These are routed by serialize_query to the right top-level body fields.
     if in_stock is True:
-        body["stock_status"] = "instock"
+        conditions = [make_stock_condition("instock")] + conditions
     elif in_stock is False:
-        body["stock_status"] = "outofstock"
+        conditions = [make_stock_condition("outofstock")] + conditions
+
+    if min_price is not None or max_price is not None:
+        conditions = [make_price_condition(min_price=min_price, max_price=max_price)] + conditions
+
+    # ── Serialize ──
+    body = serialize_query(conditions, page, per_page)
 
     if product_id:
         body["ids"] = [product_id]
         body.pop("stock_status", None)
         body.pop("filters", None)
+
         if variation_page is not None and variation_page > 1:
             body["variation_page"] = variation_page
-    # In build_advanced_filter_call, replace the elif search_term block:
+
     elif search_term:
-        if conditions:
+        has_taxonomy_conditions = conditions and any("field_type" not in c for c in conditions)
+        if has_taxonomy_conditions:
             logger.info(f"Ignored leftover search_term='{search_term}' — taxonomy filters are present, relying on them.")
         else:
             # This should not happen if callers are routing correctly.
@@ -141,11 +150,11 @@ def build_advanced_filter_call(
 
     return WooAPICall(
         method="POST",
-        endpoint=f"{CUSTOM_API_BASE}/products-advanced-new",
+        endpoint="/products-advanced-new",
         params={},
         body=body,
         description=description or "Advanced product filter",
-        is_custom_api=True,
+        surface="custom_plugin",
         requires_resolution=requires_resolution or [],
     )
 
@@ -153,21 +162,28 @@ def build_advanced_filter_call(
 # ─── Private helpers ───
 
 def _build_attribute_conditions(attributes: dict, l) -> list:
-    """Convert {taxonomy: comma_terms} into query conditions, grouping shared values with OR."""
+    """Convert {attr_key: comma_terms} into query conditions, grouping shared values with OR."""
     value_groups: dict[str, list] = {}
-    for taxonomy, terms_value in attributes.items():
+    for attr_key, terms_value in attributes.items():
         raw = terms_value if isinstance(terms_value, str) else ",".join(terms_value)
         key = raw.lower().strip()
-        value_groups.setdefault(key, []).append(taxonomy)
+        value_groups.setdefault(key, []).append(attr_key)
 
     conditions = []
-    for val_key, taxonomies in value_groups.items():
+    for val_key, attr_keys in value_groups.items():
         raw_terms = [t.strip() for t in val_key.split(",") if t.strip()]
         or_conditions = []
-        for taxonomy in taxonomies:
+        for attr_key in attr_keys:
+            taxonomy = _resolve_attribute_taxonomy(attr_key, l)
             slug_list = []
             for raw_term in raw_terms:
-                term_slug = get_attribute_term_slug(taxonomy, raw_term) if l else None
+                term_slug = None
+                if l:
+                    term = l.resolve_attribute_term(attr_key, raw_term)
+                    if term:
+                        term_slug = term.backend_ref.get("slug")
+                    if not term_slug:
+                        term_slug = get_attribute_term_slug(taxonomy, raw_term)
                 if term_slug:
                     slug_list.append(term_slug)
                 else:
@@ -181,3 +197,17 @@ def _build_attribute_conditions(attributes: dict, l) -> list:
             conditions.append(make_or_group(or_conditions))
 
     return conditions
+
+
+def _resolve_attribute_taxonomy(attr_key: str, l) -> str:
+    if l:
+        attribute = l.resolve_attribute(attr_key)
+        if attribute:
+            taxonomy = attribute.backend_ref.get("taxonomy")
+            if taxonomy:
+                return taxonomy
+    logger.warning(
+        f"Deprecated attribute filter key '{attr_key}' detected; expected neutral attr_key. "
+        "Treating key as legacy taxonomy (example neutral key: 'color', not 'pa_color')."
+    )
+    return attr_key

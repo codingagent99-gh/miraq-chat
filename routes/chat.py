@@ -18,7 +18,6 @@ from app_config import (
     ORDER_CREATE_INTENTS,
     CLASSIFIER_PROVIDER_TAG,
     get_currency_symbol,
-    WOO_BASE_URL,
 )
 from core.actions import build_add_to_cart, build_open_checkout_panel, build_open_cart_panel
 from woo_client import woo_client
@@ -29,6 +28,7 @@ from api_builder import build_api_calls
 from conversation_flow import FlowState, handle_flow_state
 from chat_logger import get_logger, sanitize_log_string
 from store_registry import get_store_loader
+from ecommerce import endpoints
 
 from handlers.chat_utils import default_pagination, build_pagination, format_order_for_frontend
 from handlers.flow_handler import handle_flow
@@ -47,97 +47,6 @@ from core.actions import build_propose_checkout_address
 logger = get_logger("miraq_chat")
 chat_bp = Blueprint("chat", __name__)
 
-def _resolve_variation_slugs(resolved: dict, store_loader) -> list:
-    """
-    Convert resolved_attributes display names → WC term slugs for the cart payload.
-    e.g. {"Colors": "APOLLO Bianco", "Finish": "Matte"}
-      → [{"attribute": "pa_colors", "value": "apollobianco"},
-         {"attribute": "pa_finish",  "value": "matte"}]
-    """
-    attr_terms = getattr(store_loader, 'all_attributes_raw', []) if store_loader else []
-
-    # Build lookup: taxonomy → {display_name_lower: slug}
-    slug_lookup: dict = {}
-    for attr in attr_terms:
-        taxonomy = attr.get("taxonomy", "")
-        slug_lookup[taxonomy] = {
-            term["name"].lower(): term["slug"]
-            for term in attr.get("terms", [])
-        }
-
-    result = []
-    for label, display_value in resolved.items():
-        taxonomy = f"pa_{label.lower().replace(' ', '-')}"
-        term_map = slug_lookup.get(taxonomy, {})
-        # Use matched slug, or fall back to naive slugify (strip spaces/quotes)
-        slug = term_map.get(
-            str(display_value).lower(),
-            re.sub(r'[^a-z0-9]+', '', str(display_value).lower())
-        )
-        result.append({"attribute": taxonomy, "value": slug})
-
-    return result
-
-def _build_cart_variation_payload(product_id, variation_id, resolved_attrs, store_loader):
-    if not variation_id or not product_id:
-        return _resolve_variation_slugs(resolved_attrs, store_loader)
-
-    try:
-        var_call = WooAPICall(
-            method="GET",
-            endpoint=f"{WOO_BASE_URL}/products/{product_id}/variations/{variation_id}",
-            params={},
-            description=f"Fetch variation {variation_id} for cart payload",
-        )
-        var_resp = woo_client.execute(var_call)
-        if not (var_resp.get("success") and isinstance(var_resp.get("data"), dict)):
-            raise ValueError("variation fetch failed")
-
-        var_attrs = var_resp["data"].get("attributes", [])
-
-        attr_terms = getattr(store_loader, "all_attributes_raw", []) if store_loader else []
-        slug_lookup: dict = {}
-        for attr in attr_terms:
-            taxonomy = attr.get("taxonomy", "")
-            slug_lookup[taxonomy] = {
-                term["name"].lower(): term["slug"]
-                for term in attr.get("terms", [])
-            }
-
-        # Fixed axes — built directly from the variation's own attributes.
-        # The WC REST API returns `option` as the correct slug for global
-        # attributes (pa_ prefixed), so we use it as-is rather than
-        # attempting a lossy re-derivation through the term_map.
-        # Taxonomy is derived from the attribute display name because WC does
-        # NOT include a `slug` field in variation attribute objects.
-        fixed = {}
-        result = []
-        for attr in var_attrs:
-            attr_name = attr.get("name", "")
-            taxonomy  = f"pa_{attr_name.lower().replace(' ', '-')}"
-            option    = attr.get("option", "")   # already the correct WC slug
-            result.append({"attribute": taxonomy, "value": option})
-            fixed[taxonomy] = True
-
-        # Wildcard axes — from user's resolved_attrs (cart item meta)
-        for label, display_value in resolved_attrs.items():
-            taxonomy = f"pa_{label.lower().replace(' ', '-')}"
-            if taxonomy in fixed:
-                continue
-            term_map = slug_lookup.get(taxonomy, {})
-            slug = term_map.get(
-                str(display_value).lower(),
-                re.sub(r"[^a-z0-9]+", "", str(display_value).lower()),
-            )
-            result.append({"attribute": taxonomy, "value": slug})
-
-        logger.info(f"Cart variation payload: {result}")
-        return result
-
-    except Exception as exc:
-        logger.warning(f"_build_cart_variation_payload fallback | error={exc}")
-        return _resolve_variation_slugs(resolved_attrs, store_loader)
-    
 def _maybe_attach_address_proposal(
     response_data: dict,
     message: str,
@@ -170,16 +79,11 @@ def _maybe_attach_address_proposal(
         # Fetch the customer's saved billing/shipping for the "existing_on_file" field
         existing = None
         try:
-            from app_config import WOO_BASE_URL
-            from models import WooAPICall
             from woo_client import woo_client as _woo
-            cust_call = WooAPICall(
-                method="GET",
-                endpoint=f"{WOO_BASE_URL}/customers/{customer_id}",
-                params={},
+            cust_resp = _woo.execute(endpoints.fetch_customer(
+                customer_id=customer_id,
                 description="Fetch customer address for PROPOSE_CHECKOUT_ADDRESS",
-            )
-            cust_resp = _woo.execute(cust_call)
+            ))
             if cust_resp.get("success") and isinstance(cust_resp.get("data"), dict):
                 _billing  = cust_resp["data"].get("billing", {})
                 _shipping = cust_resp["data"].get("shipping", {})
@@ -872,7 +776,12 @@ def chat():
             qty   = user_context.get("pending_quantity") or 1
             name  = user_context.get("pending_product_name", "item")
             resolved = user_context.get("resolved_attributes") or {}
-            variation_attributes = _build_cart_variation_payload(pid, vid, resolved, get_store_loader())
+            variation_attributes = endpoints.build_cart_variation_payload(
+                product_id=pid,
+                variant_id=vid,
+                resolved_attrs=resolved,
+                store_loader=get_store_loader(),
+            )
 
             if pid:
                 elapsed = round((time.time() - start_time) * 1000)
