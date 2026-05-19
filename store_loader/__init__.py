@@ -21,6 +21,7 @@ from store_loader.config import (
     REQUEST_TIMEOUT, BROWSER_HEADERS,
     DEV_CACHE_ENABLED, UPDATE_DEV_CACHE_ENABLED,
     CURRENCY_MAP,
+    ECOMMERCE_BACKEND, SHOPIFY_STORE_DOMAIN, SHOPIFY_ADMIN_TOKEN,   # ← added
 )
 from store_loader.cache import BoundedVariationCache
 from store_loader.fetcher import (
@@ -39,26 +40,23 @@ logger = get_logger("miraq_chat")
 
 
 class StoreLoader(StoreQueryMixin):
-    """Fetches and caches all WooCommerce taxonomy data."""
+    """Fetches and caches all WooCommerce / Shopify taxonomy data."""
 
     _CURRENCY_MAP = CURRENCY_MAP
 
     def __init__(self):
-        self.base = WOO_BASE_URL
-        self.custom_api_base = CUSTOM_API_BASE_URL
-        self.consumer_key = WOO_CONSUMER_KEY
-        self.consumer_secret = WOO_CONSUMER_SECRET
-        self.timeout = REQUEST_TIMEOUT
+        self.base             = WOO_BASE_URL
+        self.custom_api_base  = CUSTOM_API_BASE_URL
+        self.consumer_key     = WOO_CONSUMER_KEY
+        self.consumer_secret  = WOO_CONSUMER_SECRET
+        self.timeout          = REQUEST_TIMEOUT
+        self.shopify_domain      = SHOPIFY_STORE_DOMAIN   # ← added
+        self.shopify_admin_token = SHOPIFY_ADMIN_TOKEN    # ← added
 
         self.session = requests.Session()
         self.session.headers.update(BROWSER_HEADERS)
 
         # Semantic vector model
-        # DEV_CACHE mode: skip the HuggingFace Hub network check entirely —
-        #   loads straight from local disk cache (fast, no ~10s HEAD request,
-        #   no WinError 10054 / ECONNRESET risk).
-        # Live mode: try online first so real model updates are picked up,
-        #   then fall back to local cache if the network is unavailable.
         logger.info("Loading Semantic Vector Model (all-MiniLM-L6-v2)...")
         try:
             from sentence_transformers import SentenceTransformer
@@ -138,10 +136,23 @@ class StoreLoader(StoreQueryMixin):
     # ─── Loading orchestration ───
 
     def load_all(self):
-        """Load store data (from local files in dev mode, or live API in prod)."""
+        """Load store data from the configured backend.
+
+        Backend selection (ECOMMERCE_BACKEND env var):
+          - "shopify"     → live Shopify GraphQL API (always, no dev cache)
+          - "woocommerce" → local JSON files when DEV_CACHE=true, else live API
+        """
         try:
             with self._lock:
-                if DEV_CACHE_ENABLED:
+                # ── Fetch raw data ────────────────────────────────────────
+                if ECOMMERCE_BACKEND == "shopify":
+                    from store_loader.shopify_fetcher import load_from_shopify
+                    data = load_from_shopify(
+                        store_domain=self.shopify_domain,
+                        admin_token=self.shopify_admin_token,
+                    )
+                    self._loaded_from_cache = False
+                elif DEV_CACHE_ENABLED:
                     data = load_from_local_files()
                     self._loaded_from_cache = True
                 else:
@@ -158,15 +169,15 @@ class StoreLoader(StoreQueryMixin):
                         )
                         logger.info("StoreLoader: ✅ Dev cache files updated from live API")
 
-                # Apply fetched data
-                self.categories = data["categories"]
-                self.tags = data["tags"]
-                self.products = data["products"]
+                # ── Apply fetched data ────────────────────────────────────
+                self.categories        = data["categories"]
+                self.tags              = data["tags"]
+                self.products          = data["products"]
                 self.all_attributes_raw = data["all_attributes_raw"]
-                self.currency_symbol = data["currency_symbol"]
+                self.currency_symbol   = data["currency_symbol"]
                 self._expected_product_count = data.get("expected_product_count")
 
-                # Build indexes
+                # ── Build indexes ─────────────────────────────────────────
                 build_all_lookups(self)
                 self._validate_load()
                 self._last_loaded = time.time()
@@ -263,8 +274,14 @@ class StoreLoader(StoreQueryMixin):
         self._degraded_reasons = reasons
 
     def _log_load_summary(self):
-        mode = "Local Dev Cache" if DEV_CACHE_ENABLED else "Live WooCommerce API"
-        status = "⚠️ DEGRADED" if self._degraded else "✅ HEALTHY"
+        if ECOMMERCE_BACKEND == "shopify":
+            mode = "Live Shopify GraphQL API"
+        elif DEV_CACHE_ENABLED:
+            mode = "Local Dev Cache"
+        else:
+            mode = "Live WooCommerce API"
+
+        status     = "⚠️ DEGRADED" if self._degraded else "✅ HEALTHY"
         attr_count = sum(len(a.terms) for a in self.attribute_by_key.values())
         vector_count = len(self.semantic_keys) if self.semantic_keys else 0
 

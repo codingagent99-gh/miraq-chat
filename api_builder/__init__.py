@@ -134,7 +134,8 @@ def build_api_calls(
         # Builders that need customer_id or user_message get them via kwargs
         if intent == Intent.UPDATE_CUSTOMER:
             calls = builder(e, page, customer_id=customer_id)
-        elif intent in (Intent.PRODUCT_SEARCH, Intent.FILTER_BY_ATTRIBUTE):
+        # in build_api_calls dispatcher:
+        elif intent in (Intent.PRODUCT_SEARCH, Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_DETAIL):
             calls = builder(e, page, user_message=user_message)
         elif intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.HISTORICAL_SEARCH,
                 Intent.REORDER, Intent.ORDER_TRACKING, Intent.ORDER_STATUS,
@@ -411,13 +412,17 @@ def _build_product_search(e, page, user_message: str = "") -> list:
         product_id=e.product_id,
         **_common_exclusion_kwargs(e),
     )]
-    
-def _build_product_detail(e, page) -> list:
+
+
+def _build_product_detail(e, page, user_message: str = "") -> list:
+    search = e.product_name or (user_message if not e.product_id else None)
+    if not search and not e.product_id:
+        return []   # nothing to work with — let fallback handle it
     return [build_advanced_filter_call(
         product_id=e.product_id,
-        search_term=e.product_name if not e.product_id else None,
+        search_term=search,
         page=page,
-        description=f"Get details for product '{e.product_name}'",
+        description=f"Get details for product '{search}'",
     )]
 
 
@@ -688,11 +693,13 @@ def _build_checkout(e, page) -> list:
 
 def _build_fallback(e, page, intent, user_message: str = "") -> list:
     search = e.product_name or e.search_term or next(iter(e.attributes.values()), None)
-    if search:
-        logger.warning(f"api_builder: No calls for intent={intent.value} — fallback | search={search!r}")
+    if search or e.product_id:
+        logger.warning(f"api_builder: No calls for intent={intent.value} — fallback | search={search!r} | product_id={e.product_id}")
         return [build_advanced_filter_call(
-            search_term=search, page=page,
-            description=f"Fallback search: '{search}'",
+            product_id=e.product_id,
+            search_term=search if not e.product_id else None,
+            page=page,
+            description=f"Fallback search: '{search or e.product_id}'",
         )]
     logger.warning(
         f"api_builder: No calls for intent={intent.value} and NO search terms. "

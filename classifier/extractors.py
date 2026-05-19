@@ -232,6 +232,7 @@ def extract_product_name(text: str, entities: ExtractedEntities):
         return
 
     match = loader.get_product_for_text(text)
+    logger.debug(f"extract_product_name: text='{text}' | match={match}")
     if not match:
         return
 

@@ -122,7 +122,12 @@ def phase2_nlp_merge(
     We reuse it directly instead of making a second classify() call.
     """
     if original_msg and unmatched_text.strip() == original_msg.strip():
+        # Phase 1 matched nothing — full text is still unmatched, reuse original result.
         logger.debug("phase2_nlp_merge: Phase 1 matched nothing — reusing original_nlp_result, skipping re-classify")
+        nlp_result = original_nlp_result
+    elif not unmatched_text.strip():
+        # Phase 1 matched everything — nothing left to classify, reuse original result.
+        logger.debug("phase2_nlp_merge: Phase 1 matched everything — reusing original_nlp_result, skipping re-classify")
         nlp_result = original_nlp_result
     else:
         nlp_result = classify(unmatched_text)

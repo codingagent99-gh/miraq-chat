@@ -209,29 +209,64 @@ def default_pagination(page: int = 1) -> dict:
 
 
 def build_pagination(page: int, api_responses: list, api_calls: list) -> dict:
-    """Build pagination object from API responses and call params."""
+    """Build pagination object from API responses and call params.
+
+    Handles two response shapes:
+
+    WooCommerce (woo_client):
+        resp = {"success": True, "total": 28, "total_pages": 7, "data": {...}}
+        call.params contains "per_page"
+
+    Shopify executor (ShopifyQueryExecutor.execute_from_body):
+        resp = {"success": True, "data": {"total": 28, "pages": 7, "per_page": 4, ...}}
+        call.params is {} — per_page lives in call.body
+    """
     total_items = None
     total_pages = None
     per_page = DEFAULT_PER_PAGE
 
+    # ── per_page: prefer call.params (WooCommerce), fall back to call.body (Shopify) ──
     if api_calls:
-        per_page = int(api_calls[0].params.get("per_page", DEFAULT_PER_PAGE))
+        call = api_calls[0]
+        per_page = int(
+            call.params.get("per_page")
+            or (call.body or {}).get("per_page")
+            or DEFAULT_PER_PAGE
+        )
 
     for resp in api_responses:
-        if resp.get("success"):
-            raw_total = resp.get("total")
-            raw_total_pages = resp.get("total_pages")
-            if raw_total is not None:
-                try:
-                    total_items = int(raw_total)
-                except (ValueError, TypeError):
-                    pass
-            if raw_total_pages is not None:
-                try:
-                    total_pages = int(raw_total_pages)
-                except (ValueError, TypeError):
-                    pass
-            break
+        if not resp.get("success"):
+            continue
+
+        # ── WooCommerce: total/total_pages sit at the top level of resp ──
+        raw_total       = resp.get("total")
+        raw_total_pages = resp.get("total_pages")
+
+        # ── Shopify executor: they sit inside resp["data"] ──
+        # The executor uses "pages" (not "total_pages") for the page count.
+        if raw_total is None or raw_total_pages is None:
+            data = resp.get("data") or {}
+            if isinstance(data, dict):
+                if raw_total is None:
+                    raw_total = data.get("total")
+                if raw_total_pages is None:
+                    # "pages" is the Shopify executor key; also accept "total_pages"
+                    # in case a future executor aligns with the WooCommerce name.
+                    raw_total_pages = data.get("pages") or data.get("total_pages")
+
+        if raw_total is not None:
+            try:
+                total_items = int(raw_total)
+            except (ValueError, TypeError):
+                pass
+
+        if raw_total_pages is not None:
+            try:
+                total_pages = int(raw_total_pages)
+            except (ValueError, TypeError):
+                pass
+
+        break  # use only the first successful response
 
     has_more = (page < total_pages) if total_pages is not None else False
     return {

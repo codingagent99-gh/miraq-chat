@@ -341,7 +341,6 @@ def _check_empty_order(intent, entities, conversation, page, start_time):
 # ══════════════════════════════════════════════════════════════
 
 def _execute_api_calls(intent, api_calls, _resolve_variant):
-    """Execute WooCommerce API calls. Returns (all_products_raw, order_data, api_responses, api_calls_executed)."""
     if _resolve_variant:
         return [], [], [], []
 
@@ -350,7 +349,19 @@ def _execute_api_calls(intent, api_calls, _resolve_variant):
     else:
         api_calls_to_execute = api_calls
 
-    api_responses = woo_client.execute_all(api_calls_to_execute)
+    # ── NEW: split by surface ─────────────────────────────────────────────
+    shopify_calls = [c for c in api_calls_to_execute if getattr(c, "surface", "") == "shopify_executor"]
+    woo_calls     = [c for c in api_calls_to_execute if getattr(c, "surface", "") != "shopify_executor"]
+
+    api_responses = woo_client.execute_all(woo_calls)   # unchanged
+
+    if shopify_calls:
+        from api_builder.shopify_executor import ShopifyQueryExecutor
+        executor = ShopifyQueryExecutor(get_store_loader())
+        for call in shopify_calls:
+            result = executor.execute_from_body(call.body)
+            api_responses.append({"success": True, "data": result, "call": call})
+    # ─────────────────────────────────────────────────────────────────────
 
     all_products_raw = []
     order_data = []
@@ -367,7 +378,7 @@ def _execute_api_calls(intent, api_calls, _resolve_variant):
             if isinstance(data, dict) and "products" in data:
                 _enrich(data["products"])
                 target.extend(data["products"])
-            elif isinstance(data, dict) and "orders" in data:   # ← add this
+            elif isinstance(data, dict) and "orders" in data:
                 target.extend(data["orders"])
             elif isinstance(data, list):
                 _enrich(data)
@@ -377,7 +388,6 @@ def _execute_api_calls(intent, api_calls, _resolve_variant):
                 target.append(data)
 
     return all_products_raw, order_data, api_responses, api_calls_to_execute
-
 
 # ══════════════════════════════════════════════════════════════
 # ─── HELPER: Build final response ───

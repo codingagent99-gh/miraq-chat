@@ -10,7 +10,7 @@ import json
 from typing import List, Optional
 
 from models import WooAPICall
-from app_config import DEFAULT_PER_PAGE
+from app_config import CUSTOM_API_BASE_URL, DEFAULT_PER_PAGE
 from chat_logger import get_logger
 
 from api_builder.query_tree import (
@@ -18,22 +18,20 @@ from api_builder.query_tree import (
     make_or_group,
     make_price_condition,
     make_stock_condition,
-    make_search_condition,
     serialize_query,
     merge_cross_taxonomy_overlaps,
 )
-
-from api_builder.or_pairs import (
-    build_or_pair_conditions
-)
-
+from api_builder.or_pairs import build_or_pair_conditions
 from api_builder.store_helpers import (
     loader,
     attr_slug_for_label,
     get_attribute_term_slug,
 )
+from store_loader.config import ECOMMERCE_BACKEND
 
 logger = get_logger("miraq_chat")
+CUSTOM_API_BASE = CUSTOM_API_BASE_URL
+
 
 def _group_categories(cat_slugs: list) -> dict:
     """
@@ -46,10 +44,12 @@ def _group_categories(cat_slugs: list) -> dict:
 
     for slug in cat_slugs:
         parent_key = slug  # default: each slug is its own group
+
         if l and l.category_by_key:
-            cat_obj = l.resolve_category(slug)
+            cat_obj = l.category_by_key.get(slug)
             if cat_obj:
-                parent_key = cat_obj.parent_key if cat_obj.parent_key else slug
+                parent_id = (cat_obj.backend_ref or {}).get("parent_id", 0)
+                parent_key = str(parent_id) if parent_id else slug
 
         groups.setdefault(parent_key, []).append(slug)
 
@@ -59,7 +59,7 @@ def build_advanced_filter_call(
     tags=None, categories=None, attributes=None,
     excluded_tags=None, excluded_categories=None, excluded_attributes=None,
     tag_operator="AND",
-    or_pairs=None,          # now List[OrPair] instead of List[dict]
+    or_pairs=None,
     page=1, per_page=DEFAULT_PER_PAGE, description="",
     min_price=None, max_price=None, search_term=None,
     product_id=None, requires_resolution=None, in_stock=None,
@@ -89,7 +89,6 @@ def build_advanced_filter_call(
     if categories:
         uncovered_cats = [c for c in categories if c not in covered_cats]
         if uncovered_cats:
-            # Group by parent slug for AND vs OR within same taxonomy
             grouped = _group_categories(uncovered_cats)
             for slugs in grouped.values():
                 conditions.append(make_condition("product_cat", slugs, "IN"))
@@ -100,10 +99,8 @@ def build_advanced_filter_call(
 
     # ── 6. Attributes (exclude) ──
     if excluded_attributes:
-        l = loader()
-        for attr_key, slug_list in excluded_attributes.items():
+        for taxonomy, slug_list in excluded_attributes.items():
             if slug_list:
-                taxonomy = _resolve_attribute_taxonomy(attr_key, l)
                 conditions.append(make_condition(taxonomy, slug_list, "NOT IN"))
 
     # ── 7. Attributes (include) ──
@@ -113,19 +110,24 @@ def build_advanced_filter_call(
     # ── 8. Cross-taxonomy overlap merge ──
     conditions = merge_cross_taxonomy_overlaps(conditions)
 
-    # ── Prepend special-field leaves ──
-    # These are routed by serialize_query to the right top-level body fields.
-    if in_stock is True:
-        conditions = [make_stock_condition("instock")] + conditions
-    elif in_stock is False:
-        conditions = [make_stock_condition("outofstock")] + conditions
-
+    # ── 9. Price / stock — push as field_type nodes so serialize_query
+    #       routes them into body["price"] / body["stock_status"], which both
+    #       WooQueryExecutor and ShopifyQueryExecutor read from the body. ──
     if min_price is not None or max_price is not None:
-        conditions = [make_price_condition(min_price=min_price, max_price=max_price)] + conditions
+        conditions.append(make_price_condition(min_price, max_price))
+
+    if in_stock is True:
+        conditions.append(make_stock_condition("instock"))
+    elif in_stock is False:
+        conditions.append(make_stock_condition("outofstock"))
 
     # ── Serialize ──
     body = serialize_query(conditions, page, per_page)
 
+    # product_id: inject as body["ids"] so both WooQueryExecutor (which reads
+    # body["ids"]) and ShopifyQueryExecutor (which checks body["ids"] for its
+    # in-memory filter) can use it. When product_id is present, stock/filter
+    # conditions are irrelevant — clear them to avoid cross-contamination.
     if product_id:
         body["ids"] = [product_id]
         body.pop("stock_status", None)
@@ -147,10 +149,21 @@ def build_advanced_filter_call(
             )
 
     logger.debug(f"api_builder: Advanced filter body: {json.dumps(body)}")
+    
+    if ECOMMERCE_BACKEND == "shopify":
+        return WooAPICall(
+            method="POST",
+            endpoint="shopify-in-memory",   # logical name, never actually fetched
+            params={},
+            body=body,
+            description=description or "Shopify in-memory product filter",
+            surface="shopify_executor",     # ← routing key for the dispatcher
+            requires_resolution=requires_resolution or [],
+        )
 
     return WooAPICall(
         method="POST",
-        endpoint="/products-advanced-new",
+        endpoint=f"{CUSTOM_API_BASE}/products-advanced-new",
         params={},
         body=body,
         description=description or "Advanced product filter",
@@ -162,32 +175,27 @@ def build_advanced_filter_call(
 # ─── Private helpers ───
 
 def _build_attribute_conditions(attributes: dict, l) -> list:
-    """Convert {attr_key: comma_terms} into query conditions, grouping shared values with OR."""
+    """Convert {taxonomy: comma_terms} into query conditions, grouping shared values with OR."""
     value_groups: dict[str, list] = {}
-    for attr_key, terms_value in attributes.items():
+    for taxonomy, terms_value in attributes.items():
         raw = terms_value if isinstance(terms_value, str) else ",".join(terms_value)
         key = raw.lower().strip()
-        value_groups.setdefault(key, []).append(attr_key)
+        value_groups.setdefault(key, []).append(taxonomy)
 
     conditions = []
-    for val_key, attr_keys in value_groups.items():
+    for val_key, taxonomies in value_groups.items():
         raw_terms = [t.strip() for t in val_key.split(",") if t.strip()]
         or_conditions = []
-        for attr_key in attr_keys:
-            taxonomy = _resolve_attribute_taxonomy(attr_key, l)
+        for taxonomy in taxonomies:
             slug_list = []
             for raw_term in raw_terms:
-                term_slug = None
-                if l:
-                    term = l.resolve_attribute_term(attr_key, raw_term)
-                    if term:
-                        term_slug = term.backend_ref.get("slug")
-                    if not term_slug:
-                        term_slug = get_attribute_term_slug(taxonomy, raw_term)
+                term_slug = get_attribute_term_slug(taxonomy, raw_term) if l else None
                 if term_slug:
                     slug_list.append(term_slug)
                 else:
-                    slug_list.append(raw_term.replace(" ", "-").replace('"', '').replace("'", ""))
+                    slug_list.append(
+                        raw_term.replace(" ", "-").replace('"', "").replace("'", "")
+                    )
             if slug_list:
                 or_conditions.append(make_condition(taxonomy, slug_list, "IN"))
 
@@ -197,17 +205,3 @@ def _build_attribute_conditions(attributes: dict, l) -> list:
             conditions.append(make_or_group(or_conditions))
 
     return conditions
-
-
-def _resolve_attribute_taxonomy(attr_key: str, l) -> str:
-    if l:
-        attribute = l.resolve_attribute(attr_key)
-        if attribute:
-            taxonomy = attribute.backend_ref.get("taxonomy")
-            if taxonomy:
-                return taxonomy
-    logger.warning(
-        f"Deprecated attribute filter key '{attr_key}' detected; expected neutral attr_key. "
-        "Treating key as legacy taxonomy (example neutral key: 'color', not 'pa_color')."
-    )
-    return attr_key
