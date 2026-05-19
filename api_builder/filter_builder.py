@@ -27,9 +27,9 @@ from api_builder.store_helpers import (
     attr_slug_for_label,
     get_attribute_term_slug,
 )
+from store_loader.config import ECOMMERCE_BACKEND
 
 logger = get_logger("miraq_chat")
-
 CUSTOM_API_BASE = CUSTOM_API_BASE_URL
 
 
@@ -133,6 +133,17 @@ def build_advanced_filter_call(
         body.pop("filters", None)
 
     logger.debug(f"api_builder: Advanced filter body: {json.dumps(body)}")
+    
+    if ECOMMERCE_BACKEND == "shopify":
+        return WooAPICall(
+            method="POST",
+            endpoint="shopify-in-memory",   # logical name, never actually fetched
+            params={},
+            body=body,
+            description=description or "Shopify in-memory product filter",
+            surface="shopify_executor",     # ← routing key for the dispatcher
+            requires_resolution=requires_resolution or [],
+        )
 
     return WooAPICall(
         method="POST",

@@ -106,10 +106,14 @@ class StoreQueryMixin:
     def get_product_for_text(self, text: str) -> Optional[Dict]:
         text_lower = text.lower()
         candidates = []
+        
+        logger.debug(f"get_product_for_text: size={len(self.product_by_name_lower)} sample={list(self.product_by_name_lower.keys())[:5]}")  # ← ADD THIS
 
         for name_lower, entry in self.product_by_name_lower.items():
             if re.search(rf'\b{re.escape(name_lower)}\b', text_lower):
                 candidates.append(entry)
+                
+        logger.debug(f"get_product_for_text: candidates={candidates}")
 
         stop_words = self._store_generic_terms.copy()
         stop_words.update({"sample", "samples", "product", "item", "size", "sizes"})

@@ -273,6 +273,36 @@ class ShopifyQueryExecutor:
             "_raw":     {"products": sliced},
         }
 
+    def execute_from_body(self, body: dict) -> dict:
+        page     = body.get("page", 1)
+        per_page = body.get("per_page", 4)
+        ids      = body.get("ids")
+
+        if ids:
+            id_set = {str(i) for i in ids}
+            matched = [
+                p for p in (self._loader.products or [])
+                if (
+                    str(p.get("id", "")) in id_set
+                    or str(p.get("_shopify_gid", "")) in id_set
+                )
+            ]
+        else:
+            matched = self._apply_body(body)
+
+        total  = len(matched)
+        start  = (page - 1) * per_page
+        sliced = matched[start : start + per_page]
+        pages  = max(1, -(-total // per_page)) if total else 0
+
+        return {
+            "products": sliced,          # ← raw dicts, not _normalize_product()
+            "page":     page,
+            "per_page": per_page,
+            "total":    total,
+            "pages":    pages,
+            "_raw":     {"products": sliced},
+        }
     # ── private ──────────────────────────────────────────────
 
     def _apply_body(self, body: dict) -> list:

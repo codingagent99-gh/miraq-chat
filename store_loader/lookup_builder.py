@@ -18,6 +18,7 @@ from models.catalog import (
     CatalogCategory,
     CatalogTag,
 )
+from store_loader.config import ECOMMERCE_BACKEND
 
 logger = get_logger("miraq_chat")
 
@@ -289,11 +290,24 @@ def build_all_lookups(loader):
 
     # Products
     for product in loader.products:
-        name = product.get("name", "").strip()
+        status = product.get("status")
+        # "active" = Shopify published, "publish" = WooCommerce published
+        # None = safe to include (e.g. local cache data without status field)
+        if status is not None and status not in ("active", "publish"):
+            continue
+
+        name = (product.get("name") or "").strip()
         if not name:
             continue
-        entry = {"id": product.get("id"), "name": name, "slug": product.get("slug", "")}
+        entry = {
+            "id":         product.get("_shopify_gid") or product.get("id"),
+            "numeric_id": product.get("id"),
+            "name":       name,
+            "slug":       product.get("slug", ""),
+        }
         loader.product_by_name_lower[name.lower()] = entry
+        
+    logger.debug(f"lookup_builder: product_by_name_lower keys = {list(loader.product_by_name_lower.keys())}")
 
     # Longest-match catalog
     loader.longest_match_catalog = build_longest_match_catalog(
