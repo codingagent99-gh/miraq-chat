@@ -47,6 +47,7 @@ class ActionType:
 def build_add_to_cart(
     product_id: int,
     quantity: int,
+    name: Optional[str] = None,
     variation_id: Optional[int] = None,
     variation: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
@@ -54,7 +55,7 @@ def build_add_to_cart(
     Build an ``ADD_TO_CART`` action.
 
     Required: ``product_id``, ``quantity``.
-    Optional: ``variation_id``, ``variation`` (list of ``{attribute, value}`` dicts).
+    Optional: ``name``, ``variation_id``, ``variation`` (list of ``{attribute, value}`` dicts).
     """
     if product_id is None:
         raise ValueError("build_add_to_cart: product_id is required")
@@ -65,6 +66,8 @@ def build_add_to_cart(
         "product_id": int(product_id),
         "quantity":   int(quantity),
     }
+    if name is not None:
+        payload["name"] = name
     if variation_id is not None:
         payload["variation_id"] = int(variation_id)
     if variation:
@@ -151,5 +154,3 @@ def build_propose_checkout_address(
         payload["existing_on_file"] = existing_on_file
 
     return {"type": ActionType.PROPOSE_CHECKOUT_ADDRESS, "payload": payload}
-
-

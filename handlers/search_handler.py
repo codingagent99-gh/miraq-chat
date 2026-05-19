@@ -65,7 +65,6 @@ def log_matched_products(all_products_raw: list, api_calls_to_execute: list):
                 f"filters={_filters}" + (f" | search={_search!r}" if _search else "")
             )
 
-
 def handle_empty_results(
     intent,
     entities,
@@ -77,13 +76,17 @@ def handle_empty_results(
     confidence,
     store_loader,
 ):
-    """
-    Step 3.8: Handle empty search results — either local no-results message or LLM retry.
+    # ── Guard: load-more on a known product is never a "not found" ──
+    # page > 1 with a resolved product_id means the frontend is paginating
+    # variations of a product we already found. An empty page 2+ is "end of
+    # results", NOT a missing product — skip the LLM retry entirely.
+    if page > 1 and getattr(entities, "product_id", None):
+        logger.info(
+            f"Step 3.8: Skipping LLM retry — load-more for known "
+            f"product_id={entities.product_id} page={page} (not a missing product)"
+        )
+        return all_products_raw, None
 
-    Returns (updated_all_products_raw, flask_response_or_none).
-    Flask response is non-None only when results are still empty after retry
-    and we have a suggestion message to show.
-    """
     if not (intent in _SEARCH_FILTER_INTENTS and len(all_products_raw) == 0):
         return all_products_raw, None
 
@@ -94,7 +97,6 @@ def handle_empty_results(
         _no_results_msg = (
             f"I couldn't find any **{_term} {_cat.lower()}** in our catalog. "
             f"We may not carry that specific type. "
-            f"Would you like to browse all **{_cat}** instead, or try a different search?"
         )
         logger.info(
             f"Step 3.8: Unrecognized search_term='{_term}' returned 0 results — "
@@ -192,7 +194,6 @@ def handle_empty_results(
             else:
                 suggestion_msg = (
                     f"I couldn't find any **{_cat}** matching your search. "
-                    f"Would you like to browse all **{_cat}** instead?"
                 )
             logger.info("Step 3.8: LLM retry produced no suggestion — using fallback no-results message")
 

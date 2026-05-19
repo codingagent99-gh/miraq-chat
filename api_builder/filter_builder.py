@@ -63,6 +63,7 @@ def build_advanced_filter_call(
     page=1, per_page=DEFAULT_PER_PAGE, description="",
     min_price=None, max_price=None, search_term=None,
     product_id=None, requires_resolution=None, in_stock=None,
+    variation_page=None,
 ) -> WooAPICall:
 
     conditions = []
@@ -131,6 +132,21 @@ def build_advanced_filter_call(
         body["ids"] = [product_id]
         body.pop("stock_status", None)
         body.pop("filters", None)
+
+        if variation_page is not None and variation_page > 1:
+            body["variation_page"] = variation_page
+
+    elif search_term:
+        has_taxonomy_conditions = conditions and any("field_type" not in c for c in conditions)
+        if has_taxonomy_conditions:
+            logger.info(f"Ignored leftover search_term='{search_term}' — taxonomy filters are present, relying on them.")
+        else:
+            # This should not happen if callers are routing correctly.
+            # A blank body with no conditions will return arbitrary products.
+            logger.warning(
+                f"search_term='{search_term}' ignored AND no taxonomy conditions present — "
+                "query will return arbitrary products. Caller should use WooCommerce text search instead."
+            )
 
     logger.debug(f"api_builder: Advanced filter body: {json.dumps(body)}")
     

@@ -117,7 +117,8 @@ def format_product(raw: dict) -> dict:
     
     # ── SMART STOCK CHECK ──
     raw_status = raw.get("stock_status", "instock")
-    is_in_stock = (raw_status != "outofstock")
+    purchasable = raw.get("purchasable", True)  # False when all variations are OOS
+    is_in_stock = (raw_status != "outofstock") and purchasable
     
     if raw.get("type") == "variable" and not is_in_stock:
         variations = raw.get("variations", [])
@@ -182,7 +183,7 @@ def format_custom_product(raw: dict) -> dict:
     sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
     
     # ── HONEST DATA ──
-    is_in_stock = raw.get("stock_status") == "instock"
+    is_in_stock = raw.get("stock_status") == "instock" and raw.get("purchasable", True)
     is_on_sale = bool(sale_price_raw and sale_price_raw != "")
 
     # Attributes come as {slug: {...}} — convert to [{name, options}]
@@ -225,7 +226,7 @@ def format_variation(raw: dict, parent: dict = None) -> dict:
     sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
 
     # ── HONEST DATA ──
-    is_in_stock = raw.get("stock_status") == "instock"
+    is_in_stock = raw.get("stock_status") == "instock" and raw.get("purchasable", True)
     is_on_sale = raw.get("on_sale", False)
 
     attrs_raw = raw.get("attributes", [])
@@ -249,22 +250,33 @@ def format_variation(raw: dict, parent: dict = None) -> dict:
     parent_name = parent.get("name", "") if parent else ""
     name = f"{parent_name} — {attr_label}" if attr_label else parent_name
 
-    images = raw.get("image", {})
-    image_url = images.get("src", "") if isinstance(images, dict) else ""
+    # WooCommerce full variation API: singular "image" dict with "src"
+    wc_image = raw.get("image", {})
+    wc_image_url = wc_image.get("src", "") if isinstance(wc_image, dict) else ""
+
+    # Custom compact API: "images" as a flat list of URLs (needs backend to populate)
+    custom_images = raw.get("images", [])
+    if isinstance(custom_images, list) and custom_images:
+        var_images = [img if isinstance(img, str) else img.get("src", "") for img in custom_images]
+        var_images = [i for i in var_images if i]
+    elif wc_image_url:
+        var_images = [wc_image_url]
+    else:
+        var_images = parent.get("images", []) if parent else []
 
     return {
         "id":              raw.get("id"),
         "parent_id":       raw.get("parent_id") or (parent.get("id") if parent else None),
         "name":            name,
         "sku":             raw.get("sku", ""),
-        "permalink":       parent.get("permalink", "") if parent else "",
+        "permalink":       raw.get("url") or (parent.get("permalink", "") if parent else ""),
         "type":            "variation",
         "price":           price,
         "regular_price":   regular_price,
         "sale_price":      sale_price,
         "on_sale":         is_on_sale,
         "in_stock":        is_in_stock,
-        "images":          [image_url] if image_url else (parent.get("images", []) if parent else []),
+        "images":          var_images,
         "attributes":      attrs,
         "variation_label": attr_label,
     }
