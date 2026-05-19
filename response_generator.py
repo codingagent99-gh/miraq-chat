@@ -157,7 +157,8 @@ def generate_bot_message(
     confidence: float,
     order_data: List[dict] = None,
     total_items: Optional[int] = None,
-    page: int = 1
+    page: int = 1,
+    customer_id=None,
 ) -> str:
     """Generate a natural language bot response.
 
@@ -199,8 +200,8 @@ def generate_bot_message(
         # Single order detail — ORDER_STATUS/TRACKING with one order, or LAST_ORDER
         if intent in (Intent.ORDER_STATUS, Intent.ORDER_TRACKING) and order_data:
             return format_order_detail(order_data[0])
-        elif intent == Intent.ORDER_HISTORY and order_data:
-            return _format_order_history_message(order_data, date_after=getattr(entities, "date_after", None))
+        elif intent == Intent.ORDER_HISTORY:
+            return _format_order_history_message(order_data, date_after=getattr(entities, "date_after", None), customer_id=customer_id)
         elif intent == Intent.LAST_ORDER and order_data:
             order = order_data[0]
             order_id = order.get("id", "")
@@ -266,10 +267,7 @@ def generate_bot_message(
                     "Please make sure you're logged in so I can retrieve your order history."
                 )
             elif intent == Intent.ORDER_HISTORY:
-                return (
-                    "I'd love to show your order history! 📦\n\n"
-                    "Please make sure you're logged in so I can retrieve your orders."
-                )
+                pass  # handled above by _format_order_history_message
             elif intent == Intent.REORDER:
                 return (
                     "I can reorder from your last purchase! 🔄\n\n"
@@ -651,10 +649,21 @@ def _describe_date_period(date_after: str) -> str:
         return "that period"
 
 
-def _format_order_history_message(orders: List[dict], date_after: str = None) -> str:
+def _format_order_history_message(orders: List[dict], date_after: str = None, customer_id=None) -> str:
     """Return a short header — the frontend renders order cards from the structured orders array."""
     if not orders:
-        return "No orders found."
+        if date_after:
+            period = _describe_date_period(date_after)
+            return f"📭 You don't have any orders from {period}."
+        if customer_id:
+            return (
+                "You don't have any orders yet! 🛍️\n\n"
+                "Ready to place your first one? Browse our catalog to get started."
+            )
+        return (
+            "I'd love to show your order history! 📦\n\n"
+            "Please make sure you're logged in so I can retrieve your orders."
+        )
     count = len(orders)
     verb = "is" if count == 1 else "are"
     order_word = "order" if count == 1 else "orders"

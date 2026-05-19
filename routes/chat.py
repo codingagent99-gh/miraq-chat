@@ -396,6 +396,7 @@ def _execute_api_calls(intent, api_calls, _resolve_variant):
 def _build_final_response(
     intent, entities, confidence, all_products_raw, order_data,
     api_responses, api_calls_to_execute, conversation, page, start_time,
+    customer_id=None,
 ):
     """Format products and build the final JSON response."""
     products = []
@@ -433,6 +434,7 @@ def _build_final_response(
         bot_message = generate_bot_message(
             intent, entities, products, confidence, order_data,
             total_items=pagination.get("total_items"), page=page,
+            customer_id=customer_id,
         )
         suggestions_list = generate_suggestions(intent, entities, products)
 
@@ -1028,6 +1030,7 @@ def chat():
         return _build_final_response(
             intent, entities, confidence, all_products_raw, order_data,
             api_responses, api_calls_to_execute, conversation, page, start_time,
+            customer_id=customer_id,
         )
 
     except Exception as e:
