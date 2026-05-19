@@ -35,7 +35,15 @@ from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 # ═══════════════════════════════════════════
 
 app = Flask(__name__)
-CORS(app)
+CORS(app,
+    origins=[
+        "https://wgc.net.in",
+        "https://silfradigital.com",
+        "https://silfratech.in",
+        "https://staging-91e4-ecom-solutions9857d536fc-ugaqb.wpcomstaging.com",  # ← add this
+    ],
+    supports_credentials=True
+)
 from flask_migrate import Migrate
 migrate = Migrate(app, db)
 # Configure Database Connection
