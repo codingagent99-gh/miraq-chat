@@ -142,62 +142,80 @@ class StoreLoader(StoreQueryMixin):
           - "shopify"     → live Shopify GraphQL API (always, no dev cache)
           - "woocommerce" → local JSON files when DEV_CACHE=true, else live API
         """
-        try:
-            with self._lock:
-                # ── Fetch raw data ────────────────────────────────────────
-                if ECOMMERCE_BACKEND == "shopify":
-                    from store_loader.shopify_fetcher import load_from_shopify
-                    data = load_from_shopify(
-                        store_domain=self.shopify_domain,
-                        admin_token=self.shopify_admin_token,
-                    )
-                    self._loaded_from_cache = False
-                elif DEV_CACHE_ENABLED:
-                    data = load_from_local_files()
-                    self._loaded_from_cache = True
-                else:
-                    data = load_from_live_api(
-                        self.session, self.base, self.custom_api_base,
-                        self.consumer_key, self.consumer_secret, self.timeout,
-                    )
-                    self._loaded_from_cache = False
+        # Fix #2: skip if a load is already in progress instead of queuing behind it.
+        # Two concurrent loads would double the request rate and worsen 429 storms.
+        if not self._lock.acquire(blocking=False):
+            logger.warning("StoreLoader: load_all() already in progress — skipping this trigger.")
+            return
 
-                    if UPDATE_DEV_CACHE_ENABLED:
+        try:
+            # ── Fetch raw data ────────────────────────────────────────
+            if ECOMMERCE_BACKEND == "shopify":
+                from store_loader.shopify_fetcher import load_from_shopify
+                data = load_from_shopify(
+                    store_domain=self.shopify_domain,
+                    admin_token=self.shopify_admin_token,
+                )
+                self._loaded_from_cache = False
+            elif DEV_CACHE_ENABLED:
+                data = load_from_local_files()
+                self._loaded_from_cache = True
+            else:
+                data = load_from_live_api(
+                    self.session, self.base, self.custom_api_base,
+                    self.consumer_key, self.consumer_secret, self.timeout,
+                )
+                self._loaded_from_cache = False
+
+                # Fix #1: only persist the dev cache when the fetch actually
+                # returned meaningful data.  Saving empty lists would wipe any
+                # previously-good cache files on the disk.
+                if UPDATE_DEV_CACHE_ENABLED:
+                    if data["products"] and data["categories"]:
                         save_to_local_files(
                             data["categories"], data["tags"],
                             data["all_attributes_raw"], data["products"],
                         )
                         logger.info("StoreLoader: ✅ Dev cache files updated from live API")
+                    else:
+                        logger.warning(
+                            f"StoreLoader: ⚠️  Skipping dev cache update — fetch returned "
+                            f"{len(data['products'])} products / {len(data['categories'])} categories. "
+                            "Existing cache files preserved."
+                        )
 
-                # ── Apply fetched data ────────────────────────────────────
-                self.categories        = data["categories"]
-                self.tags              = data["tags"]
-                self.products          = data["products"]
-                self.all_attributes_raw = data["all_attributes_raw"]
-                self.currency_symbol   = data["currency_symbol"]
-                self._expected_product_count = data.get("expected_product_count")
+            # ── Apply fetched data ────────────────────────────────────
+            self.categories         = data["categories"]
+            self.tags               = data["tags"]
+            self.products           = data["products"]
+            self.all_attributes_raw = data["all_attributes_raw"]
+            self.currency_symbol    = data["currency_symbol"]
+            self._expected_product_count = data.get("expected_product_count")
 
-                # ── Build indexes ─────────────────────────────────────────
-                build_all_lookups(self)
-                self._validate_load()
-                self._last_loaded = time.time()
+            # ── Build indexes ─────────────────────────────────────────
+            build_all_lookups(self)
+            self._validate_load()
+            self._last_loaded = time.time()
 
-                if self.vector_model:
-                    build_semantic_vectors(self)
+            if self.vector_model:
+                build_semantic_vectors(self)
 
-                if DEV_CACHE_ENABLED:
-                    dump_lookups_for_debugging(self)
+            if DEV_CACHE_ENABLED:
+                dump_lookups_for_debugging(self)
 
-                self._log_load_summary()
-
-            # Run scanner outside the lock
-            threading.Thread(target=self._run_scanner_async, daemon=True).start()
+            self._log_load_summary()
 
         except Exception as e:
             self._degraded = True
             self._degraded_reasons = [str(e)]
             logger.error(f"StoreLoader: ❌ Failed to load store data: {e}", exc_info=True)
 
+        finally:
+            self._lock.release()
+
+        # Run scanner outside the lock
+        threading.Thread(target=self._run_scanner_async, daemon=True).start()
+        
     def sync_from_webhook(self):
         """Background function triggered by WordPress Action Webhooks."""
         logger.info("Webhook triggered! Refreshing WooCommerce data in background...")
