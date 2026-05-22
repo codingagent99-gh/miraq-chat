@@ -176,31 +176,52 @@ def handle_variant_selection(
 
     if not _var_product_id:
         return None
+    
+    # ── Shopify: load variations from in-memory store loader ──────────────
+    _sl_product = None
+    _sl = None
+    try:
+        _sl = get_store_loader()
+        if _sl:
+            _sl_product = next(
+                (p for p in (_sl.products or [])
+                if p.get("id") == _var_product_id and p.get("_shopify_gid")),
+                None,
+            )
+    except Exception:
+        pass
 
-    # Paginate to get all variations
-    all_variations = []
-    page_num = 1
-    while True:
-        var_resp = woo_client.execute(endpoints.list_variants(
+    if _sl_product:
+        # Shopify: everything is already in memory — no HTTP calls needed
+        all_variations = _sl_product.get("variations", [])
+        parent_raw = _sl_product
+        logger.info(
+            f"Step 3.55: Shopify product — loaded {len(all_variations)} variations "
+            f"from store loader for product_id={_var_product_id}"
+        )
+    else:
+        # WooCommerce: fetch via REST API (existing logic — unchanged)
+        all_variations = []
+        page_num = 1
+        while True:
+            var_resp = woo_client.execute(endpoints.list_variants(
+                product_id=_var_product_id,
+                page=page_num,
+                per_page=100,
+                status="publish",
+                description=f"Fetch variations for variant selection of '{_var_product_name}'",
+            ))
+            batch = var_resp.get("data", []) if var_resp.get("success") else []
+            all_variations.extend(batch)
+            if len(batch) < 100:
+                break
+            page_num += 1
+
+        parent_resp = woo_client.execute(endpoints.fetch_product(
             product_id=_var_product_id,
-            page=page_num,
-            per_page=100,
-            status="publish",
-            description=f"Fetch variations for variant selection of '{_var_product_name}'",
+            description=f"Fetch parent product '{_var_product_name}'",
         ))
-        batch = var_resp.get("data", []) if var_resp.get("success") else []
-        all_variations.extend(batch)
-        if len(batch) < 100:
-            break
-        page_num += 1
-
-    # Fetch parent product to know the exact variation axes required
-    parent_raw = {}
-    parent_resp = woo_client.execute(endpoints.fetch_product(
-        product_id=_var_product_id,
-        description=f"Fetch parent product '{_var_product_name}'",
-    ))
-    parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
+        parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
 
     # Load store_loader once for slug→display-name resolution and the slug lookup
     _sl = None

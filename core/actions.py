@@ -32,17 +32,25 @@ class ActionType:
     # Cart actions.
     ADD_TO_CART      = "ADD_TO_CART"
     OPEN_CART_PANEL  = "OPEN_CART_PANEL"
+    # Shopify Cart actions.
+    SHOPIFY_ADD_TO_CART = "SHOPIFY_ADD_TO_CART"
 
     # Checkout actions.
     UPDATE_CART_ITEM          = "UPDATE_CART_ITEM"
     REMOVE_CART_ITEM          = "REMOVE_CART_ITEM"
     OPEN_CHECKOUT_PANEL       = "OPEN_CHECKOUT_PANEL"
     PROPOSE_CHECKOUT_ADDRESS  = "PROPOSE_CHECKOUT_ADDRESS"
+    
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Builder helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _to_cart_id(val):
+    if isinstance(val, str) and val.startswith("gid://"):
+        return val  # Shopify GID — keep as string
+    return int(val)  # WooCommerce — cast to int
 
 def build_add_to_cart(
     product_id: int,
@@ -63,13 +71,13 @@ def build_add_to_cart(
         raise ValueError("build_add_to_cart: quantity is required")
 
     payload: Dict[str, Any] = {
-        "product_id": int(product_id),
+        "product_id": _to_cart_id(product_id),
         "quantity":   int(quantity),
     }
     if name is not None:
         payload["name"] = name
     if variation_id is not None:
-        payload["variation_id"] = int(variation_id)
+        payload["variation_id"] = _to_cart_id(variation_id)
     if variation:
         payload["variation"] = variation
 
@@ -102,9 +110,9 @@ def build_update_cart_item(
     if key is not None:
         payload["key"] = key
     if product_id is not None:
-        payload["product_id"] = int(product_id)
+        payload["product_id"] = _to_cart_id(product_id)
     if variation_id is not None:
-        payload["variation_id"] = int(variation_id)
+        payload["variation_id"] = _to_cart_id(variation_id)
 
     return {"type": ActionType.UPDATE_CART_ITEM, "payload": payload}
 
@@ -124,12 +132,27 @@ def build_remove_cart_item(
     if key is not None:
         payload["key"] = key
     if product_id is not None:
-        payload["product_id"] = int(product_id)
+        payload["product_id"] = _to_cart_id(product_id)
     if variation_id is not None:
-        payload["variation_id"] = int(variation_id)
+        payload["variation_id"] = _to_cart_id(variation_id)
 
     return {"type": ActionType.REMOVE_CART_ITEM, "payload": payload}
 
+def build_shopify_add_to_cart(
+    variant_gid: str,
+    quantity: int,
+    name: Optional[str] = None,
+) -> Dict[str, Any]:
+    # Extract numeric ID from "gid://shopify/ProductVariant/51453276684586"
+    variant_numeric_id = variant_gid.split("/")[-1]
+    payload = {
+        "variant_id":         variant_gid,
+        "variant_numeric_id": variant_numeric_id,
+        "quantity":           int(quantity),
+    }
+    if name:
+        payload["name"] = name
+    return {"type": ActionType.SHOPIFY_ADD_TO_CART, "payload": payload}
 
 def build_open_checkout_panel() -> Dict[str, Any]:
     """Build an ``OPEN_CHECKOUT_PANEL`` action (no payload fields required)."""

@@ -631,7 +631,7 @@ def chat():
 
     payload_context = body.get("user_context", {})
     if payload_context.get("customer_id") and not conversation.customer_id:
-        conversation.customer_id = payload_context.get("customer_id")
+        conversation.customer_id = str(payload_context.get("customer_id"))
         db.session.commit()
 
     customer_id = conversation.customer_id
@@ -780,34 +780,43 @@ def chat():
         # handle_flow crashes on any flow_result without "bot_message".
         # Action-based results are owned here and must never reach it.
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        
         if flow_result and flow_result.get("action") == "confirm_add_to_cart":
-            pid   = user_context.get("pending_product_id")
-            vid   = user_context.get("pending_variation_id")
-            qty   = user_context.get("pending_quantity") or 1
-            name  = user_context.get("pending_product_name", "item")
+            pid      = user_context.get("pending_product_id")
+            vid      = user_context.get("pending_variation_id")
+            qty      = user_context.get("pending_quantity") or 1
+            name     = user_context.get("pending_product_name", "item")
             resolved = user_context.get("resolved_attributes") or {}
-            variation_attributes = endpoints.build_cart_variation_payload(
-                product_id=pid,
-                variant_id=vid,
-                resolved_attrs=resolved,
-                store_loader=get_store_loader(),
-            )
 
             if pid:
                 elapsed = round((time.time() - start_time) * 1000)
-                actions = [build_add_to_cart(
-                    product_id   = pid,
-                    quantity     = qty,
-                    name         = name,
-                    variation_id = vid,
-                    variation    = variation_attributes,
-                )]
-                # Open the CART panel so the user can review what was added
-                # before proceeding to checkout. (Previously this opened the
-                # checkout panel directly, skipping cart review and producing
-                # a duplicate checkout CTA alongside the suggestion chip.)
-                actions.append(build_open_cart_panel())
 
+                _is_shopify = isinstance(vid, str) and vid.startswith("gid://")
+
+                if _is_shopify:
+                    from core.actions import build_shopify_add_to_cart
+                    actions = [build_shopify_add_to_cart(
+                        variant_gid = vid,
+                        quantity    = qty,
+                        name        = name,
+                    )]
+                else:
+                    variation_attributes = endpoints.build_cart_variation_payload(
+                        product_id   = pid,
+                        variant_id   = vid,
+                        resolved_attrs = resolved,
+                        store_loader = get_store_loader(),
+                    )
+                    actions = [build_add_to_cart(
+                        product_id   = pid,
+                        quantity     = qty,
+                        name         = name,
+                        variation_id = vid,
+                        variation    = variation_attributes,
+                    )]
+
+                actions.append(build_open_cart_panel())
+            
                 bot_msg = f"✅ Added **{name}** ×{qty} to your cart. Opening your cart so you can review…"
                 # Single, unambiguous next-step suggestion set. "Proceed to
                 # checkout" is the ONLY checkout entry-point now — the

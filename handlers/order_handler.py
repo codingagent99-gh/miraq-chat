@@ -476,7 +476,13 @@ def handle_quick_order(
         return None
     
     # ── OUT OF STOCK INTERCEPT ──
-    if _order_product_raw and _order_product_raw.get("stock_status") == "outofstock":
+    _is_shopify = bool(_order_product_raw.get("_shopify_gid"))
+    _out_of_stock = (
+        (not _order_product_raw.get("in_stock"))   # Shopify: trust in_stock boolean
+        if _is_shopify
+        else _order_product_raw.get("stock_status") == "outofstock"  # WooCommerce: unchanged
+    )
+    if _order_product_raw and _out_of_stock:
         elapsed = time.time() - start_time
         from formatters import format_product
         return jsonify({

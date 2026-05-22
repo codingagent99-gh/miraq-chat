@@ -40,6 +40,8 @@ CORS(app,
         "https://wgc.net.in",
         "https://silfradigital.com",
         "https://silfratech.in",
+        "http://localhost:5173",
+        "http://localhost:5174",
         "https://staging-91e4-ecom-solutions9857d536fc-ugaqb.wpcomstaging.com",  # ← add this
     ],
     supports_credentials=True

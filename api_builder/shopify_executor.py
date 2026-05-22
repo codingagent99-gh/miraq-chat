@@ -274,6 +274,7 @@ class ShopifyQueryExecutor:
         }
 
     def execute_from_body(self, body: dict) -> dict:
+        logger.debug(f"[ShopifyExecutor] loader.products count = {len(self._loader.products or [])}")
         page     = body.get("page", 1)
         per_page = body.get("per_page", 4)
         ids      = body.get("ids")
@@ -294,7 +295,23 @@ class ShopifyQueryExecutor:
         start  = (page - 1) * per_page
         sliced = matched[start : start + per_page]
         pages  = max(1, -(-total // per_page)) if total else 0
-
+        
+        # Right before the return in execute_from_body
+        for p in sliced:
+            if not p.get("_shopify_gid"):
+                continue  # WooCommerce products — untouched
+            variations = p.get("variations", [])
+            if variations:
+                any_in_stock = any(
+                    v.get("in_stock") or v.get("stock_status") == "instock"
+                    for v in variations
+                )
+            else:
+                # No variations — fall back to whatever is already set
+                any_in_stock = p.get("in_stock") or p.get("stock_status") == "instock"
+            p["in_stock"] = any_in_stock
+            p["stock_status"] = "instock" if any_in_stock else "outofstock"
+                
         return {
             "products": sliced,          # ← raw dicts, not _normalize_product()
             "page":     page,

@@ -40,7 +40,7 @@ class Conversation(db.Model):
     __tablename__ = "conversations"
 
     id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    customer_id = db.Column(db.Integer, nullable=True, index=True)
+    customer_id = db.Column(db.String, nullable=True, index=True)
 
     flow_state = db.Column(db.String(50), nullable=False, default="idle")
     context_data = db.Column(
