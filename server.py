@@ -44,6 +44,7 @@ CORS(app,
         "http://localhost:5173",
         "http://localhost:5174",
         "https://staging-91e4-ecom-solutions9857d536fc-ugaqb.wpcomstaging.com",
+        "https://silfra-store-4680.myshopify.com"
     ],
     supports_credentials=True
 )
