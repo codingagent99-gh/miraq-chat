@@ -21,7 +21,8 @@ from store_loader.config import (
     REQUEST_TIMEOUT, BROWSER_HEADERS,
     DEV_CACHE_ENABLED, UPDATE_DEV_CACHE_ENABLED,
     CURRENCY_MAP,
-    ECOMMERCE_BACKEND, SHOPIFY_STORE_DOMAIN, SHOPIFY_ADMIN_TOKEN,   # ← added
+    ECOMMERCE_BACKEND, SHOPIFY_STORE_DOMAIN,
+    SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET, SHOPIFY_ADMIN_TOKEN,
 )
 from store_loader.cache import BoundedVariationCache
 from store_loader.fetcher import (
@@ -44,14 +45,40 @@ class StoreLoader(StoreQueryMixin):
 
     _CURRENCY_MAP = CURRENCY_MAP
 
-    def __init__(self):
+    def __init__(self, app=None):
+        """
+        Args:
+            app: Flask app instance, forwarded to ShopifyTokenManager so it
+                 can open app contexts for DB access in background threads.
+        """
+        self._flask_app = app
+
         self.base             = WOO_BASE_URL
         self.custom_api_base  = CUSTOM_API_BASE_URL
         self.consumer_key     = WOO_CONSUMER_KEY
         self.consumer_secret  = WOO_CONSUMER_SECRET
         self.timeout          = REQUEST_TIMEOUT
-        self.shopify_domain      = SHOPIFY_STORE_DOMAIN   # ← added
-        self.shopify_admin_token = SHOPIFY_ADMIN_TOKEN    # ← added
+        self.shopify_domain   = SHOPIFY_STORE_DOMAIN
+
+        # ── Shopify token manager ─────────────────────────────────────────────
+        # If we have OAuth credentials, use the token manager (auto-refresh).
+        # Fall back to the hardcoded SHOPIFY_ADMIN_TOKEN for local dev.
+        self._token_manager = None
+        if ECOMMERCE_BACKEND == "shopify":
+            if SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET:
+                from store_loader.shopify_token_manager import ShopifyTokenManager
+                self._token_manager = ShopifyTokenManager(app=app)
+                logger.info("StoreLoader: Shopify token manager initialised (auto-refresh enabled)")
+            elif SHOPIFY_ADMIN_TOKEN:
+                logger.warning(
+                    "StoreLoader: SHOPIFY_CLIENT_ID/SECRET not set — "
+                    "falling back to hardcoded SHOPIFY_ADMIN_TOKEN (expires daily!)"
+                )
+            else:
+                logger.error(
+                    "StoreLoader: Shopify backend selected but no credentials found. "
+                    "Set SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET in .env"
+                )
 
         self.session = requests.Session()
         self.session.headers.update(BROWSER_HEADERS)
@@ -133,6 +160,18 @@ class StoreLoader(StoreQueryMixin):
         self._loaded_from_cache: bool = False
         self.conflicts: List[Dict] = []
 
+    # ─── Token helper ───
+
+    def _get_shopify_token(self) -> str:
+        """
+        Return the current Shopify access token.
+        Uses the token manager when available, otherwise falls back to the
+        hardcoded env value (dev / legacy).
+        """
+        if self._token_manager:
+            return self._token_manager.get_token()
+        return SHOPIFY_ADMIN_TOKEN
+
     # ─── Loading orchestration ───
 
     def load_all(self):
@@ -142,8 +181,6 @@ class StoreLoader(StoreQueryMixin):
           - "shopify"     → live Shopify GraphQL API (always, no dev cache)
           - "woocommerce" → local JSON files when DEV_CACHE=true, else live API
         """
-        # Fix #2: skip if a load is already in progress instead of queuing behind it.
-        # Two concurrent loads would double the request rate and worsen 429 storms.
         if not self._lock.acquire(blocking=False):
             logger.warning("StoreLoader: load_all() already in progress — skipping this trigger.")
             return
@@ -154,7 +191,7 @@ class StoreLoader(StoreQueryMixin):
                 from store_loader.shopify_fetcher import load_from_shopify
                 data = load_from_shopify(
                     store_domain=self.shopify_domain,
-                    admin_token=self.shopify_admin_token,
+                    admin_token=self._get_shopify_token(),   # ← always fresh
                 )
                 self._loaded_from_cache = False
             elif DEV_CACHE_ENABLED:
@@ -167,9 +204,6 @@ class StoreLoader(StoreQueryMixin):
                 )
                 self._loaded_from_cache = False
 
-                # Fix #1: only persist the dev cache when the fetch actually
-                # returned meaningful data.  Saving empty lists would wipe any
-                # previously-good cache files on the disk.
                 if UPDATE_DEV_CACHE_ENABLED:
                     if data["products"] and data["categories"]:
                         save_to_local_files(
@@ -215,7 +249,7 @@ class StoreLoader(StoreQueryMixin):
 
         # Run scanner outside the lock
         threading.Thread(target=self._run_scanner_async, daemon=True).start()
-        
+
     def sync_from_webhook(self):
         """Background function triggered by WordPress Action Webhooks."""
         logger.info("Webhook triggered! Refreshing WooCommerce data in background...")
@@ -225,9 +259,16 @@ class StoreLoader(StoreQueryMixin):
             logger.error(f"Webhook sync failed: {e}", exc_info=True)
 
     def start_background_refresh(self):
-        """Start the background thread that periodically reloads store data."""
+        """
+        Start the background thread that periodically reloads store data.
+        Also boots the Shopify token manager's refresh loop (if active).
+        """
+        # Start Shopify token auto-refresh
+        if self._token_manager:
+            self._token_manager.start()
+
         if DEV_CACHE_ENABLED:
-            logger.info("StoreLoader: 🛑 Background refresh DISABLED in dev mode")
+            logger.info("StoreLoader: 🛑 Catalog background refresh DISABLED in dev mode")
             return
 
         if self._refresh_thread and self._refresh_thread.is_alive():
@@ -246,7 +287,7 @@ class StoreLoader(StoreQueryMixin):
 
         self._refresh_thread = threading.Thread(target=_refresh_loop, daemon=True)
         self._refresh_thread.start()
-        logger.info(f"StoreLoader: Background refresh scheduled every {self._refresh_interval // 3600}h")
+        logger.info(f"StoreLoader: Catalog refresh scheduled every {self._refresh_interval // 3600}h")
 
     # ─── Private helpers ───
 

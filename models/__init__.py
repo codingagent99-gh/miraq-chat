@@ -6,7 +6,7 @@ work unchanged across the entire codebase.
 """
 
 # ── DB models ──
-from models.db_models import (  # noqa: F401
+from models.db_models import (
     db,
     DEFAULT_CONTEXT,
     Conversation,
@@ -14,7 +14,7 @@ from models.db_models import (  # noqa: F401
 )
 
 # ── Domain models ──
-from models.domain import (  # noqa: F401
+from models.domain import (
     Intent,
     OrPair,
     ExtractedEntities,
@@ -23,9 +23,12 @@ from models.domain import (  # noqa: F401
 )
 
 # ── Catalog models (Phase 4a) ──
-from models.catalog import (  # noqa: F401
+from models.catalog import (
     CatalogAttribute,
     CatalogAttributeTerm,
     CatalogCategory,
     CatalogTag,
 )
+
+# ── Shopify token (auto-refresh OAuth token storage) ──
+from models.shopify_token import ShopifyToken

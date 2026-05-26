@@ -77,4 +77,15 @@ CURRENCY_MAP = {
 
 ECOMMERCE_BACKEND    = os.getenv("ECOMMERCE_BACKEND",    "woocommerce").lower()
 SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "")
+
+# ── Shopify OAuth (client credentials flow) ───────────────────────────────────
+# These never change — store them in .env and leave them there.
+# The access token is managed automatically; do NOT set SHOPIFY_ADMIN_TOKEN manually.
+
+SHOPIFY_CLIENT_ID     = os.getenv("SHOPIFY_CLIENT_ID",     "")
+SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET", "")
+
+# SHOPIFY_ADMIN_TOKEN is kept for local dev / one-off overrides only.
+# When SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET are present, the token
+# manager takes over and this value is ignored at runtime.
 SHOPIFY_ADMIN_TOKEN  = os.getenv("SHOPIFY_ADMIN_TOKEN",  "")

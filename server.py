@@ -30,6 +30,7 @@ from routes.products import products_bp
 import urllib.parse
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+
 # ═══════════════════════════════════════════
 # FLASK APP & DATABASE
 # ═══════════════════════════════════════════
@@ -42,45 +43,41 @@ CORS(app,
         "https://silfratech.in",
         "http://localhost:5173",
         "http://localhost:5174",
-        "https://staging-91e4-ecom-solutions9857d536fc-ugaqb.wpcomstaging.com",  # ← add this
+        "https://staging-91e4-ecom-solutions9857d536fc-ugaqb.wpcomstaging.com",
     ],
     supports_credentials=True
 )
 from flask_migrate import Migrate
 migrate = Migrate(app, db)
+
 # Configure Database Connection
-# Defaults to localhost for dev, override with DATABASE_URL in production
 database_uri = os.getenv('DATABASE_URL', 'postgresql://postgres:admin@localhost:5432/miraq_chat')
 app.config['SQLALCHEMY_DATABASE_URI'] = database_uri
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 def ensure_database_exists(db_uri):
     """
-    Connects to the default 'postgres' database to check if our target 
+    Connects to the default 'postgres' database to check if our target
     database exists. If not, it creates it.
     """
-    # Parse the database URI (e.g., postgresql://user:pass@localhost:5432/miraq_chat)
     result = urllib.parse.urlparse(db_uri)
     username = result.username
     password = result.password
     hostname = result.hostname
     port = result.port
-    database_name = result.path[1:] # Strip the leading slash
+    database_name = result.path[1:]
 
     try:
-        # Connect to the default 'postgres' database to issue admin commands
         conn = psycopg2.connect(
-            dbname='postgres', 
-            user=username, 
-            password=password, 
-            host=hostname, 
+            dbname='postgres',
+            user=username,
+            password=password,
+            host=hostname,
             port=port
         )
-        # PostgreSQL does not allow CREATE DATABASE inside a transaction block
         conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
         cursor = conn.cursor()
 
-        # Check if the database exists
         cursor.execute(f"SELECT 1 FROM pg_catalog.pg_database WHERE datname = '{database_name}'")
         exists = cursor.fetchone()
 
@@ -88,7 +85,7 @@ def ensure_database_exists(db_uri):
             print(f"📦 Database '{database_name}' not found. Creating it now...")
             cursor.execute(f"CREATE DATABASE {database_name}")
             print(f"✅ Database '{database_name}' created successfully!")
-        
+
         cursor.close()
         conn.close()
 
@@ -97,17 +94,15 @@ def ensure_database_exists(db_uri):
         print("Make sure your PostgreSQL server is running and the credentials are correct.")
 
 ensure_database_exists(database_uri)
+
 # Bind Database to App
 db.init_app(app)
+
 # Create Tables on Startup
 with app.app_context():
+    # Import ShopifyToken here so SQLAlchemy registers it before create_all()
+    from models.shopify_token import ShopifyToken  # noqa: F401
     db.create_all()
-    # Tables are now safely created inside miraq_chat!
-# Create Tables on Startup
-with app.app_context():
-    db.create_all()
-    # Note: For production, you will eventually want to use Flask-Migrate (Alembic) 
-    # instead of create_all(), but this is perfect for getting started.
 
 # Register blueprints
 app.register_blueprint(chat_bp)
@@ -122,21 +117,17 @@ app.register_blueprint(products_bp)
 def handle_global_exception(e):
     """
     Catches ALL unhandled exceptions across the entire Flask app.
-    Forces the full traceback into our daily chat.txt log file, 
+    Forces the full traceback into our daily chat.txt log file,
     and prevents the frontend chatbot from receiving a broken HTML 500 page.
     """
     logger = get_logger("miraq_chat")
-    
     logger.critical(f"🔥 UNHANDLED CRASH: {str(e)}", exc_info=True)
-    
-    # Safety Rollback
-    # If a database transaction failed globally, we must roll it back 
-    # so the session doesn't get permanently stuck.
+
     try:
         db.session.rollback()
     except Exception:
         pass
-    
+
     return jsonify({
         "success": False,
         "bot_message": "Oops! I encountered an unexpected Error.",
@@ -145,7 +136,7 @@ def handle_global_exception(e):
         "suggestions": ["Start over", "Show me all products"],
         "metadata": {"error": "Internal Server Error"}
     }), 500
-    
+
 # ═══════════════════════════════════════════
 # ADDITIONAL ROUTES
 # ═══════════════════════════════════════════
@@ -155,7 +146,6 @@ def health():
     """
     Lightweight liveness check.
     Returns 200 OK if the server is running, 503 if store is degraded.
-    Use /status for full detail.
     """
     loader = get_store_loader()
     degraded = loader._degraded if loader else True
@@ -172,8 +162,6 @@ def health():
 def status():
     """
     Detailed store status endpoint.
-    Returns full load state, per-resource counts, degraded flag, and next retry timing.
-    Use this for monitoring dashboards or manual diagnosis.
     """
     loader = get_store_loader()
     if not loader:
@@ -189,6 +177,52 @@ def status():
         "status": "degraded" if store_status["degraded"] else "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "store": store_status,
+    }), http_code
+
+
+@app.route("/shopify-token-status", methods=["GET"])
+def shopify_token_status():
+    """
+    Diagnostic endpoint — shows the current state of the Shopify OAuth token
+    stored in Postgres. Safe to expose internally; does NOT return the token value.
+
+    Returns:
+        200  — token is healthy
+        206  — token is near expiry (< 1 h) but still valid
+        503  — token is expired or missing
+    """
+    from models.shopify_token import ShopifyToken
+    from store_loader.config import SHOPIFY_STORE_DOMAIN
+
+    row = ShopifyToken.query.get(SHOPIFY_STORE_DOMAIN)
+    if not row:
+        return jsonify({
+            "status": "missing",
+            "store_domain": SHOPIFY_STORE_DOMAIN,
+            "message": "No token found in DB. Has the server started with valid credentials?",
+        }), 503
+
+    hours_remaining = row.seconds_until_expiry / 3600
+
+    if row.is_expired:
+        http_code = 503
+        status_label = "expired"
+    elif row.needs_refresh:
+        http_code = 206
+        status_label = "near_expiry"
+    else:
+        http_code = 200
+        status_label = "healthy"
+
+    return jsonify({
+        "status":          status_label,
+        "store_domain":    row.store_domain,
+        "scope":           row.scope,
+        "fetched_at":      row.fetched_at.isoformat(),
+        "expires_at":      row.expires_at.isoformat(),
+        "hours_remaining": round(hours_remaining, 2),
+        "refresh_count":   row.refresh_count,
+        "last_error":      row.last_error,
     }), http_code
 
 
@@ -214,16 +248,12 @@ def list_categories():
 
 @app.route("/session/<session_id>", methods=["GET"])
 def get_session(session_id):
-    """
-    Get session history.
-    🚀 UPDATED: Now queries the Postgres database instead of the in-memory dict.
-    Great for debugging.
-    """
+    """Get session history from Postgres."""
     import uuid
     try:
         session_uuid = uuid.UUID(session_id)
         conversation = db.session.get(Conversation, session_uuid)
-        
+
         if conversation:
             return jsonify({
                 "session": {
@@ -236,8 +266,8 @@ def get_session(session_id):
                 }
             })
     except ValueError:
-        pass # Invalid UUID format
-        
+        pass
+
     return jsonify({"error": "Session not found"}), 404
 
 @app.route("/widget-config", methods=["GET"])
@@ -250,7 +280,7 @@ def widget_config():
 
     try:
         headers = {
-            **BROWSER_HEADERS,  # includes User-Agent, Accept, Accept-Language
+            **BROWSER_HEADERS,
             "X-Consumer-Key":    WOO_CONSUMER_KEY,
             "X-Consumer-Secret": WOO_CONSUMER_SECRET,
         }
@@ -270,7 +300,6 @@ def widget_config():
 # ═══════════════════════════════════════════
 
 def _print_dev_banner():
-    """Print a big obvious DEV MODE banner so you never mistake it for production."""
     YELLOW = "\033[93m"
     RED = "\033[91m"
     BOLD = "\033[1m"
@@ -300,8 +329,14 @@ def _print_dev_banner():
 
 
 def initialize_store():
-    """Load store data from WooCommerce at startup, then start background refresh."""
-    loader = StoreLoader()
+    """
+    Load store data from WooCommerce/Shopify at startup,
+    then start background refresh (and Shopify token manager if applicable).
+
+    The Flask app instance is passed into StoreLoader so the token manager
+    can open app contexts from its background thread.
+    """
+    loader = StoreLoader(app=app)   # ← pass app so token manager can use DB from threads
     try:
         loader.load_all()
     except Exception as e:
@@ -311,18 +346,14 @@ def initialize_store():
         logging.getLogger("miraq_chat").warning(
             "Server will respond with limited functionality until store data loads."
         )
+
     # Always register and always start background refresh
     set_store_loader(loader)
     loader.start_background_refresh()
 
-    # Show dev mode banner if data came from cache
     if DEV_CACHE_ENABLED and loader._loaded_from_cache:
         _print_dev_banner()
 
-import os
-import urllib.parse
-import psycopg2
-from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
 if __name__ == "__main__":
     print("=" * 60)
@@ -330,7 +361,6 @@ if __name__ == "__main__":
     print("=" * 60)
     print()
 
-    # Load store data
     initialize_store()
 
     print()
@@ -339,6 +369,7 @@ if __name__ == "__main__":
     print(f"   GET  http://localhost:{PORT}/health")
     print(f"   GET  http://localhost:{PORT}/status")
     print(f"   GET  http://localhost:{PORT}/categories")
+    print(f"   GET  http://localhost:{PORT}/shopify-token-status")
     print()
 
     app.run(
