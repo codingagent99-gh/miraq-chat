@@ -26,7 +26,7 @@ from models import db, Conversation
 from routes.chat import chat_bp
 from routes.admin import admin_bp
 from routes.products import products_bp
-
+from routes.shopify import shopify_bp
 import urllib.parse
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
@@ -109,6 +109,7 @@ with app.app_context():
 app.register_blueprint(chat_bp)
 app.register_blueprint(admin_bp)
 app.register_blueprint(products_bp)
+app.register_blueprint(shopify_bp)
 
 # ═══════════════════════════════════════════
 # GLOBAL ERROR HANDLER
