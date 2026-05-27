@@ -29,6 +29,7 @@ from conversation_flow import FlowState, handle_flow_state
 from chat_logger import get_logger, sanitize_log_string
 from store_registry import get_store_loader
 from ecommerce import endpoints
+from models.usage_guard import enforce_daily_limit
 
 from handlers.chat_utils import default_pagination, build_pagination, format_order_for_frontend
 from handlers.flow_handler import handle_flow
@@ -582,12 +583,12 @@ def _handle_customer_intents(
 
     return None
 
-
 # ══════════════════════════════════════════════════════════════
 # ─── MAIN CHAT PIPELINE ───
 # ══════════════════════════════════════════════════════════════
 
 @chat_bp.route("/chat", methods=["POST"])
+@enforce_daily_limit 
 def chat():
     start_time = time.time()
 
