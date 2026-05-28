@@ -15,7 +15,7 @@ from app_config import (
     CLASSIFIER_PROVIDER_TAG,
 )
 from llm_fallback import llm_fallback
-from conversation_flow import should_disambiguate, get_disambiguation_message
+from conversation_flow import should_disambiguate, get_disambiguation_message, LOW_CONFIDENCE_THRESHOLD
 from chat_logger import get_logger
 from handlers.chat_utils import default_pagination
 
@@ -142,9 +142,38 @@ def run_llm_fallback(
 
     # ── Intent/entity resolved — merge into new entities ──
     if fallback_type in ["intent_resolved", "entity_extracted"]:
-        new_intent, new_entities, new_confidence = _merge_llm_entities(
+        merge_result = _merge_llm_entities(
             llm_result, entities, fallback_type, store_loader, logger
         )
+
+        if merge_result is None:
+            # LLM returned a hallucinated intent string — treat as failure
+            disambig = get_disambiguation_message()
+            elapsed = time.time() - start_time
+            logger.warning(
+                f"Step 1.5: LLM hallucinated invalid intent — returning disambiguation | "
+                f"original_intent={intent.value} | fallback_type={fallback_type}"
+            )
+            return jsonify({
+                "success": True,
+                "bot_message": disambig["bot_message"],
+                "intent": "disambiguation",
+                "products": [],
+                "suggestions": disambig["suggestions"],
+                "session_id": session_id,
+                "metadata": {
+                    "flow_state": disambig["flow_state"],
+                    "confidence": round(confidence, 2),
+                    "original_intent": intent.value,
+                    "response_time_ms": round(elapsed * 1000),
+                    "provider": "conversation_flow",
+                    "llm_error": "LLM returned an unrecognised intent value",
+                },
+                "flow_state": disambig["flow_state"],
+                "pagination": default_pagination(page),
+            }), 200
+
+        new_intent, new_entities, new_confidence = merge_result
 
         result = ClassifiedResult(
             intent=new_intent,
@@ -209,22 +238,42 @@ def _merge_llm_entities(llm_result, original_entities, fallback_type, store_load
 
     The LLM performs intent-only classification — it does not return entities.
     Original entities from the local classifier are preserved unchanged.
+
+    Returns:
+        (Intent, ExtractedEntities, float) on success
+        None if the LLM returned an unrecognised intent string (caller should
+        treat this as a failure and return disambiguation to the user)
     """
     new_entities = original_entities
 
     # Safely extract and normalize the intent string from the LLM
     llm_intent_str = llm_result.get("intent", "unknown").lower().strip()
-    
+
     try:
-        # Single Source of Truth: Cast string directly to the Intent enum
+        # Single Source of Truth: cast string directly to the Intent enum
         new_intent = Intent(llm_intent_str)
     except ValueError:
-        # If the LLM hallucinates a fake intent, catch it safely
+        # LLM hallucinated a non-existent intent — signal failure to caller
+        # so the user gets a clean disambiguation instead of a silent misroute
         log.warning(
-            f"Step 1.5: LLM hallucinated invalid intent '{llm_intent_str}' — "
-            f"falling back to PRODUCT_SEARCH."
+            f"Step 1.5: LLM returned unrecognised intent '{llm_intent_str}' — "
+            f"returning None to trigger disambiguation."
         )
-        new_intent = Intent.PRODUCT_SEARCH
+        return None
 
-    new_confidence = llm_result.get("confidence", 0.70)
+    raw_confidence = llm_result.get("confidence", 0.70)
+
+    # Clamp: a resolved intent whose confidence sits below the disambiguation
+    # threshold would retrigger the LLM on the very next turn, creating a loop.
+    # We accept any value the LLM reported, but floor it just above the threshold
+    # so the pipeline treats this as a confident resolution.
+    _MIN_RESOLVED_CONFIDENCE = LOW_CONFIDENCE_THRESHOLD + 0.05  # 0.65
+    new_confidence = max(raw_confidence, _MIN_RESOLVED_CONFIDENCE)
+
+    if new_confidence != raw_confidence:
+        log.debug(
+            f"Step 1.5: LLM confidence clamped | "
+            f"raw={raw_confidence:.2f} -> clamped={new_confidence:.2f}"
+        )
+
     return new_intent, new_entities, new_confidence

@@ -80,6 +80,63 @@ def _sanitize_for_llm(text: str) -> str:
     return text
 
 
+def _extract_json_object(text: str) -> str:
+    """
+    Robustly extract the first JSON object {...} from an LLM response.
+
+    Handles all common LLM response formats:
+    - Clean JSON                       → returned as-is
+    - ```json\\n{...}\\n```              → fences stripped
+    - ```\\n{...}\\n```                  → fences stripped (no language tag)
+    - Prose before/after the JSON      → everything outside {...} discarded
+
+    If no braces are found the original text is returned unchanged so that
+    the downstream json.loads call produces a clear, attributable error.
+    """
+    # Strip all markdown code fence variants (with or without language tag)
+    text = re.sub(r'```(?:json)?\s*', '', text)
+    text = re.sub(r'```', '', text)
+    text = text.strip()
+
+    # Extract the first complete {...} block, ignoring any leading/trailing prose
+    start = text.find('{')
+    end = text.rfind('}')
+    if start != -1 and end != -1 and end > start:
+        return text[start:end + 1]
+
+    # No braces found — return as-is so json.loads raises a meaningful error
+    return text
+
+
+# ══════════════════════════════════════════════════════════════
+# RETRY HELPERS
+# ══════════════════════════════════════════════════════════════
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """
+    Returns True for transient errors that are safe and worth retrying once.
+
+    Retries on:
+    - Timeout / connection-level failures  (network blip)
+    - HTTP 429 Too Many Requests           (rate limit — provider will accept soon)
+    - HTTP 502 / 503 / 504                 (provider-side transient overload)
+
+    Does NOT retry on:
+    - HTTP 400 Bad Request  — our payload is malformed; retrying won't help
+    - HTTP 401 / 403        — auth error; retrying wastes quota and money
+    - HTTP 404              — wrong endpoint; retrying won't help
+    - ValueError            — code/config bug; retrying won't help
+    """
+    if isinstance(exc, requests.exceptions.Timeout):
+        return True
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return True
+    if isinstance(exc, requests.exceptions.HTTPError):
+        status = exc.response.status_code if exc.response is not None else 0
+        return status in (429, 502, 503, 504)
+    return False
+
+
 def _build_classifier_context(
     original_intent: str,
     original_confidence: float,
@@ -219,46 +276,65 @@ class LLMClient:
             raise ValueError(f"Unsupported LLM provider: {self.provider}")
     
     def chat_completion(
-        self, 
-        system_prompt: str, 
+        self,
+        system_prompt: str,
         user_message: str
     ) -> Dict[str, Any]:
         """
-        Send a chat completion request to configured LLM provider.
-        
+        Send a chat completion request to the configured LLM provider.
+
+        Includes a single retry for transient network/provider errors (timeout,
+        connection reset, HTTP 429/502/503/504). Non-retryable errors (auth,
+        bad request, config bugs) are re-raised immediately to avoid burning
+        tokens on calls that will never succeed.
+
         Args:
             system_prompt: System instructions
             user_message: User's message
-            
+
         Returns:
-            Dict with:
-                - content: LLM response text
-                - input_tokens: Input tokens used
-                - output_tokens: Output tokens used
-                - total_tokens: Total tokens used
-                - model: Model used
-                
+            Dict with content, input_tokens, output_tokens, total_tokens, model, latency_ms
+
         Raises:
-            Exception: If API call fails
+            Exception: If the API call fails after the retry budget is exhausted
         """
         start_time = time.time()
-        
-        try:
-            if self.provider in ["copilot", "openai", "azure_openai", "mistral"]:
-                result = self._openai_style_completion(system_prompt, user_message)
-            elif self.provider == "anthropic":
-                result = self._anthropic_completion(system_prompt, user_message)
-            else:
-                raise ValueError(f"Unsupported provider: {self.provider}")
-            
-            # Add latency
-            result["latency_ms"] = int((time.time() - start_time) * 1000)
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"LLM API call failed | provider={self.provider} | error={str(e)}")
-            raise
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(2):  # attempt 0 = initial call, attempt 1 = one retry
+            try:
+                if attempt > 0:
+                    time.sleep(1)  # brief pause before retry
+                    logger.warning(
+                        f"LLM retry attempt {attempt} | provider={self.provider} | "
+                        f"previous_error={last_exc}"
+                    )
+
+                if self.provider in ["copilot", "openai", "azure_openai", "mistral"]:
+                    result = self._openai_style_completion(system_prompt, user_message)
+                elif self.provider == "anthropic":
+                    result = self._anthropic_completion(system_prompt, user_message)
+                else:
+                    raise ValueError(f"Unsupported provider: {self.provider}")
+
+                result["latency_ms"] = int((time.time() - start_time) * 1000)
+                return result
+
+            except Exception as e:
+                last_exc = e
+                if not _is_retryable_error(e) or attempt == 1:
+                    # Non-retryable error, or retry budget exhausted — give up
+                    logger.error(
+                        f"LLM API call failed | provider={self.provider} | "
+                        f"attempt={attempt} | error={str(e)}"
+                    )
+                    raise
+                logger.warning(
+                    f"LLM transient error, will retry | provider={self.provider} | "
+                    f"error={str(e)}"
+                )
+
+        raise last_exc  # unreachable, satisfies type checkers
     
     def _openai_style_completion(
         self, 
@@ -438,18 +514,16 @@ def llm_fallback(
         )
         
         # Parse LLM response
-        llm_content = llm_response["content"].strip()
-        
-        # Extract JSON from response (handle markdown code blocks)
-        json_match = re.search(r'```json\s*(\{.*?\})\s*```', llm_content, re.DOTALL)
-        if json_match:
-            llm_content = json_match.group(1)
-        
+        llm_content = _extract_json_object(llm_response["content"].strip())
+
         # Parse JSON
         try:
             parsed = json.loads(llm_content)
         except json.JSONDecodeError as e:
-            logger.warning(f"Step 1.5: Failed to parse LLM response as JSON | error={str(e)}")
+            logger.warning(
+                f"Step 1.5: Failed to parse LLM response as JSON | "
+                f"error={str(e)} | raw_content={llm_response['content'][:200]!r}"
+            )
             return {
                 "success": False,
                 "error": "LLM returned invalid JSON",
@@ -587,17 +661,15 @@ Return ONLY valid JSON."""
         )
         
         # Parse response
-        llm_content = llm_response["content"].strip()
-        
-        # Extract JSON
-        json_match = re.search(r'```json\s*(\{.*?\})\s*```', llm_content, re.DOTALL)
-        if json_match:
-            llm_content = json_match.group(1)
-        
+        llm_content = _extract_json_object(llm_response["content"].strip())
+
         try:
             parsed = json.loads(llm_content)
         except json.JSONDecodeError:
-            logger.warning("Step 3.8: Failed to parse LLM response as JSON")
+            logger.warning(
+                f"Step 3.8: Failed to parse LLM response as JSON | "
+                f"raw_content={llm_response['content'][:200]!r}"
+            )
             return {
                 "success": False,
                 "error": "LLM returned invalid JSON",
