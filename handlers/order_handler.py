@@ -284,8 +284,15 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
 
     source_order = order_data[0]
     
+    logger.debug(f"[DEBUG] source_order keys: {list(source_order.keys())}")
+    logger.debug(f"[DEBUG] source_order shipping: {source_order.get('shipping')}")
+    logger.debug(f"[DEBUG] source_order billing: {source_order.get('billing')}")
+        
     # Security check to ensure they own the order they are trying to reorder!
-    if source_order.get("customer_id") != customer_id:
+    def _extract_id(val) -> str:
+        return str(val).split("/")[-1] if val else ""
+
+    if _extract_id(source_order.get("customer_id")) != _extract_id(customer_id):
         logger.warning(f"Step 3.5: Reorder failed | Unauthorized access attempt for order #{source_order.get('id')}")
         return None
 
@@ -298,7 +305,8 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
     # Check Stock Status Before Reordering!
     product_ids = [item["product_id"] for item in source_line_items if item.get("product_id")]
     
-    if product_ids:
+    from app_config import ECOMMERCE_BACKEND
+    if product_ids and ECOMMERCE_BACKEND != "shopify":
         stock_call = endpoints.check_stock(
             product_ids=product_ids,
             description="Check stock status for reorder items",
@@ -358,28 +366,68 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
     if not new_line_items:
         return None
 
-    reorder_call = endpoints.create_order(
-        payload={
-            "status": "processing",
-            "customer_id": customer_id,
-            "payment_method": DEFAULT_PAYMENT_METHOD,
-            "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
-            "set_paid": False,
-            "line_items": new_line_items,
-        },
-        description="Create reorder from last order line items",
-    )
-    reorder_resp = woo_client.execute(reorder_call)
+    from app_config import ECOMMERCE_BACKEND
+    if ECOMMERCE_BACKEND == "shopify":
+        from api_builder.shopify_orders_executor import ShopifyOrdersExecutor
+        from models import WooAPICall
+        reorder_call = WooAPICall(
+            method="POST",
+            endpoint="orders",
+            params={},
+            body={
+                "_op":         "create_order",
+                "customer_id": str(customer_id),
+                "line_items":  new_line_items,
+            },
+            surface="shopify_orders",
+            description="Create Shopify reorder",
+        )
+        reorder_resp = ShopifyOrdersExecutor().execute(reorder_call)
+    else:
+        reorder_call = endpoints.create_order(
+            payload={
+                "status": "processing",
+                "customer_id": customer_id,
+                "payment_method": DEFAULT_PAYMENT_METHOD,
+                "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
+                "set_paid": False,
+                "line_items": new_line_items,
+            },
+            description="Create reorder from last order line items",
+        )
+        reorder_resp = woo_client.execute(reorder_call)
     
+    elapsed = time.time() - start_time
     if reorder_resp.get("success") and isinstance(reorder_resp.get("data"), dict):
         new_order = reorder_resp["data"]
-        order_data.append(new_order)
         logger.info(f"Step 3.5: Reorder created successfully | order_id={new_order.get('id')} | order_number={new_order.get('number')}")
+        bot_message = (
+            f"🔄 **Reorder placed!** (new order #{new_order.get('number') or new_order.get('id')})\n\n"
+            + "\n".join(f"  • {i.get('name','Item')} × {i.get('quantity',1)}" for i in source_line_items if i.get("product_id"))
+            + "\n\nYour order has been created and is being processed. ✅"
+        )
+        suggestions = ["Show my orders", "Track my order"]
     else:
         error_msg = sanitize_log_string(str(reorder_resp.get('error', 'Unknown')))
-        logger.warning(f"Step 3.5: Reorder failed | error={error_msg}")
-        
-    return None # Fall through so chat.py formats the success/failure message!
+        logger.warning(f"Step 3.5: Reorder creation failed | error={error_msg}")
+        bot_message = (
+            f"🔄 **Items identified** (from order #{source_order.get('number') or source_order.get('id')})\n\n"
+            + "\n".join(f"  • {i.get('name','Item')} × {i.get('quantity',1)}" for i in source_line_items if i.get("product_id"))
+            + "\n\n⚠️ The new order could not be created automatically. Please place the order manually or contact support."
+        )
+        suggestions = ["Show my orders", "Browse products", "Contact support"]
+
+    return jsonify({
+        "success": True,
+        "bot_message": bot_message,
+        "intent": intent.value,
+        "products": [],
+        "suggestions": suggestions,
+        "session_id": session_id,
+        "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": round(elapsed * 1000)},
+        "flow_state": FlowState.IDLE.value,
+        "pagination": default_pagination(page),
+    }), 200
 
 def handle_order_detail(current_flow_state, customer_id, user_context, session_id, page, start_time):
     """Step 3.5b: Fetch and display a specific order's details."""

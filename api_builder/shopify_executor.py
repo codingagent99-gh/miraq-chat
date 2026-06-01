@@ -363,10 +363,25 @@ class ShopifyQueryExecutor:
 
             # ── 3. free-text search (name + descriptions) ─────────────────
             if search_f:
+                # Also scan tag names/slugs and variant option values so a
+                # query like "matte tiles" matches products with a
+                # Finish="Matte" variant even when no taxonomy filter exists.
+                tag_text = " ".join(
+                    t.get("slug", "") + " " + t.get("name", "")
+                    for t in (product.get("tags") or [])
+                ).lower()
+                variation_text = " ".join(
+                    a.get("option", "") + " " + a.get("name", "")
+                    for v in (product.get("variations") or [])
+                    for a in (v.get("attributes") or [])
+                    if isinstance(a, dict)
+                ).lower()
                 haystack = " ".join(filter(None, [
                     (product.get("name") or "").lower(),
                     (product.get("description") or "").lower(),
                     (product.get("short_description") or "").lower(),
+                    tag_text,
+                    variation_text,
                 ]))
                 if search_f not in haystack:
                     continue

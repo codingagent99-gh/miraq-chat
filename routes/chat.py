@@ -350,18 +350,45 @@ def _execute_api_calls(intent, api_calls, _resolve_variant):
     else:
         api_calls_to_execute = api_calls
 
-    # ── NEW: split by surface ─────────────────────────────────────────────
-    shopify_calls = [c for c in api_calls_to_execute if getattr(c, "surface", "") == "shopify_executor"]
-    woo_calls     = [c for c in api_calls_to_execute if getattr(c, "surface", "") != "shopify_executor"]
+    # ── split by surface ─────────────────────────────────────────────
+    shopify_calls  = [c for c in api_calls_to_execute if getattr(c, "surface", "") == "shopify_graphql"]
+    shopify_order_calls = [c for c in api_calls_to_execute if getattr(c, "surface", "") == "shopify_orders"]
+    woo_calls      = [c for c in api_calls_to_execute
+                      if getattr(c, "surface", "") not in ("shopify_graphql", "shopify_orders")]
 
-    api_responses = woo_client.execute_all(woo_calls)   # unchanged
+    api_responses = woo_client.execute_all(woo_calls)
+
+    if shopify_order_calls:
+        from api_builder.shopify_orders_executor import ShopifyOrdersExecutor
+        orders_executor = ShopifyOrdersExecutor()
+        for call in shopify_order_calls:
+            try:
+                result = orders_executor.execute(call)
+                logger.debug(f"[DEBUG] Shopify order response data keys: {list(result.keys())}")
+                api_responses.append({
+                    "success": True,
+                    "data":    result,
+                    "call":    call,
+                })
+                
+            except Exception as exc:
+                logger.error(f"ShopifyOrdersExecutor failed: {exc}", exc_info=True)
+                api_responses.append({"success": False, "error": str(exc), "call": call})
 
     if shopify_calls:
-        from api_builder.shopify_executor import ShopifyQueryExecutor
-        executor = ShopifyQueryExecutor(get_store_loader())
+        from api_builder.shopify_graphql_executor import ShopifyGraphQLExecutor
+        executor = ShopifyGraphQLExecutor(get_store_loader())
         for call in shopify_calls:
-            result = executor.execute_from_body(call.body)
-            api_responses.append({"success": True, "data": result, "call": call})
+            try:
+                result = executor.execute_from_body(call.body)
+                api_responses.append({
+                    "success": True,
+                    "data":    result,   # full dict — build_pagination reads result["total"]/["pages"]
+                    "call":    call,
+                })
+            except Exception as exc:
+                logger.error(f"ShopifyGraphQLExecutor failed: {exc}", exc_info=True)
+                api_responses.append({"success": False, "error": str(exc), "call": call})
     # ─────────────────────────────────────────────────────────────────────
 
     all_products_raw = []
@@ -724,7 +751,7 @@ def chat():
         }
 
         flow_result = None
-        if current_flow_state != FlowState.IDLE:
+        if current_flow_state not in (FlowState.IDLE, FlowState.AWAITING_ANYTHING_ELSE):
             flow_result = handle_flow_state(
                 state=current_flow_state, message=message,
                 entities=flow_context, confidence=0.0,
@@ -879,6 +906,60 @@ def chat():
         entities = result.entities
         confidence = result.confidence
 
+        # ── Phase-2 entity merge: preserve Run-1 richness ──────────────────
+        # parse_csv_message internally runs a second classifier pass on the
+        # attribute-stripped text.  When that stripped text is nearly empty
+        # ("do you have   and     products in  ?") the second pass returns
+        # blank entities and a weaker fallback intent, overwriting the correct
+        # product_id, attributes, and attribute_term_ids resolved in Run 1.
+        #
+        # We surface the Run-1 result through result.phase1_entities when the
+        # parser sets it.  Fall back to inspecting result directly if the
+        # parser hasn't been updated yet.
+        _phase1 = getattr(result, "phase1_entities", None)
+        if _phase1 is not None:
+            # Restore product identity if Run-2 lost it
+            if not entities.product_id and _phase1.product_id:
+                entities.product_id   = _phase1.product_id
+                entities.product_name = _phase1.product_name
+                entities.product_slug = _phase1.product_slug
+                logger.debug(
+                    f"[EntityMerge] Restored product_id={_phase1.product_id} "
+                    f"name='{_phase1.product_name}' from phase-1 entities"
+                )
+
+            # Merge attributes: keep all phase-1 keys that Run-2 dropped
+            if _phase1.attributes:
+                merged_attrs = dict(_phase1.attributes)
+                merged_attrs.update(entities.attributes)   # Run-2 wins on overlap
+                if merged_attrs != entities.attributes:
+                    logger.debug(
+                        f"[EntityMerge] attributes merged: "
+                        f"phase1={_phase1.attributes} + phase2={entities.attributes} "
+                        f"→ {merged_attrs}"
+                    )
+                entities.attributes = merged_attrs
+
+            # Restore attribute_term_ids if Run-2 lost them
+            if not entities.attribute_term_ids and getattr(_phase1, "attribute_term_ids", None):
+                entities.attribute_term_ids = _phase1.attribute_term_ids
+                entities.attribute_slug     = _phase1.attribute_slug
+                logger.debug(
+                    f"[EntityMerge] Restored attribute_term_ids={_phase1.attribute_term_ids}"
+                )
+
+            # Use Run-1 intent/confidence when Run-2 fell back to a weaker signal
+            _WEAK_INTENTS = {Intent.PRODUCT_SEARCH}   # intents GeneralFallback emits
+            if result.intent in _WEAK_INTENTS and getattr(result, "phase1_intent", None) not in _WEAK_INTENTS:
+                _old_intent = result.intent                                     # capture before overwrite
+                intent = result.phase1_intent
+                result.intent = intent
+                confidence = max(confidence, result.phase1_confidence or confidence)
+                logger.debug(
+                    f"[EntityMerge] Upgraded intent {_old_intent} → {intent} from phase-1"
+                )
+        # ────────────────────────────────────────────────────────────────────
+
         # Lock in variant state
         if current_flow_state == FlowState.AWAITING_VARIANT_SELECTION:
             _resolve_variant = True
@@ -956,9 +1037,26 @@ def chat():
             if customer_id:
                 _resolve_user_placeholders(api_calls, customer_id)
 
+            # ── Propagate resolved_attr_values for variant pre-filtering ──────
+            # _build_product_variations stamps resolved_attr_values into the
+            # call body so build_variant_prompt knows which colours/sizes the
+            # user already specified (e.g. ["white","gray"]).  We carry that
+            # hint in user_context so the variant handler can pass it through.
+            for _ac in api_calls:
+                _rav = (_ac.body or {}).get("resolved_attr_values")
+                if _rav:
+                    user_context["resolved_attr_values"] = _rav
+                    conversation.context_data = user_context
+                    flag_modified(conversation, "context_data")
+                    logger.debug(f"[EntityMerge] Stashed resolved_attr_values={_rav} in user_context")
+                    break
+                
+            logger.debug(f"[EntityMerge] user_context resolved_attr_values at Step 7 = {user_context.get('resolved_attr_values')}")
+            # ──────────────────────────────────────────────────────────────────
+
             all_products_raw, order_data, api_responses, api_calls_to_execute = _execute_api_calls(intent, api_calls, _resolve_variant)
 
-            log_matched_products(all_products_raw, api_calls_to_execute)
+            log_matched_products(all_products_raw, api_calls_to_execute, intent=intent)
             
             _LOCK_STATES = {
                 FlowState.AWAITING_VARIANT_SELECTION,
@@ -1000,7 +1098,7 @@ def chat():
         if resp:
             return _ft(resp)
 
-        resp = handle_quantity_and_variant_check(intent, entities, all_products_raw, order_data, ORDER_CREATE_INTENTS, str(conversation.id), page, start_time, customer_id=customer_id)
+        resp = handle_quantity_and_variant_check(intent, entities, all_products_raw, order_data, ORDER_CREATE_INTENTS, str(conversation.id), page, start_time, customer_id=customer_id, resolved_attr_values=user_context.get("resolved_attr_values"))
         if resp:
             return _ft(resp)
 
@@ -1012,6 +1110,8 @@ def chat():
                 conversation.context_data = user_context
                 flag_modified(conversation, "context_data")
             return _ft(resp)
+        
+        logger.debug(f"[EntityMerge] Passing resolved_attr_values to handle_variation_product = {user_context.get('resolved_attr_values')}")
 
         resp = handle_variation_product(
             intent, 
@@ -1025,6 +1125,7 @@ def chat():
             start_time, 
             user_context=user_context,
             conversation=conversation,
+            resolved_attr_values=user_context.get("resolved_attr_values"),
             )
         if resp:
             return _ft(resp)

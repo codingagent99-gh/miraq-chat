@@ -191,9 +191,25 @@ class StoreLoader(StoreQueryMixin):
                 from store_loader.shopify_fetcher import load_from_shopify
                 data = load_from_shopify(
                     store_domain=self.shopify_domain,
-                    admin_token=self._get_shopify_token(),   # ← always fresh
+                    admin_token=self._get_shopify_token(),
                 )
                 self._loaded_from_cache = False
+
+                if UPDATE_DEV_CACHE_ENABLED:
+                    if data["products"] and data["categories"]:
+                        save_to_local_files(
+                            data["categories"], data["tags"],
+                            data["all_attributes_raw"], data["products"],
+                        )
+                        logger.info("StoreLoader: ✅ Dev cache files updated from Shopify")
+                        
+                        # Verify the folder was actually created
+                        from store_loader.config import DATA_DIR
+                        if os.path.isdir(DATA_DIR):
+                            files = os.listdir(DATA_DIR)
+                            logger.info(f"StoreLoader: 📁 Cache folder confirmed at '{DATA_DIR}' | files={files}")
+                        else:
+                            logger.error(f"StoreLoader: ❌ Cache folder NOT found at '{DATA_DIR}' after save")
             elif DEV_CACHE_ENABLED:
                 data = load_from_local_files()
                 self._loaded_from_cache = True

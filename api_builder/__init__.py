@@ -21,6 +21,7 @@ from api_builder.store_helpers import (
 )
 from api_builder.filter_builder import build_advanced_filter_call
 from ecommerce import endpoints
+from app_config import ECOMMERCE_BACKEND
 
 logger = get_logger("miraq_chat")
 
@@ -151,7 +152,7 @@ def build_api_calls(
         elif intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.HISTORICAL_SEARCH,
                 Intent.REORDER, Intent.ORDER_TRACKING, Intent.ORDER_STATUS,
                 Intent.ORDER_ITEM):
-            calls = builder(e, page, role=role)
+            calls = builder(e, page, role=role, customer_id=customer_id)
         else:
             calls = builder(e, page)
 
@@ -187,6 +188,13 @@ def _build_last_order(e, page, customer_id=None, role=None) -> list:
             requires_resolution=["customer_id"],
         )]
 
+    if ECOMMERCE_BACKEND == "shopify":
+        from api_builder.shopify_order_calls import build_last_order_call
+        return [build_last_order_call(
+            customer_id=customer_id or "CURRENT_USER_ID",
+            description="Shopify: get customer's most recent order",
+        )]
+
     return [endpoints.list_customer_orders(
         customer_id="CURRENT_USER_ID",
         page=1,
@@ -208,6 +216,18 @@ def _build_order_history(e, page, customer_id=None, role=None) -> list:
         )]
 
     count = e.order_count or DEFAULT_ORDER_PER_PAGE
+
+    if ECOMMERCE_BACKEND == "shopify":
+        from api_builder.shopify_order_calls import build_order_history_call
+        return [build_order_history_call(
+            customer_id=customer_id or "CURRENT_USER_ID",
+            page=page,
+            per_page=count,
+            description=f"Shopify: order history page={page}",
+            date_after=getattr(e, "date_after", None),
+            date_before=getattr(e, "date_before", None),
+        )]
+
     extra = {}
     if getattr(e, "date_after", None):
         extra["after"] = e.date_after
@@ -223,7 +243,19 @@ def _build_order_history(e, page, customer_id=None, role=None) -> list:
         **extra,
     )]
 
-def _build_reorder(e, page, role=None) -> list:
+def _build_reorder(e, page, customer_id=None, role=None) -> list:
+    if ECOMMERCE_BACKEND == "shopify":
+        from api_builder.shopify_order_calls import build_fetch_order_call, build_last_order_call
+        if e.order_id:
+            return [build_fetch_order_call(
+                order_id=e.order_id,
+                description=f"Shopify: fetch order #{e.order_id} for reorder",
+            )]
+        return [build_last_order_call(
+            customer_id=customer_id or "CURRENT_USER_ID",
+            description="Shopify: fetch last order for reorder",
+        )]
+
     if e.order_id:
         return [endpoints.fetch_order(
             order_id=e.order_id,
@@ -255,10 +287,24 @@ def _build_historical_search(e, page, customer_id=None, role=None) -> list:
             requires_resolution=["customer_id"],
         )]
 
+    per_page = e.order_count if getattr(e, "order_count", None) else 20
+    include_ids = [e.order_id] if getattr(e, "order_id", None) else None
+
+    if ECOMMERCE_BACKEND == "shopify":
+        from api_builder.shopify_order_calls import build_historical_search_call
+        return [build_historical_search_call(
+            customer_id=customer_id or "CURRENT_USER_ID",
+            page=page,
+            per_page=per_page,
+            description="Shopify: fetch past orders for historical search",
+            date_after=getattr(e, "date_after", None),
+            date_before=getattr(e, "date_before", None),
+            include_order_ids=include_ids,
+        )]
+
     extra = {}
-    if getattr(e, 'order_id', None):
-        extra["include"] = [e.order_id]
-    extra["per_page"] = e.order_count if getattr(e, 'order_count', None) else 20
+    if include_ids:
+        extra["include"] = include_ids
     if getattr(e, "date_after", None):
         extra["after"] = e.date_after
     if getattr(e, "date_before", None):
@@ -267,7 +313,7 @@ def _build_historical_search(e, page, customer_id=None, role=None) -> list:
     return [endpoints.list_customer_orders(
         customer_id="CURRENT_USER_ID",
         page=page,
-        per_page=extra.pop("per_page"),
+        per_page=per_page,
         description="Fetch past orders to find a historical seed product",
         requires_resolution=["customer_id"],
         **extra,
@@ -547,7 +593,6 @@ def _build_filter_by_attribute(e, page, user_message: str = "") -> list:
 
 # ─── Variations ───
 
-# AFTER
 def _extract_resolved_attr_values(attributes: dict) -> list:
     tokens = []
     for key, val in attributes.items():
@@ -636,6 +681,20 @@ def _build_order_tracking(e, page, customer_id=None, role=None) -> list:
         return [endpoints.fetch_order(
             order_id=e.order_id,
             description=f"Get order #{e.order_id} details",
+        )]
+
+    if ECOMMERCE_BACKEND == "shopify":
+        from api_builder.shopify_order_calls import build_fetch_order_call, build_order_history_call
+        if getattr(e, "order_id", None):
+            return [build_fetch_order_call(
+                order_id=e.order_id,
+                description=f"Shopify: get order #{e.order_id} details",
+            )]
+        return [build_order_history_call(
+            customer_id=customer_id or "CURRENT_USER_ID",
+            page=page,
+            per_page=5,
+            description="Shopify: list recent orders (no order ID provided)",
         )]
 
     # ── non-CS users with a specific order_id should also fetch directly ──

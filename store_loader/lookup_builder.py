@@ -138,7 +138,7 @@ def build_longest_match_catalog(
             payload = {
                 'label': label,
                 'slug': term.get("slug"),
-                'taxonomy': attr.get("taxonomy") or attr.get("attribute_name") or "",
+                'attribute_name': attr.get("attribute_name", ""),
                 'name': term.get("name", ""),
             }
             items.append((term_name, 'attribute', payload))
@@ -222,7 +222,7 @@ def build_all_lookups(loader):
 
     for attr in loader.all_attributes_raw or []:
         taxonomy = attr.get("taxonomy", "")
-        key = taxonomy.removeprefix("pa_") or attr.get("attribute_name", "").lower()
+        key = attr.get("attribute_name", "").lower()
         if not key:
             continue
 

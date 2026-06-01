@@ -38,11 +38,14 @@ _SEARCH_FILTER_INTENTS = {
 }
 
 
-def log_matched_products(all_products_raw: list, api_calls_to_execute: list):
+def log_matched_products(all_products_raw: list, api_calls_to_execute: list, intent=None):
     """
     Step 3.1: Log per-product match context on success, or exact filters on zero results.
     Visibility: matched products log at DEBUG, zero results log at WARNING.
     """
+    from models import Intent
+    _ORDER_INTENTS = {Intent.REORDER, Intent.LAST_ORDER, Intent.ORDER_HISTORY,
+                      Intent.ORDER_TRACKING, Intent.ORDER_STATUS, Intent.HISTORICAL_SEARCH}
     if all_products_raw:
         for _p in all_products_raw[:8]:
             _p_cats = [c["slug"] for c in _p.get("categories", []) if isinstance(c, dict)]
@@ -56,7 +59,7 @@ def log_matched_products(all_products_raw: list, api_calls_to_execute: list):
                 f"Step 3.1: Matched | id={_p.get('id')} name={_p.get('name')!r} | "
                 f"cats={_p_cats} | tags={_p_tags} | attrs={_p_attrs}"
             )
-    else:
+    elif intent not in _ORDER_INTENTS:
         for _call in api_calls_to_execute:
             _filters = _call.params.get("filters", "n/a")
             _search = _call.params.get("search", "")

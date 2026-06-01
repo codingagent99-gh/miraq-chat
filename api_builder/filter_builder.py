@@ -137,27 +137,37 @@ def build_advanced_filter_call(
             body["variation_page"] = variation_page
 
     elif search_term:
-        has_taxonomy_conditions = conditions and any("field_type" not in c for c in conditions)
-        if has_taxonomy_conditions:
-            logger.info(f"Ignored leftover search_term='{search_term}' — taxonomy filters are present, relying on them.")
+        if ECOMMERCE_BACKEND == "shopify":
+            # Shopify executor does in-memory name/tag/variant matching — always
+            # write the term. It cannot "return arbitrary products" because the
+            # haystack search in _apply_body() is a strict substring filter.
+            body["search"] = search_term.lower().strip()
         else:
-            # This should not happen if callers are routing correctly.
-            # A blank body with no conditions will return arbitrary products.
-            logger.warning(
-                f"search_term='{search_term}' ignored AND no taxonomy conditions present — "
-                "query will return arbitrary products. Caller should use WooCommerce text search instead."
+            has_taxonomy_conditions = conditions and any(
+                "field_type" not in c for c in conditions
             )
+            if has_taxonomy_conditions:
+                logger.info(
+                    f"Ignored leftover search_term='{search_term}' — "
+                    "taxonomy filters are present, relying on them."
+                )
+            else:
+                logger.warning(
+                    f"search_term='{search_term}' ignored AND no taxonomy "
+                    "conditions present — query will return arbitrary products. "
+                    "Caller should use WooCommerce text search instead."
+                )
 
     logger.debug(f"api_builder: Advanced filter body: {json.dumps(body)}")
     
     if ECOMMERCE_BACKEND == "shopify":
         return WooAPICall(
             method="POST",
-            endpoint="shopify-in-memory",   # logical name, never actually fetched
+            endpoint="shopify-graphql",       # logical name, never fetched
             params={},
             body=body,
-            description=description or "Shopify in-memory product filter",
-            surface="shopify_executor",     # ← routing key for the dispatcher
+            description=description or "Shopify GraphQL product filter",
+            surface="shopify_graphql",        # ← new routing key
             requires_resolution=requires_resolution or [],
         )
 
@@ -174,11 +184,40 @@ def build_advanced_filter_call(
 
 # ─── Private helpers ───
 
+def _normalise_attr_value(raw_value) -> str:
+    """
+    Normalise an attribute value into a comma-joined string regardless of
+    whether it arrived as a plain string, a list, or a string that uses
+    ' and ' / ' & ' as conjunctions (e.g. "white and gray").
+
+    All callers downstream already split on commas, so this single
+    normalisation step is the only change needed to support multi-value
+    color/attribute queries.
+    """
+    if isinstance(raw_value, (list, tuple, set)):
+        return ",".join(str(v).strip() for v in raw_value if str(v).strip())
+
+    raw = str(raw_value).strip()
+    # Convert "white and gray", "white & gray" → "white,gray"
+    import re as _re
+    raw = _re.sub(r"\s+(?:and|&)\s+", ",", raw, flags=_re.IGNORECASE)
+    return raw
+
+
 def _build_attribute_conditions(attributes: dict, l) -> list:
-    """Convert {taxonomy: comma_terms} into query conditions, grouping shared values with OR."""
+    """Convert {taxonomy: value} into query conditions, grouping shared values with OR.
+
+    Supports multi-value attributes expressed as:
+      - a list:             ['white', 'gray']
+      - comma-separated:    'white,gray'
+      - conjunction string: 'white and gray'  /  'white & gray'
+
+    Multiple values for the same taxonomy are emitted as a single IN (OR) condition
+    so the query finds products matching *any* of the requested values.
+    """
     value_groups: dict[str, list] = {}
     for taxonomy, terms_value in attributes.items():
-        raw = terms_value if isinstance(terms_value, str) else ",".join(terms_value)
+        raw = _normalise_attr_value(terms_value)
         key = raw.lower().strip()
         value_groups.setdefault(key, []).append(taxonomy)
 

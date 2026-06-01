@@ -34,3 +34,4 @@ from models.catalog import (
 from models.shopify_token import ShopifyToken
 
 from models.chat_usage import ChatUsage, CustomerPlan
+from models import db

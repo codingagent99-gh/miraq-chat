@@ -135,6 +135,13 @@ MAX_DISPLAYED_ITEMS = 3  # Maximum number of items to show before truncating wit
 DEFAULT_PAYMENT_METHOD = "cod"
 DEFAULT_PAYMENT_METHOD_TITLE = "Cash on Delivery"
 
+# ═══════════════════════════════════════════════════════════════
+# ECOMMERCE BACKEND
+# ═══════════════════════════════════════════════════════════════
+
+# Supported values: "woocommerce", "shopify"
+ECOMMERCE_BACKEND = os.getenv("ECOMMERCE_BACKEND", "woocommerce").lower()
+
 # ═══════════════════════════════════════════
 # API DEFAULTS  (move from settings.py)
 # ═══════════════════════════════════════════
