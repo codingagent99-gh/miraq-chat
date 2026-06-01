@@ -490,19 +490,27 @@ def _compute_variant_options(
 
     return result
 
-
 def build_variant_prompt(
     parent_raw: dict,
     product_name: str,
     resolved_attributes: dict = None,
     variations_list: list = None,
-    display_to_slug: dict = None,  # passed through to _compute_variant_options
+    display_to_slug: dict = None,
+    resolved_attr_values: list = None,   # ← add this, flat list fallback
 ) -> str:
     """Builds a friendly markdown prompt listing the available variation options."""
-    options = _compute_variant_options(
-        parent_raw, resolved_attributes, variations_list, display_to_slug
-    )
 
+    # resolved_attr_values is a flat hint list ['white', 'gray'] — only use it
+    # if no structured resolved_attributes were passed from the entity extractor.
+    effective_resolved = resolved_attributes
+    if not effective_resolved and resolved_attr_values:
+        # Best-effort: treat all values as belonging to Colors axis
+        effective_resolved = {"Colors": resolved_attr_values}
+
+    options = _compute_variant_options(
+        parent_raw, effective_resolved, variations_list, display_to_slug
+    )
+    
     if not options:
         return (
             f"I'd love to order **{product_name}** for you! "

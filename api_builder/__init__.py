@@ -28,11 +28,11 @@ logger = get_logger("miraq_chat")
 # VARIATION MATCHER
 # ══════════════════════════════════════════════════════════════
 
-def match_variation_to_entities(variations: list, entities) -> Optional[dict]:
+def match_variation_to_entities(variations: list, entities) -> list:
     if not variations or not entities.attributes:
-        return None
+        return []
 
-    best_variation = None
+    best_variations = []
     best_score = 0
 
     for variation in variations:
@@ -41,23 +41,34 @@ def match_variation_to_entities(variations: list, entities) -> Optional[dict]:
 
         for ent_label, ent_value in entities.attributes.items():
             ent_k = ent_label.replace("-", " ").strip().lower()
-            ent_v = re.sub(r'[\"\'`]', '', ent_value).strip().lower().replace("-", " ")
+
+            if isinstance(ent_value, (list, tuple, set)):
+                ent_values = [str(v).strip().lower().replace("-", " ") for v in ent_value]
+            else:
+                raw = re.sub(r'\s+(?:and|&)\s+', ',', str(ent_value), flags=re.IGNORECASE)
+                ent_values = [
+                    re.sub(r'[\"\'`]', '', t).strip().lower().replace("-", " ")
+                    for t in raw.split(",") if t.strip()
+                ]
 
             for v_k, v_v in var_attrs.items():
+                if not v_v:
+                    continue
                 if ent_k in v_k or v_k in ent_k:
-                    if ent_v == v_v:
-                        score += 10   # exact match — heavily weighted
-                    elif ent_v in v_v or v_v in ent_v:
-                        score += 1
+                    for ent_v in ent_values:
+                        if ent_v == v_v:
+                            score += 10
+                        elif ent_v in v_v or v_v in ent_v:
+                            score += 1
                     break
 
         if score > best_score:
             best_score = score
-            best_variation = variation
+            best_variations = [variation]
+        elif score == best_score and score > 0:
+            best_variations.append(variation)
 
-    # Only return a match if at least one attribute matched meaningfully
-    return best_variation if best_score > 0 else None
-
+    return best_variations
 
 def _normalize_variation_attrs(variation: dict) -> dict:
     """Normalize variation attributes into a flat {clean_key: clean_value} dict."""
@@ -536,9 +547,30 @@ def _build_filter_by_attribute(e, page, user_message: str = "") -> list:
 
 # ─── Variations ───
 
+# AFTER
+def _extract_resolved_attr_values(attributes: dict) -> list:
+    tokens = []
+    for key, val in attributes.items():
+        key_norm = re.sub(r'[^a-z]', '', key.lower())   # e.g. 'colors2' → 'colors', 'visual' → 'visual'
+        if isinstance(val, (list, tuple, set)):
+            for v in val:
+                v_norm = str(v).strip().lower()
+                if v_norm and v_norm not in key_norm and key_norm not in v_norm:
+                    tokens.append(v_norm)
+        else:
+            raw = re.sub(r'\s+(?:and|&)\s+', ',', str(val), flags=re.IGNORECASE)
+            for t in raw.split(","):
+                t_norm = t.strip().lower()
+                if t_norm and t_norm not in key_norm and key_norm not in t_norm:
+                    tokens.append(t_norm)
+    return tokens
+
+
 def _build_product_variations(e, page) -> list:
     attr_filters = resolve_attr_filters(e.attributes)
-    return [build_advanced_filter_call(
+
+    # Build the filter call as before
+    call = build_advanced_filter_call(
         product_id=e.product_id,
         search_term=e.product_name if not e.product_id else None,
         attributes=attr_filters or None,
@@ -551,7 +583,21 @@ def _build_product_variations(e, page) -> list:
         tag_operator=e.tag_operator,
         page=page, in_stock=e.in_stock,
         description=f"Get specific variations for '{e.product_name or 'Series'}'",
-    )]
+    )
+
+    # ── Inject resolved_attr_values so build_variant_prompt can pre-filter ──
+    # When the user said "white and gray", resolved_attr_values=["white","gray"]
+    # allows the variant prompt builder to show only matching colour options
+    # instead of the full set (e.g. 5 colours → 2 pre-filtered options).
+    if e.attributes:
+        resolved_values = _extract_resolved_attr_values(e.attributes)
+        if resolved_values:
+            call.body["resolved_attr_values"] = resolved_values
+            logger.debug(
+                f"_build_product_variations: injected resolved_attr_values={resolved_values}"
+            )
+
+    return [call]
 
 
 # ─── Discounts ───

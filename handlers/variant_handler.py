@@ -464,7 +464,7 @@ def handle_variant_selection(
     resolved_attributes = dict(prev_resolved) if prev_resolved else {}
 
     if not is_fully_resolved:
-        prompt_msg = build_variant_prompt(parent_raw, _var_product_name, resolved_attributes, all_variations, display_to_slug)
+        prompt_msg = build_variant_prompt(parent_raw, _var_product_name, resolved_attributes, all_variations, display_to_slug, resolved_attr_values=user_context.get("resolved_attr_values"))
         prompt_msg = prompt_msg.replace("Sorry, I couldn't find that exact variant. ", "")
     elif len(matched) > 1:
         attr_values_all = {}
@@ -513,7 +513,7 @@ def handle_variant_selection(
                 + "\n\nWhich one would you like?"
             )
     else:
-        prompt_msg = build_variant_prompt(parent_raw, _var_product_name, resolved_attributes, all_variations, display_to_slug)
+        prompt_msg = build_variant_prompt(parent_raw, _var_product_name, resolved_attributes, all_variations, display_to_slug, resolved_attr_values=user_context.get("resolved_attr_values"))
         if len(all_variations) > 0:
             prompt_msg = "Sorry, I couldn't find that exact variant. " + prompt_msg
 
@@ -555,6 +555,7 @@ def handle_variation_product(
     start_time,
     user_context=None,
     conversation=None,
+    resolved_attr_values=None,
 ):
     VARIATION_INTENTS = {
         Intent.PRODUCT_SEARCH,
@@ -600,6 +601,7 @@ def handle_variation_product(
 
         if parent_product_raw and parent_product_raw.get("variations"):
             variations_raw = parent_product_raw.get("variations")
+            logger.debug(f"Step 3.7: variations_raw sample={variations_raw[:2]}")
 
     if not parent_product_raw:
         return None
@@ -631,8 +633,9 @@ def handle_variation_product(
 
     elif variations_raw and has_attributes:
         if intent == Intent.PRODUCT_DETAIL:
-            matched_variation = match_variation_to_entities(variations_raw, entities)
-            if matched_variation:
+            matched_variations = match_variation_to_entities(variations_raw, entities)
+            matched_variation = matched_variations[0] if len(matched_variations) == 1 else None
+            if len(matched_variations) == 1:
                 logger.info(
                     f"Step 3.7: Matched variation id={matched_variation.get('id')} | "
                     f"attrs={[a.get('option') for a in matched_variation.get('attributes', [])]}"
@@ -643,8 +646,11 @@ def handle_variation_product(
                     _fv["permalink"] = matched_variation["url"]
                 variation_products = [_fv]
             else:
-                logger.info("Step 3.7: match_variation_to_entities found no match — falling back to filtered list")
-                filtered_vars = _filter_variations_by_entities(variations_raw, entities)
+                if len(matched_variations) > 1:
+                    logger.info(f"Step 3.7: {len(matched_variations)} tied matches — falling back to filtered list")
+                else:
+                    logger.info("Step 3.7: match_variation_to_entities found no match — falling back to filtered list")
+                filtered_vars = _filter_variations_by_entities(variations_raw, entities) if not matched_variations else matched_variations
                 variation_products = []
                 for v in filtered_vars:
                     fv = format_variation(v, parent_product_raw)
@@ -653,8 +659,9 @@ def handle_variation_product(
                     variation_products.append(fv)
 
         else:
-            matched_variation = match_variation_to_entities(variations_raw, entities)
-            if matched_variation:
+            matched_variations = match_variation_to_entities(variations_raw, entities)
+            matched_variation = matched_variations[0] if len(matched_variations) == 1 else None
+            if len(matched_variations) == 1:
                 logger.info(
                     f"Step 3.7: Exact match found id={matched_variation.get('id')} "
                     f"for intent={intent.value}"
@@ -664,12 +671,23 @@ def handle_variation_product(
                 if matched_variation.get("url"):
                     _fv["permalink"] = matched_variation["url"]
                 variation_products = [_fv]
+            elif len(matched_variations) > 1:
+                logger.info(
+                    f"Step 3.7: {len(matched_variations)} tied matches for intent={intent.value} "
+                    f"— presenting all, user must choose"
+                )
+                variation_products = [parent_formatted]
+                for v in matched_variations:
+                    fv = format_variation(v, parent_product_raw)
+                    if v.get("url"):
+                        fv["permalink"] = v["url"]
+                    variation_products.append(fv)
             else:
                 filtered_vars = _filter_variations_by_entities(variations_raw, entities)
                 if not filtered_vars and variations_raw:
                     start = (page - 1) * DEFAULT_PER_PAGE
                     filtered_vars = variations_raw[start: start + DEFAULT_PER_PAGE]
-                if len(filtered_vars) == 1:
+                if len(filtered_vars) == 1 and filtered_vars[0].get("attributes"):
                     resolved_variation = filtered_vars[0]
                     logger.info(
                         f"Step 3.7: Filter narrowed to single variation "
@@ -789,6 +807,16 @@ def handle_variation_product(
     next_flow_state = FlowState.IDLE.value
     suggestions = generate_suggestions(intent, entities, products)
 
+    if matched_variation is None and len(variation_products) > 1 and user_context is not None and conversation is not None:
+        # Tie case — multiple equal-score variations, user needs to pick
+        user_context["pending_product_id"] = parent_product_raw.get("id")
+        user_context["pending_product_name"] = parent_formatted["name"]
+        user_context["resolved_attributes"] = {}
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+        next_flow_state = FlowState.AWAITING_VARIANT_SELECTION.value
+        suggestions = ["Cancel"]
+
     if resolved_variation and user_context is not None and conversation is not None:
 
         has_variation_flags = any(
@@ -829,8 +857,11 @@ def handle_variation_product(
             conversation.context_data = user_context
             flag_modified(conversation, "context_data")
 
+            logger.debug(f"Step 3.7: wildcard build_variant_prompt | resolved_attr_values={resolved_attr_values}")
+
             bot_message = build_variant_prompt(
-                parent_product_raw, parent_formatted["name"], var_attrs, variations_raw, display_to_slug
+                parent_product_raw, parent_formatted["name"], var_attrs, variations_raw, display_to_slug,
+                resolved_attr_values=resolved_attr_values,
             )
             suggestions = ["Cancel"]
             next_flow_state = FlowState.AWAITING_VARIANT_SELECTION.value
@@ -921,6 +952,7 @@ def handle_quantity_and_variant_check(
     page,
     start_time,
     customer_id=None,
+    resolved_attr_values=None,
 ):
     """
     Step 5.5: Detect when quantity or variant selection is still needed
@@ -1086,7 +1118,7 @@ def handle_quantity_and_variant_check(
                 }), 200
 
             from handlers.chat_utils import build_variant_prompt, _compute_variant_options
-            prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug)
+            prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug, resolved_attr_values=resolved_attr_values)
             _variant_options = _compute_variant_options(_raw_for_prompt, getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug)
             elapsed = time.time() - start_time
             return jsonify({
@@ -1171,7 +1203,7 @@ def handle_quantity_and_variant_check(
             }), 200
 
         from handlers.chat_utils import build_variant_prompt, _compute_variant_options
-        prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug)
+        prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug, resolved_attr_values=resolved_attr_values)
         _variant_options = _compute_variant_options(_raw_for_prompt, getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug)
         elapsed = time.time() - start_time
         return jsonify({

@@ -93,9 +93,9 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
                     entities.target_category_slugs.update(all_slugs)
                     append_category_name(entities, data.get("name") or "")
                 elif match_type == 'attribute':
-                    label = data['label']
+                    attr_name = data['attribute_name']
                     term_slug = data['slug']
-                    merge_attribute(entities.attributes, label, term_slug)
+                    merge_attribute(entities.attributes, attr_name, term_slug)
 
         unmatched_text = re.sub(pattern, " ", unmatched_text)
 
@@ -414,5 +414,9 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
     resolved_intent, final_confidence = resolve_final_intent(
         entities, original_nlp_result.intent, original_nlp_result.confidence
     )
-
-    return ClassifiedResult(intent=resolved_intent, entities=entities, confidence=final_confidence)
+    
+    result = ClassifiedResult(intent=resolved_intent, entities=entities, confidence=final_confidence)
+    result.phase1_entities   = original_nlp_result.entities    # ExtractedEntities
+    result.phase1_intent     = original_nlp_result.intent
+    result.phase1_confidence = original_nlp_result.confidence
+    return result

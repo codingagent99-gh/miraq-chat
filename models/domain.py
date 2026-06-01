@@ -306,3 +306,6 @@ class ClassifiedResult:
     entities: ExtractedEntities
     confidence: float
     api_calls: List[WooAPICall] = field(default_factory=list)
+    phase1_entities: Optional[ExtractedEntities] = None
+    phase1_intent: Optional[Intent] = None
+    phase1_confidence: Optional[float] = None
