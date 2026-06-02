@@ -400,6 +400,41 @@ class WooEndpoints:
             requires_resolution=requires_resolution or [],
         )
 
+    def list_customers_search(
+        self,
+        search: str,
+        role: str = "all",
+        per_page: int = 5,
+        description: str = "",
+        requires_resolution: Optional[List[str]] = None,
+    ) -> WooAPICall:
+        """Search customers by name/email/company — GET /customers?search=..."""
+        return WooAPICall(
+            method="GET",
+            endpoint="/customers",
+            params={"search": search, "role": role, "per_page": per_page},
+            surface="admin",
+            description=description or f"Search customers: '{search}'",
+            requires_resolution=requires_resolution or [],
+        )
+
+    def list_rep_orders(
+        self,
+        body: dict,
+        description: str = "",
+        requires_resolution: Optional[List[str]] = None,
+    ) -> WooAPICall:
+        """List orders assigned to/placed for a rep's customer — POST /orders (custom_plugin)"""
+        return WooAPICall(
+            method="POST",
+            endpoint="/orders",
+            params={},
+            body=body,
+            surface="custom_plugin",
+            description=description or "Rep-assigned order list",
+            requires_resolution=requires_resolution or [],
+        )
+
     def update_customer(
         self,
         customer_id: int,

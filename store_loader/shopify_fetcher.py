@@ -337,6 +337,90 @@ def _aggregate_tags(products: List[dict]) -> List[dict]:
 
 
 # ══════════════════════════════════════════════════════════════
+# SINGLE-PRODUCT LIVE FETCH (cache-miss fallback)
+# ══════════════════════════════════════════════════════════════
+
+_SINGLE_PRODUCT_QUERY = """
+query Product($id: ID!) {
+  product(id: $id) {
+    id
+    handle
+    title
+    descriptionHtml
+    productType
+    vendor
+    tags
+    status
+    totalInventory
+    priceRangeV2 {
+      minVariantPrice { amount currencyCode }
+      maxVariantPrice { amount currencyCode }
+    }
+    options { id name values }
+    collections(first: 50) {
+      edges { node { id handle title } }
+    }
+    images(first: 10) {
+      edges { node { url altText } }
+    }
+    variants(first: 100) {
+      edges {
+        node {
+          id title sku price compareAtPrice
+          availableForSale inventoryQuantity
+          selectedOptions { name value }
+          image { url }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def fetch_single_product(
+    store_domain: str, admin_token: str, product_gid: str
+) -> Optional[dict]:
+    """
+    Fetch one Shopify product by GID and return it in the same Woo-shaped dict
+    that _normalise_product() produces for the bulk loader.
+
+    Used as a live fallback in variant_handler when the store_loader cache misses
+    a product (e.g. a product added after the last background refresh).
+
+    Returns the normalised product dict on success, or None on any failure.
+    The returned dict has the same shape as store_loader.products entries,
+    including a top-level ``"variations"`` list ready for variant selection.
+    """
+    try:
+        session = requests.Session()
+        data = _gql(
+            session, store_domain, admin_token,
+            _SINGLE_PRODUCT_QUERY,
+            variables={"id": product_gid},
+        )
+        raw = data.get("product")
+        if not raw:
+            logger.warning(
+                f"ShopifyFetcher.fetch_single_product: "
+                f"product(id={product_gid}) returned null — product may not exist"
+            )
+            return None
+        normalised = _normalise_product(raw, idx=0)
+        logger.info(
+            f"ShopifyFetcher.fetch_single_product: fetched '{normalised.get('name')}' "
+            f"with {len(normalised.get('variations', []))} variations"
+        )
+        return normalised
+    except Exception as e:
+        logger.error(
+            f"ShopifyFetcher.fetch_single_product({product_gid}) failed: {e}",
+            exc_info=True,
+        )
+        return None
+
+
+# ══════════════════════════════════════════════════════════════
 # PUBLIC ENTRY POINT
 # ══════════════════════════════════════════════════════════════
 

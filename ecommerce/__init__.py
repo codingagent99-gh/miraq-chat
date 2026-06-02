@@ -1,57 +1,48 @@
-"""
-ecommerce/__init__.py — Selects and exports the active e-commerce endpoint factory.
-
-The ``endpoints`` singleton is selected at import time via the ``ECOMMERCE_BACKEND``
-environment variable (default: ``"woocommerce"``).
-
-Usage::
-
-    from ecommerce import endpoints
-
-    call = endpoints.fetch_product(product_id=123)
-    result = woo_client.execute(call)
-
-    # OR for Shopify product queries:
-    from api_builder.shopify_executor import ShopifyQueryExecutor
-    executor = ShopifyQueryExecutor(store_loader)
-    result   = executor.execute(conditions, page=1, per_page=20)
-
-Adding a new backend
---------------------
-1. Create ``ecommerce/<name>_endpoints.py`` satisfying ``EcommerceEndpoints``.
-2. Add ``elif _BACKEND == "<name>": ...`` in ``get_endpoints()`` below.
-3. If the backend needs an in-memory executor, create
-   ``api_builder/<name>_executor.py`` implementing ``QueryExecutor``.
-
-No other files need to change.
-"""
-
 import os
+from typing import cast  # 👈 Import cast
+from ecommerce.endpoints import EcommerceEndpoints
 
-from ecommerce.endpoints import EcommerceEndpoints  # noqa: F401 — re-exported for type hints
-
-
-def get_endpoints() -> EcommerceEndpoints:
-    """Return the endpoint factory for the configured e-commerce backend.
-
-    Raises ``ValueError`` for unknown ``ECOMMERCE_BACKEND`` values so
-    misconfiguration is detected at startup rather than at the first API call.
+class DynamicEndpointsRouter:
     """
-    backend = os.getenv("ECOMMERCE_BACKEND", "woocommerce").lower()
-
-    if backend == "woocommerce":
+    A transparent routing proxy satisfying the EcommerceEndpoints protocol.
+    Instead of binding to one backend at boot time, it routes calls dynamically
+    at execution time based on input parameters or the active request context.
+    """
+    def __init__(self):
         from ecommerce.woo_endpoints import WooEndpoints
-        return WooEndpoints()
-
-    if backend == "shopify":
         from ecommerce.shopify_endpoints import ShopifyEndpoints
-        return ShopifyEndpoints()
+        self._backends = {
+            "woocommerce": WooEndpoints(),
+            "shopify": ShopifyEndpoints()
+        }
 
-    raise ValueError(
-        f"Unknown ECOMMERCE_BACKEND={backend!r}. "
-        "Supported values: 'woocommerce', 'shopify'."
-    )
+    def _determine_backend(self, *args, **kwargs) -> str:
+        for arg in args:
+            if isinstance(arg, str) and arg.startswith("gid://"):
+                return "shopify"
+        for val in kwargs.values():
+            if isinstance(val, str) and val.startswith("gid://"):
+                return "shopify"
 
+        try:
+            from flask import g
+            if hasattr(g, "ecommerce_backend"):
+                return g.ecommerce_backend
+        except Exception:
+            pass
 
-# Module-level singleton — created once at import time.
-endpoints: EcommerceEndpoints = get_endpoints()
+        return os.getenv("ECOMMERCE_BACKEND", "woocommerce").lower()
+
+    def __getattr__(self, name):
+        """Intercepts all endpoint methods and resolves them at call-time."""
+        def wrapper(*args, **kwargs):
+            backend_name = self._determine_backend(*args, **kwargs)
+            target_backend = self._backends.get(backend_name, self._backends["woocommerce"])
+            method = getattr(target_backend, name)
+            return method(*args, **kwargs)
+        return wrapper
+
+# 🌟 Use typing.cast to satisfy Pylance/Mypy static analysis.
+# This forces the type checker to treat the proxy as a full EcommerceEndpoints instance,
+# eliminating the error while maintaining autocomplete everywhere else!
+endpoints: EcommerceEndpoints = cast(EcommerceEndpoints, DynamicEndpointsRouter())

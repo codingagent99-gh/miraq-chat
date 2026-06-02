@@ -183,24 +183,65 @@ def handle_variant_selection(
     try:
         _sl = get_store_loader()
         if _sl:
-            _sl_product = next(
-                (p for p in (_sl.products or [])
-                if p.get("id") == _var_product_id and p.get("_shopify_gid")),
-                None,
-            )
+            _is_shopify_id = isinstance(_var_product_id, str) and _var_product_id.startswith("gid://")
+            _sl_product = None
+            if _is_shopify_id:
+                _sl_product = next(
+                    (p for p in (_sl.products or [])
+                    if p.get("id") == _var_product_id),
+                    None,
+                )
     except Exception:
         pass
 
-    if _sl_product:
-        # Shopify: everything is already in memory — no HTTP calls needed
-        all_variations = _sl_product.get("variations", [])
-        parent_raw = _sl_product
-        logger.info(
-            f"Step 3.55: Shopify product — loaded {len(all_variations)} variations "
-            f"from store loader for product_id={_var_product_id}"
-        )
+    _is_shopify = isinstance(_var_product_id, str) and _var_product_id.startswith("gid://")
+
+    if _is_shopify:
+        if _sl_product:
+            # Load variations from in-memory store loader (existing logic)
+            all_variations = _sl_product.get("variations", [])
+            parent_raw = _sl_product
+            logger.info(f"Step 3.55: Loaded {len(all_variations)} Shopify variations from store loader.")
+        else:
+            # Path B: Cache miss — fetch live from Shopify GraphQL
+            logger.warning(
+                f"Step 3.55: Shopify product {_var_product_id} missed cache. "
+                f"Attempting live Shopify fallback..."
+            )
+            _live_product = None
+            try:
+                from store_loader.shopify_fetcher import fetch_single_product
+                if _sl and _sl.shopify_domain:
+                    _live_product = fetch_single_product(
+                        store_domain=_sl.shopify_domain,
+                        admin_token=_sl._get_shopify_token(),
+                        product_gid=_var_product_id,
+                    )
+            except Exception as _live_err:
+                logger.error(
+                    f"Step 3.55: Live Shopify fallback exception "
+                    f"for {_var_product_id}: {_live_err}",
+                    exc_info=True,
+                )
+
+            if _live_product:
+                parent_raw = _live_product
+                all_variations = _live_product.get("variations", [])
+                logger.info(
+                    f"Step 3.55: Live fallback successful — "
+                    f"{len(all_variations)} variations for {_var_product_id}"
+                )
+            else:
+                logger.error(
+                    f"Step 3.55: Live fallback returned empty for {_var_product_id}. "
+                    f"Product may not exist on Shopify. Aborting."
+                )
+                all_variations = []
+                parent_raw = {}
+                return None
+
     else:
-        # WooCommerce: fetch via REST API (existing logic — unchanged)
+        # WooCommerce: Safely execute REST API call knowing it's genuinely a Woo product
         all_variations = []
         page_num = 1
         while True:
@@ -222,6 +263,7 @@ def handle_variant_selection(
             description=f"Fetch parent product '{_var_product_name}'",
         ))
         parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
+        
 
     # Load store_loader once for slug→display-name resolution and the slug lookup
     _sl = None
@@ -1055,20 +1097,44 @@ def handle_quantity_and_variant_check(
                 break
 
         if not has_full_options:
-            logger.info(f"Step 5.5: Parent attributes missing options. Fetching full product {product.get('id')} from Woo API.")
-            parent_resp = woo_client.execute(endpoints.fetch_product(
-                product_id=product.get('id'),
-                description=f"Fetch full parent product attributes for '{product['name']}'",
-            ))
-            if parent_resp.get("success"):
-                _raw_for_prompt["attributes"] = parent_resp.get("data", {}).get("attributes", [])
+            _pid = product.get("id", "")
+            _is_shopify = isinstance(_pid, str) and _pid.startswith("gid://")
+            if _is_shopify:
+                # Shopify: attributes and variations are already in memory — never call Woo API
+                logger.info(
+                    f"Step 5.5: Shopify product {_pid} — "
+                    f"loading attributes/variations from store loader, skipping Woo API."
+                )
+                try:
+                    _sl_5 = get_store_loader()
+                    _sl_prod = next(
+                        (p for p in (_sl_5.products or []) if p.get("id") == _pid),
+                        None,
+                    ) if _sl_5 else None
+                    if _sl_prod:
+                        _raw_for_prompt["attributes"] = _sl_prod.get("attributes", [])
+                        _raw_for_prompt["variations"] = _sl_prod.get("variations", [])
+                except Exception as _e:
+                    logger.warning(f"Step 5.5: store loader lookup failed for {_pid}: {_e}")
+            else:
+                logger.info(
+                    f"Step 5.5: Parent attributes missing options. "
+                    f"Fetching full product {_pid} from Woo API."
+                )
+                parent_resp = woo_client.execute(endpoints.fetch_product(
+                    product_id=_pid,
+                    description=f"Fetch full parent product attributes for '{product['name']}'",
+                ))
+                if parent_resp.get("success"):
+                    _raw_for_prompt["attributes"] = parent_resp.get("data", {}).get("attributes", [])
 
         _variations_for_cache = _raw_for_prompt.get("variations", [])
 
     if not entities.quantity:
         if product.get("type") == "variable" or product.get("variations"):
-            _raw_for_prompt = next((p for p in all_products_raw if not p.get("parent_id")), {})
-            _variations_for_cache = _raw_for_prompt.get("variations", [])
+            # _raw_for_prompt and _variations_for_cache are already populated above;
+            # do NOT re-assign from all_products_raw here — that would clobber
+            # the Shopify store-loader data loaded in the block above.
 
             if len(_variations_for_cache) == 1:
                 _resolved_var = _variations_for_cache[0]
