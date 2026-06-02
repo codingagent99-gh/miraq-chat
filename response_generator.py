@@ -157,7 +157,8 @@ def generate_bot_message(
     confidence: float,
     order_data: List[dict] = None,
     total_items: Optional[int] = None,
-    page: int = 1
+    page: int = 1,
+    customer_id=None
 ) -> str:
     """Generate a natural language bot response.
 
@@ -259,22 +260,39 @@ def generate_bot_message(
                     return (
                         f"📭 No orders found from {period}.\n\n"
                     )
-            # No date filter → user likely not logged in
-            if intent == Intent.LAST_ORDER:
-                return (
-                    "I can show you your most recent order! 📦\n\n"
-                    "Please make sure you're logged in so I can retrieve your order history."
-                )
-            elif intent == Intent.ORDER_HISTORY:
-                return (
-                    "I'd love to show your order history! 📦\n\n"
-                    "Please make sure you're logged in so I can retrieve your orders."
-                )
-            elif intent == Intent.REORDER:
-                return (
-                    "I can reorder from your last purchase! 🔄\n\n"
-                    "Please make sure you're logged in first."
-                )
+            # No date filter — distinguish logged-in-no-orders vs not logged in
+            if customer_id:
+                if intent == Intent.LAST_ORDER:
+                    return (
+                        "It looks like you haven't placed any orders yet! 🛍️\n\n"
+                        "Browse our products and place your first order."
+                    )
+                elif intent == Intent.ORDER_HISTORY:
+                    return (
+                        "You don't have any orders yet! 🛍️\n\n"
+                        "Browse our products and place your first order."
+                    )
+                elif intent == Intent.REORDER:
+                    return (
+                        "You don't have any previous orders to reorder from yet! 🛍️\n\n"
+                        "Browse our products and place your first order."
+                    )
+            else:
+                if intent == Intent.LAST_ORDER:
+                    return (
+                        "I can show you your most recent order! 📦\n\n"
+                        "Please make sure you're logged in so I can retrieve your order history."
+                    )
+                elif intent == Intent.ORDER_HISTORY:
+                    return (
+                        "I'd love to show your order history! 📦\n\n"
+                        "Please make sure you're logged in so I can retrieve your orders."
+                    )
+                elif intent == Intent.REORDER:
+                    return (
+                        "I can reorder from your last purchase! 🔄\n\n"
+                        "Please make sure you're logged in first."
+                    )
 
     # ── Quick order / Order item / Place order ──
     if intent in (Intent.QUICK_ORDER, Intent.ORDER_ITEM, Intent.PLACE_ORDER):

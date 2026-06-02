@@ -556,6 +556,7 @@ def handle_variation_product(
     user_context=None,
     conversation=None,
     resolved_attr_values=None,
+    customer_id=None,
 ):
     VARIATION_INTENTS = {
         Intent.PRODUCT_SEARCH,
@@ -789,10 +790,10 @@ def handle_variation_product(
             else:
                 bot_message = f"{summary_text}\n\n{generate_bot_message(intent, entities, products, confidence, order_data)}"
         else:
-            bot_message = generate_bot_message(intent, entities, products, confidence, order_data)
+            bot_message = generate_bot_message(intent, entities, products, confidence, order_data, customer_id=customer_id)
 
     else:
-        bot_message = generate_bot_message(intent, entities, products, confidence, order_data)
+        bot_message = generate_bot_message(intent, entities, products, confidence, order_data, customer_id=customer_id)
 
     if category_mismatch_msg:
         bot_message = f"⚠️ {category_mismatch_msg}\n\n{bot_message}"
