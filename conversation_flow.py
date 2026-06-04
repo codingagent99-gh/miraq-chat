@@ -147,7 +147,7 @@ def handle_flow_state(
         if text in exit_phrases or any(text.startswith(p + " ") for p in exit_phrases):
             return {
                 "bot_message": "No problem! I've cancelled that. Is there anything else I can help with? 😊",
-                "suggestions": ["Show me products", "Browse categories", "No, thank you"],
+                "suggestions": ["Show me products", "Browse categories"],
                 "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
                 "pass_through": False,
             }
@@ -226,7 +226,7 @@ def handle_flow_state(
         if any(kw in text for kw in ["cancel", "stop", "nevermind", "never mind", "quit", "exit"]):
             return {
                 "bot_message": "No problem! Let me know if you need anything else.",
-                "suggestions": ["Show me products", "View my orders", "No, thank you"],
+                "suggestions": ["Show me products", "View my orders"],
                 "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
                 "pass_through": False,
             }
@@ -303,7 +303,7 @@ def handle_flow_state(
         ]):
             return {
                 "bot_message": "No problem! Order cancelled. Is there anything else I can help with?",
-                "suggestions": ["Show me products", "Browse categories", "No, thank you"],
+                "suggestions": ["Show me products", "Browse categories"],
                 "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
                 "pass_through": False,
             }
@@ -391,5 +391,21 @@ def handle_flow_state(
         return {
             "action": "process_bulk_variant_selection",
             "flow_state": FlowState.AWAITING_BULK_VARIANT_SELECTION.value,
+            "pass_through": False,
+        }
+        
+    # ── State: Awaiting company name for order (rep flow) ──
+    if state == FlowState.AWAITING_ORDER_FOR_COMPANY:
+        return {
+            "action": "resolve_order_for_company",
+            "flow_state": FlowState.AWAITING_ORDER_FOR_COMPANY.value,
+            "pass_through": False,
+        }
+
+    # ── State: Awaiting customer selection from multiple matches (rep flow) ──
+    if state == FlowState.AWAITING_ORDER_FOR_SELECTION:
+        return {
+            "action": "resolve_order_for_selection",
+            "flow_state": FlowState.AWAITING_ORDER_FOR_SELECTION.value,
             "pass_through": False,
         }
