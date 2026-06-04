@@ -11,7 +11,7 @@ from models import ExtractedEntities, ClassifiedResult
 from store_registry import get_store_loader
 from config.store_config import PRODUCT_TYPE_TERMS, GENERIC_NOISE_WORDS
 from chat_logger import get_logger
-
+from models.domain import Intent
 from classifier.evaluators import get_default_pipeline
 from classifier.consolidation import consolidate_entities
 from classifier.extractors import (
@@ -37,7 +37,17 @@ from classifier.extractors import (
 logger = get_logger("miraq_chat")
 
 def classify(utterance: str) -> ClassifiedResult:
+    
     """Classify user utterance into intent + entities using the Evaluation Pipeline."""
+    # ── Bulk order button trigger (sent as magic string by frontend) ──
+    
+    if utterance.strip().lower() == "__bulk_order_trigger__":
+        return ClassifiedResult(
+            intent=Intent.BULK_ORDER,
+            entities=ExtractedEntities(),
+            confidence=1.0,
+        )
+    # ─────────────────────────────────────────────────────────────────
     text = utterance.lower().strip()
     entities = ExtractedEntities()
 

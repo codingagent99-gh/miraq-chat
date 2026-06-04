@@ -27,6 +27,14 @@ class FlowState(Enum):
     AWAITING_FILTER_CLARIFICATION = "awaiting_filter_clarification"
     AWAITING_CART_CONFIRMATION = "awaiting_cart_confirmation"
     
+    # ── Sales rep flows ──────────────────────────────────────────────
+    AWAITING_ORDER_FOR_COMPANY        = "awaiting_order_for_company"
+    AWAITING_ORDER_FOR_SELECTION      = "awaiting_order_for_selection"
+    AWAITING_BULK_ORDER_INPUT         = "awaiting_bulk_order_input"
+    AWAITING_BULK_ORDER_CONFIRMATION  = "awaiting_bulk_order_confirmation"
+    AWAITING_BULK_ADDRESS_CONFIRMATION = "awaiting_bulk_address_confirmation"
+    AWAITING_BULK_VARIANT_SELECTION = "awaiting_bulk_variant_selection"
+    
 @dataclass
 class ConversationContext:
     """Tracks the state of a multi-turn conversation."""
@@ -306,3 +314,82 @@ def handle_flow_state(
         ]
         if any(ph in text for ph in _topic_change_phrases) or text.strip() in ("hello", "hi"):
             return None
+        
+    # ── State: Awaiting bulk order confirmation (Yes/No) ──
+    if state == FlowState.AWAITING_BULK_ORDER_CONFIRMATION:
+        _yes = re.search(r'\b(yes|yeah|yep|sure|confirm|ok|okay|go\s+ahead|proceed)\b', text)
+        _no  = re.search(r'\b(no|nope|abort|never\s+mind)\b', text)
+        if _yes:
+            return {
+                "action": "confirm_bulk_order",
+                "flow_state": FlowState.AWAITING_BULK_ORDER_CONFIRMATION.value,
+                "pass_through": False,
+            }
+        elif _no:
+            return {
+                "action": "cancel_bulk_order",
+                "flow_state": FlowState.IDLE.value,
+                "pass_through": False,
+            }
+        else:
+            return {
+                "action": "bulk_confirmation_unclear",
+                "flow_state": FlowState.AWAITING_BULK_ORDER_CONFIRMATION.value,
+                "pass_through": False,
+            }
+
+    # ── State: Awaiting bulk address confirmation ──
+    if state == FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION:
+        # Structured save from the inline edit panel: message is
+        # "__BULK_ADDR__<json>" carrying edited billing + shipping blocks.
+        # Check the RAW message (not lowercased text) so the prefix and the
+        # JSON payload are preserved exactly.
+        if message.strip().startswith("__BULK_ADDR__"):
+            return {
+                "action": "bulk_address_override_structured",
+                "flow_state": FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value,
+                "pass_through": False,
+            }
+        # Sub-state: user was prompted to type a new address (legacy text path)
+        if entities.get("bulk_awaiting_address_text"):
+            return {
+                "action": "bulk_address_override_text",
+                "flow_state": FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value,
+                "pass_through": False,
+            }
+        _yes    = re.search(r'\b(yes|yeah|yep|sure|confirm|ok|okay|use|correct)\b', text)
+        _change = re.search(r'\b(change|update|different|new|edit|modify|type)\b', text)
+        _skip   = re.search(r'\b(skip|next|later)\b', text)
+        if _yes:
+            return {
+                "action": "bulk_address_confirmed",
+                "flow_state": FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value,
+                "pass_through": False,
+            }
+        elif _change:
+            return {
+                "action": "bulk_address_change",
+                "flow_state": FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value,
+                "pass_through": False,
+            }
+        elif _skip:
+            return {
+                "action": "bulk_address_skip",
+                "flow_state": FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value,
+                "pass_through": False,
+            }
+        else:
+            return {
+                "bot_message": "Please reply **Yes** to use the address on file, **Change** to type a new one, or **Skip** to proceed without an override.",
+                "suggestions": ["Yes, use it", "Change address", "Skip"],
+                "flow_state": FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value,
+                "pass_through": False,
+            }
+
+    # ── State: Awaiting bulk variant selection ──
+    if state == FlowState.AWAITING_BULK_VARIANT_SELECTION:
+        return {
+            "action": "process_bulk_variant_selection",
+            "flow_state": FlowState.AWAITING_BULK_VARIANT_SELECTION.value,
+            "pass_through": False,
+        }

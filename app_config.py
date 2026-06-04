@@ -232,6 +232,7 @@ def _load_custom_order_roles() -> frozenset:
     return frozenset({"cs_rep", "project_manager", "cs_project_manager"})
 
 CUSTOM_ORDER_ROLES: frozenset = _load_custom_order_roles()
+BULK_ORDER_ROLES: frozenset = CUSTOM_ORDER_ROLES | frozenset({"sales_rep"})
 
 LLM_API_BASE_URL: str = _resolve_llm_api_base_url()
 

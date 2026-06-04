@@ -17,6 +17,7 @@ from app_config import (
     CART_INTENTS,
     ORDER_CREATE_INTENTS,
     CLASSIFIER_PROVIDER_TAG,
+    BULK_ORDER_ROLES,
     get_currency_symbol,
 )
 from core.actions import build_add_to_cart, build_open_checkout_panel, build_open_cart_panel
@@ -309,7 +310,8 @@ def _wipe_stale_cart(conversation, user_context, current_flow_state):
 # ══════════════════════════════════════════════════════════════
 
 def _check_empty_order(intent, entities, conversation, page, start_time):
-    """Return a response if the order intent has no usable product reference."""
+    if intent == Intent.BULK_ORDER:
+        return None   # bulk orders carry no single product_id — skip this guard
     if intent not in ORDER_CREATE_INTENTS or getattr(entities, 'product_id', None):
         return None
 
@@ -423,7 +425,9 @@ def _execute_api_calls(intent, api_calls, _resolve_variant):
 
 def _build_final_response(
     intent, entities, confidence, all_products_raw, order_data,
-    api_responses, api_calls_to_execute, conversation, page, start_time, customer_id=None,
+    api_responses, api_calls_to_execute, conversation, page, start_time,
+    payload_context=None,
+    customer_id=None,
 ):
     """Format products and build the final JSON response."""
     products = []
@@ -540,6 +544,18 @@ def _build_final_response(
         response["order_pagination"] = build_pagination(
             page, api_responses, api_calls_to_execute
         )
+        
+    _sr_ctx = payload_context or {}
+    _sr_role = _sr_ctx.get("role", "")
+    _sr_actions = response.get("actions", [])
+    # "Recently Ordered" button — rep roles only, only when products are shown
+    if _sr_role in BULK_ORDER_ROLES and customer_id and products:
+        _sr_actions.append({"type": "SHOW_RECENTLY_ORDERED_BUTTON", "payload": {}})
+    # "Bulk Order" button — all logged-in users, always visible when customer_id present
+    if customer_id:
+        _sr_actions.append({"type": "SHOW_BULK_ORDER_BUTTON", "payload": {}})
+    if _sr_actions:
+        response["actions"] = _sr_actions
 
     return _finalize_turn(conversation, jsonify(response))
 
@@ -666,6 +682,12 @@ def chat():
     customer_id = conversation.customer_id
     user_context = conversation.context_data or {}
 
+    # Persist role into user_context so handlers can read it without payload_context
+    _incoming_role = payload_context.get("role", "")
+    if _incoming_role and user_context.get("role") != _incoming_role:
+        user_context["role"] = _incoming_role
+        flag_modified(conversation, "context_data")
+
     logger.info(f"[MEMORY TRACE 1] INCOMING from Frontend Payload: {payload_context}")
     logger.info(f"[MEMORY TRACE 2] LOADED from Postgres DB: {user_context}")
 
@@ -749,6 +771,7 @@ def chat():
             "pending_quantity": user_context.get("pending_quantity"),
             "pending_variation_id": user_context.get("pending_variation_id"),
             "resolved_attributes": user_context.get("resolved_attributes"),
+            "bulk_awaiting_address_text": user_context.get("bulk_awaiting_address_text", False),
         }
 
         flow_result = None
@@ -894,6 +917,111 @@ def chat():
 
         # else: fall through to classifier
 
+        # ── Early action dispatch ──────────────────────────────────────────
+        # When the state machine returns a flow action (bulk order steps,
+        # order-for resolution), it is driven entirely by flow_result — it does
+        # NOT need classification. Dispatching it here, before Step 3, prevents
+        # the message (e.g. "Yes, confirm", "Change address") from falling
+        # through to the classifier/LLM, which would otherwise misroute it to a
+        # product search or update_customer intent and hijack the turn.
+        if flow_result and flow_result.get("action"):
+            _early_action = flow_result["action"]
+            _early_role = payload_context.get("role", "")
+            _early_store_loader = get_store_loader()
+
+            if _early_action == "process_bulk_input":
+                from handlers.bulk_order_handler import handle_bulk_order_input
+                resp = handle_bulk_order_input(
+                    message, _early_store_loader, conversation, user_context, page, start_time
+                )
+                if resp:
+                    return _ft(resp)
+
+            elif _early_action == "process_bulk_variant_selection":
+                from handlers.bulk_order_handler import handle_bulk_variant_selection_reply
+                resp = handle_bulk_variant_selection_reply(
+                    message, _early_store_loader, conversation, user_context, page, start_time
+                )
+                if resp:
+                    return _ft(resp)
+
+            elif _early_action == "confirm_bulk_order":
+                from handlers.bulk_order_handler import handle_bulk_order_confirmation
+                resp = handle_bulk_order_confirmation(
+                    user_context, conversation, page, start_time
+                )
+                if resp:
+                    return _ft(resp)
+
+            elif _early_action == "cancel_bulk_order":
+                for _k in (
+                    "pending_bulk_lines", "bulk_current_line_index",
+                    "bulk_confirmed_lines", "bulk_address_overrides",
+                    "bulk_awaiting_address_text",
+                ):
+                    user_context.pop(_k, None)
+                flag_modified(conversation, "context_data")
+                conversation.flow_state = FlowState.IDLE.value
+                _elapsed = round((time.time() - start_time) * 1000)
+                return _ft(jsonify({
+                    "success": True,
+                    "bot_message": "Bulk order cancelled. What else can I help you with?",
+                    "intent": "guided_flow",
+                    "products": [],
+                    "suggestions": ["Show me products", "Start a bulk order"],
+                    "session_id": str(conversation.id),
+                    "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": _elapsed},
+                    "flow_state": FlowState.IDLE.value,
+                    "pagination": default_pagination(page),
+                }))
+
+            elif _early_action == "bulk_confirmation_unclear":
+                _elapsed = round((time.time() - start_time) * 1000)
+                return _ft(jsonify({
+                    "success": True,
+                    "bot_message": "Please reply **Yes** to confirm all orders or **No** to cancel.",
+                    "intent": "guided_flow",
+                    "products": [],
+                    "suggestions": ["Yes, confirm", "No, cancel"],
+                    "session_id": str(conversation.id),
+                    "metadata": {
+                        "flow_state": FlowState.AWAITING_BULK_ORDER_CONFIRMATION.value,
+                        "response_time_ms": _elapsed,
+                    },
+                    "flow_state": FlowState.AWAITING_BULK_ORDER_CONFIRMATION.value,
+                    "pagination": default_pagination(page),
+                }))
+
+            elif _early_action in (
+                "bulk_address_confirmed",
+                "bulk_address_change",
+                "bulk_address_override_text",
+                "bulk_address_override_structured",
+                "bulk_address_skip",
+            ):
+                from handlers.bulk_order_handler import handle_bulk_address_confirmation_reply
+                resp = handle_bulk_address_confirmation_reply(
+                    _early_action, message, conversation, user_context, page, start_time
+                )
+                if resp:
+                    return _ft(resp)
+
+            elif _early_action == "resolve_order_for_company" and _early_role in BULK_ORDER_ROLES:
+                from handlers.sales_rep_handler import handle_order_for_company_reply
+                resp = handle_order_for_company_reply(
+                    message, conversation, user_context, page, start_time
+                )
+                if resp:
+                    return _ft(resp)
+
+            elif _early_action == "resolve_order_for_selection" and _early_role in BULK_ORDER_ROLES:
+                from handlers.sales_rep_handler import handle_order_for_selection_reply
+                resp = handle_order_for_selection_reply(
+                    message, conversation, user_context, page, start_time
+                )
+                if resp:
+                    return _ft(resp)
+
         # ── Step 3: Classify ──
         _resolve_variant = bool(flow_result and flow_result.get("resolve_variant"))
         store_loader = get_store_loader()
@@ -997,6 +1125,7 @@ def chat():
             and intent not in (
                 Intent.PRODUCT_ATTRIBUTE_INFO, Intent.PRODUCT_VARIATIONS,
                 Intent.QUICK_ORDER, Intent.PLACE_ORDER, Intent.ORDER_ITEM,
+                Intent.BULK_ORDER,
             )):
             clarification_resp = build_semantic_clarification(
                 entities, user_context, str(conversation.id), page, start_time, flow_result,
@@ -1082,6 +1211,156 @@ def chat():
         if cust_resp:
             return cust_resp
 
+        # ════════════════════════════════════════════════════════════════
+        # Step 8.5: Sales rep & bulk order flow dispatch
+        # ════════════════════════════════════════════════════════════════
+        _role = payload_context.get("role", "")
+
+        # Bulk order is available to ALL logged-in users
+        # (rep gets company resolution, regular customer places on their own account)
+        if intent == Intent.BULK_ORDER and customer_id:
+            # Check if the message already contains the orders (direct typing)
+            # vs just the trigger signal (button click / single keyword).
+            # Mirror the same logic BulkOrderEvaluator uses.
+            _bulk_fragments = [f.strip() for f in message.split(',') if f.strip()]
+            _bulk_qualified = sum(
+                1 for f in _bulk_fragments
+                if re.search(r'\d', f) and (
+                    re.search(r'\bfor\b', f, re.I) or
+                    re.search(r'\b(order|buy|purchase|reorder|re-order)\b', f, re.I)
+                )
+            )
+            if _bulk_qualified >= 2:
+                # Orders are already in the message — skip the prompt, parse directly
+                from handlers.bulk_order_handler import handle_bulk_order_input
+                resp = handle_bulk_order_input(
+                    message, store_loader, conversation, user_context, page, start_time
+                )
+                if resp:
+                    return _ft(resp)
+            else:
+                # Button click or single trigger word — show the prompt
+                from handlers.bulk_order_handler import handle_bulk_order_trigger
+                resp = handle_bulk_order_trigger(conversation, user_context, page, start_time)
+                if resp:
+                    return _ft(resp)
+
+        # Action-based flow dispatch — fires when flow_result has an action sentinel
+        # set by the handle_flow_state branches added in Phase 5
+        if flow_result and flow_result.get("action"):
+            _sr_action = flow_result["action"]
+
+            # ── Bulk order input processing ──
+            if _sr_action == "process_bulk_input":
+                from handlers.bulk_order_handler import handle_bulk_order_input
+                resp = handle_bulk_order_input(
+                    message, store_loader, conversation, user_context, page, start_time
+                )
+                if resp:
+                    return _ft(resp)
+                
+            elif _sr_action == "process_bulk_variant_selection":
+                from handlers.bulk_order_handler import handle_bulk_variant_selection_reply
+                resp = handle_bulk_variant_selection_reply(
+                    message, store_loader, conversation, user_context, page, start_time
+                )
+                if resp:
+                    return _ft(resp)
+
+            # ── Bulk order confirmation (Yes) ──
+            elif _sr_action == "confirm_bulk_order":
+                from handlers.bulk_order_handler import handle_bulk_order_confirmation
+                resp = handle_bulk_order_confirmation(
+                    user_context, conversation, page, start_time
+                )
+                if resp:
+                    return _ft(resp)
+
+            # ── Bulk order cancelled ──
+            elif _sr_action == "cancel_bulk_order":
+                user_context.pop("pending_bulk_lines", None)
+                user_context.pop("bulk_current_line_index", None)
+                user_context.pop("bulk_confirmed_lines", None)
+                user_context.pop("bulk_address_overrides", None)
+                user_context.pop("bulk_awaiting_address_text", None)
+                flag_modified(conversation, "context_data")
+                conversation.flow_state = FlowState.IDLE.value
+                _elapsed = round((time.time() - start_time) * 1000)
+                return _ft(jsonify({
+                    "success": True,
+                    "bot_message": "Bulk order cancelled. What else can I help you with?",
+                    "intent": "guided_flow",
+                    "products": [],
+                    "suggestions": ["Show me products", "Start a bulk order"],
+                    "session_id": str(conversation.id),
+                    "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": _elapsed},
+                    "flow_state": FlowState.IDLE.value,
+                    "pagination": default_pagination(page),
+                }))
+
+            # ── Bulk confirmation unclear ──
+            elif _sr_action == "bulk_confirmation_unclear":
+                _elapsed = round((time.time() - start_time) * 1000)
+                return _ft(jsonify({
+                    "success": True,
+                    "bot_message": "Please reply **Yes** to confirm all orders or **No** to cancel.",
+                    "intent": "guided_flow",
+                    "products": [],
+                    "suggestions": ["Yes, confirm", "No, cancel"],
+                    "session_id": str(conversation.id),
+                    "metadata": {
+                        "flow_state": FlowState.AWAITING_BULK_ORDER_CONFIRMATION.value,
+                        "response_time_ms": _elapsed,
+                    },
+                    "flow_state": FlowState.AWAITING_BULK_ORDER_CONFIRMATION.value,
+                    "pagination": default_pagination(page),
+                }))
+
+            # ── Bulk address confirmation sub-actions ──
+            elif _sr_action in (
+                "bulk_address_confirmed",
+                "bulk_address_change",
+                "bulk_address_override_text",
+                "bulk_address_skip",
+            ):
+                from handlers.bulk_order_handler import handle_bulk_address_confirmation_reply
+                resp = handle_bulk_address_confirmation_reply(
+                    _sr_action, message, conversation, user_context, page, start_time
+                )
+                if resp:
+                    return _ft(resp)
+
+            # ── Order-for: resolve company name (rep roles only) ──
+            elif _sr_action == "resolve_order_for_company" and _role in BULK_ORDER_ROLES:
+                from handlers.sales_rep_handler import handle_order_for_company_reply
+                resp = handle_order_for_company_reply(
+                    message, conversation, user_context, page, start_time
+                )
+                if resp:
+                    return _ft(resp)
+
+            # ── Order-for: rep picks from multiple customer matches ──
+            elif _sr_action == "resolve_order_for_selection" and _role in BULK_ORDER_ROLES:
+                from handlers.sales_rep_handler import handle_order_for_selection_reply
+                resp = handle_order_for_selection_reply(
+                    message, conversation, user_context, page, start_time
+                )
+                if resp:
+                    return _ft(resp)
+
+        # ── Intercept: ask "who to order for" before any order intent (rep only) ──
+        if (
+            _role in BULK_ORDER_ROLES
+            and intent in (Intent.QUICK_ORDER, Intent.PLACE_ORDER, Intent.ORDER_ITEM)
+            and not user_context.get("order_for_customer_id")
+            and customer_id  # must be logged in
+        ):
+            from handlers.sales_rep_handler import handle_order_for_prompt
+            resp = handle_order_for_prompt(conversation, page, start_time)
+            if resp:
+                return _ft(resp)
+        # ════════════════════════════════════════════════════════════════
+
         # ── Step 9: Route through specialized handlers ──
         resp = handle_reorder(intent, entities, order_data, customer_id, str(conversation.id), page, start_time)
         if resp:
@@ -1140,7 +1419,9 @@ def chat():
         # ── Step 10: Final response ──
         return _build_final_response(
             intent, entities, confidence, all_products_raw, order_data,
-            api_responses, api_calls_to_execute, conversation, page, start_time, customer_id=customer_id,
+            api_responses, api_calls_to_execute, conversation, page, start_time,
+            payload_context=payload_context,
+            customer_id=customer_id,
         )
 
     except Exception as e:

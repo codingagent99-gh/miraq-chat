@@ -197,6 +197,16 @@ class EcommerceEndpoints(Protocol):
     ) -> WooAPICall:
         """Row 6.3 — Update a customer's profile."""
         ...
+        
+    def search_customers_by_company(
+        self,
+        company_name: str,
+        per_page: int = 3,
+        description: str = "",
+        requires_resolution: Optional[List[str]] = None,
+    ) -> WooAPICall:
+        """Search customers by billing company name (custom-api/v1 endpoint)."""
+        ...
 
     # ── Additional (not in CSV mapping; present in codebase) ────────────────
 

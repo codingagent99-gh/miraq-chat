@@ -30,7 +30,7 @@ from routes.shopify import shopify_bp
 import urllib.parse
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
-
+from routes.sales_rep import sales_rep_bp
 # ═══════════════════════════════════════════
 # FLASK APP & DATABASE
 # ═══════════════════════════════════════════
@@ -110,6 +110,7 @@ app.register_blueprint(chat_bp)
 app.register_blueprint(admin_bp)
 app.register_blueprint(products_bp)
 app.register_blueprint(shopify_bp)
+app.register_blueprint(sales_rep_bp)
 
 # ═══════════════════════════════════════════
 # GLOBAL ERROR HANDLER

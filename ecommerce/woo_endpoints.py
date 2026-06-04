@@ -442,7 +442,7 @@ class WooEndpoints:
         description: str = "",
         requires_resolution: Optional[List[str]] = None,
     ) -> WooAPICall:
-        """Row 6.3 — PUT /customers/{customer_id}"""
+        """Row 6.3 — Update a customer's profile."""
         return WooAPICall(
             method="PUT",
             endpoint=f"/customers/{customer_id}",
@@ -554,6 +554,23 @@ class WooEndpoints:
             body=body,
             surface="custom_plugin",
             description=description or "CS rep order list",
+            requires_resolution=requires_resolution or [],
+        )
+    
+    def search_customers_by_company(
+        self,
+        company_name: str,
+        per_page: int = 3,
+        description: str = "",
+        requires_resolution: Optional[List[str]] = None,
+    ) -> WooAPICall:
+        """GET /customers/by-company?name=<company> (custom_plugin surface)"""
+        return WooAPICall(
+            method="GET",
+            endpoint="/customers/by-company",
+            params={"name": company_name, "per_page": per_page},
+            surface="custom_plugin",
+            description=description or f"Search customers by company '{company_name}'",
             requires_resolution=requires_resolution or [],
         )
 

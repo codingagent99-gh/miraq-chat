@@ -89,6 +89,7 @@ class Intent(Enum):
     REMOVE_FROM_CART  = "remove_from_cart"
     UPDATE_CART_QTY   = "update_cart_qty"
     CHECKOUT          = "checkout"
+    BULK_ORDER        = "bulk_order"
 
 
 # ══════════════════════════════════════════════════════════════

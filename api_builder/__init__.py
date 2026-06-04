@@ -320,7 +320,7 @@ def _build_historical_search(e, page, customer_id=None, role=None) -> list:
     )]
 
 
-def _build_order_item(e, page) -> list:
+def _build_order_item(e, page, role=None) -> list:
     product_name = e.order_item_name or e.product_name or ""
     attr_filters = resolve_attr_filters(e.attributes)
     if not (e.product_id or product_name):
