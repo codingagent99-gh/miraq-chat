@@ -82,8 +82,7 @@ def handle_bulk_order_trigger(conversation, user_context, page, start_time):
             "Tell me everything you need to order today. "
             "You can include multiple customers and products in one message.\n\n"
             "**Example:**\n"
-            "*Order 20 Harmony White for ABC Builders, 15 Coral Grey for XYZ Interiors, "
-            "and reorder last week's Paloma order for Skyline Projects.*"
+            "*Order 20 Harmony White for ABC Builders, 15 Coral Grey for XYZ Interiors"
         ),
         "intent": "guided_flow",
         "products": [],
@@ -709,13 +708,29 @@ def _advance_to_next_address_confirmation(resolved_lines, idx, conversation, use
         items_text = f"[Reorder] {items_text}"
 
     # Full field set so the inline edit panel can prefill every field.
-    _ADDR_FIELDS = (
+    # Billing carries the CS custom fields; shipping carries order_notes.
+    _BILLING_FIELDS = (
         "first_name", "last_name", "company",
-        "address_1", "address_2", "city", "state", "postcode", "country", "phone",
+        "billing_field_type", "billing_project",
+        "address_1", "address_2", "city", "state", "postcode", "country",
+        "phone", "email", "project_rep",
+    )
+    _SHIPPING_FIELDS = (
+        "first_name", "last_name", "company",
+        "address_1", "address_2", "city", "state", "postcode", "country",
+        "order_notes",
     )
 
-    def _full(block):
-        return {f: (block or {}).get(f, "") for f in _ADDR_FIELDS}
+    def _pick(block, fields):
+        return {f: (block or {}).get(f, "") for f in fields}
+
+    billing_payload = _pick(billing_block, _BILLING_FIELDS)
+    shipping_payload = _pick(shipping_block, _SHIPPING_FIELDS)
+
+    # Default "Your Rep" to the logged-in rep's email so the dropdown is
+    # pre-selected from the start, unless the company record already has one.
+    if not billing_payload.get("project_rep"):
+        billing_payload["project_rep"] = user_context.get("rep_email", "")
 
     # ▼ emit a structured action so React can render the address card + panel
     address_action = {
@@ -733,8 +748,8 @@ def _advance_to_next_address_confirmation(resolved_lines, idx, conversation, use
             },
             "addr_str": addr_str,
             # Full structured blocks for the editable panel prefill.
-            "billing": _full(billing_block),
-            "shipping": _full(shipping_block),
+            "billing": billing_payload,
+            "shipping": shipping_payload,
             "progress": {"current": idx + 1, "total": len(resolved_lines)},
         },
     }
@@ -794,11 +809,37 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
         override = address_overrides.get(str(line_idx)) or {}
         override_billing = override.get("billing") or {}
         override_shipping = override.get("shipping") or {}
+        
+        def _merge(base, override):
+            base = dict(base or {})
+            for k, v in (override or {}).items():
+                if v not in (None, ""):       # don't let blank panel fields wipe real data
+                    base[k] = v
+            return base
 
-        # Billing: edited values win, else the company's billing block.
-        billing = {**(line.get("billing_address") or {}), **override_billing}
-        # Shipping: edited values win, else the company's shipping block.
-        shipping = {**(line.get("shipping_address") or {}), **override_shipping}
+        billing = _merge(line.get("billing_address"), override_billing)
+        shipping = _merge(line.get("shipping_address"), override_shipping)
+
+        # ── Custom CS fields → order meta (not address-block fields) ──
+        # project_rep defaults to the logged-in rep's email when still blank.
+        rep_email = user_context.get("rep_email", "")
+        project_rep  = billing.get("project_rep") or rep_email
+        project_name = billing.get("billing_project") or ""
+        field_type   = billing.get("billing_field_type") or ""
+        order_notes  = shipping.get("order_notes") or ""
+
+        meta_data = []
+        if project_rep:
+            meta_data.append({"key": "_billing_project_rep", "value": project_rep})
+        if project_name:
+            meta_data.append({"key": "_billing_project_name", "value": project_name})
+        if field_type:
+            meta_data.append({"key": "_billing_field_type", "value": field_type})
+
+        # Remove custom keys from the Woo address blocks — they live in meta.
+        for _k in ("project_rep", "billing_project", "billing_field_type", "order_notes"):
+            billing.pop(_k, None)
+            shipping.pop(_k, None)
 
         payload = {
             "status": "processing",
@@ -814,6 +855,12 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
                 }
             ],
         }
+        if meta_data:
+            payload["meta_data"] = meta_data
+        if order_notes:
+            payload["customer_note"] = order_notes
+        billing  = {k: v for k, v in billing.items() if v}
+        shipping = {k: v for k, v in shipping.items() if v}
         if billing.get("address_1"):
             payload["billing"] = billing
         if shipping.get("address_1"):

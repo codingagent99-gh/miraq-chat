@@ -686,6 +686,12 @@ def chat():
     _incoming_role = payload_context.get("role", "")
     if _incoming_role and user_context.get("role") != _incoming_role:
         user_context["role"] = _incoming_role
+
+    # Persist rep email too, so order creation can default project_rep to the
+    # logged-in rep (custom-api saves the rep's *email* into _billing_project_rep).
+    _incoming_email = payload_context.get("email", "")
+    if _incoming_email and user_context.get("rep_email") != _incoming_email:
+        user_context["rep_email"] = _incoming_email
         flag_modified(conversation, "context_data")
 
     logger.info(f"[MEMORY TRACE 1] INCOMING from Frontend Payload: {payload_context}")
