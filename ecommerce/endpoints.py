@@ -217,6 +217,16 @@ class EcommerceEndpoints(Protocol):
     ) -> WooAPICall:
         """Exact customer lookup by email address."""
         ...
+        
+    def search_orders_by_product(
+        self,
+        product_id: int,
+        per_page: int = 3,
+        description: str = "",
+        requires_resolution: Optional[List[str]] = None,
+    ) -> WooAPICall:
+        """Recent orders containing a specific product — GET /orders?product=<id>."""
+        ...
 
     # ── Additional (not in CSV mapping; present in codebase) ────────────────
 

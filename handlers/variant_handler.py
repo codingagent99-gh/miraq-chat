@@ -6,7 +6,7 @@ import time
 import re
 from flask import jsonify
 
-from app_config import DEFAULT_PER_PAGE, CLASSIFIER_PROVIDER_TAG, get_currency_symbol
+from app_config import DEFAULT_PER_PAGE, CLASSIFIER_PROVIDER_TAG, get_currency_symbol, ORDER_CREATE_INTENTS
 from models import Intent, WooAPICall
 from woo_client import woo_client
 from formatters import format_product, format_variation, _filter_variations_by_entities
@@ -599,6 +599,7 @@ def handle_variation_product(
     conversation=None,
     resolved_attr_values=None,
     customer_id=None,
+    role="",
 ):
     VARIATION_INTENTS = {
         Intent.PRODUCT_SEARCH,
@@ -851,14 +852,16 @@ def handle_variation_product(
     suggestions = generate_suggestions(intent, entities, products)
 
     if matched_variation is None and len(variation_products) > 1 and user_context is not None and conversation is not None:
-        # Tie case — multiple equal-score variations, user needs to pick
-        user_context["pending_product_id"] = parent_product_raw.get("id")
-        user_context["pending_product_name"] = parent_formatted["name"]
-        user_context["resolved_attributes"] = {}
-        conversation.context_data = user_context
-        flag_modified(conversation, "context_data")
-        next_flow_state = FlowState.AWAITING_VARIANT_SELECTION.value
-        suggestions = ["Cancel"]
+        if intent in ORDER_CREATE_INTENTS:
+            # Order intent tie — user must pick a specific variant before we can proceed
+            user_context["pending_product_id"] = parent_product_raw.get("id")
+            user_context["pending_product_name"] = parent_formatted["name"]
+            user_context["resolved_attributes"] = {}
+            conversation.context_data = user_context
+            flag_modified(conversation, "context_data")
+            next_flow_state = FlowState.AWAITING_VARIANT_SELECTION.value
+            suggestions = ["Cancel"]
+        # Browsing intent — show all variations, remain IDLE
 
     if resolved_variation and user_context is not None and conversation is not None:
 
@@ -889,25 +892,28 @@ def handle_variation_product(
         missing_axes = all_variation_axes - set(var_attrs.keys())
 
         if missing_axes:
-            logger.info(
-                f"Step 3.7: Variation {resolved_variation.get('id')} is wildcard — "
-                f"missing axes: {missing_axes} — → AWAITING_VARIANT_SELECTION"
-            )
-            user_context["pending_product_id"]   = parent_product_raw.get("id")
-            user_context["pending_variation_id"] = resolved_variation.get("id")
-            user_context["pending_product_name"] = parent_formatted["name"]
-            user_context["resolved_attributes"]  = var_attrs
-            conversation.context_data = user_context
-            flag_modified(conversation, "context_data")
+            if intent in ORDER_CREATE_INTENTS:
+                # Order intent wildcard — need remaining axis before placing order
+                logger.info(
+                    f"Step 3.7: Variation {resolved_variation.get('id')} is wildcard — "
+                    f"missing axes: {missing_axes} — → AWAITING_VARIANT_SELECTION"
+                )
+                user_context["pending_product_id"]   = parent_product_raw.get("id")
+                user_context["pending_variation_id"] = resolved_variation.get("id")
+                user_context["pending_product_name"] = parent_formatted["name"]
+                user_context["resolved_attributes"]  = var_attrs
+                conversation.context_data = user_context
+                flag_modified(conversation, "context_data")
 
-            logger.debug(f"Step 3.7: wildcard build_variant_prompt | resolved_attr_values={resolved_attr_values}")
+                logger.debug(f"Step 3.7: wildcard build_variant_prompt | resolved_attr_values={resolved_attr_values}")
 
-            bot_message = build_variant_prompt(
-                parent_product_raw, parent_formatted["name"], var_attrs, variations_raw, display_to_slug,
-                resolved_attr_values=resolved_attr_values,
-            )
-            suggestions = ["Cancel"]
-            next_flow_state = FlowState.AWAITING_VARIANT_SELECTION.value
+                bot_message = build_variant_prompt(
+                    parent_product_raw, parent_formatted["name"], var_attrs, variations_raw, display_to_slug,
+                    resolved_attr_values=resolved_attr_values,
+                )
+                suggestions = ["Cancel"]
+                next_flow_state = FlowState.AWAITING_VARIANT_SELECTION.value
+            # Browsing intent — display matched variation, remain IDLE
 
         else:
             variation_name = (
@@ -971,6 +977,22 @@ def handle_variation_product(
             if matched_variation else {}
         ),
     }
+    
+    # ── Rep: product order history ──────────────────────────────────────────
+    # Injected here so variable products (which never reach _build_final_response)
+    # still get the SHOW_PRODUCT_RECENT_ORDERS action.
+    _rep_actions = []
+    if role and entities.product_id:
+        from utils.rep_utils import (
+            fetch_product_order_history,
+            format_product_orders_for_action,
+        )
+        _recent = fetch_product_order_history(entities.product_id, role)
+        if _recent:
+            _rep_actions.append({
+                "type": "SHOW_PRODUCT_RECENT_ORDERS",
+                "payload": {"orders": format_product_orders_for_action(_recent)},
+            })
 
     return jsonify({
         "success":     True,
@@ -982,8 +1004,8 @@ def handle_variation_product(
         "metadata":    metadata,
         "pagination":  pagination,
         "flow_state":  next_flow_state,
+        **({"actions": _rep_actions} if _rep_actions else {}),
     }), 200
-
 
 def handle_quantity_and_variant_check(
     intent,

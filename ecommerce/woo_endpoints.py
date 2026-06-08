@@ -596,6 +596,32 @@ class WooEndpoints:
             requires_resolution=requires_resolution or [],
         )
 
+    def search_orders_by_product(
+        self,
+        product_id: int,
+        per_page: int = 3,
+        description: str = "",
+        requires_resolution: Optional[List[str]] = None,
+    ) -> WooAPICall:
+        """GET /orders?product=<id>&orderby=date&order=desc (admin surface).
+
+        Returns recent orders that contain this product, regardless of which
+        customer placed them — used to surface rep-facing order history on
+        product search results.
+        """
+        return WooAPICall(
+            method="GET",
+            endpoint="/orders",
+            params={
+                "product":  product_id,
+                "per_page": per_page,
+                "orderby":  "date",
+                "order":    "desc",
+            },
+            surface="admin",
+            description=description or f"Recent orders for product_id={product_id}",
+            requires_resolution=requires_resolution or [],
+        )
     # ── Response parsers ────────────────────────────────────────────────────
     # Each parser takes the raw ``woo_client.execute(...).get("data")`` dict
     # (or list) and returns a backend-neutral dict (or list of dicts).

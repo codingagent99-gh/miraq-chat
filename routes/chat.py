@@ -11,6 +11,7 @@ from flask import Blueprint, request, jsonify
 from models import db, Conversation, Message, Intent
 from sqlalchemy.orm.attributes import flag_modified
 import re
+import json
 from models import ExtractedEntities, ClassifiedResult, WooAPICall
 from app_config import (
     ORDER_INTENTS,
@@ -46,7 +47,10 @@ from parsers.address_parser import extract_address, address_summary
 from utils.language_utils import detect_and_translate
 from handlers.cart_handler import handle_cart_intent
 from core.actions import build_propose_checkout_address
-
+from utils.rep_utils import (
+    fetch_product_order_history  as _fetch_product_order_history,
+    format_product_orders_for_action as _format_product_orders_for_action,
+)
 # ── Bulk order & sales rep handlers (top-level; no deferred imports needed) ──
 from handlers.bulk_order_handler import (
     handle_bulk_order_trigger,
@@ -59,6 +63,7 @@ from handlers.bulk_order_handler import (
     handle_bulk_quantity_reply,
     handle_cancel_bulk_order,
     handle_bulk_confirmation_unclear,
+    handle_product_reorder,
 )
 from handlers.sales_rep_handler import (
     handle_order_for_email_reply,
@@ -321,7 +326,6 @@ def _handle_cart_flow(action, user_context, conversation, store_loader, page, st
         })
 
     return None
-
 
 # ══════════════════════════════════════════════════════════════
 # ─── ADDRESS PROPOSAL ───
@@ -803,10 +807,28 @@ def _build_final_response(
     _sr_ctx     = payload_context or {}
     _sr_role    = _sr_ctx.get("role", "")
     _sr_actions = response.get("actions", [])
+
     if _sr_role in BULK_ORDER_ROLES and customer_id and products:
         _sr_actions.append({"type": "SHOW_RECENTLY_ORDERED_BUTTON", "payload": {}})
+
+        # Product order history — only when a specific product resolved
+        _searched_product_id = getattr(entities, "product_id", None)
+        if not _searched_product_id and len(products) == 1:
+            _searched_product_id = products[0].get("id")
+
+        if _searched_product_id:
+            _recent_orders = _fetch_product_order_history(_searched_product_id, _sr_role)
+            if _recent_orders:
+                _sr_actions.append({
+                    "type": "SHOW_PRODUCT_RECENT_ORDERS",
+                    "payload": {
+                        "orders": _format_product_orders_for_action(_recent_orders),
+                    },
+                })
+
     if customer_id:
         _sr_actions.append({"type": "SHOW_BULK_ORDER_BUTTON", "payload": {}})
+
     if _sr_actions:
         response["actions"] = _sr_actions
 
@@ -973,7 +995,7 @@ def chat():
         user_msg = Message(conversation_id=conversation.id, role="user", content=message)
         db.session.add(user_msg)
         db.session.commit()
-
+        
         # ── Single store_loader fetch for the whole request ──
         store_loader = get_store_loader()
 
@@ -993,6 +1015,19 @@ def chat():
             current_flow_state = FlowState.IDLE
 
         _wipe_stale_cart(conversation, user_context, current_flow_state)
+
+        # ── Product reorder intercept ──   ← MOVE HERE (after current_flow_state is set)
+        if message.startswith("__PRODUCT_REORDER__"):
+            try:
+                _reorder_payload = json.loads(message[len("__PRODUCT_REORDER__"):])
+            except (ValueError, TypeError):
+                _reorder_payload = {}
+            if _reorder_payload:
+                resp = handle_product_reorder(
+                    _reorder_payload, store_loader, conversation, user_context, page, start_time
+                )
+                if resp:
+                    return _ft(resp)
 
         # ── Step 0.5: Suggestion retry (early exit) ──
         sr_resp = handle_suggestion_retry(body, message, str(conversation.id), customer_id, page, start_time)
@@ -1311,6 +1346,7 @@ def chat():
             conversation=conversation,
             resolved_attr_values=user_context.get("resolved_attr_values"),
             customer_id=customer_id,
+            role=role,
         )
         if resp:
             return _ft(resp)

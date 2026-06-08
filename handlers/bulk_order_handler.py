@@ -756,6 +756,110 @@ def handle_bulk_email_reply(message, store_loader, conversation, user_context, p
     )
 
 # ══════════════════════════════════════════════════════════════
+# ── Public: handle_product_reorder ──
+# ══════════════════════════════════════════════════════════════
+
+def handle_product_reorder(payload, store_loader, conversation, user_context, page, start_time):
+    """
+    Called when a rep clicks 'Reorder' on the product order history card.
+
+    Payload shape (from _format_product_orders_for_action):
+        {
+            "order_id":              "12345",
+            "order_number":          "12345",
+            "customer_id":           "272749971",
+            "customer_display_name": "Abel Design Group",
+            "items": [
+                {"product_name": "Harmony White", "product_id": 16972,
+                 "variation_id": 0, "quantity": 20}
+            ]
+        }
+
+    Builds BulkOrderLine dicts and drops straight into address confirmation —
+    no variant or quantity prompts needed (those are already known from the
+    original order).
+    """
+    customer_id      = payload.get("customer_id", "")
+    customer_display = payload.get("customer_display_name", "")
+    order_id         = payload.get("order_id", "")
+    items            = payload.get("items", [])
+
+    if not customer_id or not items:
+        logger.warning(f"handle_product_reorder | missing customer_id or items | payload={payload}")
+        return None
+
+    # ── Fetch fresh billing/shipping address for this customer ──
+    billing  = {}
+    shipping = {}
+    try:
+        cust_call   = endpoints.fetch_customer(
+            customer_id=int(customer_id),
+            description=f"Fetch address for reorder — {customer_display}",
+        )
+        cust_result = woo_client.execute(cust_call)
+        if cust_result.get("success") and isinstance(cust_result.get("data"), dict):
+            data     = cust_result["data"]
+            billing  = data.get("billing",  {}) or {}
+            shipping = data.get("shipping", {}) or {}
+            if not shipping.get("address_1"):
+                shipping = billing
+    except Exception as exc:
+        logger.warning(f"handle_product_reorder | address fetch failed | error={exc}")
+
+    # ── Build one BulkOrderLine per line item ──
+    lines_as_dicts = []
+    for item in items:
+        product_id   = item.get("product_id")
+        variation_id = item.get("variation_id") or None
+        if not product_id:
+            continue
+        lines_as_dicts.append({
+            "raw_fragment":            "",
+            "company_name":            customer_display,
+            "email":                   "",
+            "product_name":            item.get("product_name", ""),
+            "quantity":                item.get("quantity", 1),
+            "quantity_explicitly_set": True,
+            "product_id":              product_id,
+            "variation_id":            variation_id,
+            "customer_id":             str(customer_id),
+            "customer_display_name":   customer_display,
+            "shipping_address":        shipping,
+            "billing_address":         billing,
+            "is_reorder":              True,
+            "reorder_source_order_id": int(order_id) if order_id else None,
+            "unresolved":              False,
+            "unresolved_reason":       None,
+            "address_confirmed":       False,
+            "address_skipped":         False,
+        })
+
+    if not lines_as_dicts:
+        return None
+
+    # ── Store state and go straight to address confirmation ──
+    user_context["pending_bulk_lines"]     = lines_as_dicts
+    user_context["bulk_current_line_index"] = 0
+    user_context["bulk_confirmed_lines"]   = []
+    user_context["bulk_address_overrides"] = {}
+    conversation.context_data = user_context
+    flag_modified(conversation, "context_data")
+
+    logger.info(
+        f"handle_product_reorder | order_id={order_id} | customer={customer_display} "
+        f"| {len(lines_as_dicts)} line(s)"
+    )
+
+    return _advance_to_next_address_confirmation(
+        resolved_lines=lines_as_dicts,
+        idx=0,
+        conversation=conversation,
+        user_context=user_context,
+        page=page,
+        start_time=start_time,
+    )
+    
+# ══════════════════════════════════════════════════════════════
 # ── Public: handle_bulk_product_reply ──
 # ══════════════════════════════════════════════════════════════
 
