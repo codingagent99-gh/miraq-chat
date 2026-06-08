@@ -207,6 +207,16 @@ class EcommerceEndpoints(Protocol):
     ) -> WooAPICall:
         """Search customers by billing company name (custom-api/v1 endpoint)."""
         ...
+        
+    def search_customers_by_email(
+        self,
+        email: str,
+        per_page: int = 1,
+        description: str = "",
+        requires_resolution: Optional[List[str]] = None,
+    ) -> WooAPICall:
+        """Exact customer lookup by email address."""
+        ...
 
     # ── Additional (not in CSV mapping; present in codebase) ────────────────
 

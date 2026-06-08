@@ -46,8 +46,286 @@ from parsers.address_parser import extract_address, address_summary
 from utils.language_utils import detect_and_translate
 from handlers.cart_handler import handle_cart_intent
 from core.actions import build_propose_checkout_address
+
+# ── Bulk order & sales rep handlers (top-level; no deferred imports needed) ──
+from handlers.bulk_order_handler import (
+    handle_bulk_order_trigger,
+    handle_bulk_order_input,
+    handle_bulk_order_confirmation,
+    handle_bulk_address_confirmation_reply,
+    handle_bulk_variant_selection_reply,
+    handle_bulk_email_reply,
+    handle_bulk_product_reply,
+    handle_bulk_quantity_reply,
+    handle_cancel_bulk_order,
+    handle_bulk_confirmation_unclear,
+)
+from handlers.sales_rep_handler import (
+    handle_order_for_email_reply,
+    handle_order_for_prompt,
+)
+
 logger = get_logger("miraq_chat")
 chat_bp = Blueprint("chat", __name__)
+
+
+# ══════════════════════════════════════════════════════════════
+# ─── MODULE-LEVEL HELPERS ───
+# ══════════════════════════════════════════════════════════════
+
+def _is_inline_bulk_order(message: str, store_loader=None) -> bool:
+    # Check 1: comma-separated fragments with quantities (original)
+    fragments = [f.strip() for f in message.split(",") if f.strip()]
+    qualified = sum(
+        1 for f in fragments
+        if re.search(r"\d", f) and (
+            re.search(r"\bfor\b", f, re.I) or
+            re.search(r"\b(order|buy|purchase|reorder|re-order)\b", f, re.I)
+        )
+    )
+    if qualified >= 2:
+        return True
+
+    # Check 2: 2+ resolvable catalog products — same logic as BulkOrderEvaluator
+    if store_loader and store_loader.products:
+        _name_set = {p["name"].lower() for p in store_loader.products if p.get("name")}
+        resolved_count = sum(
+            1 for name in _name_set
+            if re.search(r"\b" + re.escape(name) + r"\b", message, re.I)
+        )
+        if resolved_count >= 2:
+            return True
+
+    return False
+
+
+def _merge_phase_entities(result):
+    """
+    Restore phase-1 entity richness when the phase-2 classifier pass degraded it.
+
+    parse_csv_message runs a second pass on attribute-stripped text. When that
+    text is nearly empty the second pass returns blank entities and a weaker
+    intent, overwriting the correct product_id / attributes resolved in pass 1.
+    We surface the pass-1 result through result.phase1_entities and merge it
+    back here.
+
+    Returns (intent, entities, confidence).
+    """
+    intent     = result.intent
+    entities   = result.entities
+    confidence = result.confidence
+
+    phase1 = getattr(result, "phase1_entities", None)
+    if phase1 is None:
+        return intent, entities, confidence
+
+    # Restore product identity if pass-2 lost it
+    if not entities.product_id and phase1.product_id:
+        entities.product_id   = phase1.product_id
+        entities.product_name = phase1.product_name
+        entities.product_slug = phase1.product_slug
+        logger.debug(
+            f"[EntityMerge] Restored product_id={phase1.product_id} "
+            f"name='{phase1.product_name}' from phase-1 entities"
+        )
+
+    # Merge attributes: keep all phase-1 keys that pass-2 dropped
+    if phase1.attributes:
+        merged_attrs = dict(phase1.attributes)
+        merged_attrs.update(entities.attributes)   # pass-2 wins on overlap
+        if merged_attrs != entities.attributes:
+            logger.debug(
+                f"[EntityMerge] attributes merged: "
+                f"phase1={phase1.attributes} + phase2={entities.attributes} "
+                f"→ {merged_attrs}"
+            )
+        entities.attributes = merged_attrs
+
+    # Restore attribute_term_ids if pass-2 lost them
+    if not entities.attribute_term_ids and getattr(phase1, "attribute_term_ids", None):
+        entities.attribute_term_ids = phase1.attribute_term_ids
+        entities.attribute_slug     = phase1.attribute_slug
+        logger.debug(
+            f"[EntityMerge] Restored attribute_term_ids={phase1.attribute_term_ids}"
+        )
+
+    # Use pass-1 intent/confidence when pass-2 fell back to a weaker signal
+    _WEAK_INTENTS = {Intent.PRODUCT_SEARCH}
+    if result.intent in _WEAK_INTENTS and getattr(result, "phase1_intent", None) not in _WEAK_INTENTS:
+        _old_intent    = result.intent
+        intent         = result.phase1_intent
+        result.intent  = intent
+        confidence     = max(confidence, result.phase1_confidence or confidence)
+        logger.debug(
+            f"[EntityMerge] Upgraded intent {_old_intent} → {intent} from phase-1"
+        )
+
+    return intent, entities, confidence
+
+
+def _dispatch_bulk_action(action, message, role, store_loader, conversation, user_context, page, start_time):
+    """
+    Route a bulk-order or sales-rep flow action to its handler.
+    Returns a Flask response tuple, or None if the action is not recognised.
+    """
+    if action == "process_bulk_input":
+        return handle_bulk_order_input(
+            message, store_loader, conversation, user_context, page, start_time
+        )
+    elif action == "process_bulk_variant_selection":
+        return handle_bulk_variant_selection_reply(
+            message, store_loader, conversation, user_context, page, start_time
+        )
+    elif action == "process_bulk_email_reply":
+        return handle_bulk_email_reply(
+            message, store_loader, conversation, user_context, page, start_time
+        )
+    elif action == "process_bulk_product_reply":
+        return handle_bulk_product_reply(
+            message, store_loader, conversation, user_context, page, start_time
+        )
+    elif action == "confirm_bulk_order":
+        return handle_bulk_order_confirmation(
+            user_context, conversation, page, start_time
+        )
+    elif action == "cancel_bulk_order":
+        return handle_cancel_bulk_order(
+            user_context, conversation, page, start_time
+        )
+    elif action == "bulk_confirmation_unclear":
+        return handle_bulk_confirmation_unclear(
+            conversation, page, start_time
+        )
+    elif action == "process_bulk_quantity_reply":
+        return handle_bulk_quantity_reply(
+            message, store_loader, conversation, user_context, page, start_time
+        )
+    elif action in (
+        "bulk_address_confirmed",
+        "bulk_address_change",
+        "bulk_address_override_text",
+        "bulk_address_override_structured",
+        "bulk_address_skip",
+    ):
+        return handle_bulk_address_confirmation_reply(
+            action, message, conversation, user_context, page, start_time
+        )
+    elif action == "resolve_order_for_email" and role in BULK_ORDER_ROLES:
+        return handle_order_for_email_reply(
+            message, conversation, user_context, page, start_time
+        )
+    return None
+
+
+def _handle_cart_flow(action, user_context, conversation, store_loader, page, start_time):
+    """
+    Handle cart confirmation flow actions returned by handle_flow_state.
+
+    Covers the three cart-confirmation actions that live inside the flow
+    state machine rather than as standalone intents:
+      - prompt_cart_confirmation  (AWAITING_QUANTITY → ask "add to cart?")
+      - confirm_add_to_cart       (AWAITING_CART_CONFIRMATION → Yes)
+      - decline_add_to_cart       (AWAITING_CART_CONFIRMATION → No)
+
+    Returns a raw Flask response (caller wraps with _ft), or None if the
+    action is not a cart-flow action.
+    """
+    if action == "prompt_cart_confirmation":
+        pid      = user_context.get("pending_product_id")
+        vid      = user_context.get("pending_variation_id")
+        qty      = user_context.get("pending_quantity") or 1
+        name     = user_context.get("pending_product_name", "item")
+        resolved = user_context.get("resolved_attributes") or {}
+        variant_label  = " / ".join(str(v) for v in resolved.values()) if resolved else ""
+        variant_suffix = f" ({variant_label})" if variant_label else ""
+
+        elapsed = round((time.time() - start_time) * 1000)
+        return jsonify({
+            "success":     True,
+            "bot_message": f"Got it — add **{name}**{variant_suffix} ×{qty} to your cart?",
+            "intent":      "guided_flow",
+            "products":    [],
+            "suggestions": ["Yes, add it", "No thanks"],
+            "session_id":  str(conversation.id),
+            "metadata": {
+                "flow_state":           FlowState.AWAITING_CART_CONFIRMATION.value,
+                "pending_product_id":   pid,
+                "pending_product_name": name,
+                "pending_quantity":     qty,
+                "pending_variation_id": vid,
+                "resolved_attributes":  resolved,
+                "response_time_ms":     elapsed,
+            },
+            "flow_state":  FlowState.AWAITING_CART_CONFIRMATION.value,
+            "pagination":  default_pagination(page),
+            "actions":     [],
+        })
+
+    if action == "confirm_add_to_cart":
+        pid      = user_context.get("pending_product_id")
+        vid      = user_context.get("pending_variation_id")
+        qty      = user_context.get("pending_quantity") or 1
+        name     = user_context.get("pending_product_name", "item")
+        resolved = user_context.get("resolved_attributes") or {}
+
+        if not pid:
+            return None
+
+        _is_shopify = isinstance(vid, str) and vid.startswith("gid://")
+        if _is_shopify:
+            from core.actions import build_shopify_add_to_cart
+            actions = [build_shopify_add_to_cart(
+                variant_gid=vid,
+                quantity=qty,
+                name=name,
+            )]
+        else:
+            variation_attributes = endpoints.build_cart_variation_payload(
+                product_id=pid,
+                variant_id=vid,
+                resolved_attrs=resolved,
+                store_loader=store_loader,
+            )
+            actions = [build_add_to_cart(
+                product_id=pid,
+                quantity=qty,
+                name=name,
+                variation_id=vid,
+                variation=variation_attributes,
+            )]
+        actions.append(build_open_cart_panel())
+
+        return jsonify({
+            "success":     True,
+            "bot_message": f"✅ Added **{name}** ×{qty} to your cart. Opening your cart so you can review…",
+            "intent":      Intent.ADD_TO_CART.value,
+            "suggestions": ["Proceed to checkout", "Continue shopping", "View cart"],
+            "session_id":  str(conversation.id),
+            "pagination":  default_pagination(page),
+            "flow_state":  FlowState.IDLE.value,
+            "actions":     actions,
+        })
+
+    if action == "decline_add_to_cart":
+        elapsed = round((time.time() - start_time) * 1000)
+        return jsonify({
+            "success":     True,
+            "bot_message": "No problem! What else are you looking for?",
+            "intent":      "browse",
+            "products":    [],
+            "suggestions": ["Show me products", "View categories", "View cart"],
+            "session_id":  str(conversation.id),
+            "metadata":    {"response_time_ms": elapsed},
+            "pagination":  default_pagination(page),
+            "flow_state":  FlowState.IDLE.value,
+        })
+
+    return None
+
+
+# ══════════════════════════════════════════════════════════════
+# ─── ADDRESS PROPOSAL ───
+# ══════════════════════════════════════════════════════════════
 
 def _maybe_attach_address_proposal(
     response_data: dict,
@@ -114,20 +392,22 @@ def _maybe_attach_address_proposal(
         ]
     except Exception as exc:
         logger.warning(f"_maybe_attach_address_proposal failed silently | error={exc}")
-        
+
+
 # ══════════════════════════════════════════════════════════════
 # ─── DATABASE SESSION HELPERS ───
 # ══════════════════════════════════════════════════════════════
 
 def resolve_session_id():
     """Resolves the chat session ID from X-MiraQ-Session header or generates a new one."""
-    miraq_session = request.headers.get('X-MiraQ-Session')
+    miraq_session = request.headers.get("X-MiraQ-Session")
     if miraq_session:
         try:
             return uuid.UUID(miraq_session)
         except ValueError:
             logger.warning(f"Invalid X-MiraQ-Session format received: {miraq_session}")
     return uuid.uuid4()
+
 
 def _finalize_turn(
     conversation,
@@ -163,12 +443,12 @@ def _finalize_turn(
             _proposal_customer_id,
             current_flow_state=_proposal_flow_state,
         )
-        
+
     combined_metadata = data.get("metadata", {}).copy()
-    combined_metadata["products"] = data.get("products", [])
-    combined_metadata["categories"] = data.get("categories", [])
+    combined_metadata["products"]    = data.get("products", [])
+    combined_metadata["categories"]  = data.get("categories", [])
     combined_metadata["suggestions"] = data.get("suggestions", [])
-    combined_metadata["actions"] = data.get("actions", [])
+    combined_metadata["actions"]     = data.get("actions", [])
 
     # 1. Save Bot Message
     bot_msg = Message(
@@ -176,7 +456,7 @@ def _finalize_turn(
         role="bot",
         content=data.get("bot_message", ""),
         intent=data.get("intent", ""),
-        metadata_json=combined_metadata, # Save the bundled data
+        metadata_json=combined_metadata,
     )
     db.session.add(bot_msg)
 
@@ -222,10 +502,10 @@ def _finalize_turn(
 # ─── HISTORY ROUTE ───
 # ══════════════════════════════════════════════════════════════
 
-@chat_bp.route('/chat/history', methods=['GET'])
+@chat_bp.route("/chat/history", methods=["GET"])
 def get_chat_history():
     """Fetches paginated chat history for the frontend to hydrate the UI."""
-    miraq_session = request.headers.get('X-MiraQ-Session')
+    miraq_session = request.headers.get("X-MiraQ-Session")
     if not miraq_session:
         return jsonify({"messages": [], "has_more": False}), 200
 
@@ -236,46 +516,44 @@ def get_chat_history():
         if not conversation:
             return jsonify({"messages": [], "has_more": False}), 200
 
-        page = int(request.args.get('page', 1))
-        limit = int(request.args.get('limit', 20))
+        page  = int(request.args.get("page", 1))
+        limit = int(request.args.get("limit", 20))
         offset = (page - 1) * limit
 
-        messages_query = Message.query.filter_by(conversation_id=session_uuid)\
-            .order_by(Message.created_at.desc())\
+        messages_query = (
+            Message.query
+            .filter_by(conversation_id=session_uuid)
+            .order_by(Message.created_at.desc())
             .limit(limit).offset(offset).all()
+        )
 
         total_messages = Message.query.filter_by(conversation_id=session_uuid).count()
         has_more = (offset + limit) < total_messages
 
         messages_query.reverse()
-        
+
         history = []
         for msg in messages_query:
             item = {
-                "role": msg.role,
-                "message": msg.content,
-                "intent": msg.intent,
+                "role":      msg.role,
+                "message":   msg.content,
+                "intent":    msg.intent,
                 "timestamp": msg.created_at.isoformat(),
             }
-            
-            # ---> FIX HERE: Unpack the rich UI data for bot messages <---
             if msg.role == "bot" and msg.metadata_json:
-                item["products"] = msg.metadata_json.get("products", [])
-                item["categories"] = msg.metadata_json.get("categories", [])
+                item["products"]    = msg.metadata_json.get("products", [])
+                item["categories"]  = msg.metadata_json.get("categories", [])
                 item["suggestions"] = msg.metadata_json.get("suggestions", [])
-                item["actions"] = msg.metadata_json.get("actions", [])
-                
-                # Separate the actual metadata from our bundled UI arrays
-                item["metadata"] = {
-                    k: v for k, v in msg.metadata_json.items() 
-                    if k not in ["products", "categories", "suggestions", "actions"]
+                item["actions"]     = msg.metadata_json.get("actions", [])
+                item["metadata"]    = {
+                    k: v for k, v in msg.metadata_json.items()
+                    if k not in ("products", "categories", "suggestions", "actions")
                 }
-                
             history.append(item)
 
         return jsonify({
-            "messages": history,
-            "has_more": has_more,
+            "messages":  history,
+            "has_more":  has_more,
             "next_page": page + 1 if has_more else None,
         }), 200
 
@@ -312,30 +590,30 @@ def _wipe_stale_cart(conversation, user_context, current_flow_state):
 def _check_empty_order(intent, entities, conversation, page, start_time):
     if intent == Intent.BULK_ORDER:
         return None   # bulk orders carry no single product_id — skip this guard
-    if intent not in ORDER_CREATE_INTENTS or getattr(entities, 'product_id', None):
+    if intent not in ORDER_CREATE_INTENTS or getattr(entities, "product_id", None):
         return None
 
-    p_name = (getattr(entities, 'product_name', None) or "").lower().strip()
-    s_term = (getattr(entities, 'search_term', None) or "").lower().strip()
+    p_name  = (getattr(entities, "product_name", None) or "").lower().strip()
+    s_term  = (getattr(entities, "search_term", None) or "").lower().strip()
     generic = {"", "product", "a product", "the product", "item", "an item", "something", "anything", "order", "some"}
 
     if p_name not in generic or s_term not in generic:
         return None
-    if getattr(entities, 'attributes', {}) or getattr(entities, 'target_category_slugs', set()):
+    if getattr(entities, "attributes", {}) or getattr(entities, "target_category_slugs", set()):
         return None
 
     logger.info(f"🛑 Caught generic order words | p_name='{p_name}' | s_term='{s_term}'")
     elapsed = time.time() - start_time
     return _finalize_turn(conversation, jsonify({
-        "success": True,
+        "success":     True,
         "bot_message": "To place an order, please include the product name! For example, you can type: **'I want to order Plumeria'**.",
-        "intent": "clarification_needed",
-        "products": [],
+        "intent":      "clarification_needed",
+        "products":    [],
         "suggestions": ["Show me the catalog", "Cancel"],
-        "session_id": str(conversation.id),
-        "metadata": {"confidence": 1.0, "products_count": 0, "response_time_ms": round(elapsed * 1000)},
-        "pagination": default_pagination(page),
-        "flow_state": FlowState.IDLE.value,
+        "session_id":  str(conversation.id),
+        "metadata":    {"confidence": 1.0, "products_count": 0, "response_time_ms": round(elapsed * 1000)},
+        "pagination":  default_pagination(page),
+        "flow_state":  FlowState.IDLE.value,
     }))
 
 
@@ -353,10 +631,10 @@ def _execute_api_calls(intent, api_calls, _resolve_variant):
         api_calls_to_execute = api_calls
 
     # ── split by surface ─────────────────────────────────────────────
-    shopify_calls  = [c for c in api_calls_to_execute if getattr(c, "surface", "") == "shopify_graphql"]
+    shopify_calls       = [c for c in api_calls_to_execute if getattr(c, "surface", "") == "shopify_graphql"]
     shopify_order_calls = [c for c in api_calls_to_execute if getattr(c, "surface", "") == "shopify_orders"]
-    woo_calls      = [c for c in api_calls_to_execute
-                      if getattr(c, "surface", "") not in ("shopify_graphql", "shopify_orders")]
+    woo_calls           = [c for c in api_calls_to_execute
+                           if getattr(c, "surface", "") not in ("shopify_graphql", "shopify_orders")]
 
     api_responses = woo_client.execute_all(woo_calls)
 
@@ -367,12 +645,7 @@ def _execute_api_calls(intent, api_calls, _resolve_variant):
             try:
                 result = orders_executor.execute(call)
                 logger.debug(f"[DEBUG] Shopify order response data keys: {list(result.keys())}")
-                api_responses.append({
-                    "success": True,
-                    "data":    result,
-                    "call":    call,
-                })
-                
+                api_responses.append({"success": True, "data": result, "call": call})
             except Exception as exc:
                 logger.error(f"ShopifyOrdersExecutor failed: {exc}", exc_info=True)
                 api_responses.append({"success": False, "error": str(exc), "call": call})
@@ -383,18 +656,14 @@ def _execute_api_calls(intent, api_calls, _resolve_variant):
         for call in shopify_calls:
             try:
                 result = executor.execute_from_body(call.body)
-                api_responses.append({
-                    "success": True,
-                    "data":    result,   # full dict — build_pagination reads result["total"]/["pages"]
-                    "call":    call,
-                })
+                api_responses.append({"success": True, "data": result, "call": call})
             except Exception as exc:
                 logger.error(f"ShopifyGraphQLExecutor failed: {exc}", exc_info=True)
                 api_responses.append({"success": False, "error": str(exc), "call": call})
     # ─────────────────────────────────────────────────────────────────────
 
     all_products_raw = []
-    order_data = []
+    order_data       = []
 
     def _enrich(prod_list):
         for p in prod_list:
@@ -403,7 +672,7 @@ def _execute_api_calls(intent, api_calls, _resolve_variant):
 
     for resp in api_responses:
         if resp.get("success"):
-            data = resp.get("data")
+            data   = resp.get("data")
             target = order_data if intent in ORDER_INTENTS else all_products_raw
             if isinstance(data, dict) and "products" in data:
                 _enrich(data["products"])
@@ -419,6 +688,7 @@ def _execute_api_calls(intent, api_calls, _resolve_variant):
 
     return all_products_raw, order_data, api_responses, api_calls_to_execute
 
+
 # ══════════════════════════════════════════════════════════════
 # ─── HELPER: Build final response ───
 # ══════════════════════════════════════════════════════════════
@@ -430,8 +700,8 @@ def _build_final_response(
     customer_id=None,
 ):
     """Format products and build the final JSON response."""
-    products = []
-    categories = []
+    products        = []
+    categories      = []
     suggestions_list = []
 
     if intent in (Intent.CATEGORY_LIST, Intent.PRODUCT_CATALOG):
@@ -441,9 +711,9 @@ def _build_final_response(
             if name and name not in seen_names:
                 seen_names.add(name)
                 categories.append({
-                    "id": cat.get("id"),
-                    "name": name.replace("&amp;", "&"),
-                    "slug": cat.get("slug", ""),
+                    "id":    cat.get("id"),
+                    "name":  name.replace("&amp;", "&"),
+                    "slug":  cat.get("slug", ""),
                     "count": cat.get("count", 0),
                 })
     else:
@@ -455,33 +725,21 @@ def _build_final_response(
             else:
                 products.append(format_product(p))
 
-    products = [p for p in products if p.get("name")]
+    products   = [p for p in products if p.get("name")]
     pagination = build_pagination(page, api_responses, api_calls_to_execute)
 
     if intent in (Intent.CATEGORY_LIST, Intent.PRODUCT_CATALOG):
-        bot_message = "Here are our top categories to help you get started!"
+        bot_message      = "Here are our top categories to help you get started!"
         suggestions_list = ["Cancel"]
     else:
-        bot_message = generate_bot_message(
+        bot_message      = generate_bot_message(
             intent, entities, products, confidence, order_data,
             total_items=pagination.get("total_items"), page=page,
-            customer_id=customer_id
+            customer_id=customer_id,
         )
         suggestions_list = generate_suggestions(intent, entities, products)
 
     # ── Determine flow state ──────────────────────────────────────────────────
-    #
-    # Priority order:
-    #   1. Checkout/order success      → AWAITING_ANYTHING_ELSE
-    #   2. Single product found during browsing → AWAITING_CART_CONFIRMATION
-    #   3. Everything else             → IDLE
-    #
-    # AWAITING_CART_CONFIRMATION only fires when:
-    #   - Intent is a browsing/search intent (not an order intent)
-    #   - Exactly one product came back (ambiguous multi-results shouldn't
-    #     auto-prompt "add to cart?")
-    #   - A product_id is resolvable (so the Yes handler has something to add)
-    #
     _BROWSING_INTENTS = {
         Intent.PRODUCT_SEARCH,
         Intent.PRODUCT_DETAIL,
@@ -505,7 +763,6 @@ def _build_final_response(
 
     elif intent in _BROWSING_INTENTS and _single_product_found:
         next_flow_state = FlowState.AWAITING_CART_CONFIRMATION.value
-        # Inject confirmation prompt into bot message and suggestions
         product_name = products[0].get("name", "this product")
         bot_message = (
             f"{bot_message}\n\nWould you like to add **{product_name}** to your cart?"
@@ -516,48 +773,45 @@ def _build_final_response(
         next_flow_state = FlowState.IDLE.value
 
     # ── Build response ────────────────────────────────────────────────────────
-    elapsed = time.time() - start_time
+    elapsed  = time.time() - start_time
     response = {
-        "success": True,
+        "success":     True,
         "bot_message": bot_message,
-        "intent": intent.value,
-        "products": products,
-        "categories": categories,
+        "intent":      intent.value,
+        "products":    products,
+        "categories":  categories,
         "suggestions": suggestions_list,
-        "session_id": str(conversation.id),
+        "session_id":  str(conversation.id),
         "metadata": {
-            "confidence": round(confidence, 2),
-            "products_count": len(products),
+            "confidence":       round(confidence, 2),
+            "products_count":   len(products),
             "categories_count": len(categories),
-            "provider": CLASSIFIER_PROVIDER_TAG,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "provider":         CLASSIFIER_PROVIDER_TAG,
+            "timestamp":        datetime.now(timezone.utc).isoformat(),
             "response_time_ms": round(elapsed * 1000),
-            "intent_raw": intent.value,
-            "entities": _entities_to_dict(entities),
+            "intent_raw":       intent.value,
+            "entities":         _entities_to_dict(entities),
         },
-        "pagination": pagination,
-        "flow_state": next_flow_state,
+        "pagination":  pagination,
+        "flow_state":  next_flow_state,
     }
 
     if intent in (Intent.ORDER_HISTORY, Intent.LAST_ORDER) and order_data:
-        response["orders"] = [format_order_for_frontend(o) for o in order_data]
-        response["order_pagination"] = build_pagination(
-            page, api_responses, api_calls_to_execute
-        )
-        
-    _sr_ctx = payload_context or {}
-    _sr_role = _sr_ctx.get("role", "")
+        response["orders"]            = [format_order_for_frontend(o) for o in order_data]
+        response["order_pagination"]  = build_pagination(page, api_responses, api_calls_to_execute)
+
+    _sr_ctx     = payload_context or {}
+    _sr_role    = _sr_ctx.get("role", "")
     _sr_actions = response.get("actions", [])
-    # "Recently Ordered" button — rep roles only, only when products are shown
     if _sr_role in BULK_ORDER_ROLES and customer_id and products:
         _sr_actions.append({"type": "SHOW_RECENTLY_ORDERED_BUTTON", "payload": {}})
-    # "Bulk Order" button — all logged-in users, always visible when customer_id present
     if customer_id:
         _sr_actions.append({"type": "SHOW_BULK_ORDER_BUTTON", "payload": {}})
     if _sr_actions:
         response["actions"] = _sr_actions
 
     return _finalize_turn(conversation, jsonify(response))
+
 
 # ══════════════════════════════════════════════════════════════
 # ─── HELPER: Handle customer intent responses ───
@@ -569,7 +823,7 @@ def _handle_customer_intents(
 ):
     """Handle FETCH_CUSTOMER and UPDATE_CUSTOMER intents. Returns response or None."""
     if intent == Intent.FETCH_CUSTOMER:
-        elapsed = int((time.time() - start_time) * 1000)
+        elapsed      = int((time.time() - start_time) * 1000)
         customer_raw = order_data[0] if order_data else {}
 
         display = {}
@@ -585,19 +839,19 @@ def _handle_customer_intents(
         lines = [f"**{k}**: {v or 'not set'}" for k, v in display.items()]
 
         return _finalize_turn(conversation, jsonify({
-            "success": True,
+            "success":     True,
             "bot_message": "Here's what I have on file:\n" + "\n".join(lines),
-            "intent": "fetch_customer",
-            "products": [],
+            "intent":      "fetch_customer",
+            "products":    [],
             "suggestions": [],
-            "session_id": str(conversation.id),
-            "metadata": {"confidence": round(confidence, 2), "response_time_ms": elapsed},
-            "pagination": default_pagination(page),
-            "flow_state": FlowState.IDLE.value,
+            "session_id":  str(conversation.id),
+            "metadata":    {"confidence": round(confidence, 2), "response_time_ms": elapsed},
+            "pagination":  default_pagination(page),
+            "flow_state":  FlowState.IDLE.value,
         }))
 
     if intent == Intent.UPDATE_CUSTOMER:
-        elapsed = int((time.time() - start_time) * 1000)
+        elapsed        = int((time.time() - start_time) * 1000)
         update_success = False
         for _api_call, _api_resp in zip(api_calls_to_execute, api_responses):
             if _api_call.method == "PUT" and "/customers/" in _api_call.endpoint:
@@ -606,33 +860,34 @@ def _handle_customer_intents(
         _update_signal = [{"success": update_success}]
 
         return _finalize_turn(conversation, jsonify({
-            "success": update_success,
+            "success":     update_success,
             "bot_message": generate_bot_message(intent, entities, [], confidence, _update_signal),
-            "intent": intent.value,
-            "products": [],
+            "intent":      intent.value,
+            "products":    [],
             "suggestions": generate_suggestions(intent, entities, []),
-            "session_id": str(conversation.id),
+            "session_id":  str(conversation.id),
             "metadata": {
-                "confidence": round(confidence, 2),
-                "products_count": 0,
-                "provider": CLASSIFIER_PROVIDER_TAG,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "confidence":       round(confidence, 2),
+                "products_count":   0,
+                "provider":         CLASSIFIER_PROVIDER_TAG,
+                "timestamp":        datetime.now(timezone.utc).isoformat(),
                 "response_time_ms": elapsed,
-                "intent_raw": intent.value,
-                "entities": _entities_to_dict(entities),
+                "intent_raw":       intent.value,
+                "entities":         _entities_to_dict(entities),
             },
-            "pagination": default_pagination(page),
-            "flow_state": FlowState.IDLE.value,
+            "pagination":  default_pagination(page),
+            "flow_state":  FlowState.IDLE.value,
         }))
 
     return None
+
 
 # ══════════════════════════════════════════════════════════════
 # ─── MAIN CHAT PIPELINE ───
 # ══════════════════════════════════════════════════════════════
 
 @chat_bp.route("/chat", methods=["POST"])
-@enforce_daily_limit 
+@enforce_daily_limit
 def chat():
     start_time = time.time()
 
@@ -641,7 +896,7 @@ def chat():
     if not body:
         logger.warning("POST /chat | Invalid JSON body")
         return jsonify({
-            "success": False,
+            "success":     False,
             "bot_message": "Invalid request. Send JSON with 'message' field.",
             "intent": "error", "products": [],
             "suggestions": ["Show me all products", "What categories do you have?"],
@@ -650,7 +905,7 @@ def chat():
         }), 400
 
     message = body.get("message", "").strip()
-    page = int(body.get("page", 1))
+    page    = int(body.get("page", 1))
 
     # ── Language detection ──
     # Skip translation during variant selection — the user is typing back
@@ -667,7 +922,7 @@ def chat():
             logger.info(f"[LangCheck] translated from '{detected_lang}' | '{message[:100]}'")
 
     # ── Session & DB setup ──
-    session_id = resolve_session_id()
+    session_id   = resolve_session_id()
     conversation = Conversation.query.get(session_id)
     if not conversation:
         conversation = Conversation(id=session_id)
@@ -679,33 +934,33 @@ def chat():
         conversation.customer_id = str(payload_context.get("customer_id"))
         db.session.commit()
 
-    customer_id = conversation.customer_id
+    customer_id  = conversation.customer_id
     user_context = conversation.context_data or {}
 
     # Persist role into user_context so handlers can read it without payload_context
-    _incoming_role = payload_context.get("role", "")
-    if _incoming_role and user_context.get("role") != _incoming_role:
-        user_context["role"] = _incoming_role
+    role = payload_context.get("role", "")
+    if role and user_context.get("role") != role:
+        user_context["role"] = role
 
-    # Persist rep email too, so order creation can default project_rep to the
-    # logged-in rep (custom-api saves the rep's *email* into _billing_project_rep).
+    # Persist rep email so order creation can default project_rep to the
+    # logged-in rep (custom-api saves the rep's email into _billing_project_rep).
     _incoming_email = payload_context.get("email", "")
     if _incoming_email and user_context.get("rep_email") != _incoming_email:
         user_context["rep_email"] = _incoming_email
         flag_modified(conversation, "context_data")
 
-    logger.info(f"[MEMORY TRACE 1] INCOMING from Frontend Payload: {payload_context}")
-    logger.info(f"[MEMORY TRACE 2] LOADED from Postgres DB: {user_context}")
-
     if user_context is not conversation.context_data:
         conversation.context_data = user_context
 
     truncated_msg = message[:100] + "..." if len(message) > 100 else message
-    logger.info(f'POST /chat | session={session_id} | message="{sanitize_log_string(truncated_msg)}" | customer_id={customer_id} | flow_state={conversation.flow_state}')
+    logger.info(
+        f'POST /chat | session={session_id} | message="{sanitize_log_string(truncated_msg)}" '
+        f"| customer_id={customer_id} | flow_state={conversation.flow_state}"
+    )
 
     if not message:
         return jsonify({
-            "success": False,
+            "success":     False,
             "bot_message": "Please type a message! Try asking about our products, categories, or your orders.",
             "intent": "error", "products": [],
             "suggestions": ["Show me all products", "What categories do you have?"],
@@ -718,6 +973,9 @@ def chat():
         user_msg = Message(conversation_id=conversation.id, role="user", content=message)
         db.session.add(user_msg)
         db.session.commit()
+
+        # ── Single store_loader fetch for the whole request ──
+        store_loader = get_store_loader()
 
         def _ft(resp):
             """Local alias: wraps _finalize_turn with address-proposal context."""
@@ -743,7 +1001,7 @@ def chat():
 
         # ── Step 1: Filter clarification bypass ──
         _skip_classification = False
-        bypass_result = None
+        bypass_result        = None
 
         forced_search_match = re.match(r"(?i)^no\s*-\s*search\s*for\s*['\"](.*?)['\"]$", message)
 
@@ -752,31 +1010,30 @@ def chat():
             if pending_semantic:
                 clarification_result = resolve_filter_clarification(message, user_context, pending_semantic)
                 if clarification_result:
-                    current_flow_state = FlowState.IDLE
-                    user_context["flow_state"] = FlowState.IDLE.value
-                    conversation.context_data = user_context
-                    bypass_result = clarification_result
-                    _skip_classification = True
-                    
+                    current_flow_state              = FlowState.IDLE
+                    user_context["flow_state"]      = FlowState.IDLE.value
+                    conversation.context_data       = user_context
+                    bypass_result                   = clarification_result
+                    _skip_classification            = True
+
         elif forced_search_match:
-            # Issue 2 Fix: Catch pagination/retry clicks that send the rejection string outside the flow state
             extracted_term = forced_search_match.group(1)
             logger.info(f"Intercepted explicit forced search string. Term: '{extracted_term}'")
             bypass_entities = ExtractedEntities(search_term=extracted_term)
-            bypass_result = ClassifiedResult(
+            bypass_result   = ClassifiedResult(
                 intent=Intent.PRODUCT_SEARCH,
                 entities=bypass_entities,
-                confidence=1.0
+                confidence=1.0,
             )
             _skip_classification = True
 
         # ── Step 2: Conversation flow state machine ──
         flow_context = {
-            "pending_product_name": user_context.get("pending_product_name"),
-            "pending_product_id": user_context.get("pending_product_id"),
-            "pending_quantity": user_context.get("pending_quantity"),
-            "pending_variation_id": user_context.get("pending_variation_id"),
-            "resolved_attributes": user_context.get("resolved_attributes"),
+            "pending_product_name":     user_context.get("pending_product_name"),
+            "pending_product_id":       user_context.get("pending_product_id"),
+            "pending_quantity":         user_context.get("pending_quantity"),
+            "pending_variation_id":     user_context.get("pending_variation_id"),
+            "resolved_attributes":      user_context.get("resolved_attributes"),
             "bulk_awaiting_address_text": user_context.get("bulk_awaiting_address_text", False),
         }
 
@@ -788,7 +1045,7 @@ def chat():
             )
             if flow_result and flow_result.get("override_message"):
                 message = flow_result["override_message"]
-                
+
         if flow_result:
             _persistent_keys = [
                 "pending_product_id", "pending_product_name", "pending_quantity",
@@ -799,114 +1056,15 @@ def chat():
                     user_context[k] = flow_result[k]
             conversation.context_data = user_context
             flag_modified(conversation, "context_data")
-            logger.info(f"[MEMORY TRACE 3] STATE MACHINE returned: {flow_result}")
-            logger.info(f"[MEMORY TRACE 4] UPDATED user_context: {user_context}")
 
-        # ── Cart confirmation PROMPT intercept (after AWAITING_QUANTITY) ──
-        if flow_result and flow_result.get("action") == "prompt_cart_confirmation":
-            pid       = user_context.get("pending_product_id")
-            vid       = user_context.get("pending_variation_id")
-            qty       = user_context.get("pending_quantity") or 1
-            name      = user_context.get("pending_product_name", "item")
-            resolved  = user_context.get("resolved_attributes") or {}
-            variant_label = " / ".join(str(v) for v in resolved.values()) if resolved else ""
-            variant_suffix = f" ({variant_label})" if variant_label else ""
+        # ── Cart confirmation flow (prompt / confirm / decline) ──
+        _flow_action = flow_result.get("action") if flow_result else None
+        if _flow_action in ("prompt_cart_confirmation", "confirm_add_to_cart", "decline_add_to_cart"):
+            resp = _handle_cart_flow(_flow_action, user_context, conversation, store_loader, page, start_time)
+            if resp is not None:
+                return _ft(resp)
 
-            elapsed = round((time.time() - start_time) * 1000)
-            return _finalize_turn(conversation, jsonify({
-                "success":     True,
-                "bot_message": f"Got it — add **{name}**{variant_suffix} ×{qty} to your cart?",
-                "intent":      "guided_flow",
-                "products":    [],
-                "suggestions": ["Yes, add it", "No thanks"],
-                "session_id":  str(conversation.id),
-                "metadata": {
-                    "flow_state":           FlowState.AWAITING_CART_CONFIRMATION.value,
-                    "pending_product_id":   pid,
-                    "pending_product_name": name,
-                    "pending_quantity":     qty,
-                    "pending_variation_id": vid,
-                    "resolved_attributes":  resolved,
-                    "response_time_ms":     elapsed,
-                },
-                "flow_state":  FlowState.AWAITING_CART_CONFIRMATION.value,
-                "pagination":  default_pagination(page),
-                "actions":     [],
-            }))
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # ── Cart confirmation intercept — MUST be before handle_flow ──
-        # handle_flow crashes on any flow_result without "bot_message".
-        # Action-based results are owned here and must never reach it.
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        
-        if flow_result and flow_result.get("action") == "confirm_add_to_cart":
-            pid      = user_context.get("pending_product_id")
-            vid      = user_context.get("pending_variation_id")
-            qty      = user_context.get("pending_quantity") or 1
-            name     = user_context.get("pending_product_name", "item")
-            resolved = user_context.get("resolved_attributes") or {}
-
-            if pid:
-                elapsed = round((time.time() - start_time) * 1000)
-
-                _is_shopify = isinstance(vid, str) and vid.startswith("gid://")
-
-                if _is_shopify:
-                    from core.actions import build_shopify_add_to_cart
-                    actions = [build_shopify_add_to_cart(
-                        variant_gid = vid,
-                        quantity    = qty,
-                        name        = name,
-                    )]
-                else:
-                    variation_attributes = endpoints.build_cart_variation_payload(
-                        product_id   = pid,
-                        variant_id   = vid,
-                        resolved_attrs = resolved,
-                        store_loader = get_store_loader(),
-                    )
-                    actions = [build_add_to_cart(
-                        product_id   = pid,
-                        quantity     = qty,
-                        name         = name,
-                        variation_id = vid,
-                        variation    = variation_attributes,
-                    )]
-
-                actions.append(build_open_cart_panel())
-            
-                bot_msg = f"✅ Added **{name}** ×{qty} to your cart. Opening your cart so you can review…"
-                # Single, unambiguous next-step suggestion set. "Proceed to
-                # checkout" is the ONLY checkout entry-point now — the
-                # OPEN_CHECKOUT_PANEL action is no longer auto-emitted here.
-                suggestions = ["Proceed to checkout", "Continue shopping", "View cart"]
-
-                return _ft(jsonify({
-                    "success":     True,
-                    "bot_message": bot_msg,
-                    "intent":      Intent.ADD_TO_CART.value,
-                    "suggestions": suggestions,
-                    "session_id":  str(conversation.id),
-                    "pagination":  default_pagination(page),
-                    "flow_state":  FlowState.IDLE.value,
-                    "actions":     actions,
-                }))
-                
-        if flow_result and flow_result.get("action") == "decline_add_to_cart":
-            elapsed = round((time.time() - start_time) * 1000)
-            return _ft(jsonify({
-                "success":     True,
-                "bot_message": "No problem! What else are you looking for?",
-                "intent":      "browse",
-                "products":    [],
-                "suggestions": ["Show me products", "View categories", "View cart"],
-                "session_id":  str(conversation.id),
-                "metadata":    {"response_time_ms": elapsed},
-                "pagination":  default_pagination(page),
-                "flow_state":  FlowState.IDLE.value,
-            }))
-
-        # ── Flow router ──────────────────────────────────────────────────
+        # ── Flow router (pass_through=False, no action) ──
         # pass_through=True means "also let classifier run after"
         _needs_flow_handler = (
             flow_result
@@ -921,188 +1079,37 @@ def chat():
             if resp:
                 return _ft(resp)
 
-        # else: fall through to classifier
-
         # ── Early action dispatch ──────────────────────────────────────────
-        # When the state machine returns a flow action (bulk order steps,
-        # order-for resolution), it is driven entirely by flow_result — it does
-        # NOT need classification. Dispatching it here, before Step 3, prevents
-        # the message (e.g. "Yes, confirm", "Change address") from falling
-        # through to the classifier/LLM, which would otherwise misroute it to a
-        # product search or update_customer intent and hijack the turn.
-        if flow_result and flow_result.get("action"):
-            _early_action = flow_result["action"]
-            _early_role = payload_context.get("role", "")
-            _early_store_loader = get_store_loader()
-
-            if _early_action == "process_bulk_input":
-                from handlers.bulk_order_handler import handle_bulk_order_input
-                resp = handle_bulk_order_input(
-                    message, _early_store_loader, conversation, user_context, page, start_time
-                )
-                if resp:
-                    return _ft(resp)
-
-            elif _early_action == "process_bulk_variant_selection":
-                from handlers.bulk_order_handler import handle_bulk_variant_selection_reply
-                resp = handle_bulk_variant_selection_reply(
-                    message, _early_store_loader, conversation, user_context, page, start_time
-                )
-                if resp:
-                    return _ft(resp)
-
-            elif _early_action == "confirm_bulk_order":
-                from handlers.bulk_order_handler import handle_bulk_order_confirmation
-                resp = handle_bulk_order_confirmation(
-                    user_context, conversation, page, start_time
-                )
-                if resp:
-                    return _ft(resp)
-
-            elif _early_action == "cancel_bulk_order":
-                for _k in (
-                    "pending_bulk_lines", "bulk_current_line_index",
-                    "bulk_confirmed_lines", "bulk_address_overrides",
-                    "bulk_awaiting_address_text",
-                ):
-                    user_context.pop(_k, None)
-                flag_modified(conversation, "context_data")
-                conversation.flow_state = FlowState.IDLE.value
-                _elapsed = round((time.time() - start_time) * 1000)
-                return _ft(jsonify({
-                    "success": True,
-                    "bot_message": "Bulk order cancelled. What else can I help you with?",
-                    "intent": "guided_flow",
-                    "products": [],
-                    "suggestions": ["Show me products", "Start a bulk order"],
-                    "session_id": str(conversation.id),
-                    "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": _elapsed},
-                    "flow_state": FlowState.IDLE.value,
-                    "pagination": default_pagination(page),
-                }))
-
-            elif _early_action == "bulk_confirmation_unclear":
-                _elapsed = round((time.time() - start_time) * 1000)
-                return _ft(jsonify({
-                    "success": True,
-                    "bot_message": "Please reply **Yes** to confirm all orders or **No** to cancel.",
-                    "intent": "guided_flow",
-                    "products": [],
-                    "suggestions": ["Yes, confirm", "No, cancel"],
-                    "session_id": str(conversation.id),
-                    "metadata": {
-                        "flow_state": FlowState.AWAITING_BULK_ORDER_CONFIRMATION.value,
-                        "response_time_ms": _elapsed,
-                    },
-                    "flow_state": FlowState.AWAITING_BULK_ORDER_CONFIRMATION.value,
-                    "pagination": default_pagination(page),
-                }))
-
-            elif _early_action in (
-                "bulk_address_confirmed",
-                "bulk_address_change",
-                "bulk_address_override_text",
-                "bulk_address_override_structured",
-                "bulk_address_skip",
-            ):
-                from handlers.bulk_order_handler import handle_bulk_address_confirmation_reply
-                resp = handle_bulk_address_confirmation_reply(
-                    _early_action, message, conversation, user_context, page, start_time
-                )
-                if resp:
-                    return _ft(resp)
-
-            elif _early_action == "resolve_order_for_company" and _early_role in BULK_ORDER_ROLES:
-                from handlers.sales_rep_handler import handle_order_for_company_reply
-                resp = handle_order_for_company_reply(
-                    message, conversation, user_context, page, start_time
-                )
-                if resp:
-                    return _ft(resp)
-
-            elif _early_action == "resolve_order_for_selection" and _early_role in BULK_ORDER_ROLES:
-                from handlers.sales_rep_handler import handle_order_for_selection_reply
-                resp = handle_order_for_selection_reply(
-                    message, conversation, user_context, page, start_time
-                )
-                if resp:
-                    return _ft(resp)
+        # Bulk/rep flow actions short-circuit here before classification so
+        # replies like "Yes, confirm" or "Change address" are never misrouted
+        # to the product-search or update_customer classifier paths.
+        if _flow_action:
+            resp = _dispatch_bulk_action(
+                _flow_action, message, role, store_loader,
+                conversation, user_context, page, start_time,
+            )
+            if resp is not None:
+                return _ft(resp)
 
         # ── Step 3: Classify ──
         _resolve_variant = bool(flow_result and flow_result.get("resolve_variant"))
-        store_loader = get_store_loader()
 
         if _skip_classification:
             result = bypass_result
         else:
             result = parse_csv_message(message, store_loader)
 
-        intent = result.intent
-        entities = result.entities
-        confidence = result.confidence
-
-        # ── Phase-2 entity merge: preserve Run-1 richness ──────────────────
-        # parse_csv_message internally runs a second classifier pass on the
-        # attribute-stripped text.  When that stripped text is nearly empty
-        # ("do you have   and     products in  ?") the second pass returns
-        # blank entities and a weaker fallback intent, overwriting the correct
-        # product_id, attributes, and attribute_term_ids resolved in Run 1.
-        #
-        # We surface the Run-1 result through result.phase1_entities when the
-        # parser sets it.  Fall back to inspecting result directly if the
-        # parser hasn't been updated yet.
-        _phase1 = getattr(result, "phase1_entities", None)
-        if _phase1 is not None:
-            # Restore product identity if Run-2 lost it
-            if not entities.product_id and _phase1.product_id:
-                entities.product_id   = _phase1.product_id
-                entities.product_name = _phase1.product_name
-                entities.product_slug = _phase1.product_slug
-                logger.debug(
-                    f"[EntityMerge] Restored product_id={_phase1.product_id} "
-                    f"name='{_phase1.product_name}' from phase-1 entities"
-                )
-
-            # Merge attributes: keep all phase-1 keys that Run-2 dropped
-            if _phase1.attributes:
-                merged_attrs = dict(_phase1.attributes)
-                merged_attrs.update(entities.attributes)   # Run-2 wins on overlap
-                if merged_attrs != entities.attributes:
-                    logger.debug(
-                        f"[EntityMerge] attributes merged: "
-                        f"phase1={_phase1.attributes} + phase2={entities.attributes} "
-                        f"→ {merged_attrs}"
-                    )
-                entities.attributes = merged_attrs
-
-            # Restore attribute_term_ids if Run-2 lost them
-            if not entities.attribute_term_ids and getattr(_phase1, "attribute_term_ids", None):
-                entities.attribute_term_ids = _phase1.attribute_term_ids
-                entities.attribute_slug     = _phase1.attribute_slug
-                logger.debug(
-                    f"[EntityMerge] Restored attribute_term_ids={_phase1.attribute_term_ids}"
-                )
-
-            # Use Run-1 intent/confidence when Run-2 fell back to a weaker signal
-            _WEAK_INTENTS = {Intent.PRODUCT_SEARCH}   # intents GeneralFallback emits
-            if result.intent in _WEAK_INTENTS and getattr(result, "phase1_intent", None) not in _WEAK_INTENTS:
-                _old_intent = result.intent                                     # capture before overwrite
-                intent = result.phase1_intent
-                result.intent = intent
-                confidence = max(confidence, result.phase1_confidence or confidence)
-                logger.debug(
-                    f"[EntityMerge] Upgraded intent {_old_intent} → {intent} from phase-1"
-                )
-        # ────────────────────────────────────────────────────────────────────
+        # Merge phase-1 / phase-2 entity richness
+        intent, entities, confidence = _merge_phase_entities(result)
 
         # Lock in variant state
         if current_flow_state == FlowState.AWAITING_VARIANT_SELECTION:
-            _resolve_variant = True
-            intent = Intent.QUICK_ORDER
-            result.intent = intent
-            entities.product_id = user_context.get("pending_product_id")
+            _resolve_variant      = True
+            intent                = Intent.QUICK_ORDER
+            result.intent         = intent
+            entities.product_id   = user_context.get("pending_product_id")
             entities.product_name = user_context.get("pending_product_name")
-            confidence = 1.0
+            confidence            = 1.0
 
         # ── Step 4: LLM fallback ──
         session_history = [{"role": m.role, "message": m.content} for m in conversation.messages[-4:-1]]
@@ -1117,7 +1124,7 @@ def chat():
 
             if llm_outcome is not None:
                 if not isinstance(llm_outcome, tuple) or not isinstance(llm_outcome[0], tuple):
-                    if hasattr(llm_outcome, 'get_data'):
+                    if hasattr(llm_outcome, "get_data"):
                         return _ft(llm_outcome)
                     if isinstance(llm_outcome, tuple) and len(llm_outcome) == 2 and isinstance(llm_outcome[1], int):
                         return _ft(llm_outcome)
@@ -1125,14 +1132,15 @@ def chat():
                     intent, entities, confidence, result = llm_outcome
 
         # ── Step 5: Semantic clarification ──
-        
-        if (entities.semantic_matches
+        if (
+            entities.semantic_matches
             and current_flow_state != FlowState.AWAITING_FILTER_CLARIFICATION
             and intent not in (
                 Intent.PRODUCT_ATTRIBUTE_INFO, Intent.PRODUCT_VARIATIONS,
                 Intent.QUICK_ORDER, Intent.PLACE_ORDER, Intent.ORDER_ITEM,
                 Intent.BULK_ORDER,
-            )):
+            )
+        ):
             clarification_resp = build_semantic_clarification(
                 entities, user_context, str(conversation.id), page, start_time, flow_result,
             )
@@ -1145,10 +1153,9 @@ def chat():
         empty_resp = _check_empty_order(intent, entities, conversation, page, start_time)
         if empty_resp:
             return empty_resp
-        
+
         # ── Step 6.5: Cart intent fork ──
         if intent in CART_INTENTS or intent == Intent.CHECKOUT:
-            # handle_cart_intent will now call woo_cart.py
             cart_resp = handle_cart_intent(
                 intent, entities, user_context, conversation, page, start_time
             )
@@ -1156,28 +1163,29 @@ def chat():
                 conversation.context_data = user_context
                 flag_modified(conversation, "context_data")
                 return _ft(cart_resp)
-            
+
         # ── Step 7: Execute API calls ──
         last_product_ctx = user_context.get("last_product")
 
-        if _resolve_variant:
+        if _resolve_variant or intent == Intent.BULK_ORDER:
             # Variant resolution uses session-cached variations — no API calls needed.
             # Skipping build_api_calls entirely prevents or_pairs dict-vs-OrPair crashes
             # that occur when catalog_parser populates attr_tag_or_pairs as plain dicts.
             api_calls = []
             all_products_raw, order_data, api_responses, api_calls_to_execute = [], [], [], []
         else:
-            role = payload_context.get("role")
             logger.info(f"build_api_calls: role={role}, customer_id={customer_id}")
-            api_calls = build_api_calls(result, page, user_message=message, session_id=str(conversation.id), customer_id=customer_id, role=role)
+            api_calls = build_api_calls(
+                result, page, user_message=message,
+                session_id=str(conversation.id), customer_id=customer_id, role=role,
+            )
             if customer_id:
                 _resolve_user_placeholders(api_calls, customer_id)
 
             # ── Propagate resolved_attr_values for variant pre-filtering ──────
             # _build_product_variations stamps resolved_attr_values into the
             # call body so build_variant_prompt knows which colours/sizes the
-            # user already specified (e.g. ["white","gray"]).  We carry that
-            # hint in user_context so the variant handler can pass it through.
+            # user already specified.  We carry that hint in user_context.
             for _ac in api_calls:
                 _rav = (_ac.body or {}).get("resolved_attr_values")
                 if _rav:
@@ -1186,14 +1194,19 @@ def chat():
                     flag_modified(conversation, "context_data")
                     logger.debug(f"[EntityMerge] Stashed resolved_attr_values={_rav} in user_context")
                     break
-                
-            logger.debug(f"[EntityMerge] user_context resolved_attr_values at Step 7 = {user_context.get('resolved_attr_values')}")
+
+            logger.debug(
+                f"[EntityMerge] user_context resolved_attr_values at Step 7 = "
+                f"{user_context.get('resolved_attr_values')}"
+            )
             # ──────────────────────────────────────────────────────────────────
 
-            all_products_raw, order_data, api_responses, api_calls_to_execute = _execute_api_calls(intent, api_calls, _resolve_variant)
+            all_products_raw, order_data, api_responses, api_calls_to_execute = (
+                _execute_api_calls(intent, api_calls, _resolve_variant)
+            )
 
             log_matched_products(all_products_raw, api_calls_to_execute, intent=intent)
-            
+
             _LOCK_STATES = {
                 FlowState.AWAITING_VARIANT_SELECTION,
                 FlowState.AWAITING_CART_CONFIRMATION,
@@ -1204,7 +1217,7 @@ def chat():
                 first_prod = all_products_raw[0]
                 user_context["last_product"] = {"id": first_prod.get("id"), "name": first_prod.get("name")}
                 if current_flow_state not in _LOCK_STATES:
-                    user_context["pending_product_id"] = first_prod.get("id")
+                    user_context["pending_product_id"]   = first_prod.get("id")
                     user_context["pending_product_name"] = first_prod.get("name")
                     conversation.context_data = user_context
                     flag_modified(conversation, "context_data")
@@ -1217,155 +1230,25 @@ def chat():
         if cust_resp:
             return cust_resp
 
-        # ════════════════════════════════════════════════════════════════
-        # Step 8.5: Sales rep & bulk order flow dispatch
-        # ════════════════════════════════════════════════════════════════
-        _role = payload_context.get("role", "")
-
-        # Bulk order is available to ALL logged-in users
-        # (rep gets company resolution, regular customer places on their own account)
+        # ── Step 8.5: Bulk order intent (from classifier) ──
         if intent == Intent.BULK_ORDER and customer_id:
-            # Check if the message already contains the orders (direct typing)
-            # vs just the trigger signal (button click / single keyword).
-            # Mirror the same logic BulkOrderEvaluator uses.
-            _bulk_fragments = [f.strip() for f in message.split(',') if f.strip()]
-            _bulk_qualified = sum(
-                1 for f in _bulk_fragments
-                if re.search(r'\d', f) and (
-                    re.search(r'\bfor\b', f, re.I) or
-                    re.search(r'\b(order|buy|purchase|reorder|re-order)\b', f, re.I)
-                )
-            )
-            if _bulk_qualified >= 2:
-                # Orders are already in the message — skip the prompt, parse directly
-                from handlers.bulk_order_handler import handle_bulk_order_input
-                resp = handle_bulk_order_input(
-                    message, store_loader, conversation, user_context, page, start_time
-                )
-                if resp:
-                    return _ft(resp)
+            if _is_inline_bulk_order(message, store_loader):
+                resp = handle_bulk_order_input(message, store_loader, conversation, user_context, page, start_time)
             else:
-                # Button click or single trigger word — show the prompt
-                from handlers.bulk_order_handler import handle_bulk_order_trigger
                 resp = handle_bulk_order_trigger(conversation, user_context, page, start_time)
-                if resp:
-                    return _ft(resp)
-
-        # Action-based flow dispatch — fires when flow_result has an action sentinel
-        # set by the handle_flow_state branches added in Phase 5
-        if flow_result and flow_result.get("action"):
-            _sr_action = flow_result["action"]
-
-            # ── Bulk order input processing ──
-            if _sr_action == "process_bulk_input":
-                from handlers.bulk_order_handler import handle_bulk_order_input
-                resp = handle_bulk_order_input(
-                    message, store_loader, conversation, user_context, page, start_time
-                )
-                if resp:
-                    return _ft(resp)
-                
-            elif _sr_action == "process_bulk_variant_selection":
-                from handlers.bulk_order_handler import handle_bulk_variant_selection_reply
-                resp = handle_bulk_variant_selection_reply(
-                    message, store_loader, conversation, user_context, page, start_time
-                )
-                if resp:
-                    return _ft(resp)
-
-            # ── Bulk order confirmation (Yes) ──
-            elif _sr_action == "confirm_bulk_order":
-                from handlers.bulk_order_handler import handle_bulk_order_confirmation
-                resp = handle_bulk_order_confirmation(
-                    user_context, conversation, page, start_time
-                )
-                if resp:
-                    return _ft(resp)
-
-            # ── Bulk order cancelled ──
-            elif _sr_action == "cancel_bulk_order":
-                user_context.pop("pending_bulk_lines", None)
-                user_context.pop("bulk_current_line_index", None)
-                user_context.pop("bulk_confirmed_lines", None)
-                user_context.pop("bulk_address_overrides", None)
-                user_context.pop("bulk_awaiting_address_text", None)
-                flag_modified(conversation, "context_data")
-                conversation.flow_state = FlowState.IDLE.value
-                _elapsed = round((time.time() - start_time) * 1000)
-                return _ft(jsonify({
-                    "success": True,
-                    "bot_message": "Bulk order cancelled. What else can I help you with?",
-                    "intent": "guided_flow",
-                    "products": [],
-                    "suggestions": ["Show me products", "Start a bulk order"],
-                    "session_id": str(conversation.id),
-                    "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": _elapsed},
-                    "flow_state": FlowState.IDLE.value,
-                    "pagination": default_pagination(page),
-                }))
-
-            # ── Bulk confirmation unclear ──
-            elif _sr_action == "bulk_confirmation_unclear":
-                _elapsed = round((time.time() - start_time) * 1000)
-                return _ft(jsonify({
-                    "success": True,
-                    "bot_message": "Please reply **Yes** to confirm all orders or **No** to cancel.",
-                    "intent": "guided_flow",
-                    "products": [],
-                    "suggestions": ["Yes, confirm", "No, cancel"],
-                    "session_id": str(conversation.id),
-                    "metadata": {
-                        "flow_state": FlowState.AWAITING_BULK_ORDER_CONFIRMATION.value,
-                        "response_time_ms": _elapsed,
-                    },
-                    "flow_state": FlowState.AWAITING_BULK_ORDER_CONFIRMATION.value,
-                    "pagination": default_pagination(page),
-                }))
-
-            # ── Bulk address confirmation sub-actions ──
-            elif _sr_action in (
-                "bulk_address_confirmed",
-                "bulk_address_change",
-                "bulk_address_override_text",
-                "bulk_address_skip",
-            ):
-                from handlers.bulk_order_handler import handle_bulk_address_confirmation_reply
-                resp = handle_bulk_address_confirmation_reply(
-                    _sr_action, message, conversation, user_context, page, start_time
-                )
-                if resp:
-                    return _ft(resp)
-
-            # ── Order-for: resolve company name (rep roles only) ──
-            elif _sr_action == "resolve_order_for_company" and _role in BULK_ORDER_ROLES:
-                from handlers.sales_rep_handler import handle_order_for_company_reply
-                resp = handle_order_for_company_reply(
-                    message, conversation, user_context, page, start_time
-                )
-                if resp:
-                    return _ft(resp)
-
-            # ── Order-for: rep picks from multiple customer matches ──
-            elif _sr_action == "resolve_order_for_selection" and _role in BULK_ORDER_ROLES:
-                from handlers.sales_rep_handler import handle_order_for_selection_reply
-                resp = handle_order_for_selection_reply(
-                    message, conversation, user_context, page, start_time
-                )
-                if resp:
-                    return _ft(resp)
+            if resp:
+                return _ft(resp)
 
         # ── Intercept: ask "who to order for" before any order intent (rep only) ──
         if (
-            _role in BULK_ORDER_ROLES
+            role in BULK_ORDER_ROLES
             and intent in (Intent.QUICK_ORDER, Intent.PLACE_ORDER, Intent.ORDER_ITEM)
             and not user_context.get("order_for_customer_id")
-            and customer_id  # must be logged in
+            and customer_id
         ):
-            from handlers.sales_rep_handler import handle_order_for_prompt
             resp = handle_order_for_prompt(conversation, page, start_time)
             if resp:
                 return _ft(resp)
-        # ════════════════════════════════════════════════════════════════
 
         # ── Step 9: Route through specialized handlers ──
         resp = handle_reorder(intent, entities, order_data, customer_id, str(conversation.id), page, start_time)
@@ -1380,45 +1263,62 @@ def chat():
         if resp:
             return _ft(resp)
 
-        resp = handle_variant_selection(current_flow_state, intent, entities, message, customer_id, str(conversation.id), page, start_time, user_context, _resolve_variant)
+        resp = handle_variant_selection(
+            current_flow_state, intent, entities, message,
+            customer_id, str(conversation.id), page, start_time,
+            user_context, _resolve_variant,
+        )
         if resp:
             return _ft(resp)
 
-        resp = handle_quantity_and_variant_check(intent, entities, all_products_raw, order_data, ORDER_CREATE_INTENTS, str(conversation.id), page, start_time, customer_id=customer_id, resolved_attr_values=user_context.get("resolved_attr_values"))
+        resp = handle_quantity_and_variant_check(
+            intent, entities, all_products_raw, order_data,
+            ORDER_CREATE_INTENTS, str(conversation.id), page, start_time,
+            customer_id=customer_id,
+            resolved_attr_values=user_context.get("resolved_attr_values"),
+        )
         if resp:
             return _ft(resp)
 
-        resp = handle_quick_order(intent, entities, all_products_raw, last_product_ctx, customer_id, str(conversation.id), page, start_time, ORDER_CREATE_INTENTS)
+        resp = handle_quick_order(
+            intent, entities, all_products_raw, last_product_ctx,
+            customer_id, str(conversation.id), page, start_time, ORDER_CREATE_INTENTS,
+        )
         if resp:
-            if getattr(entities, 'product_id', None):
-                user_context["pending_product_id"] = entities.product_id
-                user_context["pending_product_name"] = getattr(entities, 'product_name', None)
+            if getattr(entities, "product_id", None):
+                user_context["pending_product_id"]   = entities.product_id
+                user_context["pending_product_name"] = getattr(entities, "product_name", None)
                 conversation.context_data = user_context
                 flag_modified(conversation, "context_data")
             return _ft(resp)
-        
-        logger.debug(f"[EntityMerge] Passing resolved_attr_values to handle_variation_product = {user_context.get('resolved_attr_values')}")
+
+        logger.debug(
+            f"[EntityMerge] Passing resolved_attr_values to handle_variation_product = "
+            f"{user_context.get('resolved_attr_values')}"
+        )
 
         resp = handle_variation_product(
-            intent, 
-            entities, 
-            api_responses, 
-            api_calls_to_execute, 
-            confidence, 
-            order_data, 
-            str(conversation.id), 
-            page, 
-            start_time, 
+            intent,
+            entities,
+            api_responses,
+            api_calls_to_execute,
+            confidence,
+            order_data,
+            str(conversation.id),
+            page,
+            start_time,
             user_context=user_context,
             conversation=conversation,
             resolved_attr_values=user_context.get("resolved_attr_values"),
             customer_id=customer_id,
-            )
+        )
         if resp:
             return _ft(resp)
 
-        store_loader = get_store_loader()
-        all_products_raw, resp = handle_empty_results(intent, entities, all_products_raw, message, str(conversation.id), page, start_time, confidence, store_loader)
+        all_products_raw, resp = handle_empty_results(
+            intent, entities, all_products_raw, message,
+            str(conversation.id), page, start_time, confidence, store_loader,
+        )
         if resp:
             return _ft(resp)
 
@@ -1444,10 +1344,10 @@ def chat():
         db.session.commit()
 
         return jsonify({
-            "success": False,
-            "session_id": str(conversation.id),
-            "intent": "error",
+            "success":     False,
+            "session_id":  str(conversation.id),
+            "intent":      "error",
             "bot_message": error_msg.content,
-            "products": [],
+            "products":    [],
             "suggestions": ["Start over", "Show me all products"],
         }), 500

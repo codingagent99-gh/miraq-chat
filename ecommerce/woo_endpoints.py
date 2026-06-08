@@ -573,6 +573,28 @@ class WooEndpoints:
             description=description or f"Search customers by company '{company_name}'",
             requires_resolution=requires_resolution or [],
         )
+        
+    def search_customers_by_email(
+        self,
+        email: str,
+        per_page: int = 1,
+        description: str = "",
+        requires_resolution: Optional[List[str]] = None,
+    ) -> WooAPICall:
+        """Exact customer lookup by email — GET /customers?email=<email> (admin surface).
+
+        WooCommerce treats email as a unique key, so this always returns 0 or 1 results.
+        Prefer this over list_customers_search for email-based resolution — the ?email=
+        param is an exact match, while ?search= is a fuzzy text scan across name/email/company.
+        """
+        return WooAPICall(
+            method="GET",
+            endpoint="/customers",
+            params={"email": email, "per_page": per_page},
+            surface="admin",
+            description=description or f"Lookup customer by email '{email}'",
+            requires_resolution=requires_resolution or [],
+        )
 
     # ── Response parsers ────────────────────────────────────────────────────
     # Each parser takes the raw ``woo_client.execute(...).get("data")`` dict

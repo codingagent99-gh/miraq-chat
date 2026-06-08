@@ -21,7 +21,7 @@ from app_config import BULK_ORDER_ROLES
 
 logger = get_logger("miraq_chat")
 
-
+EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', re.I)
 # ══════════════════════════════════════════════════════════════
 # DATACLASS
 # ══════════════════════════════════════════════════════════════
@@ -29,20 +29,21 @@ logger = get_logger("miraq_chat")
 @dataclass
 class BulkOrderLine:
     raw_fragment: str
-    company_name: str                     # as typed by rep; empty string for non-rep
-    product_name: str                     # as typed
+    company_name: str                     # as typed (display only; not used for resolution)
+    email: str                            # customer identifier; empty string if not provided
+    product_name: str
     quantity: int
-    product_id: Optional[int]             # resolved via store_loader; None if not found
-    variation_id: Optional[int]           # resolved from product variants; None if simple product
-    customer_id: Optional[str]            # resolved via WooCommerce; None if not found
-    customer_display_name: str            # "ABC Builders" / "⚠️ ABC (closest)" / "⚠️ Not found"
-    shipping_address: Optional[dict]      # from company's WooCommerce shipping block; None until fetched
-    billing_address: Optional[dict]       # from company's WooCommerce billing block; None until fetched
+    quantity_explicitly_set: bool
+    product_id: Optional[int]
+    variation_id: Optional[int]
+    customer_id: Optional[str]
+    customer_display_name: str
+    shipping_address: Optional[dict]
+    billing_address: Optional[dict]
     is_reorder: bool
     reorder_source_order_id: Optional[int]
-    unresolved: bool                      # True if product_id or customer_id is None
-    unresolved_reason: Optional[str]      # "product_not_found"|"company_not_found"|"both_not_found"
-
+    unresolved: bool
+    unresolved_reason: Optional[str]
 
 # ══════════════════════════════════════════════════════════════
 # INTERNAL: intermediate pre-line structure
@@ -52,9 +53,11 @@ class BulkOrderLine:
 class _PreLine:
     raw_fragment: str
     company_name: str
+    email: str
     product_name: str
     quantity: int
     is_reorder: bool
+    quantity_explicitly_set: bool = False
     product_id: Optional[int] = None
     customer_id: Optional[str] = None
     reorder_source_order_id: Optional[int] = None
@@ -86,12 +89,33 @@ def parse_bulk_order_utterance(
     _is_rep = role in BULK_ORDER_ROLES
 
     # ── Step 1: Split into fragments ─────────────────────────────────────────
+    _catalog_names = {
+        p["name"].lower() for p in (store_loader.products or []) if p.get("name")
+    }
+
+    # Pass 1: split on commas
     raw_parts = re.split(r',\s*', text)
+
+    # Pass 2: within each comma-part, split on "and" if both sides
+    # resolve to catalog products OR if "and" precedes a digit (existing logic).
+    # This handles: "A and B", "A, B and C", "A and B and C".
     final_fragments = []
     for part in raw_parts:
-        # Split on " and " only when immediately followed by a digit
-        sub = re.split(r'\s+and\s+(?=\d)', part)
-        final_fragments.extend(sub)
+        # Always split "and" before a digit (original behaviour)
+        digit_split = re.split(r'\s+and\s+(?=\d)', part)
+        expanded = []
+        for sub in digit_split:
+            if re.search(r'\band\b', sub, re.I):
+                and_parts = [p.strip() for p in re.split(r'\s+and\s+', sub, flags=re.I) if p.strip()]
+                resolved = sum(
+                    1 for p in and_parts
+                    if any(name in p.lower() for name in _catalog_names)
+                )
+                if resolved >= 2:
+                    expanded.extend(and_parts)
+                    continue
+            expanded.append(sub)
+        final_fragments.extend(expanded)
 
     # ── Step 2: Per-fragment extraction ──────────────────────────────────────
     pre_lines: List[_PreLine] = []
@@ -101,40 +125,55 @@ def parse_bulk_order_utterance(
         if not fragment:
             continue
 
-        # Quantity: first integer in fragment
         qty_match = re.search(r'\b(\d+)\b', fragment)
         quantity = int(qty_match.group(1)) if qty_match else 1
+        quantity_explicitly_set = qty_match is not None
 
-        # Reorder flag
         is_reorder = bool(
             re.search(r'\b(reorder|re-order|last\s+week[\'s]*|previous)\b', fragment, re.I)
         )
 
-        # Company: text after " for " (rep only)
+        # ── Email extraction (rep only — non-rep orders on their own account) ──
+        email = ""
+        if _is_rep:
+            email_match = EMAIL_RE.search(fragment)
+            if email_match:
+                email = email_match.group(0).strip()
+
+        # ── Company name: text after "for" minus any email (display only) ──
         company_name = ""
         if _is_rep:
             for_match = re.search(r'\bfor\s+(.+)$', fragment, re.I)
             if for_match:
-                company_name = for_match.group(1).strip()
+                candidate = EMAIL_RE.sub('', for_match.group(1)).strip().strip(', ')
+                if candidate:
+                    company_name = candidate
 
-        # Product: strip quantity and "for <company>" from the fragment
+        # ── Product: strip quantity, email addresses, and "for …" tail ──
         product_part = fragment
         if qty_match:
             product_part = product_part[qty_match.end():].strip()
-        if company_name:
-            product_part = re.sub(
-                r'\s*\bfor\s+' + re.escape(company_name) + r'\s*$',
-                '',
-                product_part,
-                flags=re.I,
-            ).strip()
+        product_part = EMAIL_RE.sub('', product_part).strip()
+        product_part = re.sub(r'\s*\bfor\b.*$', '', product_part, flags=re.I).strip()
+        
+        # Strip leading intent phrase + order verb — anchored so it never
+        # strips "order" appearing mid-string (e.g. "harmony order confirmation")
+        product_part = re.sub(
+            r'^(?:(?:i\s+(?:want|need|would\s+like)\s+to|please|can\s+you)\s+)?'
+            r'(?:order|buy|purchase|reorder|re-order)\s+',
+            '',
+            product_part,
+            flags=re.I,
+        ).strip()
         product_name = product_part.strip(" ,.-")
 
         pre_lines.append(_PreLine(
             raw_fragment=fragment,
             company_name=company_name,
+            email=email,
             product_name=product_name,
             quantity=quantity,
+            quantity_explicitly_set=quantity_explicitly_set,
             is_reorder=is_reorder,
         ))
 
@@ -166,6 +205,17 @@ def parse_bulk_order_utterance(
                         matched_catalog_name = p["name"]
                         break
 
+        # 3b.5. Substring scan: find the longest catalog name contained within
+        # product_name. Safety net for any verb-prefixed text that slipped
+        # through Step 2 cleaning (e.g. "i want to order saga" → "Saga").
+        if pl.product_id is None:
+            for p in sorted(products, key=lambda x: len(x.get("name", "")), reverse=True):
+                p_name = p.get("name", "")
+                if p_name and re.search(r'\b' + re.escape(p_name) + r'\b', pl.product_name, re.I):
+                    pl.product_id = p["id"]
+                    matched_catalog_name = p["name"]
+                    break
+
         # 3c. Fuzzy fallback (cutoff=0.6)
         if pl.product_id is None:
             product_names = [p.get("name", "") for p in products]
@@ -180,18 +230,22 @@ def parse_bulk_order_utterance(
                 )
 
         # 3d. Extract variant hint OR company name from remainder
+        # 3d. Extract variant hint OR display company from remainder
         if matched_catalog_name and pl.product_name.lower().startswith(matched_catalog_name.lower()):
             remainder = pl.product_name[len(matched_catalog_name):].strip(" ,.-")
             if remainder:
                 _for_match = re.match(r'^for\s+(.+)$', remainder, re.I)
                 if _for_match:
-                    # "for <Name>" → company name, not a variant hint
+                    # "for <Name>" in remainder → display-only company hint
+                    # Email (the actual resolution key) was already extracted in Step 2.
                     if not pl.company_name:
-                        pl.company_name = _for_match.group(1).strip()
+                        candidate = EMAIL_RE.sub('', _for_match.group(1)).strip().strip(', ')
+                        if candidate:
+                            pl.company_name = candidate
                 else:
                     pl.variant_hint = remainder
-            pl.product_name = matched_catalog_name   # always normalize to catalog name
-
+            pl.product_name = matched_catalog_name
+            
         if pl.product_id:
             logger.debug(
                 f"bulk_parser | resolved product '{pl.product_name}' → id={pl.product_id} "
@@ -239,70 +293,45 @@ def parse_bulk_order_utterance(
                 f"for product_id={pl.product_id}"
             )
 
-    # ── Step 4: Company resolution (rep only, batched) ────────────────────────
-    # Non-rep users have no company_name values, so unique_companies is empty
+    # ── Step 4: Customer resolution by email (rep only, batched) ──────────────
+    # Non-rep users have no email values, so unique_emails is empty
     # and this step is a no-op for them.
-    company_resolution_cache: dict = {}  # company_name -> resolved dict | None
+    email_resolution_cache: dict = {}   # email -> resolved dict | None
 
-    unique_companies = list({pl.company_name for pl in pre_lines if pl.company_name})
+    unique_emails = list({pl.email for pl in pre_lines if pl.email})
 
-    for company in unique_companies:
-        call = endpoints.search_customers_by_company(
-            company_name=company,
-            per_page=3,
-            description=f"Bulk order company lookup: '{company}'",
+    for email in unique_emails:
+        call = endpoints.search_customers_by_email(
+            email=email,
+            per_page=1,
+            description=f"Bulk order email lookup: '{email}'",
         )
         result = woo_client.execute(call)
 
-        if (
-            not result.get("success")
-            or not isinstance(result.get("data"), list)
-            or not result["data"]
-        ):
-            logger.debug(f"bulk_parser | company '{company}' → not found (API miss)")
-            company_resolution_cache[company] = None
+        customers = result.get("data", [])
+        if not result.get("success") or not isinstance(customers, list) or not customers:
+            logger.debug(f"bulk_parser | email '{email}' → not found")
+            email_resolution_cache[email] = None
             continue
 
-        customers = result["data"]
+        customer = customers[0]
+        company_field = customer.get("company") or customer.get("billing", {}).get("company", "")
+        full_name = f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip()
+        display = company_field or full_name or f"Customer #{customer['id']}"
 
-        displays = []
-        for c in customers:
-            # New endpoint returns flat 'company' key, not nested billing.company
-            company_field = c.get("company", "")
-            full_name = f"{c.get('first_name', '')} {c.get('last_name', '')}".strip()
-            displays.append(company_field or full_name or f"Customer #{c['id']}")
-                                                           
-        close = difflib.get_close_matches(
-            company.lower(),
-            [d.lower() for d in displays],
-            n=1,
-            cutoff=0.3,
-        )
+        email_resolution_cache[email] = {
+            "id": str(customer["id"]),
+            "display": display,
+            "billing": customer.get("billing", {}),
+            "shipping": customer.get("shipping", {}),
+        }
+        logger.debug(f"bulk_parser | email '{email}' → id={customer['id']} display='{display}'")
 
-        if close:
-            idx = [d.lower() for d in displays].index(close[0])
-            chosen = customers[idx]
-            is_exact = displays[idx].lower() == company.lower()
-            display_prefix = "" if is_exact else "⚠️ "
-            company_resolution_cache[company] = {
-                "id": str(chosen["id"]),
-                "display": f"{display_prefix}{displays[idx]}",
-                "billing": chosen.get("billing", {}),
-                "shipping": chosen.get("shipping", {}),
-            }
-            logger.debug(
-                f"bulk_parser | company '{company}' → "
-                f"id={chosen['id']} display='{displays[idx]}' exact={is_exact}"
-            )
-        else:
-            company_resolution_cache[company] = None
-            logger.debug(f"bulk_parser | company '{company}' → no fuzzy match")
-
-    # Stamp customer_id onto pre_lines so Step 5 can use it
+    # Stamp customer_id onto pre_lines so Step 5 (reorder) can use it
     for pl in pre_lines:
-        if not pl.company_name:
+        if not pl.email:
             continue
-        resolution = company_resolution_cache.get(pl.company_name)
+        resolution = email_resolution_cache.get(pl.email)
         if resolution:
             pl.customer_id = resolution["id"]
 
@@ -350,44 +379,49 @@ def parse_bulk_order_utterance(
 
     for pl in pre_lines:
         if _is_rep:
-            resolution = company_resolution_cache.get(pl.company_name)
+            resolution = email_resolution_cache.get(pl.email) if pl.email else None
             if resolution:
                 customer_id = resolution["id"]
                 customer_display_name = resolution["display"]
-                # shipping ← company shipping block; billing ← company billing block
                 shipping_address = resolution.get("shipping") or {}
                 billing_address = resolution.get("billing") or {}
-                # Fallback: if the company has no shipping block on file, reuse
-                # billing so the order still ships somewhere sensible.
                 if not shipping_address.get("address_1"):
                     shipping_address = billing_address
             else:
                 customer_id = None
-                customer_display_name = "⚠️ Not found"
+                customer_display_name = "⚠️ Not found" if pl.email else "⚠️ Email required"
                 shipping_address = None
                 billing_address = None
         else:
-            # Non-rep: always place on their own account
             customer_id = self_customer_id
             customer_display_name = "My Account"
-            shipping_address = None  # fetched later during address confirmation
-            billing_address = None   # fetched later during address confirmation
+            shipping_address = None
+            billing_address = None
 
-        unresolved = (pl.product_id is None) or (customer_id is None)
-        if pl.product_id is None and customer_id is None:
+        # Unresolved reason — now distinguishes "not provided" from "not found"
+        _customer_unresolved = customer_id is None
+        _product_unresolved = pl.product_id is None
+
+        if _product_unresolved and _customer_unresolved:
+            unresolved = True
             unresolved_reason = "both_not_found"
-        elif pl.product_id is None:
+        elif _product_unresolved:
+            unresolved = True
             unresolved_reason = "product_not_found"
-        elif customer_id is None:
-            unresolved_reason = "company_not_found"
+        elif _customer_unresolved:
+            unresolved = True
+            unresolved_reason = "email_not_provided" if (_is_rep and not pl.email) else "email_not_found"
         else:
+            unresolved = False
             unresolved_reason = None
 
         result_lines.append(BulkOrderLine(
             raw_fragment=pl.raw_fragment,
             company_name=pl.company_name,
+            email=pl.email,
             product_name=pl.product_name,
             quantity=pl.quantity,
+            quantity_explicitly_set=pl.quantity_explicitly_set,
             product_id=pl.product_id,
             variation_id=pl.variation_id,
             customer_id=customer_id,

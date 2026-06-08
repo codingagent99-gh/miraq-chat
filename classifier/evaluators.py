@@ -330,26 +330,40 @@ class CartCheckoutEvaluator(IntentEvaluator):
         return None, 0.0
 
 class BulkOrderEvaluator(IntentEvaluator):
-    """
-    Intercepts direct-typed bulk orders before OrderActionEvaluator
-    consumes the first 'order' fragment and discards the rest.
-    Fires when 2+ comma-separated fragments each have a digit + 'for' or an order verb.
-    """
     _ORDER_VERBS = re.compile(r'\b(order|buy|purchase|reorder|re-order)\b', re.I)
 
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
+
+        # ── Check 1: comma fragments with quantities (existing, unchanged) ──
         fragments = [f.strip() for f in text.split(',') if f.strip()]
-        if len(fragments) < 2:
-            return None, 0.0
-        qualified = sum(
-            1 for f in fragments
-            if re.search(r'\d', f) and (
-                re.search(r'\bfor\b', f, re.I) or self._ORDER_VERBS.search(f)
+        if len(fragments) >= 2:
+            qualified = sum(
+                1 for f in fragments
+                if re.search(r'\d', f) and (
+                    re.search(r'\bfor\b', f, re.I) or self._ORDER_VERBS.search(f)
+                )
             )
-        )
-        if qualified >= 2:
-            return Intent.BULK_ORDER, 0.92
+            if qualified >= 2:
+                return Intent.BULK_ORDER, 0.92
+
+        # ── Check 2: order trigger + 2+ resolvable catalog products ──
+        # Handles all separators: comma-only, "and"-only, "A, B and C",
+        # comma+email, any mix — no digit requirement.
+        if self._ORDER_VERBS.search(text):
+            loader = get_store_loader()
+            if loader and loader.products:
+                _name_set = {
+                    p["name"].lower() for p in loader.products if p.get("name")
+                }
+                resolved_count = sum(
+                    1 for name in _name_set
+                    if re.search(r'\b' + re.escape(name) + r'\b', text, re.I)
+                )
+                if resolved_count >= 2:
+                    return Intent.BULK_ORDER, 0.92
+
         return None, 0.0
+
 # ═══════════════════════════════════════════
 # PIPELINE RUNNER
 # ═══════════════════════════════════════════

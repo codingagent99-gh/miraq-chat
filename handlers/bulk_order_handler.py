@@ -36,9 +36,53 @@ from conversation_flow import FlowState
 from chat_logger import get_logger
 from handlers.chat_utils import default_pagination
 from parsers.bulk_order_parser import parse_bulk_order_utterance, BulkOrderLine
-
+import re
+import difflib
 logger = get_logger("miraq_chat")
 
+_BULK_STATE_KEYS = (
+    "pending_bulk_lines", "bulk_current_line_index",
+    "bulk_confirmed_lines", "bulk_address_overrides",
+    "bulk_awaiting_address_text",
+    "bulk_product_missing_indices", "bulk_product_current_pos",
+    "bulk_quantity_pending_indices", "bulk_quantity_current_pos",
+)
+
+def handle_cancel_bulk_order(user_context, conversation, page, start_time):
+    for k in _BULK_STATE_KEYS:
+        user_context.pop(k, None)
+    flag_modified(conversation, "context_data")
+    conversation.flow_state = FlowState.IDLE.value
+    elapsed = round((time.time() - start_time) * 1000)
+    return jsonify({
+        "success": True,
+        "bot_message": "Bulk order cancelled. What else can I help you with?",
+        "intent": "guided_flow",
+        "products": [],
+        "suggestions": ["Show me products", "Start a bulk order"],
+        "session_id": str(conversation.id),
+        "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": elapsed},
+        "flow_state": FlowState.IDLE.value,
+        "pagination": default_pagination(page),
+    }), 200
+
+
+def handle_bulk_confirmation_unclear(conversation, page, start_time):
+    elapsed = round((time.time() - start_time) * 1000)
+    return jsonify({
+        "success": True,
+        "bot_message": "Please reply **Yes** to confirm all orders or **No** to cancel.",
+        "intent": "guided_flow",
+        "products": [],
+        "suggestions": ["Yes, confirm", "No, cancel"],
+        "session_id": str(conversation.id),
+        "metadata": {
+            "flow_state": FlowState.AWAITING_BULK_ORDER_CONFIRMATION.value,
+            "response_time_ms": elapsed,
+        },
+        "flow_state": FlowState.AWAITING_BULK_ORDER_CONFIRMATION.value,
+        "pagination": default_pagination(page),
+    }), 200
 # ══════════════════════════════════════════════════════════════
 # ── Helper: detect variable products ──
 # ══════════════════════════════════════════════════════════════
@@ -82,7 +126,7 @@ def handle_bulk_order_trigger(conversation, user_context, page, start_time):
             "Tell me everything you need to order today. "
             "You can include multiple customers and products in one message.\n\n"
             "**Example:**\n"
-            "*Order 20 Harmony White for ABC Builders, 15 Coral Grey for XYZ Interiors"
+            "*Order 20 Harmony White for abc@buildersco.com, 15 Coral Grey for xyz@interiors.com*"
         ),
         "intent": "guided_flow",
         "products": [],
@@ -143,6 +187,7 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
         {
             "raw_fragment": l.raw_fragment,
             "company_name": l.company_name,
+            "email": l.email,
             "product_name": l.product_name,
             "quantity": l.quantity,
             "product_id": l.product_id,
@@ -155,6 +200,7 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
             "reorder_source_order_id": l.reorder_source_order_id,
             "unresolved": l.unresolved,
             "unresolved_reason": l.unresolved_reason,
+            "quantity_explicitly_set":  l.quantity_explicitly_set,
             "address_confirmed": False,
             "address_skipped": False,
         }
@@ -167,7 +213,91 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
     user_context["bulk_address_overrides"] = {}
     conversation.context_data = user_context
     flag_modified(conversation, "context_data")
+    
+    
+    # Step 4.5: Any line with a completely blank product name → ask before anything else
+    # (applies to all roles — no point asking email/address without knowing what to order)
+    product_blank_indices = [
+        i for i, l in enumerate(lines_as_dicts)
+        if not l.get("product_name", "").strip()
+    ]
+    if product_blank_indices:
+        user_context["bulk_product_missing_indices"] = product_blank_indices
+        user_context["bulk_product_current_pos"] = 0
+        conversation.flow_state = FlowState.AWAITING_BULK_PRODUCT.value
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
 
+        first_line = lines_as_dicts[product_blank_indices[0]]
+        customer_hint = (
+            f" for **{first_line['customer_display_name']}**"
+            if first_line.get("customer_id") else ""
+        )
+        already_resolved = [l for l in lines_as_dicts if not l.get("unresolved")]
+        resolved_note = f"\n\n{len(already_resolved)} other line(s) already resolved." if already_resolved else ""
+
+        elapsed = round((time.time() - start_time) * 1000)
+        return jsonify({
+            "success": True,
+            "bot_message": (
+                f"What product and quantity would you like to order{customer_hint}?{resolved_note}"
+            ),
+            "intent": "guided_flow",
+            "products": [],
+            "suggestions": ["Cancel"],
+            "session_id": str(conversation.id),
+            "metadata": {
+                "flow_state": FlowState.AWAITING_BULK_PRODUCT.value,
+                "response_time_ms": elapsed,
+            },
+            "flow_state": FlowState.AWAITING_BULK_PRODUCT.value,
+            "pagination": default_pagination(page),
+        }), 200
+
+    # Step 4.6: Rep lines missing an email → ask before proceeding
+    if role in BULK_ORDER_ROLES:
+        email_missing = [l for l in lines_as_dicts if l.get("unresolved_reason") == "email_not_provided"]
+        if email_missing:
+            conversation.flow_state = FlowState.AWAITING_BULK_EMAIL.value
+            conversation.context_data = user_context
+            flag_modified(conversation, "context_data")
+
+            product_lines = "\n".join(
+                f"• **{l['quantity']}× {l['product_name']}**"
+                for l in email_missing
+            )
+            already_resolved = [l for l in lines_as_dicts if not l.get("unresolved")]
+            resolved_note = f"\n\n{len(already_resolved)} other line(s) already resolved." if already_resolved else ""
+
+            elapsed = round((time.time() - start_time) * 1000)
+            return jsonify({
+                "success": True,
+                "bot_message": (
+                    f"Got it:\n{product_lines}{resolved_note}\n\n"
+                    "Please provide the customer's email address."
+                ),
+                "intent": "guided_flow",
+                "products": [],
+                "suggestions": ["Cancel"],
+                "session_id": str(conversation.id),
+                "metadata": {
+                    "flow_state": FlowState.AWAITING_BULK_EMAIL.value,
+                    "response_time_ms": elapsed,
+                },
+                "flow_state": FlowState.AWAITING_BULK_EMAIL.value,
+                "pagination": default_pagination(page),
+            }), 200
+
+    # Step 4.7: Lines with no explicit quantity — ask before variant selection
+    qty_unset = [
+        i for i, l in enumerate(lines_as_dicts)
+        if not l.get("quantity_explicitly_set") and not l.get("unresolved")
+    ]
+    if qty_unset:
+        return _prompt_for_quantity(
+            qty_unset, lines_as_dicts, conversation, user_context, page, start_time
+        )
+           
     # Step 5: Check for variable products with unresolved variation_id
     needs_variant_indices = [
         i for i, l in enumerate(lines_as_dicts)
@@ -213,7 +343,9 @@ def _format_bulk_confirmation_table(lines) -> str:
             status = "✅ Ready"
         elif unresolved_reason == "product_not_found":
             status = "❌ Product not found"
-        elif unresolved_reason == "company_not_found":
+        elif unresolved_reason == "email_not_provided":
+            status = "❌ Email required"
+        elif unresolved_reason == "email_not_found":
             status = "❌ Customer not found"
         elif unresolved_reason == "both_not_found":
             status = "❌ Both not found"
@@ -436,9 +568,11 @@ def handle_bulk_variant_selection_reply(
     # If quantity was not specified earlier, extract the last standalone
     # integer from the user's reply. Attribute options like "12x24" don't
     # produce bare word-boundary integers, so the last match is the qty.
-    if not line.get("quantity"):
+    if not line.get("quantity") or not line.get("quantity_explicitly_set"):
         qty_matches = _re.findall(r'\b(\d+)\b', message)
-        line["quantity"] = int(qty_matches[-1]) if qty_matches else 1
+        if qty_matches:
+            line["quantity"] = int(qty_matches[-1])
+            line["quantity_explicitly_set"] = True   # ← ADD
     
     lines_as_dicts[line_idx] = line
     user_context["pending_bulk_lines"] = lines_as_dicts
@@ -459,6 +593,504 @@ def handle_bulk_variant_selection_reply(
         lines_as_dicts, conversation, user_context, page, start_time
     )
 
+# ══════════════════════════════════════════════════════════════
+# ── Public: handle_bulk_email_reply ──
+# ══════════════════════════════════════════════════════════════
+
+def handle_bulk_email_reply(message, store_loader, conversation, user_context, page, start_time):
+    """
+    Called during AWAITING_BULK_EMAIL when the rep provides customer email(s).
+    Extracts email(s), resolves customers via API, stamps the pending lines,
+    then resumes the normal bulk flow (variant selection → confirmation).
+    """
+    import re as _re
+    _EMAIL_RE = _re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', _re.I)
+
+    emails = _EMAIL_RE.findall(message)
+    if not emails:
+        elapsed = round((time.time() - start_time) * 1000)
+        return jsonify({
+            "success": True,
+            "bot_message": "I couldn't find a valid email address. Please provide the customer's email.",
+            "intent": "guided_flow",
+            "products": [],
+            "suggestions": ["Cancel"],
+            "session_id": str(conversation.id),
+            "metadata": {
+                "flow_state": FlowState.AWAITING_BULK_EMAIL.value,
+                "response_time_ms": elapsed,
+            },
+            "flow_state": FlowState.AWAITING_BULK_EMAIL.value,
+            "pagination": default_pagination(page),
+        }), 200
+
+    lines_as_dicts = user_context.get("pending_bulk_lines", [])
+    missing_indices = [
+        i for i, l in enumerate(lines_as_dicts)
+        if l.get("unresolved_reason") == "email_not_provided"
+    ]
+
+    # Multiple emails + single unresolved line → clone the line for each email
+    if len(emails) > 1 and len(missing_indices) == 1:
+        base_idx = missing_indices[0]
+        base = lines_as_dicts[base_idx]
+        clones = [{**base, "email": email} for email in emails]
+        lines_as_dicts = lines_as_dicts[:base_idx] + clones + lines_as_dicts[base_idx + 1:]
+        missing_indices = list(range(base_idx, base_idx + len(emails)))
+    else:
+        # Assign emails round-robin to unresolved lines
+        for i, line_idx in enumerate(missing_indices):
+            lines_as_dicts[line_idx]["email"] = emails[i % len(emails)]
+
+    # Resolve each newly assigned email
+    email_cache: dict = {}
+    for line_idx in missing_indices:
+        line = lines_as_dicts[line_idx]
+        email = line.get("email", "")
+        if not email:
+            continue
+
+        if email not in email_cache:
+            call = endpoints.search_customers_by_email(
+                email=email,
+                per_page=1,
+                description=f"Bulk email reply lookup: '{email}'",
+            )
+            result = woo_client.execute(call)
+            customers = result.get("data", []) if result.get("success") else []
+            if isinstance(customers, list) and customers:
+                c = customers[0]
+                company = c.get("company") or c.get("billing", {}).get("company", "")
+                full_name = f"{c.get('first_name', '')} {c.get('last_name', '')}".strip()
+                billing = c.get("billing", {}) or {}
+                shipping = c.get("shipping", {}) or {}
+                if not shipping.get("address_1"):
+                    shipping = billing
+                email_cache[email] = {
+                    "id": str(c["id"]),
+                    "display": company or full_name or f"Customer #{c['id']}",
+                    "billing": billing,
+                    "shipping": shipping,
+                }
+            else:
+                email_cache[email] = None
+
+        resolution = email_cache.get(email)
+        if resolution:
+            line["customer_id"] = resolution["id"]
+            line["customer_display_name"] = resolution["display"]
+            line["billing_address"] = resolution["billing"]
+            line["shipping_address"] = resolution["shipping"]
+            line["unresolved"] = line.get("product_id") is None
+            line["unresolved_reason"] = "product_not_found" if line["unresolved"] else None
+        else:
+            line["unresolved"] = True
+            line["unresolved_reason"] = "email_not_found"
+            line["customer_display_name"] = "⚠️ Not found"
+
+    user_context["pending_bulk_lines"] = lines_as_dicts
+    conversation.context_data = user_context
+    flag_modified(conversation, "context_data")
+    
+    blank_after_email = [
+        i for i, l in enumerate(lines_as_dicts)
+        if not l.get("product_name", "").strip()
+    ]
+    if blank_after_email:
+        user_context["bulk_product_missing_indices"] = blank_after_email
+        user_context["bulk_product_current_pos"] = 0
+        conversation.flow_state = FlowState.AWAITING_BULK_PRODUCT.value
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+
+        first_line = lines_as_dicts[blank_after_email[0]]
+        customer_hint = (
+            f" for **{first_line['customer_display_name']}**"
+            if first_line.get("customer_id") else ""
+        )
+        elapsed = round((time.time() - start_time) * 1000)
+        return jsonify({
+            "success": True,
+            "bot_message": f"What product and quantity would you like to order{customer_hint}?",
+            "intent": "guided_flow",
+            "products": [],
+            "suggestions": ["Cancel"],
+            "session_id": str(conversation.id),
+            "metadata": {
+                "flow_state": FlowState.AWAITING_BULK_PRODUCT.value,
+                "response_time_ms": elapsed,
+            },
+            "flow_state": FlowState.AWAITING_BULK_PRODUCT.value,
+            "pagination": default_pagination(page),
+        }), 200
+        
+    qty_unset = [
+        i for i, l in enumerate(lines_as_dicts)
+        if not l.get("quantity_explicitly_set") and not l.get("unresolved")
+    ]
+    if qty_unset:
+        return _prompt_for_quantity(
+            qty_unset, lines_as_dicts, conversation, user_context, page, start_time
+        )
+
+    # Check for variable products still needing variant selection
+    needs_variant_indices = [
+        i for i, l in enumerate(lines_as_dicts)
+        if l.get("product_id") and not l.get("variation_id")
+        and _is_variable_product(l["product_id"], store_loader)
+    ]
+
+    if needs_variant_indices:
+        user_context["bulk_variant_line_indices"] = needs_variant_indices
+        user_context["bulk_variant_current_pos"] = 0
+        user_context["bulk_variant_cache"] = {}
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+        return _ask_for_bulk_variant(
+            lines_as_dicts, needs_variant_indices, 0,
+            conversation, user_context, page, start_time,
+        )
+
+    return _build_bulk_confirmation_response(
+        lines_as_dicts, conversation, user_context, page, start_time
+    )
+
+# ══════════════════════════════════════════════════════════════
+# ── Public: handle_bulk_product_reply ──
+# ══════════════════════════════════════════════════════════════
+
+def handle_bulk_product_reply(message, store_loader, conversation, user_context, page, start_time):
+    """
+    Called during AWAITING_BULK_PRODUCT when the rep provides a product name
+    (and optional quantity) for a line that had a blank product.
+
+    After filling the product, resumes the normal pipeline:
+      blank product → email missing → variant selection → confirmation
+    """
+    lines_as_dicts = user_context.get("pending_bulk_lines", [])
+    missing_indices = user_context.get("bulk_product_missing_indices", [])
+    pos = user_context.get("bulk_product_current_pos", 0)
+    role = user_context.get("role", "")
+
+    # Guard
+    if not missing_indices or pos >= len(missing_indices):
+        return _continue_after_slots_filled(lines_as_dicts, store_loader, conversation, user_context, page, start_time)
+
+    line_idx = missing_indices[pos]
+    line = lines_as_dicts[line_idx]
+
+    # ── Parse quantity from the reply ──
+    qty_match = re.search(r'\b(\d+)\b', message)
+    if qty_match:
+        line["quantity"] = int(qty_match.group(1))
+        # Strip quantity from the product portion
+        product_text = (message[:qty_match.start()] + message[qty_match.end():]).strip().strip(".,- ")
+    else:
+        product_text = message.strip().strip(".,- ")
+
+    # ── Resolve product against catalog ──
+    resolved_id = None
+    resolved_name = product_text
+
+    if store_loader and product_text:
+        products = store_loader.products or []
+
+        # Exact match
+        for p in products:
+            if p.get("name", "").lower() == product_text.lower():
+                resolved_id = p["id"]
+                resolved_name = p["name"]
+                break
+
+        # First-word match
+        if resolved_id is None:
+            first_word = product_text.split()[0] if product_text.split() else ""
+            for p in products:
+                if p.get("name", "").lower() == first_word.lower():
+                    resolved_id = p["id"]
+                    resolved_name = p["name"]
+                    break
+
+        # Fuzzy fallback
+        if resolved_id is None:
+            product_names = [p.get("name", "") for p in products]
+            close = difflib.get_close_matches(product_text, product_names, n=1, cutoff=0.6)
+            if close:
+                resolved_name = close[0]
+                resolved_id = next(
+                    (p["id"] for p in products if p.get("name") == resolved_name), None
+                )
+
+    line["product_name"] = resolved_name
+    line["product_id"] = resolved_id
+
+    # Recompute unresolved state
+    customer_missing = line.get("customer_id") is None
+    if resolved_id:
+        line["unresolved"] = customer_missing
+        if customer_missing:
+            line["unresolved_reason"] = "email_not_provided" if not line.get("email") else "email_not_found"
+        else:
+            line["unresolved_reason"] = None
+    else:
+        line["unresolved"] = True
+        line["unresolved_reason"] = "product_not_found"
+
+    lines_as_dicts[line_idx] = line
+    next_pos = pos + 1
+    user_context["bulk_product_current_pos"] = next_pos
+    user_context["pending_bulk_lines"] = lines_as_dicts
+    conversation.context_data = user_context
+    flag_modified(conversation, "context_data")
+
+    # More blank products in this batch?
+    if next_pos < len(missing_indices):
+        next_idx = missing_indices[next_pos]
+        next_line = lines_as_dicts[next_idx]
+        customer_hint = (
+            f" for **{next_line['customer_display_name']}**"
+            if next_line.get("customer_id") else ""
+        )
+        elapsed = round((time.time() - start_time) * 1000)
+        return jsonify({
+            "success": True,
+            "bot_message": f"What product and quantity would you like to order{customer_hint}?",
+            "intent": "guided_flow",
+            "products": [],
+            "suggestions": ["Cancel"],
+            "session_id": str(conversation.id),
+            "metadata": {
+                "flow_state": FlowState.AWAITING_BULK_PRODUCT.value,
+                "response_time_ms": elapsed,
+            },
+            "flow_state": FlowState.AWAITING_BULK_PRODUCT.value,
+            "pagination": default_pagination(page),
+        }), 200
+
+    # All blank products filled — continue pipeline
+    return _continue_after_slots_filled(
+        lines_as_dicts, store_loader, conversation, user_context, page, start_time
+    )
+
+
+def _continue_after_slots_filled(lines_as_dicts, store_loader, conversation, user_context, page, start_time):
+    """
+    Shared exit point after all blank-product slots are filled.
+    Cleans up product-tracking keys, then checks for missing emails,
+    variable products, and finally builds the confirmation response.
+    """
+    role = user_context.get("role", "")
+
+    # Clean up product-slot tracking
+    user_context.pop("bulk_product_missing_indices", None)
+    user_context.pop("bulk_product_current_pos", None)
+    
+    # Quantity unset on any resolved line?       ← ADD
+    qty_unset = [
+        i for i, l in enumerate(lines_as_dicts)
+        if not l.get("quantity_explicitly_set") and not l.get("unresolved")
+    ]
+    if qty_unset:
+        return _prompt_for_quantity(
+            qty_unset, lines_as_dicts, conversation, user_context, page, start_time
+        )
+
+    # Email still missing on any line?
+    if role in BULK_ORDER_ROLES:
+        email_missing = [l for l in lines_as_dicts if l.get("unresolved_reason") == "email_not_provided"]
+        if email_missing:
+            conversation.flow_state = FlowState.AWAITING_BULK_EMAIL.value
+            conversation.context_data = user_context
+            flag_modified(conversation, "context_data")
+
+            product_lines = "\n".join(
+                f"• **{l['quantity']}× {l['product_name']}**" for l in email_missing
+            )
+            elapsed = round((time.time() - start_time) * 1000)
+            return jsonify({
+                "success": True,
+                "bot_message": (
+                    f"Got it:\n{product_lines}\n\n"
+                    "Please provide the customer's email address."
+                ),
+                "intent": "guided_flow",
+                "products": [],
+                "suggestions": ["Cancel"],
+                "session_id": str(conversation.id),
+                "metadata": {
+                    "flow_state": FlowState.AWAITING_BULK_EMAIL.value,
+                    "response_time_ms": elapsed,
+                },
+                "flow_state": FlowState.AWAITING_BULK_EMAIL.value,
+                "pagination": default_pagination(page),
+            }), 200
+
+    # Variable products needing variant selection?
+    needs_variant_indices = [
+        i for i, l in enumerate(lines_as_dicts)
+        if l.get("product_id") and not l.get("variation_id")
+        and _is_variable_product(l["product_id"], store_loader)
+    ]
+    if needs_variant_indices:
+        user_context["bulk_variant_line_indices"] = needs_variant_indices
+        user_context["bulk_variant_current_pos"] = 0
+        user_context["bulk_variant_cache"] = {}
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+        return _ask_for_bulk_variant(
+            lines_as_dicts, needs_variant_indices, 0,
+            conversation, user_context, page, start_time,
+        )
+
+    return _build_bulk_confirmation_response(
+        lines_as_dicts, conversation, user_context, page, start_time
+    )
+
+# ══════════════════════════════════════════════════════════════
+# ── Private: _prompt_for_quantity ──
+# ══════════════════════════════════════════════════════════════
+
+def _prompt_for_quantity(qty_unset, lines_as_dicts, conversation, user_context, page, start_time):
+    """
+    Store the pending indices, set AWAITING_BULK_QUANTITY, and ask for
+    the quantity of the first unset line.
+    """
+    user_context["bulk_quantity_pending_indices"] = qty_unset
+    user_context["bulk_quantity_current_pos"]     = 0
+    conversation.flow_state  = FlowState.AWAITING_BULK_QUANTITY.value
+    conversation.context_data = user_context
+    flag_modified(conversation, "context_data")
+
+    line = lines_as_dicts[qty_unset[0]]
+    elapsed = round((time.time() - start_time) * 1000)
+    return jsonify({
+        "success":     True,
+        "bot_message": (
+            f"How many **{line['product_name']}** "
+            f"for **{line['customer_display_name']}**?"
+        ),
+        "intent":      "guided_flow",
+        "products":    [],
+        "suggestions": ["1", "5", "10", "15", "20", "Cancel"],
+        "session_id":  str(conversation.id),
+        "metadata": {
+            "flow_state":       FlowState.AWAITING_BULK_QUANTITY.value,
+            "response_time_ms": elapsed,
+        },
+        "flow_state":  FlowState.AWAITING_BULK_QUANTITY.value,
+        "pagination":  default_pagination(page),
+    }), 200
+
+
+# ══════════════════════════════════════════════════════════════
+# ── Public: handle_bulk_quantity_reply ──
+# ══════════════════════════════════════════════════════════════
+
+def handle_bulk_quantity_reply(message, store_loader, conversation, user_context, page, start_time):
+    """
+    Called during AWAITING_BULK_QUANTITY when the rep specifies a quantity.
+    Stamps the quantity, advances to the next unset line or continues pipeline.
+    """
+    import re as _re
+
+    lines_as_dicts   = user_context.get("pending_bulk_lines", [])
+    pending_indices  = user_context.get("bulk_quantity_pending_indices", [])
+    pos              = user_context.get("bulk_quantity_current_pos", 0)
+
+    if not pending_indices or pos >= len(pending_indices):
+        return _continue_after_quantity_filled(
+            lines_as_dicts, store_loader, conversation, user_context, page, start_time
+        )
+
+    line_idx = pending_indices[pos]
+    line     = lines_as_dicts[line_idx]
+
+    qty_match = _re.search(r'\b(\d+)\b', message)
+    if not qty_match:
+        elapsed = round((time.time() - start_time) * 1000)
+        return jsonify({
+            "success":     True,
+            "bot_message": (
+                f"Please enter a quantity for **{line['product_name']}** "
+                f"(e.g. 1, 5, 10):"
+            ),
+            "intent":      "guided_flow",
+            "products":    [],
+            "suggestions": ["1", "5", "10", "15", "20", "Cancel"],
+            "session_id":  str(conversation.id),
+            "metadata": {
+                "flow_state":       FlowState.AWAITING_BULK_QUANTITY.value,
+                "response_time_ms": elapsed,
+            },
+            "flow_state":  FlowState.AWAITING_BULK_QUANTITY.value,
+            "pagination":  default_pagination(page),
+        }), 200
+
+    line["quantity"]              = int(qty_match.group(1))
+    line["quantity_explicitly_set"] = True
+    lines_as_dicts[line_idx]     = line
+
+    next_pos = pos + 1
+    user_context["bulk_quantity_current_pos"] = next_pos
+    user_context["pending_bulk_lines"]        = lines_as_dicts
+    conversation.context_data = user_context
+    flag_modified(conversation, "context_data")
+
+    # More lines still need a quantity?
+    if next_pos < len(pending_indices):
+        next_line = lines_as_dicts[pending_indices[next_pos]]
+        elapsed   = round((time.time() - start_time) * 1000)
+        return jsonify({
+            "success":     True,
+            "bot_message": (
+                f"How many **{next_line['product_name']}** "
+                f"for **{next_line['customer_display_name']}**?"
+            ),
+            "intent":      "guided_flow",
+            "products":    [],
+            "suggestions": ["1", "5", "10", "15", "20", "Cancel"],
+            "session_id":  str(conversation.id),
+            "metadata": {
+                "flow_state":       FlowState.AWAITING_BULK_QUANTITY.value,
+                "response_time_ms": elapsed,
+            },
+            "flow_state":  FlowState.AWAITING_BULK_QUANTITY.value,
+            "pagination":  default_pagination(page),
+        }), 200
+
+    return _continue_after_quantity_filled(
+        lines_as_dicts, store_loader, conversation, user_context, page, start_time
+    )
+
+
+def _continue_after_quantity_filled(lines_as_dicts, store_loader, conversation, user_context, page, start_time):
+    """
+    Exit point after all quantity slots are filled.
+    Cleans up quantity-tracking keys then continues to variant selection or confirmation.
+    """
+    user_context.pop("bulk_quantity_pending_indices", None)
+    user_context.pop("bulk_quantity_current_pos", None)
+
+    needs_variant_indices = [
+        i for i, l in enumerate(lines_as_dicts)
+        if l.get("product_id") and not l.get("variation_id")
+        and _is_variable_product(l["product_id"], store_loader)
+    ]
+    if needs_variant_indices:
+        user_context["bulk_variant_line_indices"] = needs_variant_indices
+        user_context["bulk_variant_current_pos"]  = 0
+        user_context["bulk_variant_cache"]        = {}
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+        return _ask_for_bulk_variant(
+            lines_as_dicts, needs_variant_indices, 0,
+            conversation, user_context, page, start_time,
+        )
+
+    return _build_bulk_confirmation_response(
+        lines_as_dicts, conversation, user_context, page, start_time
+    )
+    
 # ══════════════════════════════════════════════════════════════
 # ── Function 4: handle_bulk_order_confirmation ──
 # ══════════════════════════════════════════════════════════════
@@ -901,6 +1533,10 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
     user_context.pop("bulk_confirmed_lines", None)
     user_context.pop("bulk_address_overrides", None)
     user_context.pop("bulk_awaiting_address_text", None)
+    user_context.pop("bulk_product_missing_indices", None)
+    user_context.pop("bulk_product_current_pos", None)
+    user_context.pop("bulk_quantity_pending_indices", None)
+    user_context.pop("bulk_quantity_current_pos", None)
     conversation.context_data = user_context
     flag_modified(conversation, "context_data")
     conversation.flow_state = FlowState.IDLE.value

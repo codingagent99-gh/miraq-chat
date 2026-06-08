@@ -28,12 +28,14 @@ class FlowState(Enum):
     AWAITING_CART_CONFIRMATION = "awaiting_cart_confirmation"
     
     # ── Sales rep flows ──────────────────────────────────────────────
-    AWAITING_ORDER_FOR_COMPANY        = "awaiting_order_for_company"
-    AWAITING_ORDER_FOR_SELECTION      = "awaiting_order_for_selection"
+    AWAITING_ORDER_FOR_EMAIL          = "awaiting_order_for_email"   # renamed
     AWAITING_BULK_ORDER_INPUT         = "awaiting_bulk_order_input"
     AWAITING_BULK_ORDER_CONFIRMATION  = "awaiting_bulk_order_confirmation"
     AWAITING_BULK_ADDRESS_CONFIRMATION = "awaiting_bulk_address_confirmation"
-    AWAITING_BULK_VARIANT_SELECTION = "awaiting_bulk_variant_selection"
+    AWAITING_BULK_VARIANT_SELECTION   = "awaiting_bulk_variant_selection"
+    AWAITING_BULK_EMAIL               = "awaiting_bulk_email"
+    AWAITING_BULK_PRODUCT             = "awaiting_bulk_product"
+    AWAITING_BULK_QUANTITY = "awaiting_bulk_quantity"
     
 @dataclass
 class ConversationContext:
@@ -394,18 +396,53 @@ def handle_flow_state(
             "pass_through": False,
         }
         
-    # ── State: Awaiting company name for order (rep flow) ──
-    if state == FlowState.AWAITING_ORDER_FOR_COMPANY:
+    # ── State: Awaiting customer email for order-for flow (rep only) ──
+    if state == FlowState.AWAITING_ORDER_FOR_EMAIL:
         return {
-            "action": "resolve_order_for_company",
-            "flow_state": FlowState.AWAITING_ORDER_FOR_COMPANY.value,
+            "action":     "resolve_order_for_email",
+            "flow_state": FlowState.AWAITING_ORDER_FOR_EMAIL.value,
             "pass_through": False,
         }
-
-    # ── State: Awaiting customer selection from multiple matches (rep flow) ──
-    if state == FlowState.AWAITING_ORDER_FOR_SELECTION:
+    
+    # ── State: Awaiting email address for bulk order customer resolution ──
+    if state == FlowState.AWAITING_BULK_EMAIL:
+        import re as _re
+        _EMAIL_RE = _re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', _re.I)
+        emails = _EMAIL_RE.findall(message)
+        if emails:
+            return {
+                "action": "process_bulk_email_reply",
+                "flow_state": FlowState.AWAITING_BULK_EMAIL.value,
+                "pass_through": False,
+            }
+        else:
+            return {
+                "bot_message": "Please provide a valid email address to look up the customer.",
+                "suggestions": [],
+                "flow_state": FlowState.AWAITING_BULK_EMAIL.value,
+                "pass_through": False,
+            }
+    # ── State: Awaiting product name for bulk order line ──
+    if state == FlowState.AWAITING_BULK_PRODUCT:
+        # Any non-empty reply is treated as a product + optional quantity description.
+        # The global escape hatch above already handles cancel/exit.
         return {
-            "action": "resolve_order_for_selection",
-            "flow_state": FlowState.AWAITING_ORDER_FOR_SELECTION.value,
+            "action": "process_bulk_product_reply",
+            "flow_state": FlowState.AWAITING_BULK_PRODUCT.value,
+            "pass_through": False,
+        }
+        
+    # ── State: Awaiting bulk order lines (after trigger prompt) ──
+    if state == FlowState.AWAITING_BULK_ORDER_INPUT:
+        return {
+            "action":     "process_bulk_input",
+            "flow_state": FlowState.AWAITING_BULK_ORDER_INPUT.value,
+            "pass_through": False,
+        }
+        
+    if state == FlowState.AWAITING_BULK_QUANTITY:
+        return {
+            "action": "process_bulk_quantity_reply",
+            "flow_state": FlowState.AWAITING_BULK_QUANTITY.value,
             "pass_through": False,
         }
