@@ -1027,7 +1027,7 @@ def chat():
                     _reorder_payload, store_loader, conversation, user_context, page, start_time
                 )
                 if resp:
-                    return _ft(resp)
+                    return _finalize_turn(conversation, resp)  # no _proposal_message
 
         # ── Step 0.5: Suggestion retry (early exit) ──
         sr_resp = handle_suggestion_retry(body, message, str(conversation.id), customer_id, page, start_time)
