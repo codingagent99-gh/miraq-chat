@@ -1029,6 +1029,14 @@ def chat():
                 if resp:
                     return _finalize_turn(conversation, resp)  # no _proposal_message
 
+        # ── Bulk cancel intercept ──
+        # Fired by the "Cancel bulk process" button on BulkAddressConfirmationCard.
+        # Short-circuits before the flow state machine so all pending bulk state
+        # is cleared regardless of which sub-step the address flow is in.
+        if message.strip() == "__BULK_CANCEL__":
+            resp = handle_cancel_bulk_order(user_context, conversation, page, start_time)
+            return _finalize_turn(conversation, resp)  # no address proposal on a cancel
+
         # ── Step 0.5: Suggestion retry (early exit) ──
         sr_resp = handle_suggestion_retry(body, message, str(conversation.id), customer_id, page, start_time)
         if sr_resp:
