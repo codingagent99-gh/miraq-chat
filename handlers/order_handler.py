@@ -258,7 +258,7 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
     if intent != Intent.REORDER:
         return None
 
-    # 🚀 THE INTERCEPT: If they didn't provide an order ID and didn't explicitly say "last order"
+    # INTERCEPT: If they didn't provide an order ID and didn't explicitly say "last order"
     if not entities.order_id and not getattr(entities, 'explicit_last_order', False):
         elapsed = time.time() - start_time
         bot_msg = "Which order would you like to reorder? 🔄\n\nPlease provide the order number (e.g., #12345), or simply say 'my last order'."
@@ -427,6 +427,76 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
         "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": round(elapsed * 1000)},
         "flow_state": FlowState.IDLE.value,
         "pagination": default_pagination(page),
+    }), 200
+
+def handle_order_status(intent, entities, order_data, customer_id, session_id, page, start_time):
+    """Step 3.5d: Handle ORDER_STATUS/ORDER_TRACKING when no specific order ID was given.
+
+    When the user asks about an order without providing a number, api_builder
+    falls back to list_customer_orders (filtered by date if available). This
+    handler interprets that list:
+      - 0 results → clear no-match message
+      - 1 result  → return None so _build_final_response calls format_order_detail normally
+      - 2+ results → show the list, set AWAITING_ORDER_DETAIL for disambiguation
+    """
+    if intent not in (Intent.ORDER_STATUS, Intent.ORDER_TRACKING):
+        return None
+    # Specific order_id was present — the direct fetch already ran; let
+    # _build_final_response call format_order_detail(order_data[0]) as normal.
+    if getattr(entities, "order_id", None):
+        return None
+
+    elapsed = time.time() - start_time
+
+    if not order_data:
+        date_after = getattr(entities, "date_after", None)
+        if date_after:
+            from response_generator import _describe_date_period
+            period = _describe_date_period(date_after)
+            msg = f"I couldn't find any orders from {period}."
+        else:
+            msg = "I couldn't find any recent orders on your account."
+        return jsonify({
+            "success": True,
+            "bot_message": msg,
+            "intent": intent.value,
+            "products": [],
+            "suggestions": ["Show my recent orders", "Browse products"],
+            "session_id": session_id,
+            "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": round(elapsed * 1000)},
+            "pagination": default_pagination(page),
+            "flow_state": FlowState.IDLE.value,
+        }), 200
+
+    if len(order_data) == 1:
+        # Single match — fall through to _build_final_response which will call
+        # format_order_detail(order_data[0]) for ORDER_STATUS/TRACKING.
+        return None
+
+    # Multiple orders — ask the user to pick one
+    date_after = getattr(entities, "date_after", None)
+    if date_after:
+        from response_generator import _describe_date_period
+        period = _describe_date_period(date_after)
+        bot_msg = f"I found {len(order_data)} orders from {period}. Which one did you mean?"
+    else:
+        bot_msg = f"I found {len(order_data)} recent orders. Which one were you asking about?"
+
+    from handlers.chat_utils import format_order_for_frontend
+    return jsonify({
+        "success": True,
+        "bot_message": bot_msg,
+        "intent": intent.value,
+        "products": [],
+        "orders": [format_order_for_frontend(o) for o in order_data],
+        "suggestions": [],
+        "session_id": session_id,
+        "metadata": {
+            "flow_state": FlowState.AWAITING_ORDER_DETAIL.value,
+            "response_time_ms": round(elapsed * 1000),
+        },
+        "pagination": default_pagination(page),
+        "flow_state": FlowState.AWAITING_ORDER_DETAIL.value,
     }), 200
 
 def handle_order_detail(current_flow_state, customer_id, user_context, session_id, page, start_time):

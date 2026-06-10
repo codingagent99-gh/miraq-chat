@@ -250,8 +250,15 @@ def _merge_llm_entities(llm_result, original_entities, fallback_type, store_load
     llm_intent_str = llm_result.get("intent", "unknown").lower().strip()
 
     try:
-        # Single Source of Truth: cast string directly to the Intent enum
-        new_intent = Intent(llm_intent_str)
+        # Case-insensitive lookup — handles HISTORICAL_SEARCH (value is uppercase, unlike all others)
+        _intent_map = {m.value.lower(): m for m in Intent}
+        new_intent = _intent_map.get(llm_intent_str)
+        if new_intent is None:
+            log.warning(
+                f"Step 1.5: LLM returned unrecognised intent '{llm_intent_str}' — "
+                f"returning None to trigger disambiguation."
+            )
+            return None
     except ValueError:
         # LLM hallucinated a non-existent intent — signal failure to caller
         # so the user gets a clean disambiguation instead of a silent misroute

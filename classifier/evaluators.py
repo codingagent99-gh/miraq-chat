@@ -104,6 +104,10 @@ class OrderActionEvaluator(IntentEvaluator):
 
         if re.search(r"^\s*(my\s+)?orders?\s*[?!.]?\s*$", text):
             return Intent.ORDER_HISTORY, 0.90
+        
+        # Assertion-style: "I should have orders from June" / "I have orders from last month"
+        if re.search(r'\b(?:should\s+have|have|had)\s+(?:an?\s+)?orders?\b', text):
+            return Intent.ORDER_HISTORY, 0.92
 
         if re.search(r"\b(last|latest|most\s*recent|previous)\b.*\border\b", text) and not re.search(r"\b(last|past)\s+\d*\s*(day|week|month|year)s?\b", text):
             entities.order_count = 1
@@ -175,7 +179,18 @@ class ProductDetailEvaluator(IntentEvaluator):
             return Intent.RELATED_PRODUCTS, 0.88
         if re.search(r"\bquick\s*ship\b|\bavailable\s*now\b|\bimmediate\b", text):
             entities.quick_ship = True
+            entities.attributes["quick-ship"] = "yes"  # inject the implied term value
+            # If other filters exist, let the combined filter handle it
+            has_other_filters = bool(
+                entities.product_name
+                or entities.tag_slugs
+                or getattr(entities, 'target_category_slugs', set())
+                or {k: v for k, v in entities.attributes.items() if k != "quick-ship"}
+            )
+            if has_other_filters:
+                return None, 0.0  # fall through to CatalogSearchEvaluator → FILTER_BY_ATTRIBUTE
             return Intent.PRODUCT_QUICK_SHIP, 0.91
+
         return None, 0.0
 
     @staticmethod

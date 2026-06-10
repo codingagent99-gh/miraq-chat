@@ -180,8 +180,9 @@ def handle_flow_state(
             }
 
     # ── State: User is picking intent from menu ──
+    
     if state == FlowState.AWAITING_INTENT_CHOICE:
-        if any(kw in text for kw in ["product", "information", "search", "find"]):
+        if re.search(r'\b(product|information|search|find)\b', text):
             return {
                 "bot_message": (
                     "Sure! What product or category are you looking for? "
@@ -195,14 +196,14 @@ def handle_flow_state(
                 "flow_state": FlowState.AWAITING_PRODUCT_OR_CATEGORY.value,
                 "pass_through": False,
             }
-        elif any(kw in text for kw in ["category", "categories", "browse"]):
+        elif re.search(r'\b(category|categories|browse)\b', text):
             return {
                 "bot_message": "Let me show you our categories!",
                 "flow_state": FlowState.IDLE.value,
-                "pass_through": True,  # Let classifier handle "show categories"
+                "pass_through": True,
                 "override_message": "show me all categories",
             }
-        elif any(kw in text for kw in ["order", "place", "buy", "purchase"]):
+        elif re.search(r'\b(order|place|buy|purchase)\b', text):
             return {
                 "bot_message": (
                     "I can help you place an order! 🛒\n\n"
@@ -217,12 +218,11 @@ def handle_flow_state(
                 "flow_state": FlowState.AWAITING_PRODUCT_OR_CATEGORY.value,
                 "pass_through": False,
             }
-        elif any(kw in text for kw in ["yes", "yeah", "ok", "sure", "start again"]):
+        elif re.search(r'\b(yes|yeah|ok|sure)\b|start\s+again', text):
             return get_disambiguation_message()
         else:
-            # No keyword matched — let the classifier pipeline handle it
             return None
-
+        
     # ── State: Awaiting specific order ID to reorder ──
     if state == FlowState.AWAITING_REORDER_ID:
         if any(kw in text for kw in ["cancel", "stop", "nevermind", "never mind", "quit", "exit"]):

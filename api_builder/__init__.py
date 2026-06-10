@@ -509,8 +509,9 @@ def _build_product_by_tag(e, page) -> list:
     
 def _build_product_quick_ship(e, page) -> list:
     return [build_advanced_filter_call(
-        tags=[TAG_SLUG_QUICK_SHIP], page=page,
-        description="Quick ship / in-stock products",
+        attributes={"quick-ship": "yes"},
+        page=page,
+        description="Quick ship products (pa_quick-ship=yes)",
     )]
 
 
@@ -678,9 +679,21 @@ def _build_save_for_later(e, page) -> list:
 
 def _build_order_tracking(e, page, customer_id=None, role=None) -> list:
     if role in CUSTOM_ORDER_ROLES:
-        return [endpoints.fetch_order(
-            order_id=e.order_id,
-            description=f"Get order #{e.order_id} details",
+        if getattr(e, "order_id", None):
+            return [endpoints.fetch_order(
+                order_id=e.order_id,
+                description=f"Get order #{e.order_id} details",
+            )]
+        # No order_id — list recent orders with optional date filter
+        body = {"customer_id": "CURRENT_USER_ID", "page": page, "per_page": 5}
+        if getattr(e, "date_after", None):
+            body["after"] = e.date_after
+        if getattr(e, "date_before", None):
+            body["before"] = e.date_before
+        return [endpoints.list_cs_orders(
+            body=body,
+            description="CS rep: list recent orders (no order ID provided)",
+            requires_resolution=["customer_id"],
         )]
 
     if ECOMMERCE_BACKEND == "shopify":
@@ -695,23 +708,30 @@ def _build_order_tracking(e, page, customer_id=None, role=None) -> list:
             page=page,
             per_page=5,
             description="Shopify: list recent orders (no order ID provided)",
+            date_after=getattr(e, "date_after", None),
+            date_before=getattr(e, "date_before", None),
         )]
 
-    # ── non-CS users with a specific order_id should also fetch directly ──
     if getattr(e, "order_id", None):
         return [endpoints.fetch_order(
             order_id=e.order_id,
             description=f"Get order #{e.order_id} details",
         )]
 
+    extra = {}
+    if getattr(e, "date_after", None):
+        extra["after"] = e.date_after
+    if getattr(e, "date_before", None):
+        extra["before"] = e.date_before
     return [endpoints.list_customer_orders(
         customer_id="CURRENT_USER_ID",
         page=page,
         per_page=5,
         description="List recent orders (no order ID provided)",
         requires_resolution=["customer_id"],
+        **extra,
     )]
-    
+   
 def _build_place_order(e, page) -> list:
     search_term = e.product_name or e.order_item_name
     attr_filters = resolve_attr_filters(e.attributes)

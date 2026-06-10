@@ -9,7 +9,7 @@ import re
 import html
 from datetime import datetime, timedelta
 from typing import Optional
-
+import calendar
 from models import ExtractedEntities
 from store_registry import get_store_loader
 from config.store_config import (
@@ -747,11 +747,24 @@ def _normalize_fused_dates(text: str) -> str:
     text = re.sub(r'\b(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(20\d{2})\b', r'\1-\2-\3', text)
     return text
 
-
 def extract_time_range(text: str, entities: ExtractedEntities):
     """Extract date/time ranges for order history queries."""
     text_lower = text.lower()
     now = datetime.now()
+
+    # ── Relative: "last/past week/month/year" (bare — no number) ─────────────
+    m_bare = re.search(r'\b(?:last|past)\s+(week|month|year)\b', text_lower)
+    if m_bare:
+        unit = m_bare.group(1)
+        if unit == 'week':
+            start = now - timedelta(weeks=1)
+        elif unit == 'month':
+            start = now - timedelta(days=30)
+        else:
+            start = now - timedelta(days=365)
+        entities.date_after  = start.replace(hour=0,  minute=0,  second=0,  microsecond=0).isoformat()
+        entities.date_before = now.replace(  hour=23, minute=59, second=59, microsecond=999999).isoformat()
+        return
 
     # ── Relative: "last/past N days/weeks/months/years" ──────────────────────
     m_rel = re.search(r'(?:last|past)\s+(\d+)\s+(day|week|month|year)s?', text_lower)
@@ -817,6 +830,23 @@ def extract_time_range(text: str, entities: ExtractedEntities):
         if start and end:
             entities.date_after  = start.replace(hour=0,  minute=0,  second=0,  microsecond=0).isoformat()
             entities.date_before = end.replace(  hour=23, minute=59, second=59, microsecond=999999).isoformat()
+            return
+        
+    # ── Named calendar month: "from june", "in march", "the month of april" ──
+    # Must run before the dateparser guard: dateparser anchors a bare month name
+    # to *today* (both date_after and date_before collapse to the current day).
+    m_named = re.search(
+        rf'\b(?:from|in|during|for|of|month\s+of)\s+({_MONTH_NAMES_PAT})\b',
+        text_lower
+    )
+    if m_named:
+        mon = m_named.group(1)
+        month_num = next((v for k, v in _MONTH_MAP.items() if mon.startswith(k)), None)
+        if month_num:
+            yr = now.year if month_num <= now.month else now.year - 1
+            last_day = calendar.monthrange(yr, month_num)[1]
+            entities.date_after  = datetime(yr, month_num, 1, 0, 0, 0).isoformat()
+            entities.date_before = datetime(yr, month_num, last_day, 23, 59, 59, 999999).isoformat()
             return
 
     # ── Guard: only run dateparser if order-related ───────────────────────────
