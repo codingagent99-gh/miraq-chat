@@ -36,7 +36,13 @@ from models.usage_guard import enforce_daily_limit
 from handlers.chat_utils import default_pagination, build_pagination, format_order_for_frontend
 from handlers.flow_handler import handle_flow
 from handlers.llm_handler import run_llm_fallback
-from handlers.order_handler import handle_reorder, handle_order_detail, handle_quick_order, handle_historical_search
+from handlers.order_handler import (
+    handle_reorder,
+    handle_order_detail,
+    handle_quick_order,
+    handle_historical_search,
+    handle_order_status,
+)
 from handlers.variant_handler import handle_variant_selection, handle_variation_product, handle_quantity_and_variant_check
 from handlers.search_handler import log_matched_products, handle_empty_results
 from handlers.suggestion_retry_handler import handle_suggestion_retry
@@ -1294,6 +1300,10 @@ def chat():
                 return _ft(resp)
 
         # ── Step 9: Route through specialized handlers ──
+        resp = handle_order_status(intent, entities, order_data, customer_id, str(conversation.id), page, start_time)
+        if resp:
+            return _ft(resp)
+
         resp = handle_reorder(intent, entities, order_data, customer_id, str(conversation.id), page, start_time)
         if resp:
             return _ft(resp)
