@@ -48,10 +48,6 @@ from handlers.search_handler import log_matched_products, handle_empty_results
 from handlers.suggestion_retry_handler import handle_suggestion_retry
 from handlers.filter_clarification_handler import resolve_filter_clarification
 from handlers.semantic_clarification_handler import build_semantic_clarification
-from handlers.search_refinement import (
-    is_refinement, apply_refinement, save_active_search,
-    clear_active_search, describe_active_filters,
-)
 from parsers.catalog_parser import parse_csv_message
 from parsers.address_parser import extract_address, address_summary
 from utils.language_utils import detect_and_translate
@@ -729,7 +725,6 @@ def _build_final_response(
     api_responses, api_calls_to_execute, conversation, page, start_time,
     payload_context=None,
     customer_id=None,
-    refinement_summary=None,
 ):
     """Format products and build the final JSON response."""
     products        = []
@@ -770,10 +765,6 @@ def _build_final_response(
             customer_id=customer_id,
         )
         suggestions_list = generate_suggestions(intent, entities, products)
-
-    # ── Refinement prefix: show the accumulated filter set to the shopper ──
-    if refinement_summary:
-        bot_message = f"*Showing {refinement_summary}*\n\n{bot_message}"
 
     # ── Determine flow state ──────────────────────────────────────────────────
     _BROWSING_INTENTS = {
@@ -1247,21 +1238,6 @@ def chat():
         # ── Step 7: Execute API calls ──
         last_product_ctx = user_context.get("last_product")
 
-        # ── Step 6.9: Conversational search refinement ──────────────────────
-        # If this is a product search that only adds narrowing detail to a
-        # fresh prior search, merge the prior filters in (then re-consolidate).
-        # Otherwise it's a new search: drop any stale active-search context.
-        _active_search = user_context.get("active_search")
-        _did_refine = False
-        if is_refinement(intent, entities, _active_search):
-            apply_refinement(intent, entities, _active_search, message)
-            _did_refine = True
-        elif intent in (Intent.PRODUCT_SEARCH, Intent.FILTER_BY_ATTRIBUTE,
-                        Intent.CATEGORY_BROWSE, Intent.PRODUCT_LIST, Intent.PRODUCT_BY_TAG):
-            # A new product search supersedes any previous one.
-            clear_active_search(user_context)
-        # ────────────────────────────────────────────────────────────────────
-
         if _resolve_variant or intent == Intent.BULK_ORDER:
             # Variant resolution uses session-cached variations — no API calls needed.
             # Skipping build_api_calls entirely prevents or_pairs dict-vs-OrPair crashes
@@ -1467,7 +1443,6 @@ def chat():
             api_responses, api_calls_to_execute, conversation, page, start_time,
             payload_context=payload_context,
             customer_id=customer_id,
-            refinement_summary=(describe_active_filters(entities) if _did_refine else None),
         )
 
     except Exception as e:
