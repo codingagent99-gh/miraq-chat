@@ -591,7 +591,6 @@ def generate_suggestions(
     elif intent == Intent.PRODUCT_DETAIL:
         if products:
             suggestions.append(f"Order {products[0]['name']}")
-            suggestions.append("Show me similar products")
     elif intent == Intent.PRODUCT_ATTRIBUTE_INFO:
         if products:
             p_name = products[0].get('name', '')
