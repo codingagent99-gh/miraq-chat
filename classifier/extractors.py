@@ -627,6 +627,13 @@ def extract_order_id(text: str, entities: ExtractedEntities):
     if match:
         entities.order_id = int(match.group(1))
 
+_LOOKUP_EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', re.I)
+
+def extract_email(text: str, entities: ExtractedEntities):
+    """Extract an email address used to filter a rep's orders by recipient."""
+    m = _LOOKUP_EMAIL_RE.search(text)
+    if m:
+        entities.lookup_email = m.group(0).lower()
 
 def extract_collection_year(text: str, entities: ExtractedEntities):
     """Extract collection year and associated tags."""

@@ -23,6 +23,7 @@ from classifier.extractors import (
     extract_tag,
     extract_collection_year,
     extract_order_id,
+    extract_email,
     extract_time_range,
     extract_order_item,
     extract_unresolved_descriptors,
@@ -123,6 +124,7 @@ def classify(utterance: str) -> ClassifiedResult:
     # ─── 4. Secondary extractions ───
     extract_collection_year(text, entities)
     extract_order_id(text, entities)
+    extract_email(text, entities)
     logger.debug("ClassifierPipeline: Calling extract_time_range")
     extract_time_range(text, entities)
     logger.debug(f"ClassifierPipeline: After extract_time_range | entities={entities}")

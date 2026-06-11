@@ -684,15 +684,21 @@ def _build_order_tracking(e, page, customer_id=None, role=None) -> list:
                 order_id=e.order_id,
                 description=f"Get order #{e.order_id} details",
             )]
-        # No order_id — list recent orders with optional date filter
-        body = {"customer_id": "CURRENT_USER_ID", "page": page, "per_page": 5}
+        # No order_id — list orders. Widen the net when we'll filter client-side
+        # (email lookup or date range) so the target isn't missed beyond page 1.
+        _will_filter = bool(getattr(e, "lookup_email", None) or getattr(e, "date_after", None))
+        body = {
+            "customer_id": "CURRENT_USER_ID",
+            "page": page,
+            "per_page": 50 if _will_filter else DEFAULT_ORDER_PER_PAGE,
+        }
         if getattr(e, "date_after", None):
             body["after"] = e.date_after
         if getattr(e, "date_before", None):
             body["before"] = e.date_before
         return [endpoints.list_cs_orders(
             body=body,
-            description="CS rep: list recent orders (no order ID provided)",
+            description="CS rep: list orders (no order ID provided)",
             requires_resolution=["customer_id"],
         )]
 

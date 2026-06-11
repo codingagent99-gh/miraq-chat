@@ -160,6 +160,23 @@ def _merge_phase_entities(result):
             f"[EntityMerge] Restored attribute_term_ids={phase1.attribute_term_ids}"
         )
 
+    # Restore lookup_email if pass-2 stripped the email from its text.
+    # Phase-2 runs on attribute-masked text, which removes the '@domain' token,
+    # so extract_email finds nothing on pass-2 and the address is lost without this.
+    if not entities.lookup_email and getattr(phase1, "lookup_email", None):
+        entities.lookup_email = phase1.lookup_email
+        logger.debug(
+            f"[EntityMerge] Restored lookup_email={phase1.lookup_email!r} from phase-1 entities"
+        )
+
+    # Restore date range if pass-2 lost it (same masking risk as lookup_email).
+    if not entities.date_after and getattr(phase1, "date_after", None):
+        entities.date_after  = phase1.date_after
+        entities.date_before = phase1.date_before
+        logger.debug(
+            f"[EntityMerge] Restored date_after={phase1.date_after!r} from phase-1 entities"
+        )
+
     # Use pass-1 intent/confidence when pass-2 fell back to a weaker signal
     _WEAK_INTENTS = {Intent.PRODUCT_SEARCH}
     if result.intent in _WEAK_INTENTS and getattr(result, "phase1_intent", None) not in _WEAK_INTENTS:
@@ -1181,13 +1198,18 @@ def chat():
                     intent, entities, confidence, result = llm_outcome
 
         # ── Step 5: Semantic clarification ──
+        # Skip entirely when an email lookup is in play: an email address can
+        # contain a catalog term as a substring (e.g. "a.annick@interior...")
+        # which would falsely match a category and hijack the order-status flow.
         if (
             entities.semantic_matches
+            and not getattr(entities, "lookup_email", None)
             and current_flow_state != FlowState.AWAITING_FILTER_CLARIFICATION
             and intent not in (
                 Intent.PRODUCT_ATTRIBUTE_INFO, Intent.PRODUCT_VARIATIONS,
                 Intent.QUICK_ORDER, Intent.PLACE_ORDER, Intent.ORDER_ITEM,
                 Intent.BULK_ORDER,
+                Intent.ORDER_STATUS, Intent.ORDER_TRACKING,
             )
         ):
             clarification_resp = build_semantic_clarification(
@@ -1300,6 +1322,17 @@ def chat():
                 return _ft(resp)
 
         # ── Step 9: Route through specialized handlers ──
+        # ── Email filter: narrow rep's orders to a specific recipient ──
+        # When a rep asks "status of the order I sent to <email>", keep only the
+        # orders whose billing email matches. The fetch is widened to 50 in
+        # _build_order_tracking when a lookup_email/date filter is present so the
+        # target isn't missed beyond the default page size.
+        if role in BULK_ORDER_ROLES and getattr(entities, "lookup_email", None) and order_data:
+            _want = entities.lookup_email.lower()
+            order_data = [
+                o for o in order_data
+                if (o.get("billing", {}).get("email") or "").lower() == _want
+            ]
         resp = handle_order_status(intent, entities, order_data, customer_id, str(conversation.id), page, start_time)
         if resp:
             return _ft(resp)

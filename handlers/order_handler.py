@@ -433,26 +433,41 @@ def handle_order_status(intent, entities, order_data, customer_id, session_id, p
     """Step 3.5d: Handle ORDER_STATUS/ORDER_TRACKING when no specific order ID was given.
 
     When the user asks about an order without providing a number, api_builder
-    falls back to list_customer_orders (filtered by date if available). This
-    handler interprets that list:
-      - 0 results → clear no-match message
-      - 1 result  → return None so _build_final_response calls format_order_detail normally
-      - 2+ results → show the list, set AWAITING_ORDER_DETAIL for disambiguation
+    falls back to list_cs_orders (filtered by date if available). chat.py may
+    further narrow the result by lookup_email (a rep asking about the order they
+    sent to a specific recipient). This handler interprets the resulting list:
+      - 0 results → clear no-match message, naming the email/period searched
+      - 1 result  → return None so _build_final_response calls format_order_detail
+      - 2+ results → tappable order cards, AWAITING_ORDER_DETAIL (tap re-enters
+                     as "show me order #N" and resolves to a single detail)
     """
     if intent not in (Intent.ORDER_STATUS, Intent.ORDER_TRACKING):
         return None
-    # Specific order_id was present — the direct fetch already ran; let
-    # _build_final_response call format_order_detail(order_data[0]) as normal.
+    # Specific order_id was present — the direct fetch already ran (this is also
+    # the path taken when the user taps an order card, which re-enters as
+    # "show me order #N"). Let _build_final_response call format_order_detail.
     if getattr(entities, "order_id", None):
         return None
 
-    elapsed = time.time() - start_time
+    elapsed      = time.time() - start_time
+    lookup_email = getattr(entities, "lookup_email", None)
+    date_after   = getattr(entities, "date_after", None)
 
+    # Build the human-readable period phrase once (exception-safe helper).
+    period = None
+    if date_after:
+        from response_generator import _describe_date_period
+        period = _describe_date_period(date_after)
+
+    # ── 0 results ──────────────────────────────────────────────────────────
+    # Name the email and/or period so the message reflects what was actually
+    # searched — "no orders for X from the last week", not a generic miss.
     if not order_data:
-        date_after = getattr(entities, "date_after", None)
-        if date_after:
-            from response_generator import _describe_date_period
-            period = _describe_date_period(date_after)
+        if lookup_email and period:
+            msg = f"I couldn't find any orders for **{lookup_email}** from {period}."
+        elif lookup_email:
+            msg = f"I couldn't find any orders for **{lookup_email}**."
+        elif period:
             msg = f"I couldn't find any orders from {period}."
         else:
             msg = "I couldn't find any recent orders on your account."
@@ -468,19 +483,26 @@ def handle_order_status(intent, entities, order_data, customer_id, session_id, p
             "flow_state": FlowState.IDLE.value,
         }), 200
 
+    # ── 1 result ───────────────────────────────────────────────────────────
+    # Single match — fall through to _build_final_response which will call
+    # format_order_detail(order_data[0]) for ORDER_STATUS/TRACKING.
     if len(order_data) == 1:
-        # Single match — fall through to _build_final_response which will call
-        # format_order_detail(order_data[0]) for ORDER_STATUS/TRACKING.
         return None
 
-    # Multiple orders — ask the user to pick one
-    date_after = getattr(entities, "date_after", None)
-    if date_after:
-        from response_generator import _describe_date_period
-        period = _describe_date_period(date_after)
-        bot_msg = f"I found {len(order_data)} orders from {period}. Which one did you mean?"
+    # ── 2+ results ─────────────────────────────────────────────────────────
+    # Present tappable order cards. AWAITING_ORDER_DETAIL is safe here: tapping
+    # a card sends "show me order #N", which re-enters the pipeline, resolves
+    # via extract_order_id -> fetch_order, and exits to flow_state IDLE.
+    # (Bot text is suppressed by the frontend when order cards render; the copy
+    # below is an accessibility/fallback string only.)
+    if lookup_email and period:
+        bot_msg = f"I found {len(order_data)} orders for **{lookup_email}** from {period}. Tap one to see its status."
+    elif lookup_email:
+        bot_msg = f"I found {len(order_data)} orders for **{lookup_email}**. Tap one to see its status."
+    elif period:
+        bot_msg = f"I found {len(order_data)} orders from {period}. Tap one to see its status."
     else:
-        bot_msg = f"I found {len(order_data)} recent orders. Which one were you asking about?"
+        bot_msg = f"I found {len(order_data)} recent orders. Tap one to see its status."
 
     from handlers.chat_utils import format_order_for_frontend
     return jsonify({

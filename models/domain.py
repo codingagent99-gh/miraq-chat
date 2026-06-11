@@ -91,7 +91,6 @@ class Intent(Enum):
     CHECKOUT          = "checkout"
     BULK_ORDER        = "bulk_order"
 
-
 # ══════════════════════════════════════════════════════════════
 # OR PAIR — typed replacement for List[dict]
 # ══════════════════════════════════════════════════════════════
@@ -133,7 +132,6 @@ class OrPair:
     def is_valid(self) -> bool:
         """An OR pair needs at least 2 branches to be meaningful."""
         return self.branches >= 2
-
 
 # ══════════════════════════════════════════════════════════════
 # EXTRACTED ENTITIES
@@ -195,6 +193,7 @@ class ExtractedEntities:
     order_count: Optional[int] = None
     order_item_name: Optional[str] = None
     explicit_last_order: bool = False
+    lookup_email: Optional[str] = None
 
     # ──── Attribute info query ────
     target_attribute: Optional[str] = None
