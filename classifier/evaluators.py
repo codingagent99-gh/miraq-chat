@@ -57,7 +57,7 @@ class OrderActionEvaluator(IntentEvaluator):
                 entities.order_count = 1
             return Intent.HISTORICAL_SEARCH, 0.96
 
-        _is_tracking_or_info = re.search(r"\b(track|tracking|status|where|last|history|previous|past|look|show|search|browse|find|see|display)\b", text)
+        _is_tracking_or_info = re.search(r"\b(track|tracking|status|where|last|latest|most\s*recent|history|previous|past|look|show|search|browse|find|see|display|detail|details|info|provide)\b", text)
 
         if re.search(r"\bwant\s+to\s+(order|buy|purchase)\b|\bi'?d\s+like\s+to\s+(order|buy|purchase)\b|\bplace\s+(an?\s+)?order\b", text) and not _is_tracking_or_info:
             return Intent.QUICK_ORDER, 0.93
