@@ -670,13 +670,13 @@ def handle_variation_product(
 
     resolved_variation = None
     matched_variation = None
+    variation_products = []
 
     if intent == Intent.PRODUCT_ATTRIBUTE_INFO:
         products = [parent_formatted]
         logger.info("Step 3.7: Attribute Info requested. Returning ONLY parent product card.")
 
     elif variations_raw and has_attributes:
-        variation_products = []
         if intent == Intent.PRODUCT_DETAIL:
             matched_variations = match_variation_to_entities(variations_raw, entities)
             matched_variation = matched_variations[0] if len(matched_variations) == 1 else None
