@@ -1287,13 +1287,6 @@ def chat():
             if all_products_raw:
                 first_prod = all_products_raw[0]
                 user_context["last_product"] = {"id": first_prod.get("id"), "name": first_prod.get("name")}
-                # Persist the (consolidated, possibly-merged) filter set as the
-                # active search so the next narrowing query can refine it.
-                if intent in (Intent.PRODUCT_SEARCH, Intent.FILTER_BY_ATTRIBUTE,
-                              Intent.CATEGORY_BROWSE, Intent.PRODUCT_LIST, Intent.PRODUCT_BY_TAG):
-                    save_active_search(user_context, entities)
-                    conversation.context_data = user_context
-                    flag_modified(conversation, "context_data")
                 if current_flow_state not in _LOCK_STATES:
                     user_context["pending_product_id"]   = first_prod.get("id")
                     user_context["pending_product_name"] = first_prod.get("name")
