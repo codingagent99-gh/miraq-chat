@@ -585,6 +585,52 @@ def handle_variant_selection(
     }), 200
 
 
+def _seed_resolved_from_entities(entities, variations: list, store_loader) -> dict:
+    """
+    Map the attributes the user already stated (entities.attributes) onto the
+    variation axis they belong to, by matching VALUES against each axis's
+    options. Returns {axis_display_name: matched_option_display}.
+
+    Matching on value (not key) sidesteps classifier key fragmentation —
+    e.g. entities may carry {'colors 2': 'beige'} or {'colors': 'adams-beige'},
+    but we just look for which axis has an option that corresponds to 'beige'.
+    """
+    seeded: dict = {}
+    ent_attrs = getattr(entities, "attributes", None) or {}
+    if not ent_attrs or not variations:
+        return seeded
+
+    # Collect the requested values, normalised (strip non-alphanumerics, lower).
+    def _norm(s):
+        return re.sub(r'[^a-z0-9]+', '', str(s).lower())
+
+    requested = set()
+    for v in ent_attrs.values():
+        for part in re.split(r'\s*(?:,|and|&)\s*', str(v), flags=re.IGNORECASE):
+            n = _norm(part)
+            if n:
+                requested.add(n)
+    if not requested:
+        return seeded
+
+    # For each axis present on the variations, see if any of its option values
+    # corresponds to a requested value (substring either direction handles
+    # "beige" vs "adams beige").
+    for var in variations:
+        opts = _get_safe_options(var.get("attributes", []), store_loader)
+        for axis_name, opt_display in opts.items():
+            if axis_name in seeded:
+                continue
+            opt_norm = _norm(opt_display)
+            if not opt_norm:
+                continue
+            for req in requested:
+                if req and (req in opt_norm or opt_norm in req):
+                    seeded[axis_name] = opt_display
+                    break
+    return seeded
+
+
 def handle_variation_product(
     intent,
     entities,
@@ -854,12 +900,18 @@ def handle_variation_product(
 
     if matched_variation is None and len(variation_products) > 1 and user_context is not None and conversation is not None:
         if intent in ORDER_CREATE_INTENTS:
-            # Order intent tie — user must pick a specific variant before we can proceed
+            # Order intent tie — user must pick a specific variant before we can proceed.
+            # Seed any axis the user ALREADY stated (e.g. "Adams Beige" → Colors: ADAMS Beige)
+            # so the variant prompt only asks for the axes still missing, and the
+            # stated color survives across turns instead of being re-asked.
+            _seeded = _seed_resolved_from_entities(entities, variation_products, _sl)
             user_context["pending_product_id"] = parent_product_raw.get("id")
             user_context["pending_product_name"] = parent_formatted["name"]
-            user_context["resolved_attributes"] = {}
+            user_context["resolved_attributes"] = _seeded
             conversation.context_data = user_context
             flag_modified(conversation, "context_data")
+            if _seeded:
+                logger.info(f"Step 3.7: Seeded resolved axes from user input → {_seeded}")
             next_flow_state = FlowState.AWAITING_VARIANT_SELECTION.value
             suggestions = ["Cancel"]
         # Browsing intent — show all variations, remain IDLE
@@ -1210,6 +1262,9 @@ def handle_quantity_and_variant_check(
             from handlers.chat_utils import build_variant_prompt, _compute_variant_options
             prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug, resolved_attr_values=resolved_attr_values)
             _variant_options = _compute_variant_options(_raw_for_prompt, getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug)
+            _seeded = _seed_resolved_from_entities(entities, _variations_for_cache, _sl)
+            if _seeded:
+                logger.info(f"Step 5.5 (variant prompt): Seeded resolved axes from user input → {_seeded}")
             elapsed = time.time() - start_time
             return jsonify({
                 "success": True,
@@ -1223,6 +1278,7 @@ def handle_quantity_and_variant_check(
                     "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
                     "pending_product_id": product.get("id"),
                     "pending_product_name": product["name"],
+                    "resolved_attributes": _seeded,
                     "response_time_ms": round(elapsed * 1000),
                 },
                 "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
@@ -1295,6 +1351,12 @@ def handle_quantity_and_variant_check(
         from handlers.chat_utils import build_variant_prompt, _compute_variant_options
         prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug, resolved_attr_values=resolved_attr_values)
         _variant_options = _compute_variant_options(_raw_for_prompt, getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug)
+        # Axes the user already stated (e.g. "Adams Beige" → Colors). Returned in
+        # metadata so the caller persists them; this keeps the stated color from
+        # being re-asked after the remaining axes (Finish/Sample Size) are answered.
+        _seeded = _seed_resolved_from_entities(entities, _variations_for_cache, _sl)
+        if _seeded:
+            logger.info(f"Step 3.7 (quick): Seeded resolved axes from user input → {_seeded}")
         elapsed = time.time() - start_time
         return jsonify({
             "success": True,
@@ -1309,6 +1371,7 @@ def handle_quantity_and_variant_check(
                 "pending_product_id":   product.get("id"),
                 "pending_product_name": product["name"],
                 "pending_quantity":     entities.quantity,
+                "resolved_attributes":  _seeded,
                 "response_time_ms":     round(elapsed * 1000),
             },
             "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
