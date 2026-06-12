@@ -399,13 +399,21 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
 
     if not loader:
         return original_nlp_result
+    
+    # Strip noise words before Phase 1 sees the text
+    from config.store_config import GENERIC_NOISE_WORDS
+    import re
+    clean_msg = msg.lower()
+    for gw in GENERIC_NOISE_WORDS:
+        clean_msg = re.sub(rf'\b{re.escape(gw)}\b', ' ', clean_msg)
+    clean_msg = re.sub(r'\s+', ' ', clean_msg).strip()
 
     # Phase 1: Catalog match
-    entities, unmatched_text = phase1_catalog_match(msg, loader)
+    entities, unmatched_text = phase1_catalog_match(clean_msg, loader)
 
     # Phase 2: NLP fallback merge
     # Pass original_msg so phase2 can skip re-classify when Phase 1 matched nothing
-    nlp_entities = phase2_nlp_merge(unmatched_text, entities, original_nlp_result, loader, original_msg=msg)
+    nlp_entities = phase2_nlp_merge(unmatched_text, entities, original_nlp_result, loader, original_msg=clean_msg)
 
     # Phase 3: Semantic vector search
     phase3_semantic_search(unmatched_text, nlp_entities, entities, loader)
