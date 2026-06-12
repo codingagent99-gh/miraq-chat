@@ -162,3 +162,16 @@ def _load_single_value_attributes() -> set:
     return {x.lower().strip() for x in _DEFAULT_SINGLE_VALUE_ATTRIBUTES}
 
 SINGLE_VALUE_ATTRIBUTES: set = _load_single_value_attributes()
+
+# ═══════════════════════════════════════════════════════════════
+# SEMANTIC AUTO-APPLY THRESHOLD
+# When there is exactly one semantic match candidate and its vector score
+# meets or exceeds this value, the match is applied silently — no prompt.
+# Below the threshold (or multiple candidates), clarification is shown.
+# Lower = more auto-applies (faster UX, occasional silent wrong match).
+# Override via env var SEMANTIC_AUTO_APPLY_THRESHOLD (float, e.g. "0.55").
+# ═══════════════════════════════════════════════════════════════
+
+SEMANTIC_AUTO_APPLY_THRESHOLD: float = float(
+    os.getenv("SEMANTIC_AUTO_APPLY_THRESHOLD", "0.55")
+)
