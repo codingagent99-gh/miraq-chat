@@ -46,12 +46,13 @@ from handlers.order_handler import (
 from handlers.variant_handler import handle_variant_selection, handle_variation_product, handle_quantity_and_variant_check
 from handlers.search_handler import log_matched_products, handle_empty_results
 from handlers.suggestion_retry_handler import handle_suggestion_retry
-from handlers.filter_clarification_handler import resolve_filter_clarification
+from handlers.filter_clarification_handler import resolve_filter_clarification, apply_semantic_match
 from handlers.semantic_clarification_handler import build_semantic_clarification
 from handlers.search_refinement import (
     merge_into_active_search, save_active_search, clear_active_search,
     describe_active_filters,
 )
+from config.store_config import SEMANTIC_AUTO_APPLY_THRESHOLD
 from parsers.catalog_parser import parse_csv_message
 from parsers.address_parser import extract_address, address_summary
 from utils.language_utils import detect_and_translate
@@ -1240,7 +1241,7 @@ def chat():
                 if isinstance(llm_outcome, tuple) and len(llm_outcome) == 4:
                     intent, entities, confidence, result = llm_outcome
 
-        # ── Step 5: Semantic clarification ──
+        # ── Step 5: Semantic match resolution (auto-apply or clarify) ──
         # Skip entirely when an email lookup is in play: an email address can
         # contain a catalog term as a substring (e.g. "a.annick@interior...")
         # which would falsely match a category and hijack the order-status flow.
@@ -1255,13 +1256,41 @@ def chat():
                 Intent.ORDER_STATUS, Intent.ORDER_TRACKING,
             )
         ):
-            clarification_resp = build_semantic_clarification(
-                entities, user_context, str(conversation.id), page, start_time, flow_result,
-            )
-            if clarification_resp:
-                conversation.context_data = user_context
-                flag_modified(conversation, "context_data")
-                return _ft(clarification_resp)
+            _rejected = user_context.get("rejected_semantic_terms", [])
+            _sem_groups = [
+                [c] if isinstance(c, dict) else list(c)
+                for c in entities.semantic_matches
+            ]
+            _sem_groups = [
+                [c for c in g if c["suggested_name"] not in _rejected]
+                for g in _sem_groups
+            ]
+            _sem_groups = [g for g in _sem_groups if g]
+
+            _auto_applied = False
+            if (
+                len(_sem_groups) == 1
+                and len(_sem_groups[0]) == 1
+                and _sem_groups[0][0].get("score", 0) >= SEMANTIC_AUTO_APPLY_THRESHOLD
+            ):
+                _m = _sem_groups[0][0]
+                apply_semantic_match(entities, _m)
+                entities.semantic_matches = []
+                entities.search_term = None  # discard noise leftover (e.g. "filter")
+                _auto_applied = True
+                logger.info(
+                    f"[SemanticAutoApply] score={_m.get('score', 0):.4f} >= {SEMANTIC_AUTO_APPLY_THRESHOLD}"
+                    f" | applied {_m['type']}:{_m['suggested_name']}"
+                )
+
+            if not _auto_applied:
+                clarification_resp = build_semantic_clarification(
+                    entities, user_context, str(conversation.id), page, start_time, flow_result,
+                )
+                if clarification_resp:
+                    conversation.context_data = user_context
+                    flag_modified(conversation, "context_data")
+                    return _ft(clarification_resp)
 
         # ── Step 6: Empty order guard ──
         empty_resp = _check_empty_order(intent, entities, conversation, page, start_time)

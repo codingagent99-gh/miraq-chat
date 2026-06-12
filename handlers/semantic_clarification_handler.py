@@ -114,6 +114,7 @@ def build_semantic_clarification(
             if has_strong_filters:
                 suggestion_buttons.append("Skip - use my current filters")
 
+    suggestion_buttons.append("New Search")
     suggestion_buttons.append("Cancel")
 
     elapsed = time.time() - start_time

@@ -8,6 +8,42 @@ from conversation_flow import FlowState
 from utils.entity_helpers import restore_carryover, merge_attribute
 
 
+def apply_semantic_match(entities, opt):
+    """
+    Apply a single semantic match option to entities in-place.
+
+    Shared by both the manual-accept path (resolve_filter_clarification) and
+    the auto-apply path (chat.py Step 5), so both paths produce identical
+    entity mutations for the same match.
+    """
+    is_neg = opt.get("is_negative", False)
+    if opt["type"] == "tag":
+        if is_neg:
+            if not hasattr(entities, 'excluded_tags'):
+                entities.excluded_tags = []
+            entities.excluded_tags.append(opt["slug"])
+        else:
+            entities.tag_slugs.append(opt["slug"])
+    elif opt["type"] == "category":
+        if is_neg:
+            if not hasattr(entities, 'excluded_categories'):
+                entities.excluded_categories = []
+            entities.excluded_categories.append(opt["slug"])
+        else:
+            entities.target_category_slugs.add(opt["slug"])
+            entities.category_name = opt["suggested_name"]
+    elif opt["type"] == "attribute":
+        taxonomy = opt["taxonomy"]
+        if is_neg:
+            if not hasattr(entities, 'excluded_attributes'):
+                entities.excluded_attributes = {}
+            if taxonomy not in entities.excluded_attributes:
+                entities.excluded_attributes[taxonomy] = []
+            entities.excluded_attributes[taxonomy].append(opt["slug"])
+        else:
+            merge_attribute(entities.attributes, taxonomy, opt["slug"])
+
+
 def resolve_filter_clarification(message, user_context, pending_semantic):
     """
     Resolve user response to a semantic filter clarification prompt.
@@ -66,32 +102,7 @@ def resolve_filter_clarification(message, user_context, pending_semantic):
         options_to_apply.extend(pending_semantic.get("extra_semantics", []))
 
         for opt in options_to_apply:
-            is_neg = opt.get("is_negative", False)
-            if opt["type"] == "tag":
-                if is_neg:
-                    if not hasattr(entities, 'excluded_tags'):
-                        entities.excluded_tags = []
-                    entities.excluded_tags.append(opt["slug"])
-                else:
-                    entities.tag_slugs.append(opt["slug"])
-            elif opt["type"] == "category":
-                if is_neg:
-                    if not hasattr(entities, 'excluded_categories'):
-                        entities.excluded_categories = []
-                    entities.excluded_categories.append(opt["slug"])
-                else:
-                    entities.target_category_slugs.add(opt["slug"])
-                    entities.category_name = opt["suggested_name"]
-            elif opt["type"] == "attribute":
-                taxonomy = opt["taxonomy"]
-                if is_neg:
-                    if not hasattr(entities, 'excluded_attributes'):
-                        entities.excluded_attributes = {}
-                    if taxonomy not in entities.excluded_attributes:
-                        entities.excluded_attributes[taxonomy] = []
-                    entities.excluded_attributes[taxonomy].append(opt["slug"])
-                else:
-                    merge_attribute(entities.attributes, taxonomy, opt["slug"])
+            apply_semantic_match(entities, opt)
 
     elif is_reject:
         if "rejected_semantic_terms" not in user_context:
@@ -122,5 +133,5 @@ def resolve_filter_clarification(message, user_context, pending_semantic):
     if is_reject:
         bypass_intent = Intent.PRODUCT_SEARCH
     else:
-        bypass_intent = Intent.PRODUCT_SEARCH if getattr(entities, 'product_id', None) else Intent.FILTER_BY_ATTRIBUTE    
+        bypass_intent = Intent.PRODUCT_SEARCH if getattr(entities, 'product_id', None) else Intent.FILTER_BY_ATTRIBUTE
     return ClassifiedResult(intent=bypass_intent, entities=entities, confidence=0.98)
