@@ -128,3 +128,37 @@ def _load_generic_noise_words() -> list:
     return list(_DEFAULT_GENERIC_NOISE_WORDS)
 
 GENERIC_NOISE_WORDS: list = _load_generic_noise_words()
+
+
+# ═══════════════════════════════════════════════════════════════
+# SINGLE-VALUE ATTRIBUTES  (conversational search refinement)
+# When refining an active search, a new value for an attribute that is already
+# set either REPLACES the old value (single-value) or is ADDED alongside it
+# (multi-value, the default).
+#
+# WooCommerce cannot tell us this — every pa_* attribute is structurally
+# multi-value — so it is a human/semantic decision. Default is APPEND (safe:
+# never produces a zero-result from an unwanted replace). List here only the
+# attributes that should REPLACE instead.
+#
+# IMPORTANT: keys must be the NEUTRAL attribute key, matching how
+# entities.attributes is keyed — i.e. taxonomy with "pa_" stripped and
+# hyphens turned to spaces (e.g. pa_quick-ship -> "quick ship"), lowercased.
+# `price` is always single-value and is handled in code, not listed here.
+# Override via env var SINGLE_VALUE_ATTRIBUTES_JSON (JSON array).
+# ═══════════════════════════════════════════════════════════════
+
+_DEFAULT_SINGLE_VALUE_ATTRIBUTES = ["size", "thickness", "weight", "width", "length", "depth"]
+
+def _load_single_value_attributes() -> set:
+    raw = os.getenv("SINGLE_VALUE_ATTRIBUTES_JSON", "")
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return {str(x).lower().strip() for x in parsed}
+        except Exception:
+            pass
+    return {x.lower().strip() for x in _DEFAULT_SINGLE_VALUE_ATTRIBUTES}
+
+SINGLE_VALUE_ATTRIBUTES: set = _load_single_value_attributes()

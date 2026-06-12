@@ -48,6 +48,10 @@ from handlers.search_handler import log_matched_products, handle_empty_results
 from handlers.suggestion_retry_handler import handle_suggestion_retry
 from handlers.filter_clarification_handler import resolve_filter_clarification
 from handlers.semantic_clarification_handler import build_semantic_clarification
+from handlers.search_refinement import (
+    merge_into_active_search, save_active_search, clear_active_search,
+    describe_active_filters,
+)
 from parsers.catalog_parser import parse_csv_message
 from parsers.address_parser import extract_address, address_summary
 from utils.language_utils import detect_and_translate
@@ -725,6 +729,7 @@ def _build_final_response(
     api_responses, api_calls_to_execute, conversation, page, start_time,
     payload_context=None,
     customer_id=None,
+    refinement_summary=None,
 ):
     """Format products and build the final JSON response."""
     products        = []
@@ -765,6 +770,19 @@ def _build_final_response(
             customer_id=customer_id,
         )
         suggestions_list = generate_suggestions(intent, entities, products)
+
+    # ── Refinement prefix + New Search affordance ──
+    # On a refined search, show the accumulated filter set so the shopper always
+    # knows what they're looking at. Whenever product results are shown, offer
+    # "New Search" — the only (guaranteed) way to reset the accumulated filters.
+    _PRODUCT_RESULT_INTENTS = {
+        Intent.PRODUCT_SEARCH, Intent.FILTER_BY_ATTRIBUTE,
+        Intent.CATEGORY_BROWSE, Intent.PRODUCT_LIST, Intent.PRODUCT_BY_TAG,
+    }
+    if refinement_summary:
+        bot_message = f"*Showing {refinement_summary}*\n\n{bot_message}"
+    if intent in _PRODUCT_RESULT_INTENTS and products and "New Search" not in suggestions_list:
+        suggestions_list = list(suggestions_list) + ["New Search"]
 
     # ── Determine flow state ──────────────────────────────────────────────────
     _BROWSING_INTENTS = {
@@ -1013,6 +1031,31 @@ def chat():
             "pagination": default_pagination(page),
         }), 400
 
+    # ── New Search reset ──────────────────────────────────────────────────
+    # ARCHITECTURALLY DISTINCT from the suggestion-interpretation system: this
+    # is an early exact-match interceptor (like __bulk_order_trigger__), not a
+    # phrase the classifier happens to handle. It is merely DELIVERED via a
+    # suggestion chip ("New Search") because that is zero-frontend. Do NOT
+    # "consolidate" this by routing it through classify() — the whole point is a
+    # GUARANTEED reset, not a probable one.
+    if message.strip().lower() == "new search":
+        clear_active_search(user_context)
+        conversation.context_data = user_context
+        conversation.flow_state = FlowState.IDLE.value
+        flag_modified(conversation, "context_data")
+        db.session.commit()
+        return jsonify({
+            "success": True,
+            "bot_message": "What would you like to search for?",
+            "intent": "new_search",
+            "products": [],
+            "suggestions": [],
+            "session_id": str(conversation.id),
+            "metadata": {"flow_state": FlowState.IDLE.value},
+            "flow_state": FlowState.IDLE.value,
+            "pagination": default_pagination(page),
+        }), 200
+
     try:
         # ── Save user message ──
         user_msg = Message(conversation_id=conversation.id, role="user", content=message)
@@ -1238,6 +1281,22 @@ def chat():
         # ── Step 7: Execute API calls ──
         last_product_ctx = user_context.get("last_product")
 
+        # ── Step 6.9: Conversational search refinement (button-based) ───────
+        # Typing always CONTINUES the active search — no new-vs-refine guessing.
+        # Merge accumulated filters into this turn's entities for product-search
+        # intents. Reset happens only via the "New Search" interceptor above.
+        _PRODUCT_SEARCH_INTENTS = (
+            Intent.PRODUCT_SEARCH, Intent.FILTER_BY_ATTRIBUTE,
+            Intent.CATEGORY_BROWSE, Intent.PRODUCT_LIST, Intent.PRODUCT_BY_TAG,
+        )
+        _did_refine = False
+        if intent in _PRODUCT_SEARCH_INTENTS:
+            _active = user_context.get("active_search")
+            if _active:
+                merge_into_active_search(entities, _active)
+                _did_refine = True
+        # ────────────────────────────────────────────────────────────────────
+
         if _resolve_variant or intent == Intent.BULK_ORDER:
             # Variant resolution uses session-cached variations — no API calls needed.
             # Skipping build_api_calls entirely prevents or_pairs dict-vs-OrPair crashes
@@ -1287,6 +1346,13 @@ def chat():
             if all_products_raw:
                 first_prod = all_products_raw[0]
                 user_context["last_product"] = {"id": first_prod.get("id"), "name": first_prod.get("name")}
+                # Persist the (consolidated, merged) filter set so the next turn
+                # accumulates on top of it. Only on success — never carry a
+                # zero-result filter set forward as a refinement base.
+                if intent in _PRODUCT_SEARCH_INTENTS:
+                    save_active_search(user_context, entities)
+                    conversation.context_data = user_context
+                    flag_modified(conversation, "context_data")
                 if current_flow_state not in _LOCK_STATES:
                     user_context["pending_product_id"]   = first_prod.get("id")
                     user_context["pending_product_name"] = first_prod.get("name")
@@ -1364,27 +1430,6 @@ def chat():
             resolved_attr_values=user_context.get("resolved_attr_values"),
         )
         if resp:
-            # Persist seeded resolved axes (e.g. Colors: ADAMS Beige) so the
-            # stated color survives into the next variant-selection turn.
-            # The handler returns a (Response, status) tuple — unwrap it.
-            _meta = {}
-            try:
-                _resp_obj = resp[0] if isinstance(resp, tuple) else resp
-                _payload = _resp_obj.get_json(silent=True) or {}
-                _meta = _payload.get("metadata", {}) or {}
-            except Exception:
-                _meta = {}
-            if isinstance(_meta, dict) and _meta.get("resolved_attributes"):
-                user_context["resolved_attributes"]  = _meta["resolved_attributes"]
-                if _meta.get("pending_product_id"):
-                    user_context["pending_product_id"]   = _meta["pending_product_id"]
-                if _meta.get("pending_product_name"):
-                    user_context["pending_product_name"] = _meta["pending_product_name"]
-                if _meta.get("pending_quantity"):
-                    user_context["pending_quantity"] = _meta["pending_quantity"]
-                conversation.context_data = user_context
-                flag_modified(conversation, "context_data")
-                logger.info(f"Step 5.5: Persisted seeded resolved_attributes={_meta['resolved_attributes']}")
             return _ft(resp)
 
         resp = handle_quick_order(
@@ -1423,6 +1468,30 @@ def chat():
         if resp:
             return _ft(resp)
 
+        # ── Zero-result safety net for refined searches ──
+        # Accumulated filters can AND down to nothing (e.g. beige + marble).
+        # Name the active filters and point to New Search, so the shopper can
+        # self-correct without the backend guessing intent.
+        if _did_refine and not all_products_raw and intent in _PRODUCT_SEARCH_INTENTS:
+            _filters = describe_active_filters(entities)
+            _elapsed = time.time() - start_time
+            return _ft(jsonify({
+                "success": True,
+                "bot_message": (
+                    f"No products match **{_filters}**.\n\n"
+                    "Tap **New Search** to start over, or try a different filter."
+                    if _filters else
+                    "No products match those filters.\n\nTap **New Search** to start over."
+                ),
+                "intent": intent.value,
+                "products": [],
+                "suggestions": ["New Search"],
+                "session_id": str(conversation.id),
+                "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": round(_elapsed * 1000)},
+                "flow_state": FlowState.IDLE.value,
+                "pagination": default_pagination(page),
+            }))
+
         all_products_raw, resp = handle_empty_results(
             intent, entities, all_products_raw, message,
             str(conversation.id), page, start_time, confidence, store_loader,
@@ -1436,6 +1505,7 @@ def chat():
             api_responses, api_calls_to_execute, conversation, page, start_time,
             payload_context=payload_context,
             customer_id=customer_id,
+            refinement_summary=(describe_active_filters(entities) if _did_refine else None),
         )
 
     except Exception as e:
