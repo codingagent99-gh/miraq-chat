@@ -24,6 +24,7 @@ Public API:
   - clear_active_search(user_context)
   - active_search_is_fresh(active_search) -> bool
   - describe_active_filters(entities) -> str
+  - detect_slot_conflicts(entities, active_search) -> list[dict]
 """
 
 import time
@@ -54,6 +55,97 @@ def active_search_is_fresh(active_search: Optional[dict]) -> bool:
 def _is_single_value(attr_key: str) -> bool:
     """Whether an attribute replaces (single) or appends (multi) on refinement."""
     return attr_key.lower().strip() in SINGLE_VALUE_ATTRIBUTES
+
+
+def detect_slot_conflicts(entities: ExtractedEntities, active_search: Optional[dict]) -> list[dict]:
+    """
+    Returns multi-value attribute slots where active_search already holds a value
+    AND the current turn extracted a *different* value for the same key.
+
+    Checks two locations:
+      1. entities.attributes (keyed attr values)
+      2. entities.attr_tag_or_pairs (OR-pair values, e.g. WGC color stored as
+         {tag_slug, attr_taxonomy, attr_term}) — grouped by attr_taxonomy/attr_key.
+
+    Single-value attributes (always-replace) are excluded — they have no ambiguity.
+    Incoming values already present in the existing set are excluded (no new info).
+    Returns [] when active_search is stale or absent.
+    Each entry: {"key": str, "existing": str, "incoming": str}
+      OR-pair entries also carry: {"type": "or_pair", "attr_taxonomy": str}
+    """
+    if not active_search_is_fresh(active_search):
+        return []
+
+    slots     = active_search.get("slots", {})
+    conflicts = []
+
+    # ── 1. Plain attributes ────────────────────────────────────────────────
+    for key, incoming_val in entities.attributes.items():
+        if _is_single_value(key):
+            continue                              # silent replace, no prompt needed
+
+        existing_val = slots.get("attributes", {}).get(key)
+        if not existing_val:
+            continue                              # empty slot: fill directly, no conflict
+
+        incoming_str = str(incoming_val).strip()
+        existing_str = str(existing_val).strip()
+        if not incoming_str:
+            continue
+
+        # Only flag when the incoming set is not already a subset of existing
+        existing_values = {v.strip() for v in existing_str.split(",") if v.strip()}
+        incoming_values = {v.strip() for v in incoming_str.split(",") if v.strip()}
+
+        if not incoming_values.issubset(existing_values):
+            conflicts.append({
+                "key":      key,
+                "existing": existing_str,
+                "incoming": incoming_str,
+            })
+
+    # ── 2. OR pairs — grouped by attr_taxonomy/attr_key ───────────────────
+    # e.g. active has {attr_taxonomy: "pa_colors-2", attr_term: "beige"} and
+    # current turn brings {attr_taxonomy: "pa_colors-2", attr_term: "white"}.
+    # attr_key is the preferred field; attr_taxonomy is the deprecated alias.
+    active_or_pairs   = slots.get("attr_tag_or_pairs", [])
+    incoming_or_pairs = getattr(entities, "attr_tag_or_pairs", [])
+
+    if active_or_pairs and incoming_or_pairs:
+        # Group active pairs by taxonomy key → set of terms already present
+        active_by_tax: dict = {}
+        for op in active_or_pairs:
+            tax  = op.get("attr_key") or op.get("attr_taxonomy")
+            term = op.get("attr_term", "")
+            if tax:
+                active_by_tax.setdefault(tax, set()).add(term)
+
+        seen_conflict_taxes: set = set()
+        for op in incoming_or_pairs:
+            tax = op.get("attr_key") or op.get("attr_taxonomy")
+            if not tax or tax not in active_by_tax or tax in seen_conflict_taxes:
+                continue
+            incoming_term  = op.get("attr_term", "")
+            existing_terms = active_by_tax[tax]
+            if incoming_term and incoming_term not in existing_terms:
+                # Build a user-friendly display key:
+                # "pa_colors-2" → strip "pa_" → "colors-2" → strip trailing digit suffix → "colors"
+                raw = tax[3:] if tax.startswith("pa_") else tax
+                parts = raw.split("-")
+                while parts and parts[-1].isdigit():
+                    parts.pop()
+                display_key = " ".join(parts).strip() or tax
+
+                conflicts.append({
+                    "key":          display_key,
+                    "existing":     ", ".join(sorted(existing_terms)),
+                    "incoming":     incoming_term,
+                    "type":         "or_pair",
+                    "attr_taxonomy": tax,
+                })
+                seen_conflict_taxes.add(tax)
+
+    return conflicts
 
 
 def _append_value(existing: str, new: str) -> str:
@@ -176,6 +268,16 @@ def describe_active_filters(entities: ExtractedEntities) -> str:
         for v in str(val).split(","):
             v = v.strip().replace("-", " ")
             if v:
+                parts.append(v)
+
+    # OR pairs (e.g. WGC colors stored as attr_tag_or_pairs rather than attributes)
+    seen_or_terms = set(parts)
+    for op in getattr(entities, "attr_tag_or_pairs", []):
+        term = op.get("attr_term", "")
+        if term:
+            v = term.replace("-", " ").strip()
+            if v and v not in seen_or_terms:
+                seen_or_terms.add(v)
                 parts.append(v)
 
     base = " + ".join(p for p in parts if p)

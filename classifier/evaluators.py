@@ -254,7 +254,7 @@ class CatalogSearchEvaluator(IntentEvaluator):
 
         if re.search(r"\b(what|list|show|all)\b.*\bcategor(y|ies)\b", text):
             return Intent.CATEGORY_LIST, 0.91
-        if entities.attributes and not entities.product_name:
+        if (entities.attributes or getattr(entities, 'attr_tag_or_pairs', [])) and not entities.product_name:
             return Intent.FILTER_BY_ATTRIBUTE, 0.89
         if entities.collection_year:
             return Intent.PRODUCT_BY_COLLECTION, 0.89
@@ -308,7 +308,7 @@ class GeneralFallbackEvaluator(IntentEvaluator):
                         return Intent.PRODUCT_SEARCH, 0.80
                 return Intent.PRODUCT_LIST, 0.75
 
-        if (entities.attributes or entities.in_stock) and not entities.product_name:
+        if (entities.attributes or getattr(entities, 'attr_tag_or_pairs', []) or entities.in_stock) and not entities.product_name:
             return Intent.FILTER_BY_ATTRIBUTE, 0.89
 
         return Intent.UNKNOWN, 0.0

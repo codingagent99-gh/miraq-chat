@@ -50,8 +50,9 @@ from handlers.filter_clarification_handler import resolve_filter_clarification, 
 from handlers.semantic_clarification_handler import build_semantic_clarification
 from handlers.search_refinement import (
     merge_into_active_search, save_active_search, clear_active_search,
-    describe_active_filters,
+    describe_active_filters, detect_slot_conflicts, active_search_is_fresh,
 )
+from handlers.refinement_choice_handler import build_refinement_prompt, resolve_refinement_choice
 from config.store_config import SEMANTIC_AUTO_APPLY_THRESHOLD
 from parsers.catalog_parser import parse_csv_message
 from parsers.address_parser import extract_address, address_summary
@@ -1112,6 +1113,7 @@ def chat():
         # ── Step 1: Filter clarification bypass ──
         _skip_classification = False
         bypass_result        = None
+        _rfn_resolved        = False
 
         forced_search_match = re.match(r"(?i)^no\s*-\s*search\s*for\s*['\"](.*?)['\"]$", message)
 
@@ -1125,6 +1127,29 @@ def chat():
                     conversation.context_data       = user_context
                     bypass_result                   = clarification_result
                     _skip_classification            = True
+
+        elif current_flow_state == FlowState.AWAITING_REFINEMENT_CHOICE:
+            _pending_rfn = user_context.get("pending_refinement")
+            if _pending_rfn:
+                _rfn_entities = resolve_refinement_choice(message, _pending_rfn)
+                # Always reset state — recognized chip or unexpected input, we leave
+                # AWAITING_REFINEMENT_CHOICE either way so the next turn is clean.
+                current_flow_state                = FlowState.IDLE
+                conversation.flow_state           = FlowState.IDLE.value
+                user_context["flow_state"]        = FlowState.IDLE.value
+                user_context.pop("pending_refinement", None)
+                conversation.context_data         = user_context
+                flag_modified(conversation, "context_data")
+                if _rfn_entities is not None:
+                    # Recognized chip — use resolved entities, bypass classification.
+                    bypass_result        = ClassifiedResult(
+                        intent=Intent.PRODUCT_SEARCH,
+                        entities=_rfn_entities,
+                        confidence=0.99,
+                    )
+                    _skip_classification = True
+                    _rfn_resolved        = True
+                # else: unrecognized input — fall through to normal classification.
 
         elif forced_search_match:
             extracted_term = forced_search_match.group(1)
@@ -1319,11 +1344,40 @@ def chat():
             Intent.CATEGORY_BROWSE, Intent.PRODUCT_LIST, Intent.PRODUCT_BY_TAG,
         )
         _did_refine = False
-        if intent in _PRODUCT_SEARCH_INTENTS:
+
+        if _rfn_resolved:
+            # Entities were fully merged by refinement choice resolution (Step 1).
+            # Skip the normal merge — entities are already the complete filter set.
+            _did_refine = True
+
+        elif intent in _PRODUCT_SEARCH_INTENTS:
             _active = user_context.get("active_search")
-            if _active:
-                merge_into_active_search(entities, _active)
-                _did_refine = True
+            if _active and active_search_is_fresh(_active):
+                conflicts = detect_slot_conflicts(entities, _active)
+                if conflicts:
+                    # ── Multi-value slot conflict: ask add-or-replace ──────────
+                    # Stash everything the resolution handler needs to rebuild
+                    # fully-merged entities once the shopper taps a chip.
+                    user_context["pending_refinement"] = {
+                        "conflicts":           conflicts,
+                        "active_search":       _active,
+                        "incoming_attributes": dict(entities.attributes),
+                        "incoming_tags":       list(entities.tag_slugs),
+                        "incoming_categories": list(getattr(entities, "target_category_slugs", set())),
+                        "incoming_min_price":  entities.min_price,
+                        "incoming_max_price":  entities.max_price,
+                        "incoming_or_pairs":   list(getattr(entities, "attr_tag_or_pairs", [])),
+                    }
+                    conversation.flow_state   = FlowState.AWAITING_REFINEMENT_CHOICE.value
+                    conversation.context_data = user_context
+                    flag_modified(conversation, "context_data")
+                    db.session.commit()
+                    return _ft(build_refinement_prompt(
+                        conflicts, str(conversation.id), page, start_time
+                    ))
+                else:
+                    merge_into_active_search(entities, _active)
+                    _did_refine = True
         # ────────────────────────────────────────────────────────────────────
 
         if _resolve_variant or intent == Intent.BULK_ORDER:
