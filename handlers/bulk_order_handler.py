@@ -145,7 +145,7 @@ def handle_bulk_order_trigger(conversation, user_context, page, start_time):
 # ── Function 2: handle_bulk_order_input ──
 # ══════════════════════════════════════════════════════════════
 
-def handle_bulk_order_input(message, store_loader, conversation, user_context, page, start_time):
+def handle_bulk_order_input(message, store_loader, conversation, user_context, page, start_time, pre_resolved=None):
     """
     Parses the free-text bulk order utterance, serializes lines into
     user_context, and returns a confirmation table for the rep to approve.
@@ -206,6 +206,41 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
         }
         for l in lines
     ]
+    
+     # ── Patch: apply classifier-resolved product when parser misidentified digits in name ──
+    if pre_resolved and pre_resolved.product_id:
+        for ld in lines_as_dicts:
+            if ld.get("unresolved") and ld.get("unresolved_reason") in (
+                "product_not_found", "both_not_found"
+            ):
+                # Strip the known product name from raw_fragment,
+                # then re-scan what's left for an explicit quantity
+                stripped = re.sub(
+                    re.escape(pre_resolved.product_name or ""),
+                    "", ld["raw_fragment"], flags=re.I,
+                ).strip()
+                qty_match = re.search(r'\b(\d+)\b(?!\.\d)', stripped)
+
+                ld["product_id"]   = pre_resolved.product_id
+                ld["product_name"] = pre_resolved.product_name
+                ld["variation_id"] = pre_resolved.variation_id
+
+                if qty_match:
+                    ld["quantity"] = int(qty_match.group(1))
+                    ld["quantity_explicitly_set"] = True
+
+                # Fix unresolved: still unresolved only if customer is also missing
+                if ld.get("customer_id"):
+                    ld["unresolved"]        = False
+                    ld["unresolved_reason"] = None
+                else:
+                    ld["unresolved_reason"] = "email_not_provided"
+
+                logger.debug(
+                    f"bulk_handler | pre_resolved patch applied | "
+                    f"product='{pre_resolved.product_name}' id={pre_resolved.product_id} "
+                    f"qty={ld['quantity']}"
+                )
 
     user_context["pending_bulk_lines"] = lines_as_dicts
     user_context["bulk_current_line_index"] = 0

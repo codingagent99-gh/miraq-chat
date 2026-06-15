@@ -17,6 +17,9 @@ from utils.entity_helpers import (
 
 logger = get_logger("miraq_chat")
 
+# Matches dimension strings like 12x24, 12"x24", 4x8, 2"x2", 12 x 24
+_DIM_RE = re.compile(r'^\d+["\']?\s*[xX×]\s*\d+["\']?$')
+
 
 # ══════════════════════════════════════════════════════════════
 # PHASE 1: Longest-String Catalog Match
@@ -65,18 +68,37 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
         is_collision = 'tag' in types_matched and 'attribute' in types_matched
 
         if is_collision:
-            tag_data = next(m[1] for m in matches if m[0] == 'tag')
-            attr_data = next(m[1] for m in matches if m[0] == 'attribute')
+            attr_matches = [m[1] for m in matches if m[0] == 'attribute']
+            tag_data     = next(m[1] for m in matches if m[0] == 'tag')
+            is_dimension = bool(_DIM_RE.match(name.strip()))
 
-            if not hasattr(entities, 'attr_tag_or_pairs'):
-                entities.attr_tag_or_pairs = []
-
-            entities.attr_tag_or_pairs.append({
-                "tag_slug":      tag_data.get("slug"),
-                "attr_taxonomy": attr_data.get("label", ""),
-                "attr_term":     attr_data.get("slug"),
-                "display_text":  name,
-            })
+            if is_dimension or len(attr_matches) > 1:
+                # Dimension value (e.g. 12"x24") or multiple attribute taxonomies
+                # sharing the same name (e.g. pa_sample-size + pa_tile-size).
+                # The tag match here is spurious — the tag slug CONTAINS the
+                # dimension string but describes something else (e.g. an edge type).
+                # Emit attribute-only OR pairs (tag_slug=None) so
+                # build_or_pair_conditions can group them into a single OR condition
+                # without polluting the query with an irrelevant tag.
+                if not hasattr(entities, 'attr_tag_or_pairs'):
+                    entities.attr_tag_or_pairs = []
+                for attr_data in attr_matches:
+                    entities.attr_tag_or_pairs.append({
+                        "tag_slug":      None,
+                        "attr_taxonomy": attr_data.get("label", ""),
+                        "attr_term":     attr_data.get("slug"),
+                        "display_text":  name,
+                    })
+            else:
+                # Standard single collision: one tag + one attribute → normal OR pair
+                if not hasattr(entities, 'attr_tag_or_pairs'):
+                    entities.attr_tag_or_pairs = []
+                entities.attr_tag_or_pairs.append({
+                    "tag_slug":      tag_data.get("slug"),
+                    "attr_taxonomy": attr_matches[0].get("label", ""),
+                    "attr_term":     attr_matches[0].get("slug"),
+                    "display_text":  name,
+                })
         else:
             for match_type, data in matches:
                 if match_type == 'tag':
@@ -177,7 +199,20 @@ def phase2_nlp_merge(
         if not hasattr(entities, 'attr_tag_or_pairs'):
             entities.attr_tag_or_pairs = []
 
+        # Phase 1 pairs take precedence over NLP pairs for the same (taxonomy, term).
+        # Without this, Phase 1's clean tag_slug=None pairs for dimension values are
+        # shadowed by the NLP's version which carries a spurious tag, creating two
+        # separate AND conditions instead of one merged OR group.
+        existing_attr_keys = {
+            (p.get("attr_taxonomy"), p.get("attr_term"))
+            for p in entities.attr_tag_or_pairs
+            if isinstance(p, dict)
+        }
+
         for pair in original_nlp_result.entities.attr_tag_or_pairs:
+            pair_attr_key = (pair.get("attr_taxonomy"), pair.get("attr_term"))
+            if pair_attr_key in existing_attr_keys:
+                continue  # Phase 1 already resolved this taxonomy+term more cleanly
             if pair not in entities.attr_tag_or_pairs:
                 entities.attr_tag_or_pairs.append(pair)
 

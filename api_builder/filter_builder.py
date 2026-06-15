@@ -152,10 +152,15 @@ def build_advanced_filter_call(
                     "taxonomy filters are present, relying on them."
                 )
             else:
-                logger.warning(
-                    f"search_term='{search_term}' ignored AND no taxonomy "
-                    "conditions present — query will return arbitrary products. "
-                    "Caller should use WooCommerce text search instead."
+                # No taxonomy conditions — write the search term into the body
+                # as a last-resort safety net. Callers that need proper text-search
+                # behaviour (e.g. _build_product_search) should have already routed
+                # to endpoints.search_products before reaching here. This ensures
+                # we never silently return arbitrary products.
+                body["search"] = search_term.lower().strip()
+                logger.info(
+                    f"filter_builder: No taxonomy conditions — writing "
+                    f"search_term='{search_term}' to body['search'] as text-search fallback."
                 )
 
     logger.debug(f"api_builder: Advanced filter body: {json.dumps(body)}")

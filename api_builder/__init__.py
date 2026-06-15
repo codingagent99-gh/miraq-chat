@@ -449,6 +449,33 @@ def _build_product_search(e, page, user_message: str = "") -> list:
     if not actual_search and not e.tag_slugs and not e.target_category_slugs and not attr_filters and not e.product_id and not active_or_pairs:
         actual_search = user_message
 
+    # ── Text-only search guard ──────────────────────────────────────────────
+    # When the only entity is a free-text search term with no resolved taxonomy
+    # signals (no product_id, tags, categories, attributes, or OR-pairs), the
+    # custom advanced filter endpoint has nothing to filter on and will return
+    # arbitrary products. Fall back to WooCommerce text search so results are
+    # either genuinely matching products or zero (which surfaces the "not found"
+    # message in handle_empty_results).  Same pattern as _build_quick_order.
+    has_taxonomy = bool(
+        e.product_id
+        or e.tag_slugs
+        or e.target_category_slugs
+        or attr_filters
+        or active_or_pairs
+    )
+    if not has_taxonomy and actual_search:
+        logger.info(
+            f"_build_product_search: No taxonomy signals for '{actual_search}' — "
+            "falling back to WooCommerce text search"
+        )
+        return [endpoints.search_products(
+            search_term=actual_search,
+            page=page,
+            per_page=DEFAULT_PER_PAGE,
+            description=f"Text search for '{actual_search}'",
+        )]
+    # ────────────────────────────────────────────────────────────────────────
+
     # When a specific product_id is resolved, the endpoint finds that product
     # on page 1 of the product list — always. Passing page=2 moves past it
     # and returns nothing. Instead, keep the product query on page=1 and pass

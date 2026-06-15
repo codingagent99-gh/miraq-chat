@@ -1454,7 +1454,8 @@ def chat():
         # ── Step 8.5: Bulk order intent (from classifier) ──
         if intent == Intent.BULK_ORDER and customer_id:
             if _is_inline_bulk_order(message, store_loader):
-                resp = handle_bulk_order_input(message, store_loader, conversation, user_context, page, start_time)
+                resp = handle_bulk_order_input(message, store_loader, conversation, user_context, page, start_time,
+                               pre_resolved=entities)
             else:
                 resp = handle_bulk_order_trigger(conversation, user_context, page, start_time)
             if resp:

@@ -9,6 +9,7 @@ Single source of truth for:
      (so the main builder can skip them from standalone conditions)
 """
 
+import re
 from typing import List, Set, Tuple
 from models import OrPair
 from api_builder.query_tree import make_condition, make_or_group
@@ -35,7 +36,9 @@ def resolve_or_pair(pair: OrPair) -> OrPair:
     taxonomy = pair.attr_taxonomy or ""
     term = pair.attr_term or ""
 
-    # Resolve human term → WooCommerce slug
+    # Resolve human term → WooCommerce slug, trying multiple normalisations
+    # because the catalog stores slugified forms (e.g. "12-x-24") that may not
+    # directly index to the actual WooCommerce term slug (e.g. "12x24").
     term_slug = term.lower().replace(" ", "-") if term else ""
     l = loader()
     if l and attr_key:
@@ -44,7 +47,17 @@ def resolve_or_pair(pair: OrPair) -> OrPair:
             taxonomy = attr.backend_ref.get("taxonomy", "") or taxonomy
 
             if term:
-                resolved_term = l.resolve_attribute_term(attr_key, term)
+                resolved_term = None
+                for candidate in (
+                    term,                                   # as-is from catalog
+                    term.replace("-", " "),                 # "12-x-24" → "12 x 24"
+                    re.sub(r"[\s\-]+", "", term),           # "12-x-24" → "12x24"
+                    re.sub(r"\s*[xX×]\s*", '"x', term) + '"',  # "12 x 24" → '12"x24"'
+                ):
+                    resolved_term = l.resolve_attribute_term(attr_key, candidate)
+                    if resolved_term:
+                        break
+
                 if resolved_term:
                     term_slug = (
                         resolved_term.backend_ref.get("slug")
@@ -65,32 +78,59 @@ def build_or_pair_conditions(pairs: List[OrPair]) -> Tuple[list, Set[str], Set[s
     """
     Convert a list of OrPair into query-tree conditions.
 
+    Pairs that share the same (tag_slug, attr_term) key are merged into a
+    single OR group — e.g. {tag=None, pa_sample-size: 12x24} and
+    {tag=None, pa_tile-size: 12x24} collapse into one OR condition:
+    (pa_sample-size=12x24 OR pa_tile-size=12x24).
+    Without merging they produce separate AND conditions which over-constrains
+    the query and returns 0 results.
+
     Returns:
-        conditions:     list of OR-group condition nodes to append
-        covered_tags:   set of tag slugs already inside an OR pair (skip in standalone tag conditions)
-        covered_cats:   set of category slugs already inside an OR pair (skip in standalone cat conditions)
+        conditions:   list of OR-group condition nodes to append
+        covered_tags: set of tag slugs already inside an OR pair
+        covered_cats: set of category slugs already inside an OR pair
     """
+    from collections import OrderedDict
+
     conditions = []
     covered_tags: Set[str] = set()
     covered_cats: Set[str] = set()
 
+    # Group pairs by (tag_slug, attr_term) — same key means same user value
+    # expressed across multiple taxonomies; they belong in one OR group.
+    grouped: OrderedDict = OrderedDict()
     for raw_pair in pairs:
         pair = resolve_or_pair(raw_pair)
+        key = (pair.tag_slug or "", pair.attr_term or "")
+        grouped.setdefault(key, []).append(pair)
 
+    for (tag_slug, attr_term), group in grouped.items():
         or_conds = []
-        if pair.tag_slug:
-            or_conds.append(make_condition("product_tag", [pair.tag_slug], "IN"))
-            covered_tags.add(pair.tag_slug)
-        if pair.cat_slugs:
-            or_conds.append(make_condition("product_cat", pair.cat_slugs, "IN"))
-            covered_cats.update(pair.cat_slugs)
-        if pair.attr_taxonomy and pair.attr_term:
-            or_conds.append(make_condition(pair.attr_taxonomy, [pair.attr_term], "IN"))
+
+        # Tag branch (shared across the group)
+        if tag_slug:
+            or_conds.append(make_condition("product_tag", [tag_slug], "IN"))
+            covered_tags.add(tag_slug)
+
+        # Category branches — deduplicated across all pairs in the group
+        seen_cats: Set[str] = set()
+        for pair in group:
+            for slug in (pair.cat_slugs or []):
+                if slug not in seen_cats:
+                    or_conds.append(make_condition("product_cat", [slug], "IN"))
+                    seen_cats.add(slug)
+                    covered_cats.add(slug)
+
+        # Attribute branches — one per unique taxonomy in the group
+        seen_taxonomies: Set[str] = set()
+        for pair in group:
+            if pair.attr_taxonomy and pair.attr_term and pair.attr_taxonomy not in seen_taxonomies:
+                or_conds.append(make_condition(pair.attr_taxonomy, [pair.attr_term], "IN"))
+                seen_taxonomies.add(pair.attr_taxonomy)
 
         if len(or_conds) >= 2:
             conditions.append(make_or_group(or_conds))
         elif len(or_conds) == 1:
-            # Degraded to a single branch — still valid, just not OR
             conditions.append(or_conds[0])
 
     return conditions, covered_tags, covered_cats

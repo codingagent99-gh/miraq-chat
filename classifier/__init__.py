@@ -59,6 +59,9 @@ def classify(utterance: str) -> ClassifiedResult:
     entity_text = text
     for gw in GENERIC_NOISE_WORDS:
         entity_text = re.sub(rf'\b{re.escape(gw)}\b', ' ', entity_text, flags=re.IGNORECASE)
+        
+    attr_text = entity_text
+    tag_text = entity_text
 
     # ─── 2. Core entity extraction ───
     extract_product_name(entity_text, entities)

@@ -93,6 +93,15 @@ def parse_bulk_order_utterance(
         p["name"].lower() for p in (store_loader.products or []) if p.get("name")
     }
 
+    # Longest-name-first product list — used in Step 2 to pre-claim a catalog
+    # product name from a fragment before the qty scanner runs, so multi-word
+    # / versioned names (e.g. "Aura 2.0") aren't split apart by quantity logic.
+    _products_by_name_len = sorted(
+        (p for p in (store_loader.products or []) if p.get("name")),
+        key=lambda p: len(p["name"]),
+        reverse=True,
+    )
+
     # Pass 1: split on commas
     raw_parts = re.split(r',\s*', text)
 
@@ -125,7 +134,23 @@ def parse_bulk_order_utterance(
         if not fragment:
             continue
 
-        qty_match = re.search(r'\b(\d+)\b', fragment)
+        # ── Pre-claim a catalog product name (longest match wins) so the
+        # qty scanner never sees its tokens. Fixes cases like "order aura 2.0"
+        # where \b matches between '2' and '.', causing qty to be misread
+        # as 2 from the ".0" suffix of a versioned product name.
+        _pre_match_span = None
+        for _p in _products_by_name_len:
+            _m = re.search(r'\b' + re.escape(_p["name"]) + r'\b', fragment, re.I)
+            if _m:
+                _pre_match_span = _m.span()
+                break
+
+        if _pre_match_span:
+            qty_scan_text = fragment[:_pre_match_span[0]] + fragment[_pre_match_span[1]:]
+        else:
+            qty_scan_text = fragment
+
+        qty_match = re.search(r'\b(\d+)\b', qty_scan_text)
         quantity = int(qty_match.group(1)) if qty_match else 1
         quantity_explicitly_set = qty_match is not None
 
@@ -150,8 +175,13 @@ def parse_bulk_order_utterance(
                     company_name = candidate
 
         # ── Product: strip quantity, email addresses, and "for …" tail ──
+        # If a catalog product name was pre-claimed above, leave the fragment
+        # intact instead — slicing at qty_match.end() here could cut into or
+        # past the claimed product name (e.g. a leading "20 " before it),
+        # whereas Step 3's matching logic (3a/3b/3b.5) can find it cleanly
+        # in the unsliced text.
         product_part = fragment
-        if qty_match:
+        if qty_match and _pre_match_span is None:
             product_part = product_part[qty_match.end():].strip()
         product_part = EMAIL_RE.sub('', product_part).strip()
         product_part = re.sub(r'\s*\bfor\b.*$', '', product_part, flags=re.I).strip()
@@ -229,21 +259,25 @@ def parse_bulk_order_utterance(
                     None,
                 )
 
-        # 3d. Extract variant hint OR company name from remainder
-        # 3d. Extract variant hint OR display company from remainder
-        if matched_catalog_name and pl.product_name.lower().startswith(matched_catalog_name.lower()):
-            remainder = pl.product_name[len(matched_catalog_name):].strip(" ,.-")
-            if remainder:
-                _for_match = re.match(r'^for\s+(.+)$', remainder, re.I)
-                if _for_match:
-                    # "for <Name>" in remainder → display-only company hint
-                    # Email (the actual resolution key) was already extracted in Step 2.
-                    if not pl.company_name:
-                        candidate = EMAIL_RE.sub('', _for_match.group(1)).strip().strip(', ')
-                        if candidate:
-                            pl.company_name = candidate
-                else:
-                    pl.variant_hint = remainder
+        # 3d. Extract variant hint OR display company from remainder, and
+        # normalize product_name to the canonical catalog name. Normalization
+        # now fires whenever a match was found — not just when product_name
+        # starts with it — because the Step 2 pre-claim can leave a leading
+        # qty token in product_name (e.g. "20 harmony white").
+        if matched_catalog_name:
+            if pl.product_name.lower().startswith(matched_catalog_name.lower()):
+                remainder = pl.product_name[len(matched_catalog_name):].strip(" ,.-")
+                if remainder:
+                    _for_match = re.match(r'^for\s+(.+)$', remainder, re.I)
+                    if _for_match:
+                        # "for <Name>" in remainder → display-only company hint
+                        # Email (the actual resolution key) was already extracted in Step 2.
+                        if not pl.company_name:
+                            candidate = EMAIL_RE.sub('', _for_match.group(1)).strip().strip(', ')
+                            if candidate:
+                                pl.company_name = candidate
+                    else:
+                        pl.variant_hint = remainder
             pl.product_name = matched_catalog_name
             
         if pl.product_id:
