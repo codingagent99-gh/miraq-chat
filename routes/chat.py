@@ -800,10 +800,8 @@ def _build_final_response(
 
     _single_product_found = (
         len(products) == 1
-        and (
-            entities.product_id
-            or conversation.context_data.get("pending_product_id")
-        )
+        and bool(entities.product_id)
+
     )
 
     if intent in ORDER_CREATE_INTENTS and order_data:

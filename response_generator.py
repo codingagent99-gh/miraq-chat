@@ -118,17 +118,27 @@ def _build_search_context_string(entities: ExtractedEntities) -> str:
         desc_parts.append(f"Tag: **{tag_str}**")
 
     if getattr(entities, 'attr_tag_or_pairs', None):
+        or_by_label: dict[str, list] = {}
+        or_label_order: list[str] = []
         for pair in entities.attr_tag_or_pairs:
             display = pair.get("display_text", "")
             if display:
-                # Capitalise but preserve punctuation (e.g. '7/16" thick' -> '7/16" Thick')
                 clean = " ".join(w.capitalize() for w in display.split())
             else:
-                # Fallback: reconstruct from term slug
                 clean = _resolve_attribute_term_name(pair.get("attr_taxonomy", ""), pair.get("attr_term", ""))
             taxonomy = pair.get("attr_taxonomy", "")
             label = _resolve_attribute_label(taxonomy) if taxonomy else "Filter"
-            desc_parts.append(f"{label}: **{clean}**")
+            if label not in or_by_label:
+                or_by_label[label] = []
+                or_label_order.append(label)
+            if clean and clean not in or_by_label[label]:
+                or_by_label[label].append(clean)
+        for label in or_label_order:
+            vals = or_by_label[label]
+            joined = f"{vals[0]} & {vals[1]}" if len(vals) == 2 else (
+                ", ".join(vals[:-1]) + f" & {vals[-1]}" if len(vals) > 2 else vals[0]
+            )
+            desc_parts.append(f"{label}: **{joined}**")
 
     # EXCLUSIONS
     if getattr(entities, 'excluded_tags', None):
