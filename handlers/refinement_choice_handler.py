@@ -71,11 +71,11 @@ def build_refinement_prompt(
 
         bot_message = (
             f"You're currently looking at **{existing_disp}** {attr_disp.lower()} products. "
-            f"Would you like to add **{incoming_disp}** alongside, "
-            f"or switch to {incoming_disp} only?"
+            f"Would you like to narrow to products available in "
+            f"**both {existing_disp} and {incoming_disp}**, or switch to {incoming_disp} only?"
         )
         suggestion_buttons = [
-            f"Add {incoming_disp}",
+            "Show both",
             f"Switch to {incoming_disp}",
             "New Search",
         ]
@@ -138,7 +138,7 @@ def resolve_refinement_choice(
     if len(conflicts) == 1:
         c             = conflicts[0]
         incoming_disp = _display(c["incoming"])
-        if msg.lower() == f"add {incoming_disp}".lower():
+        if msg.lower() == "show both":
             mode = "add"
         elif msg.lower() == f"switch to {incoming_disp}".lower():
             mode = "replace"
