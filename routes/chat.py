@@ -786,6 +786,8 @@ def _build_final_response(
         bot_message = f"*Showing {refinement_summary}*\n\n{bot_message}"
     if intent in _PRODUCT_RESULT_INTENTS and products and "New Search" not in suggestions_list:
         suggestions_list = list(suggestions_list) + ["New Search"]
+    elif intent == Intent.PRODUCT_QUICK_SHIP and "New Search" not in suggestions_list:
+        suggestions_list = list(suggestions_list) + ["New Search"]
 
     # ── Determine flow state ──────────────────────────────────────────────────
     _BROWSING_INTENTS = {
