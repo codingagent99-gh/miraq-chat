@@ -50,7 +50,8 @@ from handlers.filter_clarification_handler import resolve_filter_clarification, 
 from handlers.semantic_clarification_handler import build_semantic_clarification
 from handlers.search_refinement import (
     merge_into_active_search, save_active_search, clear_active_search,
-    describe_active_filters, detect_slot_conflicts, active_search_is_fresh,
+    describe_active_filters, describe_active_filters_labeled,
+    detect_slot_conflicts, active_search_is_fresh,
 )
 from handlers.refinement_choice_handler import build_refinement_prompt, resolve_refinement_choice
 from config.store_config import SEMANTIC_AUTO_APPLY_THRESHOLD
@@ -1556,14 +1557,14 @@ def chat():
         # Name the active filters and point to New Search, so the shopper can
         # self-correct without the backend guessing intent.
         if _did_refine and not all_products_raw and intent in _PRODUCT_SEARCH_INTENTS:
-            _filters = describe_active_filters(entities)
+            _filters_labeled = describe_active_filters_labeled(entities)
             _elapsed = time.time() - start_time
             return _ft(jsonify({
                 "success": True,
                 "bot_message": (
-                    f"No products match **{_filters}**.\n\n"
+                    f"No products found for {_filters_labeled}.\n\n"
                     "Tap **New Search** to start over, or try a different filter."
-                    if _filters else
+                    if _filters_labeled else
                     "No products match those filters.\n\nTap **New Search** to start over."
                 ),
                 "intent": intent.value,

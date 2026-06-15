@@ -24,6 +24,7 @@ Public API:
   - clear_active_search(user_context)
   - active_search_is_fresh(active_search) -> bool
   - describe_active_filters(entities) -> str
+  - describe_active_filters_labeled(entities) -> str
   - detect_slot_conflicts(entities, active_search) -> list[dict]
 """
 
@@ -271,13 +272,13 @@ def describe_active_filters(entities: ExtractedEntities) -> str:
                 parts.append(v)
 
     # OR pairs (e.g. WGC colors stored as attr_tag_or_pairs rather than attributes)
-    seen_or_terms = set(parts)
+    seen_or_terms = {p.lower() for p in parts}
     for op in getattr(entities, "attr_tag_or_pairs", []):
         term = op.get("attr_term", "")
         if term:
             v = term.replace("-", " ").strip()
-            if v and v not in seen_or_terms:
-                seen_or_terms.add(v)
+            if v and v.lower() not in seen_or_terms:
+                seen_or_terms.add(v.lower())
                 parts.append(v)
 
     base = " + ".join(p for p in parts if p)
@@ -293,3 +294,62 @@ def describe_active_filters(entities: ExtractedEntities) -> str:
     if base and price:
         return f"{base}, {price}"
     return base or price
+
+def describe_active_filters_labeled(entities: ExtractedEntities) -> str:
+    """
+    Returns a labeled, markdown-formatted breakdown of active filters for
+    zero-result messages — each filter dimension named separately so the
+    shopper knows exactly what is and isn't matching.
+    e.g. "**Category:** Mosaics · **Color:** beige, white · **Sample Size:** mosaic"
+    """
+    parts = []
+
+    # Category
+    cat_name = getattr(entities, "category_name", None)
+    if cat_name:
+        parts.append(("Category", cat_name))
+
+    # Plain tag slugs
+    if entities.tag_slugs:
+        parts.append(("Tag", ", ".join(s.replace("-", " ") for s in entities.tag_slugs)))
+
+    # Plain attributes — key is already a display name (e.g. "sample size")
+    for key, val in entities.attributes.items():
+        label  = key.replace("-", " ").title()
+        values = ", ".join(
+            v.strip().replace("-", " ") for v in str(val).split(",") if v.strip()
+        )
+        if values:
+            parts.append((label, values))
+
+    # OR pairs — group by taxonomy, deduplicate terms within each group
+    or_by_tax: dict = {}
+    or_tax_order: list = []
+    for op in getattr(entities, "attr_tag_or_pairs", []):
+        tax  = op.get("attr_key") or op.get("attr_taxonomy", "")
+        term = op.get("attr_term", "").replace("-", " ").strip()
+        if not tax or not term:
+            continue
+        raw = tax[3:] if tax.startswith("pa_") else tax
+        tax_parts = raw.split("-")
+        while tax_parts and tax_parts[-1].isdigit():
+            tax_parts.pop()
+        display_label = " ".join(tax_parts).strip().title() or tax
+        if display_label not in or_by_tax:
+            or_by_tax[display_label] = []
+            or_tax_order.append(display_label)
+        if term not in or_by_tax[display_label]:
+            or_by_tax[display_label].append(term)
+
+    for label in or_tax_order:
+        parts.append((label, ", ".join(or_by_tax[label])))
+
+    # Price
+    if entities.min_price is not None and entities.max_price is not None:
+        parts.append(("Price", f"${entities.min_price:g}\u2013${entities.max_price:g}"))
+    elif entities.max_price is not None:
+        parts.append(("Price", f"under ${entities.max_price:g}"))
+    elif entities.min_price is not None:
+        parts.append(("Price", f"over ${entities.min_price:g}"))
+
+    return " · ".join(f"**{label}:** {values}" for label, values in parts)
