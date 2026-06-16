@@ -99,8 +99,13 @@ def _build_search_context_string(entities: ExtractedEntities) -> str:
     if getattr(entities, 'product_name', None):
         desc_parts.append(f"Product: **{entities.product_name}**")
 
-    if getattr(entities, 'category_name', None):
-        desc_parts.append(f"Category: **{entities.category_name}**")
+    cat_name = getattr(entities, 'category_name', None)
+    if not cat_name and getattr(entities, 'target_category_slugs', None):
+        cat_name = ", ".join(
+            _resolve_category_name(s) for s in sorted(entities.target_category_slugs)
+        )
+    if cat_name:
+        desc_parts.append(f"Category: **{cat_name}**")
         
     if getattr(entities, 'attributes', None):
         for attr_name, attr_val in entities.attributes.items():
@@ -118,21 +123,46 @@ def _build_search_context_string(entities: ExtractedEntities) -> str:
         desc_parts.append(f"Tag: **{tag_str}**")
 
     if getattr(entities, 'attr_tag_or_pairs', None):
-        or_by_label: dict[str, list] = {}
-        or_label_order: list[str] = []
+        # Labels already shown via plain attributes — skip OR pairs for these
+        shown_attr_labels = {
+            _resolve_attribute_label(k).lower()
+            for k in (entities.attributes or {})
+        }
+        # Group OR pairs by attr_term — same term across multiple taxonomies
+        # (e.g. pa_sample-size + pa_tile-size both for "12\"x24\"") is one
+        # user-facing filter, not two. Show only the best-matching label.
+        or_by_term: dict = {}
         for pair in entities.attr_tag_or_pairs:
-            display = pair.get("display_text", "")
-            if display:
-                clean = " ".join(w.capitalize() for w in display.split())
-            else:
-                clean = _resolve_attribute_term_name(pair.get("attr_taxonomy", ""), pair.get("attr_term", ""))
+            attr_term = pair.get("attr_term", "")
             taxonomy = pair.get("attr_taxonomy", "")
             label = _resolve_attribute_label(taxonomy) if taxonomy else "Filter"
-            if label not in or_by_label:
-                or_by_label[label] = []
-                or_label_order.append(label)
-            if clean and clean not in or_by_label[label]:
-                or_by_label[label].append(clean)
+            display = pair.get("display_text", "")
+            clean = (
+                " ".join(w.capitalize() for w in display.split())
+                if display else
+                _resolve_attribute_term_name(taxonomy, attr_term)
+            )
+            if attr_term not in or_by_term:
+                or_by_term[attr_term] = []
+            or_by_term[attr_term].append((label, clean))
+
+        or_by_label: dict[str, list] = {}
+        or_label_order: list[str] = []
+        for attr_term, label_clean_pairs in or_by_term.items():
+            # Prefer label that matches a plain attribute already shown
+            best_label, best_clean = next(
+                (lc for lc in label_clean_pairs if lc[0].lower() in shown_attr_labels),
+                label_clean_pairs[0]
+            )
+            # Skip entirely if this label is already covered by plain attributes
+            if best_label.lower() in shown_attr_labels:
+                continue
+            if best_label not in or_by_label:
+                or_by_label[best_label] = []
+                or_label_order.append(best_label)
+            if best_clean and best_clean not in or_by_label[best_label]:
+                or_by_label[best_label].append(best_clean)
+
         for label in or_label_order:
             vals = or_by_label[label]
             joined = f"{vals[0]} & {vals[1]}" if len(vals) == 2 else (

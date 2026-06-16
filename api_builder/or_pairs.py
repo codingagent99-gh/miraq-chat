@@ -47,23 +47,41 @@ def resolve_or_pair(pair: OrPair) -> OrPair:
             taxonomy = attr.backend_ref.get("taxonomy", "") or taxonomy
 
             if term:
-                resolved_term = None
-                for candidate in (
-                    term,                                   # as-is from catalog
-                    term.replace("-", " "),                 # "12-x-24" → "12 x 24"
-                    re.sub(r"[\s\-]+", "", term),           # "12-x-24" → "12x24"
-                    re.sub(r"\s*[xX×]\s*", '"x', term) + '"',  # "12 x 24" → '12"x24"'
-                ):
-                    resolved_term = l.resolve_attribute_term(attr_key, candidate)
-                    if resolved_term:
-                        break
+                # If the term is a dimension slug (e.g. "12-x-24"), use the canonical
+                # inch-mark form directly: '12"x24"'.
+                # Reason: pa_sample-size and pa_tile-size share the same dimension
+                # but have DIFFERENT term.name values ("12\" x 24\"" vs "12 x 24"),
+                # so using term.name would give different attr_term values → two AND
+                # conditions. The constructed inch_form is the same for both taxonomies
+                # → same attr_term → one OR group → matches the working query body.
+                # The PHP endpoint passes it to WP_Tax_Query with field='slug';
+                # WordPress calls sanitize_title('12"x24"') → '12x24' → matches DB slug.
+                _dim_m = re.match(r'^(\d+)[\-\s]*[xX×][\-\s]*(\d+)$', term.strip())
+                if _dim_m:
+                    term_slug = f'{_dim_m.group(1)}"x{_dim_m.group(2)}"'
+                else:
+                    resolved_term = None
+                    for candidate in filter(None, [
+                        term,
+                        term.replace("-", " "),
+                        re.sub(r"[\s\-]+", "", term),
+                    ]):
+                        resolved_term = l.resolve_attribute_term(attr_key, candidate)
+                        if resolved_term:
+                            break
 
-                if resolved_term:
-                    term_slug = (
-                        resolved_term.backend_ref.get("slug")
-                        or resolved_term.key
-                        or term_slug
-                    )
+                    if resolved_term:
+                        term_slug = (
+                            resolved_term.backend_ref.get("slug")
+                            or resolved_term.key
+                            or term_slug
+                        )
+                    else:
+                        sample = [(t.key, t.name) for t in attr.terms[:8]]
+                        logger.debug(
+                            f"resolve_or_pair: resolution failed for attr='{attr_key}' "
+                            f"term='{term}' | available terms (key/name): {sample}"
+                        )
 
     return OrPair(
         tag_slug=pair.tag_slug,

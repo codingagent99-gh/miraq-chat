@@ -53,6 +53,7 @@ from handlers.search_refinement import (
     describe_active_filters, describe_active_filters_labeled,
     detect_slot_conflicts, active_search_is_fresh,
 )
+from parsers.catalog_parser import _detect_explicit_taxonomy_signal
 from handlers.refinement_choice_handler import build_refinement_prompt, resolve_refinement_choice
 from config.store_config import SEMANTIC_AUTO_APPLY_THRESHOLD
 from parsers.catalog_parser import parse_csv_message
@@ -1380,6 +1381,53 @@ def chat():
                     merge_into_active_search(entities, _active)
                     _did_refine = True
         # ────────────────────────────────────────────────────────────────────
+                    
+        # Explicit taxonomy signal — re-apply after merge so session-accumulated
+        # attrs (e.g. application=paver from a prior turn) don't override the
+        # user's explicit taxonomy intent (e.g. "category pavers").
+        _signal = _detect_explicit_taxonomy_signal(message, store_loader)
+        if _signal == 'product_cat' and getattr(entities, 'target_category_slugs', None):
+            _matched_cats = set(entities.target_category_slugs)
+            _cat_bases = {s.rstrip('s') for s in _matched_cats} | _matched_cats
+            entities.attr_tag_or_pairs = [
+                op for op in getattr(entities, 'attr_tag_or_pairs', [])
+                if not any(s in (op.get('cat_slugs') or []) for s in _matched_cats)
+            ]
+            entities.attributes = {
+                k: v for k, v in entities.attributes.items()
+                if str(v).strip().lower().rstrip('s') not in _cat_bases
+            }
+        elif _signal == 'product_tag' and getattr(entities, 'tag_slugs', None):
+            _matched_tags = set(entities.tag_slugs)
+            entities.attr_tag_or_pairs = [
+                op for op in getattr(entities, 'attr_tag_or_pairs', [])
+                if op.get('tag_slug') not in _matched_tags
+            ]
+            
+        elif _signal and _signal.startswith('pa_'):
+            or_pairs = getattr(entities, 'attr_tag_or_pairs', [])
+
+            # User explicitly named a taxonomy (e.g. "sample size" → pa_sample-size).
+            # Drop OR pair entries for all OTHER attribute taxonomies — they were added
+            # as backend query fallbacks, not because the user asked for them.
+            entities.attr_tag_or_pairs = [
+                op for op in or_pairs
+                if not op.get('attr_taxonomy')
+                or op.get('attr_taxonomy') == _signal
+                or f"pa_{op.get('attr_taxonomy', '')}" == _signal
+            ]
+
+            # Also resolve any category collision for this taxonomy
+            cat_slugs_in_collision = {
+                slug
+                for op in entities.attr_tag_or_pairs
+                if op.get('attr_taxonomy') == _signal
+                for slug in (op.get('cat_slugs') or [])
+            }
+            if cat_slugs_in_collision:
+                entities.target_category_slugs -= cat_slugs_in_collision
+                if not entities.target_category_slugs:
+                    entities.category_name = None
 
         if _resolve_variant or intent == Intent.BULK_ORDER:
             # Variant resolution uses session-cached variations — no API calls needed.

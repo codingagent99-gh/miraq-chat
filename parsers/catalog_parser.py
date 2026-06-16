@@ -14,12 +14,29 @@ from utils.entity_helpers import (
     append_category_name, merge_attribute, merge_tags, merge_entities,
     clean_leftovers, STOP_WORDS,
 )
-
+from typing import Optional
 logger = get_logger("miraq_chat")
 
 # Matches dimension strings like 12x24, 12"x24", 4x8, 2"x2", 12 x 24
 _DIM_RE = re.compile(r'^\d+["\']?\s*[xX×]\s*\d+["\']?$')
+# Matches slugified dimension terms like 12-x-24, 12x24, 12 x 24
+_DIM_SLUG_RE = re.compile(r'^\d+[\s\-]*[xX×][\s\-]*\d+$')
 
+
+def _detect_explicit_taxonomy_signal(msg: str, l) -> Optional[str]:
+    msg_lower = msg.lower()
+    if re.search(r'\bcategor\w*\b', msg_lower):
+        return 'product_cat'
+    if re.search(r'\btags?\b', msg_lower):
+        return 'product_tag'
+    if l and getattr(l, 'all_attributes_raw', None):
+        for attr in sorted(l.all_attributes_raw,
+                           key=lambda a: len(a.get('attribute_label', '')),
+                           reverse=True):
+            label = (attr.get('attribute_label') or '').lower().strip()
+            if label and re.search(rf'\b{re.escape(label)}\b', msg_lower):
+                return attr.get('taxonomy', '')
+    return None
 
 # ══════════════════════════════════════════════════════════════
 # PHASE 1: Longest-String Catalog Match
@@ -144,11 +161,9 @@ def phase2_nlp_merge(
     We reuse it directly instead of making a second classify() call.
     """
     if original_msg and unmatched_text.strip() == original_msg.strip():
-        # Phase 1 matched nothing — full text is still unmatched, reuse original result.
         logger.debug("phase2_nlp_merge: Phase 1 matched nothing — reusing original_nlp_result, skipping re-classify")
         nlp_result = original_nlp_result
     elif not unmatched_text.strip():
-        # Phase 1 matched everything — nothing left to classify, reuse original result.
         logger.debug("phase2_nlp_merge: Phase 1 matched everything — reusing original_nlp_result, skipping re-classify")
         nlp_result = original_nlp_result
     else:
@@ -182,7 +197,6 @@ def phase2_nlp_merge(
                 entities.target_attributes.append(t_attr)
 
     # Merge action fields from original NLP (full text)
-    # Salvage Product & Action fields that were being dropped during masking
     _action_fields = [
         'product_id', 'product_name', 'product_slug',
         'quantity', 'order_id', 'reorder', 'explicit_last_order', 'order_item_name',
@@ -199,20 +213,13 @@ def phase2_nlp_merge(
         if not hasattr(entities, 'attr_tag_or_pairs'):
             entities.attr_tag_or_pairs = []
 
-        # Phase 1 pairs take precedence over NLP pairs for the same (taxonomy, term).
-        # Without this, Phase 1's clean tag_slug=None pairs for dimension values are
-        # shadowed by the NLP's version which carries a spurious tag, creating two
-        # separate AND conditions instead of one merged OR group.
-        existing_attr_keys = {
-            (p.get("attr_taxonomy"), p.get("attr_term"))
-            for p in entities.attr_tag_or_pairs
-            if isinstance(p, dict)
-        }
-
         for pair in original_nlp_result.entities.attr_tag_or_pairs:
-            pair_attr_key = (pair.get("attr_taxonomy"), pair.get("attr_term"))
-            if pair_attr_key in existing_attr_keys:
-                continue  # Phase 1 already resolved this taxonomy+term more cleanly
+            # Strip spurious tags from dimension-value OR pairs.
+            attr_term = pair.get("attr_term", "")
+            if attr_term and _DIM_SLUG_RE.match(attr_term.strip()):
+                pair = dict(pair)
+                pair["tag_slug"] = None
+
             if pair not in entities.attr_tag_or_pairs:
                 entities.attr_tag_or_pairs.append(pair)
 

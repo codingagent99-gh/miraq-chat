@@ -36,7 +36,7 @@ from classifier.consolidation import consolidate_entities
 from models.domain import Intent
 from config.store_config import SINGLE_VALUE_ATTRIBUTES
 from chat_logger import get_logger
-
+import re
 logger = get_logger("miraq_chat")
 
 # A search context older than this (seconds) is stale - next query starts fresh.
@@ -258,7 +258,9 @@ def describe_active_filters(entities: ExtractedEntities) -> str:
     """Readable summary of the active filter set, e.g. 'beige + concrete look, under $500'."""
     parts = []
 
-    cat_name = getattr(entities, "category_name", None)
+    cat_name = getattr(entities, 'category_name', None)
+    if not cat_name and getattr(entities, 'target_category_slugs', None):
+        cat_name = ", ".join(s.replace("-", " ").title() for s in sorted(entities.target_category_slugs))
     if cat_name:
         parts.append(cat_name)
 
@@ -272,13 +274,16 @@ def describe_active_filters(entities: ExtractedEntities) -> str:
                 parts.append(v)
 
     # OR pairs (e.g. WGC colors stored as attr_tag_or_pairs rather than attributes)
-    seen_or_terms = {p.lower() for p in parts}
+    def _norm(s):
+        return re.sub(r'[^a-z0-9]', '', s.lower())
+
+    seen_or_terms_norm = {_norm(p) for p in parts}
     for op in getattr(entities, "attr_tag_or_pairs", []):
         term = op.get("attr_term", "")
         if term:
             v = term.replace("-", " ").strip()
-            if v and v.lower() not in seen_or_terms:
-                seen_or_terms.add(v.lower())
+            if v and _norm(v) not in seen_or_terms_norm:
+                seen_or_terms_norm.add(_norm(v))
                 parts.append(v)
 
     base = " + ".join(p for p in parts if p)

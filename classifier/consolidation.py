@@ -26,16 +26,19 @@ PRODUCT_SPECIFIC_INTENTS = {
 
 
 def consolidate_entities(intent: Intent, entities: ExtractedEntities, text: str):
-    """
-    Run all post-classification consolidation passes.
-    Mutates entities in-place.
-    """
+    logger.debug(f"[consolidate] START | tags={entities.tag_slugs} | attrs={dict(entities.attributes)} | or_pairs={entities.attr_tag_or_pairs}")
     _resolve_product_vs_category(intent, entities)
+    logger.debug(f"[consolidate] after _resolve_product_vs_category | tags={entities.tag_slugs}")
     _resolve_series_tag_conflict(entities, text)
+    logger.debug(f"[consolidate] after _resolve_series_tag_conflict | tags={entities.tag_slugs}")
     _deduplicate_or_pairs(entities)
+    logger.debug(f"[consolidate] after _deduplicate_or_pairs | tags={entities.tag_slugs}")
     _resolve_category_attribute_overlap(entities)
+    logger.debug(f"[consolidate] after _resolve_category_attribute_overlap | tags={entities.tag_slugs}")
     _prune_tag_covered_attrs(entities)
+    logger.debug(f"[consolidate] after _prune_tag_covered_attrs | tags={entities.tag_slugs}")
     _prune_redundant_attributes(entities)
+    logger.debug(f"[consolidate] after _prune_redundant_attributes | tags={entities.tag_slugs}")
 
 
 def _resolve_product_vs_category(intent: Intent, entities: ExtractedEntities):
@@ -69,9 +72,20 @@ def _resolve_series_tag_conflict(entities: ExtractedEntities, text: str):
 
 
 def _deduplicate_or_pairs(entities: ExtractedEntities):
-    """Remove tags and categories already covered by attr_tag_or_pairs."""
+    """Remove categories already covered by attr_tag_or_pairs."""
     if not entities.attr_tag_or_pairs:
         return
+
+    # Do NOT remove tags from tag_slugs here — if the user explicitly
+    # requested a tag in the current turn, removing it because a prior
+    # active search OR pair also references that tag silently drops a
+    # valid filter. The AND of (tag standalone) + (tag OR attr) is
+    # equivalent to just (tag), which is exactly what the user wants.
+
+    handled_cats = {p.get("attr_term") for p in entities.attr_tag_or_pairs if p.get("attr_taxonomy") == "product_cat"}
+    if handled_cats and getattr(entities, 'target_category_slugs', set()).intersection(handled_cats):
+        entities.target_category_slugs.clear()
+        entities.category_name = None
 
     loader = get_store_loader()
 

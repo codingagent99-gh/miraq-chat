@@ -38,20 +38,51 @@ def _group_categories(cat_slugs: list) -> dict:
     Group category slugs by their parent category.
     Siblings under the same parent become a single IN (OR within group).
     Categories under different parents become separate AND conditions.
+
+    Descendant slugs are dropped when an ancestor slug is also present.
+    WP_Query tax_query uses include_children=True by default, so querying
+    the ancestor already covers the full subtree — AND-ing in the children
+    creates an over-constrained query that silently drops valid products.
     """
     l = loader()
+    slug_list = list(cat_slugs)
     groups = {}
 
-    for slug in cat_slugs:
-        parent_key = slug  # default: each slug is its own group
+    if not l or not l.category_by_key:
+        for slug in slug_list:
+            groups.setdefault(slug, []).append(slug)
+        return groups
 
-        if l and l.category_by_key:
-            cat_obj = l.category_by_key.get(slug)
-            if cat_obj:
-                parent_id = (cat_obj.backend_ref or {}).get("parent_id", 0)
-                parent_key = str(parent_id) if parent_id else slug
+    slug_set = set(slug_list)
 
-        groups.setdefault(parent_key, []).append(slug)
+    def _has_ancestor_in_set(slug: str) -> bool:
+        """Walk parent_key chain; return True if any ancestor is in slug_set."""
+        visited: set = set()
+        cat = l.category_by_key.get(slug)
+        while cat:
+            pk = cat.parent_key          # already a slug, resolved at load time
+            if not pk or pk in visited:
+                break
+            if pk in slug_set:
+                return True
+            visited.add(pk)
+            cat = l.category_by_key.get(pk)
+        return False
+
+    # Keep only slugs with no ancestor in the set
+    effective = [s for s in slug_list if not _has_ancestor_in_set(s)]
+
+    for slug in effective:
+        cat_obj = l.category_by_key.get(slug)
+        parent_id = (cat_obj.backend_ref or {}).get("parent_id", 0) if cat_obj else 0
+        parent_key_str = str(parent_id) if parent_id else slug
+        groups.setdefault(parent_key_str, []).append(slug)
+
+    if len(effective) < len(slug_list):
+        logger.debug(
+            f"_group_categories: pruned {set(slug_list) - set(effective)} "
+            f"(covered by ancestor in set)"
+        )
 
     return groups
 
