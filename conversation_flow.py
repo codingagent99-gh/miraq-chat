@@ -37,7 +37,66 @@ class FlowState(Enum):
     AWAITING_BULK_EMAIL               = "awaiting_bulk_email"
     AWAITING_BULK_PRODUCT             = "awaiting_bulk_product"
     AWAITING_BULK_QUANTITY = "awaiting_bulk_quantity"
-    
+
+_ORDER_FLOW_STATES = {
+    FlowState.AWAITING_QUANTITY,
+    FlowState.AWAITING_VARIANT_SELECTION,
+    FlowState.AWAITING_CART_CONFIRMATION,
+    FlowState.AWAITING_ORDER_DETAIL,
+    FlowState.AWAITING_REORDER_ID,
+    FlowState.AWAITING_ORDER_FOR_EMAIL,
+    FlowState.AWAITING_BULK_ORDER_INPUT,
+    FlowState.AWAITING_BULK_ORDER_CONFIRMATION,
+    FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION,
+    FlowState.AWAITING_BULK_VARIANT_SELECTION,
+    FlowState.AWAITING_BULK_EMAIL,
+    FlowState.AWAITING_BULK_PRODUCT,
+    FlowState.AWAITING_BULK_QUANTITY,
+}
+
+# Keywords that signal a topic change away from the current flow
+_TOPIC_CHANGE_KEYWORDS = {
+    "show", "search", "find", "browse", "display", "list",
+    "order history", "my orders", "check order", "track",
+    "categories", "what do you have",
+}
+
+def is_order_flow(state: FlowState) -> bool:
+    """True when state is an active order/transaction flow (not search refinement)."""
+    return state in _ORDER_FLOW_STATES
+
+
+def _is_topic_change(text: str) -> bool:
+    """True if the message looks like the user wants to do something different."""
+    return any(kw in text for kw in _TOPIC_CHANGE_KEYWORDS)
+
+
+def _flow_context_message(state: FlowState) -> dict:
+    """Return a state-specific nudge message with cancel instruction."""
+    _hints = {
+        FlowState.AWAITING_QUANTITY:                "Please enter a quantity (e.g. **5**)",
+        FlowState.AWAITING_VARIANT_SELECTION:       "Please select a variant from the options above",
+        FlowState.AWAITING_CART_CONFIRMATION:       "Please reply **Yes** to add to cart or **No** to skip",
+        FlowState.AWAITING_BULK_EMAIL:              "Please provide a valid customer email address",
+        FlowState.AWAITING_BULK_PRODUCT:            "Please enter a product name",
+        FlowState.AWAITING_BULK_QUANTITY:           "Please enter a quantity",
+        FlowState.AWAITING_BULK_ORDER_INPUT:        "Please enter your order lines",
+        FlowState.AWAITING_BULK_ORDER_CONFIRMATION: "Please reply **Yes** to confirm or **No** to cancel",
+        FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION:"Please reply **Yes**, **Change**, or **Skip**",
+        FlowState.AWAITING_BULK_VARIANT_SELECTION:  "Please select a variant from the options above",
+        FlowState.AWAITING_ORDER_FOR_EMAIL:         "Please provide the customer email address",
+    }
+    hint = _hints.get(state, "Please complete the current step")
+    return {
+        "bot_message": (
+            f"{hint}.\n\n"
+            "Say **Cancel** to exit and start a new search."
+        ),
+        "suggestions": ["Cancel"],
+        "flow_state": state.value,
+        "pass_through": False,
+    }
+       
 @dataclass
 class ConversationContext:
     """Tracks the state of a multi-turn conversation."""
@@ -137,11 +196,7 @@ def handle_flow_state(
             }
         else:
             # Ambiguous — reset state and let classify handle it normally
-            return {
-                "action": None,
-                "flow_state": FlowState.IDLE.value,
-                "pass_through": True,
-            }
+           return _flow_context_message(FlowState.AWAITING_CART_CONFIRMATION)
             
     if state not in (FlowState.IDLE, FlowState.AWAITING_ANYTHING_ELSE):
         # Exact matches or starts-with to prevent accidental triggers 
@@ -276,12 +331,7 @@ def handle_flow_state(
                 "pass_through": False,
             }
         else:
-            return {
-                "bot_message": "How many would you like to order? Please enter a number.",
-                "suggestions": ["1", "5", "10", "25", "Cancel Order"],
-                "flow_state": FlowState.AWAITING_QUANTITY.value,
-                "pass_through": False,
-            }
+            return _flow_context_message(FlowState.AWAITING_QUANTITY)
 
     # ── State: Anything else? ──
     if state == FlowState.AWAITING_ANYTHING_ELSE:
@@ -315,8 +365,8 @@ def handle_flow_state(
             "show me products", "show products", "browse categories",
             "what categories", "check my orders", "check orders",
         ]
-        if any(ph in text for ph in _topic_change_phrases) or text.strip() in ("hello", "hi"):
-            return None
+        if any(ph in text for ph in _topic_change_phrases) or _is_topic_change(text) or text.strip() in ("hello", "hi"):
+            return _flow_context_message(FlowState.AWAITING_VARIANT_SELECTION)
         
     # ── State: Awaiting bulk order confirmation (Yes/No) ──
     if state == FlowState.AWAITING_BULK_ORDER_CONFIRMATION:
@@ -391,6 +441,8 @@ def handle_flow_state(
 
     # ── State: Awaiting bulk variant selection ──
     if state == FlowState.AWAITING_BULK_VARIANT_SELECTION:
+        if _is_topic_change(text):
+            return _flow_context_message(FlowState.AWAITING_BULK_VARIANT_SELECTION)
         return {
             "action": "process_bulk_variant_selection",
             "flow_state": FlowState.AWAITING_BULK_VARIANT_SELECTION.value,
@@ -427,6 +479,8 @@ def handle_flow_state(
     if state == FlowState.AWAITING_BULK_PRODUCT:
         # Any non-empty reply is treated as a product + optional quantity description.
         # The global escape hatch above already handles cancel/exit.
+        if _is_topic_change(text):
+            return _flow_context_message(FlowState.AWAITING_BULK_PRODUCT)
         return {
             "action": "process_bulk_product_reply",
             "flow_state": FlowState.AWAITING_BULK_PRODUCT.value,
@@ -435,6 +489,8 @@ def handle_flow_state(
         
     # ── State: Awaiting bulk order lines (after trigger prompt) ──
     if state == FlowState.AWAITING_BULK_ORDER_INPUT:
+        if _is_topic_change(text):
+            return _flow_context_message(FlowState.AWAITING_BULK_ORDER_INPUT)
         return {
             "action":     "process_bulk_input",
             "flow_state": FlowState.AWAITING_BULK_ORDER_INPUT.value,
@@ -442,6 +498,8 @@ def handle_flow_state(
         }
         
     if state == FlowState.AWAITING_BULK_QUANTITY:
+        if _is_topic_change(text):
+            return _flow_context_message(FlowState.AWAITING_BULK_QUANTITY)
         return {
             "action": "process_bulk_quantity_reply",
             "flow_state": FlowState.AWAITING_BULK_QUANTITY.value,

@@ -27,7 +27,7 @@ from formatters import format_product, format_custom_product, format_category, _
 from response_generator import generate_bot_message, generate_suggestions, _resolve_user_placeholders
 from classifier import classify
 from api_builder import build_api_calls
-from conversation_flow import FlowState, handle_flow_state
+from conversation_flow import FlowState, handle_flow_state, is_order_flow, _flow_context_message
 from chat_logger import get_logger, sanitize_log_string
 from store_registry import get_store_loader
 from ecommerce import endpoints
@@ -1180,6 +1180,21 @@ def chat():
                 state=current_flow_state, message=message,
                 entities=flow_context, confidence=0.0,
             )
+            # Guard: if an order flow returned None (fell through), don't let the
+            # classifier run — the user sent something off-topic mid-flow.
+            if flow_result is None and is_order_flow(current_flow_state):
+                _ctx = _flow_context_message(current_flow_state)
+                return _ft(jsonify({
+                    "success": True,
+                    "bot_message": _ctx["bot_message"],
+                    "suggestions": _ctx["suggestions"],
+                    "flow_state": _ctx["flow_state"],
+                    "session_id": str(conversation.id),
+                    "products": [],
+                    "intent": "unknown",
+                    "metadata": {"confidence": 0.0},
+                    "pagination": default_pagination(page),
+                }), 200)
             if flow_result and flow_result.get("override_message"):
                 message = flow_result["override_message"]
 

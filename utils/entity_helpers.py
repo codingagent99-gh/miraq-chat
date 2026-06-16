@@ -15,7 +15,7 @@ STOP_WORDS = {
     "product", "products", "item", "items", "option", "options", "something", "anything", "some", "any",
     "series", "collection", "line", "brand", "style", "type", "have", "has", "had",
     "please", "thanks", "thank", "hello", "hi", "hey",
-    "under", "over", "above", "below", "latest", "newest", "recent", "new", "top", "bottom"
+    "under", "over", "above", "below", "latest", "newest", "recent", "new", "top", "bottom", "within"
 }
 
 
