@@ -183,16 +183,21 @@ def build_advanced_filter_call(
                     "taxonomy filters are present, relying on them."
                 )
             else:
-                # No taxonomy conditions — write the search term into the body
-                # as a last-resort safety net. Callers that need proper text-search
-                # behaviour (e.g. _build_product_search) should have already routed
-                # to endpoints.search_products before reaching here. This ensures
-                # we never silently return arbitrary products.
-                body["search"] = search_term.lower().strip()
-                logger.info(
-                    f"filter_builder: No taxonomy conditions — writing "
-                    f"search_term='{search_term}' to body['search'] as text-search fallback."
-                )
+                _term = search_term.lower().strip()
+                _stop = {'all', 'products', 'items', 'everything', 'anything',
+                        'show', 'me', 'give', 'find', 'search', 'list', 'get'}
+                _meaningful = bool(set(_term.split()) - _stop)
+                if _meaningful:
+                    body["search"] = _term
+                    logger.info(
+                        f"filter_builder: No taxonomy conditions — writing "
+                        f"search_term='{search_term}' to body['search'] as text-search fallback."
+                    )
+                else:
+                    logger.info(
+                        f"filter_builder: Ignoring stop-word search_term='{search_term}' "
+                        "— returning unfiltered product list."
+                    )
 
     logger.debug(f"api_builder: Advanced filter body: {json.dumps(body)}")
     
