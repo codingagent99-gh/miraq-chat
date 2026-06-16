@@ -40,7 +40,7 @@ WOO_CONSUMER_KEY = os.getenv("WOO_CONSUMER_KEY", "")
 WOO_CONSUMER_SECRET = os.getenv("WOO_CONSUMER_SECRET", "")
 PORT = int(os.getenv("PORT", 5009))
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
-
+USE_RELOADER = os.getenv("USE_RELOADER", "false")
 # ═══════════════════════════════════════════════════════════════
 # STORE IDENTITY
 # ═══════════════════════════════════════════════════════════════

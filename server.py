@@ -18,7 +18,7 @@ from chat_logger import get_logger
 from flask import Flask, jsonify
 from flask_cors import CORS
 
-from app_config import PORT, DEBUG, STORE_NAME
+from app_config import PORT, DEBUG, STORE_NAME, USE_RELOADER
 from store_registry import set_store_loader, get_store_loader
 from store_loader import StoreLoader, DEV_CACHE_ENABLED
 from models import db, Conversation
@@ -402,4 +402,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=PORT,
         debug=DEBUG,
+        use_reloader= USE_RELOADER,
     )
