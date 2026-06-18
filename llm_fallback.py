@@ -108,6 +108,32 @@ def _extract_json_object(text: str) -> str:
     return text
 
 
+_JSON_STRING_RE = re.compile(r'"(?:\\.|[^"\\])*"')
+
+
+def _escape_control_chars_in_strings(text: str) -> str:
+    """
+    Some LLMs emit literal newline/tab characters inside JSON string values
+    (e.g. a multi-line bullet-point suggestion) instead of escaping them as
+    \\n / \\t. json.loads rejects unescaped control characters inside a
+    string per the JSON spec, so this finds each quoted string literal and
+    escapes any raw control characters found strictly within it, leaving
+    insignificant whitespace BETWEEN tokens (which is legal as literal
+    newlines) untouched.
+    """
+    def _fix(match: "re.Match") -> str:
+        inner = match.group(0)[1:-1]
+        inner = (
+            inner.replace('\r\n', '\\n')
+                 .replace('\n', '\\n')
+                 .replace('\r', '\\n')
+                 .replace('\t', '\\t')
+        )
+        return '"' + inner + '"'
+
+    return _JSON_STRING_RE.sub(_fix, text)
+
+
 # ══════════════════════════════════════════════════════════════
 # RETRY HELPERS
 # ══════════════════════════════════════════════════════════════
@@ -515,6 +541,7 @@ def llm_fallback(
         
         # Parse LLM response
         llm_content = _extract_json_object(llm_response["content"].strip())
+        llm_content = _escape_control_chars_in_strings(llm_content)
 
         # Parse JSON
         try:
@@ -662,6 +689,7 @@ Return ONLY valid JSON."""
         
         # Parse response
         llm_content = _extract_json_object(llm_response["content"].strip())
+        llm_content = _escape_control_chars_in_strings(llm_content)
 
         try:
             parsed = json.loads(llm_content)

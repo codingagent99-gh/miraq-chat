@@ -26,6 +26,7 @@ class FlowState(Enum):
     AWAITING_REORDER_ID = "awaiting_reorder_id"
     AWAITING_FILTER_CLARIFICATION = "awaiting_filter_clarification"
     AWAITING_REFINEMENT_CHOICE    = "awaiting_refinement_choice"
+    AWAITING_NO_RESULTS_CHOICE    = "awaiting_no_results_choice"
     AWAITING_CART_CONFIRMATION = "awaiting_cart_confirmation"
     
     # ── Sales rep flows ──────────────────────────────────────────────

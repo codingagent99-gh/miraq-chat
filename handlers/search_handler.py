@@ -114,8 +114,7 @@ def handle_empty_results(
             "products": [],
             "suggestions": [
                 f"Show all {_cat}",
-                "What categories do you have?",
-                "Show me what's on sale",
+                "New Search",
             ],
             "filter_suggestions": _filter_suggestions,
             "session_id": session_id,
@@ -214,8 +213,7 @@ def handle_empty_results(
             "products": [],
             "suggestions": [
                 f"Show all {_cat}",
-                "What categories do you have?",
-                "Show me what's on sale",
+                "New Search",
             ],
             "filter_suggestions": _filter_suggestions,
             "session_id": session_id,

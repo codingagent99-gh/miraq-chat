@@ -123,14 +123,13 @@ def _build_search_context_string(entities: ExtractedEntities) -> str:
         desc_parts.append(f"Tag: **{tag_str}**")
 
     if getattr(entities, 'attr_tag_or_pairs', None):
-        # Labels already shown via plain attributes — skip OR pairs for these
         shown_attr_labels = {
             _resolve_attribute_label(k).lower()
             for k in (entities.attributes or {})
         }
-        # Group OR pairs by attr_term — same term across multiple taxonomies
-        # (e.g. pa_sample-size + pa_tile-size both for "12\"x24\"") is one
-        # user-facing filter, not two. Show only the best-matching label.
+        # Group OR pairs by attr_term, and track WHICH kinds of match (tag,
+        # category, attribute) feed into that term — used to decide whether
+        # to annotate the displayed value with "(tag or attribute match)" etc.
         or_by_term: dict = {}
         for pair in entities.attr_tag_or_pairs:
             attr_term = pair.get("attr_term", "")
@@ -142,19 +141,25 @@ def _build_search_context_string(entities: ExtractedEntities) -> str:
                 if display else
                 _resolve_attribute_term_name(taxonomy, attr_term)
             )
+            has_tag = bool(pair.get("tag_slug"))
+            has_cat = bool(pair.get("cat_slugs"))
+            has_attr = bool(taxonomy and attr_term)
             if attr_term not in or_by_term:
-                or_by_term[attr_term] = []
-            or_by_term[attr_term].append((label, clean))
+                or_by_term[attr_term] = {"pairs": [], "has_tag": False, "has_cat": False, "has_attr": False}
+            or_by_term[attr_term]["pairs"].append((label, clean))
+            or_by_term[attr_term]["has_tag"] |= has_tag
+            or_by_term[attr_term]["has_cat"] |= has_cat
+            or_by_term[attr_term]["has_attr"] |= has_attr
 
         or_by_label: dict[str, list] = {}
         or_label_order: list[str] = []
-        for attr_term, label_clean_pairs in or_by_term.items():
-            # Prefer label that matches a plain attribute already shown
+        or_label_suffix: dict[str, str] = {}
+        for attr_term, info in or_by_term.items():
+            label_clean_pairs = info["pairs"]
             best_label, best_clean = next(
                 (lc for lc in label_clean_pairs if lc[0].lower() in shown_attr_labels),
                 label_clean_pairs[0]
             )
-            # Skip entirely if this label is already covered by plain attributes
             if best_label.lower() in shown_attr_labels:
                 continue
             if best_label not in or_by_label:
@@ -163,12 +168,21 @@ def _build_search_context_string(entities: ExtractedEntities) -> str:
             if best_clean and best_clean not in or_by_label[best_label]:
                 or_by_label[best_label].append(best_clean)
 
+            # Decide annotation: only when the OR crosses tag/attribute or
+            # category/attribute — NOT when it's just the same attribute
+            # across multiple taxonomies (e.g. sample-size + tile-size).
+            if info["has_tag"] and info["has_attr"]:
+                or_label_suffix[best_label] = " *(tag or attribute match)*"
+            elif info["has_cat"] and info["has_attr"]:
+                or_label_suffix[best_label] = " *(category or attribute match)*"
+
         for label in or_label_order:
             vals = or_by_label[label]
             joined = f"{vals[0]} & {vals[1]}" if len(vals) == 2 else (
                 ", ".join(vals[:-1]) + f" & {vals[-1]}" if len(vals) > 2 else vals[0]
             )
-            desc_parts.append(f"{label}: **{joined}**")
+            suffix = or_label_suffix.get(label, "")
+            desc_parts.append(f"{label}: **{joined}**{suffix}")
 
     # EXCLUSIONS
     if getattr(entities, 'excluded_tags', None):

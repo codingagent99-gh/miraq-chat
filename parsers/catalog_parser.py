@@ -16,7 +16,7 @@ from utils.entity_helpers import (
 )
 from typing import Optional
 logger = get_logger("miraq_chat")
-
+from classifier.utils import create_flexible_pattern
 # Matches dimension strings like 12x24, 12"x24", 4x8, 2"x2", 12 x 24
 _DIM_RE = re.compile(r'^\d+["\']?\s*[xX×]\s*\d+["\']?$')
 # Matches slugified dimension terms like 12-x-24, 12x24, 12 x 24
@@ -253,6 +253,62 @@ def phase2_nlp_merge(
 # PHASE 3: Semantic Vector Search
 # ══════════════════════════════════════════════════════════════
 
+def _mask_resolved_entities(text: str, entities: ExtractedEntities) -> str:
+    """
+    Strip terms already resolved in `entities` (categories, tags, attributes,
+    and attr_tag_or_pairs) from `text` before it's used for semantic vector
+    search. See module-level note: unmatched_text can still contain words
+    the FINAL entities object already resolved, causing semantic search to
+    re-litigate a settled match.
+
+    Two passes:
+      1. Plural-tolerant exact match via create_flexible_pattern (same
+         utility isolate_unrecognized_terms uses) — handles tile/tiles.
+      2. Shared-prefix fallback (>=4 chars) — handles word-form mismatches
+         plural tolerance can't, e.g. resolved "textured" vs text "texture".
+         Known limitation: short shared prefixes can coincidentally match
+         unrelated words (e.g. "application"/"apple"); acceptable tradeoff
+         given the catalog's vocabulary, but worth knowing about.
+    """
+    tokens = set()
+
+    for cat in (getattr(entities, 'target_category_slugs', None) or set()):
+        tokens.update(w for w in cat.replace("-", " ").split() if len(w) > 2)
+
+    for slug in (getattr(entities, 'tag_slugs', None) or []):
+        tokens.update(w for w in slug.replace("-", " ").split() if len(w) > 2)
+
+    for val in (getattr(entities, 'attributes', None) or {}).values():
+        tokens.update(w for w in str(val).replace("-", " ").split() if len(w) > 2)
+
+    for pair in (getattr(entities, 'attr_tag_or_pairs', None) or []):
+        if pair.get("tag_slug"):
+            tokens.update(w for w in pair["tag_slug"].replace("-", " ").split() if len(w) > 2)
+        if pair.get("attr_term"):
+            tokens.update(w for w in str(pair["attr_term"]).replace("-", " ").split() if len(w) > 2)
+        for c_slug in (pair.get("cat_slugs") or []):
+            tokens.update(w for w in c_slug.replace("-", " ").split() if len(w) > 2)
+
+    masked = text.lower()
+
+    # Pass 1: plural-tolerant exact match.
+    for token in tokens:
+        pattern = create_flexible_pattern(token)
+        masked = re.sub(pattern, ' ', masked, flags=re.IGNORECASE)
+
+    # Pass 2: shared-prefix fallback for stemming mismatches (textured/texture).
+    out_words = []
+    for w in masked.split():
+        w_clean = re.sub(r'[^a-z0-9]', '', w)
+        if len(w_clean) >= 4 and any(
+            len(t) >= 4 and w_clean[:4] == t[:4]
+            for t in tokens
+        ):
+            continue
+        out_words.append(w)
+
+    return re.sub(r'\s+', ' ', ' '.join(out_words)).strip()
+
 def phase3_semantic_search(
     unmatched_text: str,
     nlp_entities,
@@ -265,6 +321,13 @@ def phase3_semantic_search(
     """
     strict_search_term = getattr(nlp_entities, 'search_term', None)
     raw_pos_for_vectors = unmatched_text if unmatched_text else strict_search_term
+
+    # unmatched_text can still contain terms `entities` already resolved as
+    # exact matches (see _mask_resolved_entities docstring) — strip those
+    # before running vector search, or it re-litigates a settled match.
+    if raw_pos_for_vectors:
+        raw_pos_for_vectors = _mask_resolved_entities(raw_pos_for_vectors, entities)
+
     raw_neg = getattr(nlp_entities, 'excluded_search_term', None)
 
     cleaned_pos_text = clean_leftovers(raw_pos_for_vectors)

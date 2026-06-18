@@ -55,6 +55,7 @@ from handlers.search_refinement import (
 )
 from parsers.catalog_parser import _detect_explicit_taxonomy_signal
 from handlers.refinement_choice_handler import build_refinement_prompt, resolve_refinement_choice
+from handlers.no_results_choice_handler import build_no_results_prompt, resolve_no_results_choice
 from config.store_config import SEMANTIC_AUTO_APPLY_THRESHOLD
 from parsers.catalog_parser import parse_csv_message
 from parsers.address_parser import extract_address, address_summary
@@ -840,6 +841,7 @@ def _build_final_response(
             "response_time_ms": round(elapsed * 1000),
             "intent_raw":       intent.value,
             "entities":         _entities_to_dict(entities),
+            "resolved_query":   api_calls_to_execute[-1].body if api_calls_to_execute else None,
         },
         "pagination":  pagination,
         "flow_state":  next_flow_state,
@@ -858,8 +860,8 @@ def _build_final_response(
 
         # Product order history — only when a specific product resolved
         _searched_product_id = getattr(entities, "product_id", None)
-        if not _searched_product_id and len(products) == 1:
-            _searched_product_id = products[0].get("id")
+        # if not _searched_product_id and len(products) == 1:
+        #     _searched_product_id = products[0].get("id")
 
         if _searched_product_id:
             _recent_orders = _fetch_product_order_history(_searched_product_id, _sr_role)
@@ -1153,6 +1155,29 @@ def chat():
                     _rfn_resolved        = True
                 # else: unrecognized input — fall through to normal classification.
 
+        elif current_flow_state == FlowState.AWAITING_NO_RESULTS_CHOICE:
+            _pending_nr = user_context.get("pending_no_results_choice")
+            if _pending_nr:
+                _nr_entities = resolve_no_results_choice(message, _pending_nr)
+                # Always reset state — recognized chip or unexpected input, we leave
+                # AWAITING_NO_RESULTS_CHOICE either way so the next turn is clean.
+                current_flow_state                = FlowState.IDLE
+                conversation.flow_state           = FlowState.IDLE.value
+                user_context["flow_state"]        = FlowState.IDLE.value
+                user_context.pop("pending_no_results_choice", None)
+                conversation.context_data         = user_context
+                flag_modified(conversation, "context_data")
+                if _nr_entities is not None:
+                    # Recognized chip — use resolved entities, bypass classification.
+                    bypass_result        = ClassifiedResult(
+                        intent=Intent.PRODUCT_SEARCH,
+                        entities=_nr_entities,
+                        confidence=0.99,
+                    )
+                    _skip_classification = True
+                    _rfn_resolved        = True
+                # else: unrecognized input — fall through to normal classification.
+
         elif forced_search_match:
             extracted_term = forced_search_match.group(1)
             logger.info(f"Intercepted explicit forced search string. Term: '{extracted_term}'")
@@ -1361,6 +1386,8 @@ def chat():
             Intent.CATEGORY_BROWSE, Intent.PRODUCT_LIST, Intent.PRODUCT_BY_TAG,
         )
         _did_refine = False
+        _turn_new_snapshot = None
+        _active = None
 
         if _rfn_resolved:
             # Entities were fully merged by refinement choice resolution (Step 1).
@@ -1394,6 +1421,17 @@ def chat():
                     ))
                 else:
                     logger.debug(f"[merge_trace] BEFORE merge | tags={entities.tag_slugs} | attrs={dict(entities.attributes)} | or_pairs={entities.attr_tag_or_pairs}")
+                    # Snapshot THIS TURN's filters before merge mutates `entities`
+                    # in place — needed later if the merged search returns zero
+                    # results, so we can tell the shopper what's new vs carried.
+                    _turn_new_snapshot = {
+                        "attributes":        dict(entities.attributes),
+                        "tags":              list(entities.tag_slugs),
+                        "categories":        list(getattr(entities, "target_category_slugs", set())),
+                        "min_price":         entities.min_price,
+                        "max_price":         entities.max_price,
+                        "attr_tag_or_pairs": list(getattr(entities, "attr_tag_or_pairs", [])),
+                    }
                     merge_into_active_search(entities, _active)
                     _did_refine = True
                     logger.debug(f"[merge_trace] AFTER merge | tags={entities.tag_slugs} | attrs={dict(entities.attributes)} | or_pairs={entities.attr_tag_or_pairs}")
@@ -1666,27 +1704,44 @@ def chat():
 
         # ── Zero-result safety net for refined searches ──
         # Accumulated filters can AND down to nothing (e.g. beige + marble).
-        # Name the active filters and point to New Search, so the shopper can
-        # self-correct without the backend guessing intent.
+        # When we know what THIS turn added vs what was already active
+        # (_turn_new_snapshot), offer a one-tap fix (Pattern A) instead of a
+        # flat dump of every active filter. Fall back to the generic message
+        # only when that distinction isn't available.
         if _did_refine and not all_products_raw and intent in _PRODUCT_SEARCH_INTENTS:
-            _filters_labeled = describe_active_filters_labeled(entities)
-            _elapsed = time.time() - start_time
-            return _ft(jsonify({
-                "success": True,
-                "bot_message": (
-                    f"No products found for {_filters_labeled}.\n\n"
-                    "Tap **New Search** to start over, or try a different filter."
-                    if _filters_labeled else
-                    "No products match those filters.\n\nTap **New Search** to start over."
-                ),
-                "intent": intent.value,
-                "products": [],
-                "suggestions": ["New Search"],
-                "session_id": str(conversation.id),
-                "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": round(_elapsed * 1000)},
-                "flow_state": FlowState.IDLE.value,
-                "pagination": default_pagination(page),
-            }))
+            if _turn_new_snapshot:
+                _active_slots = _active.get("slots", {}) if _active else {}
+                user_context["pending_no_results_choice"] = {
+                    "turn_new": _turn_new_snapshot,
+                    "active":   _active_slots,
+                }
+                conversation.flow_state   = FlowState.AWAITING_NO_RESULTS_CHOICE.value
+                conversation.context_data = user_context
+                flag_modified(conversation, "context_data")
+                db.session.commit()
+                return _ft(build_no_results_prompt(
+                    _turn_new_snapshot, _active_slots,
+                    str(conversation.id), page, start_time,
+                ))
+            else:
+                _filters_labeled = describe_active_filters_labeled(entities)
+                _elapsed = time.time() - start_time
+                return _ft(jsonify({
+                    "success": True,
+                    "bot_message": (
+                        f"No products found for {_filters_labeled}.\n\n"
+                        "Tap **New Search** to start over, or try a different filter."
+                        if _filters_labeled else
+                        "No products match those filters.\n\nTap **New Search** to start over."
+                    ),
+                    "intent": intent.value,
+                    "products": [],
+                    "suggestions": ["New Search"],
+                    "session_id": str(conversation.id),
+                    "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": round(_elapsed * 1000)},
+                    "flow_state": FlowState.IDLE.value,
+                    "pagination": default_pagination(page),
+                }))
 
         all_products_raw, resp = handle_empty_results(
             intent, entities, all_products_raw, message,
