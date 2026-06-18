@@ -14,6 +14,8 @@ from typing import List, Set, Tuple
 from models import OrPair
 from api_builder.query_tree import make_condition, make_or_group
 from api_builder.store_helpers import loader
+from chat_logger import get_logger
+logger = get_logger("miraq_chat")
 
 def resolve_or_pair(pair: OrPair) -> OrPair:
     """
@@ -150,5 +152,7 @@ def build_or_pair_conditions(pairs: List[OrPair]) -> Tuple[list, Set[str], Set[s
             conditions.append(make_or_group(or_conds))
         elif len(or_conds) == 1:
             conditions.append(or_conds[0])
+
+    logger.debug(f"[or_pairs_trace] grouped_keys={list(grouped.keys())} | conditions_returned={conditions}")
 
     return conditions, covered_tags, covered_cats

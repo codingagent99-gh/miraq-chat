@@ -24,22 +24,74 @@ PRODUCT_SPECIFIC_INTENTS = {
     Intent.PLACE_ORDER, Intent.ORDER_ITEM,
 }
 
+def _resolve_tag_attribute_overlap(entities: ExtractedEntities):
+    """
+    extract_tag and extract_attributes run independently on separately-masked
+    text in classify(), with no cross-checking — so the same input (e.g.
+    "quick ship") can set BOTH tag_slugs=['quick-ship'] AND
+    attributes={'quick-ship': 'yes'} simultaneously. Merge these into a
+    single OR pair so the query becomes (product_tag=X OR pa_X=value)
+    instead of silently using only one of the two taxonomies.
+    """
+    if not (entities.tag_slugs and entities.attributes):
+        return
 
+    loader = get_store_loader()
+
+    for tag_slug in list(entities.tag_slugs):
+        tag_tokens = normalize_for_tag_compare(tag_slug.replace("-", " "))
+
+        for attr_label, attr_value in list(entities.attributes.items()):
+            label_tokens = normalize_for_tag_compare(attr_label.replace("-", " "))
+            if label_tokens != tag_tokens:
+                continue
+
+            actual_tax = ""
+            if loader and loader.all_attributes_raw:
+                attr_label_norm = attr_label.lower().strip()
+                for a in loader.all_attributes_raw:
+                    # attribute_name is the hyphenated form matching entities.attributes
+                    # dict keys (e.g. "quick-ship"); attribute_label is the human-readable
+                    # form (e.g. "Quick Ship") and won't match for multi-word names.
+                    name_raw = (a.get("attribute_name") or "").lower().strip()
+                    label_raw = (a.get("attribute_label") or a.get("name") or "").lower().strip()
+                    if attr_label_norm in (name_raw, label_raw, label_raw.replace(" ", "-")):
+                        actual_tax = a.get("taxonomy", "")
+                        break
+
+            if not actual_tax:
+                continue
+
+            entities.attr_tag_or_pairs.append({
+                "tag_slug": tag_slug,
+                "attr_taxonomy": actual_tax,
+                "attr_term": attr_value,
+            })
+
+            # Remove tag_slug AND its paired tag_id together — tag_ids and
+            # tag_slugs are parallel lists (merge_tags zips them by index),
+            # so removing only one would misalign them on future merges.
+            if tag_slug in entities.tag_slugs:
+                idx = entities.tag_slugs.index(tag_slug)
+                entities.tag_slugs.pop(idx)
+                if idx < len(entities.tag_ids):
+                    entities.tag_ids.pop(idx)
+
+            del entities.attributes[attr_label]
+            logger.info(
+                f"_resolve_tag_attribute_overlap: merged tag='{tag_slug}' + "
+                f"attr='{attr_label}:{attr_value}' → OR pair on taxonomy='{actual_tax}'"
+            )
+            break
+        
 def consolidate_entities(intent: Intent, entities: ExtractedEntities, text: str):
-    logger.debug(f"[consolidate] START | tags={entities.tag_slugs} | attrs={dict(entities.attributes)} | or_pairs={entities.attr_tag_or_pairs}")
     _resolve_product_vs_category(intent, entities)
-    logger.debug(f"[consolidate] after _resolve_product_vs_category | tags={entities.tag_slugs}")
     _resolve_series_tag_conflict(entities, text)
-    logger.debug(f"[consolidate] after _resolve_series_tag_conflict | tags={entities.tag_slugs}")
     _deduplicate_or_pairs(entities)
-    logger.debug(f"[consolidate] after _deduplicate_or_pairs | tags={entities.tag_slugs}")
     _resolve_category_attribute_overlap(entities)
-    logger.debug(f"[consolidate] after _resolve_category_attribute_overlap | tags={entities.tag_slugs}")
+    _resolve_tag_attribute_overlap(entities)
     _prune_tag_covered_attrs(entities)
-    logger.debug(f"[consolidate] after _prune_tag_covered_attrs | tags={entities.tag_slugs}")
     _prune_redundant_attributes(entities)
-    logger.debug(f"[consolidate] after _prune_redundant_attributes | tags={entities.tag_slugs}")
-
 
 def _resolve_product_vs_category(intent: Intent, entities: ExtractedEntities):
     """When both product_id and category are set, drop the lower-priority one."""
@@ -130,9 +182,14 @@ def _resolve_category_attribute_overlap(entities: ExtractedEntities):
 
         actual_tax = ""
         if loader and loader.all_attributes_raw:
+            attr_label_norm = attr_label.lower().strip()
             for a in loader.all_attributes_raw:
-                label_raw = a.get("attribute_label") or a.get("name") or a.get("attribute_name") or ""
-                if label_raw.lower().strip() == attr_label:
+                # attribute_name is the hyphenated form matching entities.attributes
+                # dict keys (e.g. "quick-ship"); attribute_label is the human-readable
+                # form (e.g. "Quick Ship") and won't match for multi-word names.
+                name_raw = (a.get("attribute_name") or "").lower().strip()
+                label_raw = (a.get("attribute_label") or a.get("name") or "").lower().strip()
+                if attr_label_norm in (name_raw, label_raw, label_raw.replace(" ", "-")):
                     actual_tax = a.get("taxonomy", "")
                     break
 

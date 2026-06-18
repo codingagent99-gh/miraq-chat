@@ -1393,50 +1393,98 @@ def chat():
                         conflicts, str(conversation.id), page, start_time
                     ))
                 else:
+                    logger.debug(f"[merge_trace] BEFORE merge | tags={entities.tag_slugs} | attrs={dict(entities.attributes)} | or_pairs={entities.attr_tag_or_pairs}")
                     merge_into_active_search(entities, _active)
                     _did_refine = True
+                    logger.debug(f"[merge_trace] AFTER merge | tags={entities.tag_slugs} | attrs={dict(entities.attributes)} | or_pairs={entities.attr_tag_or_pairs}")
         # ────────────────────────────────────────────────────────────────────
-                    
-        # Explicit taxonomy signal — re-apply after merge so session-accumulated
-        # attrs (e.g. application=paver from a prior turn) don't override the
-        # user's explicit taxonomy intent (e.g. "category pavers").
+
+        # Explicit taxonomy signal — runs once, after any active-search merge,
+        # so it always sees the full accumulated filter set regardless of
+        # whether this turn had an active search to merge into.
         _signal = _detect_explicit_taxonomy_signal(message, store_loader)
-        if _signal == 'product_cat' and getattr(entities, 'target_category_slugs', None):
-            _matched_cats = set(entities.target_category_slugs)
-            _cat_bases = {s.rstrip('s') for s in _matched_cats} | _matched_cats
-            entities.attr_tag_or_pairs = [
-                op for op in getattr(entities, 'attr_tag_or_pairs', [])
-                if not any(s in (op.get('cat_slugs') or []) for s in _matched_cats)
-            ]
-            entities.attributes = {
-                k: v for k, v in entities.attributes.items()
-                if str(v).strip().lower().rstrip('s') not in _cat_bases
-            }
+        if _signal == 'product_cat':
+            or_pairs = getattr(entities, 'attr_tag_or_pairs', [])
+            # Category may already be absorbed into an OR pair by
+            # _resolve_category_attribute_overlap (which runs earlier, inside
+            # classify()'s own consolidate_entities call) — so target_category_slugs
+            # can be empty even though the user explicitly said "category".
+            # Only recover cat_slugs from OR pairs whose category name actually
+            # appears in THIS message — otherwise an unrelated category carried
+            # forward from an earlier turn gets silently merged in.
+            msg_lower = message.lower()
+            collision_cat_slugs = set()
+            for op in or_pairs:
+                for slug in (op.get('cat_slugs') or []):
+                    cat_obj = store_loader.resolve_category(slug) if store_loader else None
+                    cat_name = (cat_obj.name if cat_obj else slug.replace('-', ' ')).lower()
+                    if cat_name in msg_lower or slug.replace('-', ' ') in msg_lower:
+                        collision_cat_slugs.add(slug)
+            _matched_cats = set(getattr(entities, 'target_category_slugs', set())) | collision_cat_slugs
+            if _matched_cats:
+                _cat_bases = {s.rstrip('s') for s in _matched_cats} | _matched_cats
+                # User said "category" explicitly — restore it as a standalone filter,
+                # dropping the OR-with-attribute version entirely.
+                entities.target_category_slugs = _matched_cats
+                entities.attr_tag_or_pairs = [
+                    op for op in or_pairs
+                    if not any(s in (op.get('cat_slugs') or []) for s in _matched_cats)
+                ]
+                entities.attributes = {
+                    k: v for k, v in entities.attributes.items()
+                    if str(v).strip().lower().rstrip('s') not in _cat_bases
+                }
         elif _signal == 'product_tag' and getattr(entities, 'tag_slugs', None):
             _matched_tags = set(entities.tag_slugs)
             entities.attr_tag_or_pairs = [
                 op for op in getattr(entities, 'attr_tag_or_pairs', [])
                 if op.get('tag_slug') not in _matched_tags
             ]
-            
+
         elif _signal and _signal.startswith('pa_'):
             or_pairs = getattr(entities, 'attr_tag_or_pairs', [])
 
-            # User explicitly named a taxonomy (e.g. "sample size" → pa_sample-size).
-            # Drop OR pair entries for all OTHER attribute taxonomies — they were added
-            # as backend query fallbacks, not because the user asked for them.
-            entities.attr_tag_or_pairs = [
+            # Pairs that already match the named taxonomy (the user's explicit choice).
+            signal_pairs = [
                 op for op in or_pairs
-                if not op.get('attr_taxonomy')
-                or op.get('attr_taxonomy') == _signal
+                if op.get('attr_taxonomy') == _signal
                 or f"pa_{op.get('attr_taxonomy', '')}" == _signal
             ]
+            # Only drop a DIFFERENT-taxonomy pair if it describes the SAME concept
+            # as a signal-matching pair (shares tag_slug or overlapping cat_slugs).
+            # Pairs with no such overlap are unrelated — e.g. a filter carried
+            # forward from a prior turn (different tag/category entirely) — and
+            # must be left untouched, even though their taxonomy differs from _signal.
+            collision_tags = {p.get('tag_slug') for p in signal_pairs if p.get('tag_slug')}
+            collision_cats = {s for p in signal_pairs for s in (p.get('cat_slugs') or [])}
 
-            # Also resolve any category collision for this taxonomy
+            kept = []
+            for op in or_pairs:
+                is_signal_match = (
+                    op.get('attr_taxonomy') == _signal
+                    or f"pa_{op.get('attr_taxonomy', '')}" == _signal
+                )
+                if is_signal_match:
+                    # User named the attribute explicitly (e.g. "countertop
+                    # application") — drop the category branch from this pair
+                    # so the query filters by the attribute alone, not OR'd
+                    # with the category.
+                    op = dict(op)
+                    op['cat_slugs'] = []
+                    kept.append(op)
+                    continue
+                op_tag = op.get('tag_slug')
+                op_cats = set(op.get('cat_slugs') or [])
+                collides = (op_tag and op_tag in collision_tags) or bool(op_cats & collision_cats)
+                if not collides:
+                    kept.append(op)
+            entities.attr_tag_or_pairs = kept
+
+            # Resolve any category collision for the signal-matched taxonomy.
             cat_slugs_in_collision = {
                 slug
                 for op in entities.attr_tag_or_pairs
-                if op.get('attr_taxonomy') == _signal
+                if op.get('attr_taxonomy') == _signal or f"pa_{op.get('attr_taxonomy','')}" == _signal
                 for slug in (op.get('cat_slugs') or [])
             }
             if cat_slugs_in_collision:
