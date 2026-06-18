@@ -136,12 +136,15 @@ class WooClient:
             )
 
             if isinstance(data, dict) and "products" in data:
-                return {
+                result = {
                     "success":     True,
                     "data":        data.get("products", []),
                     "total":       str(data.get("total", "")) or None,
                     "total_pages": str(data.get("pages", "")) or None,
                 }
+                if data.get("or_group_breakdown"):
+                    result["or_group_breakdown"] = data["or_group_breakdown"]
+                return result
 
             return {
                 "success":     True,

@@ -93,6 +93,50 @@ def resolve_or_pair(pair: OrPair) -> OrPair:
         attr_term=term_slug,
     )
 
+def summarize_or_pair_matches(products: list, pairs: list) -> dict:
+    """
+    For OR-pair searches, count how many of the already-fetched raw `products`
+    satisfy each branch (category / tag / attribute) per attr_term.
+    Computed locally — no extra API call.
+
+    `products` must be the products-advanced-new raw shape: `categories` is
+    [{"slug": ...}], `attributes` is {taxonomy: [term_names]}.
+
+    Returns: {attr_term: {"category": int, "tag": int, "attribute": int}}
+    (only keys for branches actually present in that pair are included)
+    """
+    if not pairs or not products:
+        return {}
+
+    summary: dict = {}
+    for raw_pair in pairs:
+        pair = resolve_or_pair(raw_pair)
+        bucket = summary.setdefault(pair.attr_term or "", {})
+
+        if pair.tag_slug:
+            bucket["tag"] = bucket.get("tag", 0) + sum(
+                1 for p in products
+                if pair.tag_slug in {t.get("slug") for t in p.get("tags", []) if isinstance(t, dict)}
+            )
+
+        if pair.cat_slugs:
+            cat_set = set(pair.cat_slugs)
+            bucket["category"] = bucket.get("category", 0) + sum(
+                1 for p in products
+                if cat_set & {c.get("slug") for c in p.get("categories", []) if isinstance(c, dict)}
+            )
+
+        if pair.attr_taxonomy and pair.attr_term:
+            term = pair.attr_term.lower()
+            bucket["attribute"] = bucket.get("attribute", 0) + sum(
+                1 for p in products
+                if term in {
+                    str(name).lower().replace(" ", "-")
+                    for name in (p.get("attributes") or {}).get(pair.attr_taxonomy, [])
+                }
+            )
+
+    return summary
 
 def build_or_pair_conditions(pairs: List[OrPair]) -> Tuple[list, Set[str], Set[str]]:
     """

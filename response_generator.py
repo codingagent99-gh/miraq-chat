@@ -24,6 +24,17 @@ def _attribute_key_candidates(attr_key: str) -> list[str]:
         candidates.append(key.replace("-", " "))
     return [c for c in dict.fromkeys(candidates) if c]
 
+def _resolve_attribute_taxonomy(attr_key: str) -> str:
+    try:
+        l = get_store_loader()
+    except Exception:
+        l = None
+    if l:
+        for candidate in _attribute_key_candidates(attr_key):
+            attr = l.resolve_attribute(candidate)
+            if attr:
+                return attr.backend_ref.get("taxonomy", "")
+    return ""
 
 def _resolve_attribute_label(attr_key: str) -> str:
     try:
@@ -92,97 +103,67 @@ def _build_attribute_value_summary(attributes: dict) -> str:
             values.append(_resolve_attribute_term_name(attr_key, attr_val))
     return " / ".join(values)
 
-def _build_search_context_string(entities: ExtractedEntities) -> str:
-    """Builds a human-readable string of the exact entities the bot searched for."""
+def _build_search_context_string(entities: ExtractedEntities,  or_pair_breakdown: dict = None) -> str:
     desc_parts = []
-    
+
+    consumed_cat_slugs, consumed_tag_slugs, consumed_attr = set(), set(), set()
+
+    for group in (or_pair_breakdown or []):
+        head_label, head_value, suffix_bits = None, None, []
+        for branch in group:
+            terms = branch["terms"]
+            if branch["role"] == "category":
+                label = "Category"
+                value = ", ".join(_resolve_category_name(t) for t in terms)
+                consumed_cat_slugs.update(t.lower() for t in terms)
+            elif branch["role"] == "tag":
+                label = "Tag"
+                value = ", ".join(_resolve_tag_name(t) for t in terms)
+                consumed_tag_slugs.update(t.lower() for t in terms)
+            else:
+                attr_key = branch["taxonomy"].removeprefix("pa_")
+                label = _resolve_attribute_label(attr_key)
+                value = ", ".join(_resolve_attribute_term_name(attr_key, t) for t in terms)
+                consumed_attr.update((branch["taxonomy"], t.lower()) for t in terms)
+
+            if head_label is None:
+                head_label, head_value = label, value
+            suffix_bits.append(f"{label}: {branch['count']}")
+
+        desc_parts.append(f"{head_label}: **{head_value}** *({' • '.join(suffix_bits)})*")
+
     if getattr(entities, 'product_name', None):
         desc_parts.append(f"Product: **{entities.product_name}**")
 
     cat_name = getattr(entities, 'category_name', None)
-    if not cat_name and getattr(entities, 'target_category_slugs', None):
-        cat_name = ", ".join(
-            _resolve_category_name(s) for s in sorted(entities.target_category_slugs)
-        )
-    if cat_name:
-        desc_parts.append(f"Category: **{cat_name}**")
-        
+    cat_slugs = getattr(entities, 'target_category_slugs', None) or set()
+    if not (cat_slugs and all(s.lower() in consumed_cat_slugs for s in cat_slugs)):
+        if not cat_name and cat_slugs:
+            cat_name = ", ".join(_resolve_category_name(s) for s in sorted(cat_slugs))
+        if cat_name:
+            desc_parts.append(f"Category: **{cat_name}**")
+
     if getattr(entities, 'attributes', None):
         for attr_name, attr_val in entities.attributes.items():
-            if not attr_val: continue
+            if not attr_val:
+                continue
+            taxonomy = _resolve_attribute_taxonomy(attr_name)
+            val_slug = str(attr_val).lower().replace(" ", "-")
+            if taxonomy and (taxonomy, val_slug) in consumed_attr:
+                continue
             clean_name = _resolve_attribute_label(attr_name)
             clean_val = _resolve_attribute_term_name(attr_name, attr_val)
             desc_parts.append(f"{clean_name}: **{clean_val}**")
             
     if getattr(entities, 'tag_slugs', None):
-        clean_tags = [_resolve_tag_name(t) for t in entities.tag_slugs]
-        if len(clean_tags) == 1:
-            tag_str = clean_tags[0]
-        else:
-            tag_str = ", ".join(clean_tags[:-1]) + " & " + clean_tags[-1]
-        desc_parts.append(f"Tag: **{tag_str}**")
-
-    if getattr(entities, 'attr_tag_or_pairs', None):
-        shown_attr_labels = {
-            _resolve_attribute_label(k).lower()
-            for k in (entities.attributes or {})
-        }
-        # Group OR pairs by attr_term, and track WHICH kinds of match (tag,
-        # category, attribute) feed into that term — used to decide whether
-        # to annotate the displayed value with "(tag or attribute match)" etc.
-        or_by_term: dict = {}
-        for pair in entities.attr_tag_or_pairs:
-            attr_term = pair.get("attr_term", "")
-            taxonomy = pair.get("attr_taxonomy", "")
-            label = _resolve_attribute_label(taxonomy) if taxonomy else "Filter"
-            display = pair.get("display_text", "")
-            clean = (
-                " ".join(w.capitalize() for w in display.split())
-                if display else
-                _resolve_attribute_term_name(taxonomy, attr_term)
-            )
-            has_tag = bool(pair.get("tag_slug"))
-            has_cat = bool(pair.get("cat_slugs"))
-            has_attr = bool(taxonomy and attr_term)
-            if attr_term not in or_by_term:
-                or_by_term[attr_term] = {"pairs": [], "has_tag": False, "has_cat": False, "has_attr": False}
-            or_by_term[attr_term]["pairs"].append((label, clean))
-            or_by_term[attr_term]["has_tag"] |= has_tag
-            or_by_term[attr_term]["has_cat"] |= has_cat
-            or_by_term[attr_term]["has_attr"] |= has_attr
-
-        or_by_label: dict[str, list] = {}
-        or_label_order: list[str] = []
-        or_label_suffix: dict[str, str] = {}
-        for attr_term, info in or_by_term.items():
-            label_clean_pairs = info["pairs"]
-            best_label, best_clean = next(
-                (lc for lc in label_clean_pairs if lc[0].lower() in shown_attr_labels),
-                label_clean_pairs[0]
-            )
-            if best_label.lower() in shown_attr_labels:
-                continue
-            if best_label not in or_by_label:
-                or_by_label[best_label] = []
-                or_label_order.append(best_label)
-            if best_clean and best_clean not in or_by_label[best_label]:
-                or_by_label[best_label].append(best_clean)
-
-            # Decide annotation: only when the OR crosses tag/attribute or
-            # category/attribute — NOT when it's just the same attribute
-            # across multiple taxonomies (e.g. sample-size + tile-size).
-            if info["has_tag"] and info["has_attr"]:
-                or_label_suffix[best_label] = " *(tag or attribute match)*"
-            elif info["has_cat"] and info["has_attr"]:
-                or_label_suffix[best_label] = " *(category or attribute match)*"
-
-        for label in or_label_order:
-            vals = or_by_label[label]
-            joined = f"{vals[0]} & {vals[1]}" if len(vals) == 2 else (
-                ", ".join(vals[:-1]) + f" & {vals[-1]}" if len(vals) > 2 else vals[0]
-            )
-            suffix = or_label_suffix.get(label, "")
-            desc_parts.append(f"{label}: **{joined}**{suffix}")
+        remaining_tags = [t for t in entities.tag_slugs if t.lower() not in consumed_tag_slugs]
+        if remaining_tags:
+            clean_tags = [_resolve_tag_name(t) for t in remaining_tags]
+            if len(clean_tags) == 1:
+                tag_str = clean_tags[0]
+            else:
+                tag_str = ", ".join(clean_tags[:-1]) + " & " + clean_tags[-1]
+            desc_parts.append(f"Tag: **{tag_str}**")
 
     # EXCLUSIONS
     if getattr(entities, 'excluded_tags', None):
@@ -212,7 +193,8 @@ def generate_bot_message(
     order_data: List[dict] = None,
     total_items: Optional[int] = None,
     page: int = 1,
-    customer_id=None
+    customer_id=None,
+    or_pair_breakdown: Optional[dict] = None,
 ) -> str:
     """Generate a natural language bot response.
 
@@ -530,7 +512,7 @@ def generate_bot_message(
         p = products[0]
         
         # 🚀 FIX: Use the new context builder to explicitly announce tags/categories/attributes
-        search_context = _build_search_context_string(entities)
+        search_context = _build_search_context_string(entities, or_pair_breakdown)
         match_intro = f"I found the perfect match for {search_context}! 🎯" if search_context else "I found the perfect match! 🎯"
 
         msg = f"{match_intro}\n\n**{p['name']}**\n"
@@ -551,7 +533,7 @@ def generate_bot_message(
 
     # ── Multiple products ──
     msg = ""
-    search_context = _build_search_context_string(entities)
+    search_context = _build_search_context_string(entities, or_pair_breakdown)
 
     if intent == Intent.CATEGORY_BROWSE:
         qualifier = _get_unresolved_category_qualifier(entities)

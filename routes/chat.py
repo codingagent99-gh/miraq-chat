@@ -765,6 +765,12 @@ def _build_final_response(
     products   = [p for p in products if p.get("name")]
     pagination = build_pagination(page, api_responses, api_calls_to_execute)
 
+    or_pair_breakdown = None
+    for resp in api_responses:
+        if resp.get("success") and resp.get("or_group_breakdown"):
+            or_pair_breakdown = resp["or_group_breakdown"]
+            break
+
     if intent in (Intent.CATEGORY_LIST, Intent.PRODUCT_CATALOG):
         bot_message      = "Here are our top categories to help you get started!"
         suggestions_list = ["Cancel"]
@@ -773,6 +779,7 @@ def _build_final_response(
             intent, entities, products, confidence, order_data,
             total_items=pagination.get("total_items"), page=page,
             customer_id=customer_id,
+            or_pair_breakdown=or_pair_breakdown,
         )
         suggestions_list = generate_suggestions(intent, entities, products)
 

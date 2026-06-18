@@ -157,3 +157,72 @@ def merge_cross_taxonomy_overlaps(conditions: list) -> list:
             final.append(make_or_group(group))
 
     return final
+
+def find_or_groups(node) -> list:
+    """
+    Recursively collect every OR-group's leaf conditions from a parsed
+    filter tree (the body["filters"] structure, or any sub-node of it).
+    Returns a list of branch-lists, e.g.:
+        [[{"taxonomy": "product_cat", "terms": ["pavers"], ...},
+          {"taxonomy": "pa_application", "terms": ["paver"], ...}], ...]
+    """
+    groups = []
+    if isinstance(node, list):
+        for n in node:
+            groups.extend(find_or_groups(n))
+        return groups
+    if not isinstance(node, dict):
+        return groups
+
+    if node.get("relation") == "OR":
+        subs = node.get("conditions", [])
+        if subs and all("taxonomy" in s for s in subs):
+            groups.append(subs)
+        else:
+            groups.extend(find_or_groups(subs))
+    elif "conditions" in node:
+        groups.extend(find_or_groups(node["conditions"]))
+
+    return groups
+
+
+def _branch_role(taxonomy: str) -> str:
+    if taxonomy == "product_cat":
+        return "category"
+    if taxonomy == "product_tag":
+        return "tag"
+    if taxonomy.startswith("pa_"):
+        return "attribute"
+    return "other"
+
+
+def count_or_group_matches(products: list, branch_conditions: list) -> list:
+    """
+    Per-branch product counts for one OR-group's leaf conditions, computed
+    locally from already-fetched `products` (products-advanced-new raw shape).
+    Returns: [{"taxonomy", "terms", "role", "count"}, ...]
+    """
+    results = []
+    for cond in branch_conditions:
+        taxonomy = cond.get("taxonomy", "")
+        terms = {str(t).lower() for t in cond.get("terms", [])}
+        role = _branch_role(taxonomy)
+
+        if role == "category":
+            count = sum(1 for p in products if terms & {
+                c.get("slug", "").lower() for c in p.get("categories", []) if isinstance(c, dict)
+            })
+        elif role == "tag":
+            count = sum(1 for p in products if terms & {
+                t.get("slug", "").lower() for t in p.get("tags", []) if isinstance(t, dict)
+            })
+        elif role == "attribute":
+            count = sum(1 for p in products if terms & {
+                str(n).lower().replace(" ", "-")
+                for n in (p.get("attributes") or {}).get(taxonomy, [])
+            })
+        else:
+            count = None
+
+        results.append({"taxonomy": taxonomy, "terms": cond.get("terms", []), "role": role, "count": count})
+    return results
