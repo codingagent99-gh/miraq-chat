@@ -110,6 +110,7 @@ def _build_search_context_string(entities: ExtractedEntities,  or_pair_breakdown
 
     for group in (or_pair_breakdown or []):
         head_label, head_value, suffix_bits = None, None, []
+        branch_summaries = []
         for branch in group:
             terms = branch["terms"]
             if branch["role"] == "category":
@@ -128,9 +129,14 @@ def _build_search_context_string(entities: ExtractedEntities,  or_pair_breakdown
 
             if head_label is None:
                 head_label, head_value = label, value
+            branch_summaries.append((label.lower(), value))
             suffix_bits.append(f"{label}: {branch['count']}")
 
-        note = " — these can overlap, a product may match more than one way" if len(group) > 1 else ""
+        if len(group) > 1:
+            parts = ", ".join(f"{lbl} {val}" for lbl, val in branch_summaries)
+            note = f" — Note: Same product may have {parts}; in such cases it is counted once only"
+        else:
+            note = ""
         desc_parts.append(f"**{head_value}** *({' • '.join(suffix_bits)}{note})*")
 
     if getattr(entities, 'product_name', None):
