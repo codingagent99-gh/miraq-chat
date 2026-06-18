@@ -130,7 +130,8 @@ def _build_search_context_string(entities: ExtractedEntities,  or_pair_breakdown
                 head_label, head_value = label, value
             suffix_bits.append(f"{label}: {branch['count']}")
 
-        desc_parts.append(f"{head_label}: **{head_value}** *({' • '.join(suffix_bits)})*")
+        note = " — these can overlap, a product may match more than one way" if len(group) > 1 else ""
+        desc_parts.append(f"**{head_value}** *({' • '.join(suffix_bits)}{note})*")
 
     if getattr(entities, 'product_name', None):
         desc_parts.append(f"Product: **{entities.product_name}**")
@@ -550,7 +551,8 @@ def generate_bot_message(
             
     elif intent in (Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_SEARCH, Intent.PRODUCT_BY_TAG, Intent.PRODUCT_BY_COLLECTION):
         if search_context:
-            msg += f"Found **{count}** products for {search_context}! ✨\n\n"
+            _qualifier = " in total" if or_pair_breakdown else ""
+            msg += f"Found **{count}** products{_qualifier} for {search_context}! ✨\n\n"
         else:
             msg += f"Found **{count}** products! 🛍️\n\n"
 
