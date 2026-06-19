@@ -11,6 +11,7 @@ from flask import Blueprint, request, jsonify
 from models import db, Conversation, Message, Intent
 from sqlalchemy.orm.attributes import flag_modified
 import re
+from classifier.consolidation import _resolve_tag_attribute_overlap
 import json
 from models import ExtractedEntities, ClassifiedResult, WooAPICall
 from app_config import (
@@ -1356,6 +1357,8 @@ def chat():
                     f"[SemanticAutoApply] score={_m.get('score', 0):.4f} >= {SEMANTIC_AUTO_APPLY_THRESHOLD}"
                     f" | applied {_m['type']}:{_m['suggested_name']}"
                 )
+                _resolve_tag_attribute_overlap(entities)
+
 
             if not _auto_applied:
                 clarification_resp = build_semantic_clarification(

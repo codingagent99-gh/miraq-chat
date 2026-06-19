@@ -14,6 +14,7 @@ from utils.entity_helpers import (
     append_category_name, merge_attribute, merge_tags, merge_entities,
     clean_leftovers, STOP_WORDS,
 )
+from classifier.consolidation import _resolve_tag_attribute_overlap
 from typing import Optional
 logger = get_logger("miraq_chat")
 from classifier.utils import create_flexible_pattern
@@ -495,6 +496,10 @@ def _auto_materialize(entities: ExtractedEntities):
 
     entities.semantic_matches = surviving_matches
 
+    # NEW — re-run tag/attribute overlap detection now that a semantic
+    # auto-applied tag (e.g. "Quick Ship") may exist alongside an attribute
+    # extracted earlier in the pipeline that was already independently set.
+    _resolve_tag_attribute_overlap(entities)
 
 # ══════════════════════════════════════════════════════════════
 # PHASE 4: Intent Resolution
