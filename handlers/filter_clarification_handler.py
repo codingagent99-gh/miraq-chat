@@ -80,7 +80,7 @@ def resolve_filter_clarification(message, user_context, pending_semantic):
     is_cancel = msg_lower in [
         "cancel", "exit", "stop", "nevermind", "never mind", "abort", "start over"
     ]
-    is_skip = msg_lower in ["skip - use my current filters", "skip"]
+    is_skip = msg_lower in ["skip - use my current filters", "skip", "skip - search without size"]
 
     if is_cancel:
         user_context.pop("pending_semantic_match", None)

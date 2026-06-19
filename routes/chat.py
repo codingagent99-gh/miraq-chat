@@ -6,6 +6,7 @@ Refactored: business logic extracted into parsers/ and handlers/.
 
 import time
 import uuid
+from api_builder.store_helpers import attr_slug_for_label
 from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify
 from models import db, Conversation, Message, Intent
@@ -13,6 +14,8 @@ from sqlalchemy.orm.attributes import flag_modified
 import re
 from classifier.consolidation import _resolve_tag_attribute_overlap
 import json
+from classifier.utils import normalize_for_tag_compare
+
 from models import ExtractedEntities, ClassifiedResult, WooAPICall
 from app_config import (
     ORDER_INTENTS,
@@ -137,6 +140,10 @@ def _merge_phase_entities(result):
     confidence = result.confidence
 
     phase1 = getattr(result, "phase1_entities", None)
+    logger.debug(
+        f"[MERGE_PHASE_TRACE] phase1_attrs={getattr(phase1, 'attributes', None)} | "
+        f"entities_attrs={entities.attributes}"
+    )
     if phase1 is None:
         return intent, entities, confidence
 
@@ -150,10 +157,26 @@ def _merge_phase_entities(result):
             f"name='{phase1.product_name}' from phase-1 entities"
         )
 
-    # Merge attributes: keep all phase-1 keys that pass-2 dropped
+    # Merge attributes: keep all phase-1 keys that pass-2 dropped.
+    # Different extraction passes can spell the same attribute differently
+    # (e.g. "tile size" vs "tile-size") — only the spelling that matches
+    # WooCommerce's human-readable label actually resolves via
+    # attr_slug_for_label. When two keys represent the same attribute, keep
+    # whichever one resolves; if neither does, leave the existing one alone.
     if phase1.attributes:
-        merged_attrs = dict(phase1.attributes)
-        merged_attrs.update(entities.attributes)   # pass-2 wins on overlap
+        merged_attrs = dict(entities.attributes)
+        for p1_key, p1_val in phase1.attributes.items():
+            p1_norm = normalize_for_tag_compare(p1_key.replace("-", " "))
+            equivalent_key = next(
+                (k for k in merged_attrs
+                 if normalize_for_tag_compare(k.replace("-", " ")) == p1_norm),
+                None
+            )
+            if equivalent_key is None:
+                merged_attrs[p1_key] = p1_val
+            elif attr_slug_for_label(p1_key) and not attr_slug_for_label(equivalent_key):
+                merged_attrs[p1_key] = merged_attrs.pop(equivalent_key)
+
         if merged_attrs != entities.attributes:
             logger.debug(
                 f"[EntityMerge] attributes merged: "
@@ -1315,6 +1338,39 @@ def chat():
                         return _ft(llm_outcome)
                 if isinstance(llm_outcome, tuple) and len(llm_outcome) == 4:
                     intent, entities, confidence, result = llm_outcome
+
+        # ── Step 4.5: Size-type ambiguity check ──────────────────────────
+        # "Size" on the storefront maps to three distinct WooCommerce
+        # attributes (Sample Size, Tile Size, Chip Size). If extraction
+        # independently populated 2+ of these with the SAME value, that's
+        # one ambiguous value, not three separate filters — ask which
+        # taxonomy the user meant instead of silently OR-ing all of them.
+        _SIZE_TYPE_LABELS = ['sample size', 'tile size', 'chip size']
+        _size_norm_list = [normalize_for_tag_compare(l) for l in _SIZE_TYPE_LABELS]
+        _size_keys_present = [
+            k for k in entities.attributes
+            if any(normalize_for_tag_compare(k.replace("-", " ")) == s for s in _size_norm_list)
+        ]
+        if len(_size_keys_present) > 1:
+            _values = {entities.attributes[k] for k in _size_keys_present}
+            if len(_values) == 1:
+                _shared_value = _values.pop()
+                _candidates = []
+                for k in _size_keys_present:
+                    if attr_slug_for_label(k):  # validity check only
+                        _candidates.append({
+                            "type": "attribute",
+                            "taxonomy": k,
+                            "slug": _shared_value,
+                            "suggested_name": k.title(),
+                            "user_text": _shared_value,
+                            "is_negative": False,
+                            "score": 1.0,
+                        })
+                if len(_candidates) > 1:
+                    for k in _size_keys_present:
+                        del entities.attributes[k]
+                    entities.semantic_matches = [_candidates]
 
         # ── Step 5: Semantic match resolution (auto-apply or clarify) ──
         # Skip entirely when an email lookup is in play: an email address can

@@ -80,14 +80,32 @@ def build_semantic_clarification(
         stashed_semantic_data["options"] = active_group
         stashed_semantic_data["pending_other_semantics"] = valid_term_groups[1:]
 
-        action_word = "EXCLUDE" if is_negative else "USE"
-        bot_message = f"I found multiple matches for '{user_original_term}'. Which one did you mean to {action_word}?"
-        for candidate in active_group:
-            verb = "Exclude" if candidate.get("is_negative") else "Use"
-            suggestion_buttons.append(f"{verb} {candidate['suggested_name']}")
-        suggestion_buttons.append(f"No - search for '{user_original_term}'")
-        if has_strong_filters:
-            suggestion_buttons.append("Skip - use my current filters")
+        # Same value matched under multiple attribute taxonomies (e.g. a
+        # dimension that's valid under both Sample Size and Tile Size) —
+        # this is a "which field" question, not a fuzzy "did you mean"
+        # guess, so it needs its own wording instead of the generic copy.
+        _is_attr_collision = (
+            len({c.get("slug") for c in active_group}) == 1
+            and all(c.get("type") == "attribute" for c in active_group)
+        )
+
+        if _is_attr_collision:
+            shared_value = active_group[0]["slug"]
+            type_names = " or ".join(f"**{c['suggested_name']}**" for c in active_group)
+            bot_message = f"You mentioned size **{shared_value}** — did you mean {type_names}?"
+            for candidate in active_group:
+                suggestion_buttons.append(candidate["suggested_name"])
+            if has_strong_filters:
+                suggestion_buttons.append("Skip - search without size")
+        else:
+            action_word = "EXCLUDE" if is_negative else "USE"
+            bot_message = f"I found multiple matches for '{user_original_term}'. Which one did you mean to {action_word}?"
+            for candidate in active_group:
+                verb = "Exclude" if candidate.get("is_negative") else "Use"
+                suggestion_buttons.append(f"{verb} {candidate['suggested_name']}")
+            suggestion_buttons.append(f"No - search for '{user_original_term}'")
+            if has_strong_filters:
+                suggestion_buttons.append("Skip - use my current filters")
     else:
         primary_semantics = [group[0] for group in valid_term_groups]
         stashed_semantic_data["options"] = [primary_semantics[0]]

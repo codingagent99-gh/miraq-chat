@@ -6,6 +6,8 @@ and restoring carryover state from semantic match context.
 import re
 from typing import Optional
 from models import ExtractedEntities
+from classifier.utils import normalize_for_tag_compare
+from api_builder.store_helpers import attr_slug_for_label
 
 STOP_WORDS = {
     "a", "an", "the", "and", "or", "for", "to", "of", "in", "on", "at", "by", "with", "from",
@@ -47,17 +49,34 @@ def append_category_name(entities: ExtractedEntities, new_name: str):
             if len(existing) > 1 else existing[0]
         )
 
-
 def merge_attribute(target_attrs: dict, key: str, value: str):
-    """Merge an attribute value into a target dict, deduplicating CSV terms."""
-    if key not in target_attrs:
-        target_attrs[key] = value
-    else:
-        existing_vals = target_attrs[key].split(",")
-        new_vals = [val for val in value.split(",") if val not in existing_vals]
-        if new_vals:
-            target_attrs[key] += "," + ",".join(new_vals)
+    """Merge an attribute value into a target dict, deduplicating CSV terms.
 
+    Keys are compared via normalized tokens. When two differently-spelled
+    keys represent the same attribute, the one that actually resolves via
+    attr_slug_for_label is kept as the dict key (hyphenated slug-style
+    spellings often don't match the WooCommerce label lookup at all).
+    """
+    norm_key = normalize_for_tag_compare(key.replace("-", " "))
+
+    existing_key = None
+    for k in target_attrs:
+        if normalize_for_tag_compare(k.replace("-", " ")) == norm_key:
+            existing_key = k
+            break
+
+    if existing_key is None:
+        target_attrs[key] = value
+        return
+
+    if existing_key != key and attr_slug_for_label(key) and not attr_slug_for_label(existing_key):
+        target_attrs[key] = target_attrs.pop(existing_key)
+        existing_key = key
+
+    existing_vals = target_attrs[existing_key].split(",")
+    new_vals = [val for val in value.split(",") if val not in existing_vals]
+    if new_vals:
+        target_attrs[existing_key] += "," + ",".join(new_vals)         
 
 def merge_tags(target: ExtractedEntities, source_tag_ids: list, source_tag_slugs: list):
     """Merge tag IDs and slugs into target without duplicates."""
