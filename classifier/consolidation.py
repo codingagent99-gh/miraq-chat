@@ -171,13 +171,12 @@ def _resolve_category_attribute_overlap(entities: ExtractedEntities):
     for attr_label, attr_slug in list(entities.attributes.items()):
         attr_tokens = normalize_for_tag_compare(attr_slug.replace("-", " "))
 
-        overlapping_cat_slug = None
-        for cat_slug, c_tokens in cat_tokens_map.items():
-            if attr_tokens <= c_tokens or c_tokens <= attr_tokens or attr_slug == cat_slug:
-                overlapping_cat_slug = cat_slug
-                break
+        overlapping_cat_slugs = [
+            cat_slug for cat_slug, c_tokens in cat_tokens_map.items()
+            if attr_tokens <= c_tokens or c_tokens <= attr_tokens or attr_slug == cat_slug
+        ]
 
-        if not overlapping_cat_slug:
+        if not overlapping_cat_slugs:
             continue
 
         actual_tax = ""
@@ -195,12 +194,12 @@ def _resolve_category_attribute_overlap(entities: ExtractedEntities):
 
         if actual_tax:
             entities.attr_tag_or_pairs.append({
-                "cat_slugs": [overlapping_cat_slug],
+                "cat_slugs": overlapping_cat_slugs,
                 "attr_taxonomy": actual_tax,
                 "attr_term": attr_slug,
             })
-            if overlapping_cat_slug in entities.target_category_slugs:
-                entities.target_category_slugs.remove(overlapping_cat_slug)
+            for slug in overlapping_cat_slugs:
+                entities.target_category_slugs.discard(slug)
             if not entities.target_category_slugs:
                 entities.category_name = None
             del entities.attributes[attr_label]

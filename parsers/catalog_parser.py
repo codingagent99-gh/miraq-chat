@@ -76,7 +76,7 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
             else:
                 parts.append(re.escape(w))
         flexible_name = r'\s+'.join(parts)
-        pattern = r'(?<!\w)(' + flexible_name + r')(?!\w)'
+        pattern = r'(?<![\w-])(' + flexible_name + r')(?![\w-])'
 
         if not re.search(pattern, unmatched_text):
             continue
@@ -549,7 +549,11 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
 
     # Phase 1: Catalog match
     entities, unmatched_text = phase1_catalog_match(clean_msg, loader)
-
+    logger.debug(
+        f"[PHASE1_TRACE] attr_tag_or_pairs={entities.attr_tag_or_pairs} | "
+        f"attributes={entities.attributes} | "
+        f"target_category_slugs={entities.target_category_slugs}"
+    )
     # Phase 2: NLP fallback merge
     # Pass original_msg so phase2 can skip re-classify when Phase 1 matched nothing
     nlp_entities = phase2_nlp_merge(unmatched_text, entities, original_nlp_result, loader, original_msg=clean_msg)

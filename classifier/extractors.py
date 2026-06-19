@@ -415,12 +415,12 @@ def _match_term_in_text(text: str, term_lower: str, is_dimensional: bool) -> Opt
                         return None
                 return dim_pattern
 
-    if re.search(rf"\b{re.escape(term_lower)}\b", text):
-        return rf"\b{re.escape(term_lower)}\b"
-    if re.search(rf"\b{re.escape(term_lower)}s\b", text):
-        return rf"\b{re.escape(term_lower)}s\b"
-    if len(term_lower) > 4 and re.search(rf"\b{re.escape(term_lower[:-1])}\b", text):
-        return rf"\b{re.escape(term_lower[:-1])}\b"
+    if re.search(rf"(?<![\w-]){re.escape(term_lower)}(?![\w-])", text):
+        return rf"(?<![\w-]){re.escape(term_lower)}(?![\w-])"
+    if re.search(rf"(?<![\w-]){re.escape(term_lower)}s(?![\w-])", text):
+        return rf"(?<![\w-]){re.escape(term_lower)}s(?![\w-])"
+    if len(term_lower) > 4 and re.search(rf"(?<![\w-]){re.escape(term_lower[:-1])}(?![\w-])", text):
+        return rf"(?<![\w-]){re.escape(term_lower[:-1])}(?![\w-])"
     return None
 
 
@@ -456,7 +456,7 @@ def _resolve_attribute_or_tag(
             else:
                 term_tokens = normalize_for_tag_compare(term_name_lower)
                 tag_tokens = normalize_for_tag_compare(tag_name_lower)
-                if term_tokens and term_tokens <= tag_tokens:
+                if term_tokens and term_tokens == tag_tokens:
                     covered_by_tag = True
                     covering_tag_slug = tag_entry.get("slug", "")
                     covering_tag_id = tag_entry.get("id")
