@@ -82,9 +82,10 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
             continue
 
         types_matched = [m[0] for m in matches]
-        is_collision = 'tag' in types_matched and 'attribute' in types_matched
+        is_tag_attr_collision = 'tag' in types_matched and 'attribute' in types_matched
+        is_cat_attr_collision = 'category' in types_matched and 'attribute' in types_matched
 
-        if is_collision:
+        if is_tag_attr_collision:
             attr_matches = [m[1] for m in matches if m[0] == 'attribute']
             tag_data     = next(m[1] for m in matches if m[0] == 'tag')
             is_dimension = bool(_DIM_RE.match(name.strip()))
@@ -116,6 +117,25 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
                     "attr_term":     attr_matches[0].get("slug"),
                     "display_text":  name,
                 })
+        elif is_cat_attr_collision:
+            cat_data     = next(m[1] for m in matches if m[0] == 'category')
+            attr_matches = [m[1] for m in matches if m[0] == 'attribute']
+
+            name_lower = cat_data.get("name", "").lower()
+            cat_slugs = getattr(loader, 'category_slugs_by_name', {}).get(
+                name_lower, [cat_data.get("slug")]
+            )
+
+            if not hasattr(entities, 'attr_tag_or_pairs'):
+                entities.attr_tag_or_pairs = []
+            entities.attr_tag_or_pairs.append({
+                "tag_slug":      None,
+                "cat_slugs":     list(cat_slugs),
+                "attr_taxonomy": attr_matches[0].get("label", ""),
+                "attr_term":     attr_matches[0].get("slug"),
+                "display_text":  name,
+            })
+            append_category_name(entities, cat_data.get("name") or "")
         else:
             for match_type, data in matches:
                 if match_type == 'tag':
@@ -219,6 +239,20 @@ def phase2_nlp_merge(
             if attr_term and _DIM_SLUG_RE.match(attr_term.strip()):
                 pair = dict(pair)
                 pair["tag_slug"] = None
+                
+            cat_slugs = pair.get("cat_slugs") or []
+            if cat_slugs and loader:
+                expanded = set(cat_slugs)
+                for c_slug in list(cat_slugs):
+                    cat_obj = loader.resolve_category(c_slug)
+                    if cat_obj:
+                        name_lower = cat_obj.name.lower()
+                        expanded.update(
+                            getattr(loader, 'category_slugs_by_name', {}).get(name_lower, [])
+                        )
+                if expanded != set(cat_slugs):
+                    pair = dict(pair)
+                    pair["cat_slugs"] = sorted(expanded)
 
             if pair not in entities.attr_tag_or_pairs:
                 entities.attr_tag_or_pairs.append(pair)

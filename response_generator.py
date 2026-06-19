@@ -96,6 +96,49 @@ def _resolve_category_name(category_key: str) -> str:
     return str(category_key or "").replace("-", " ").title()
 
 
+def _resolve_category_breadcrumb(category_key: str) -> str:
+    """Resolve a category's display name, appending its parent category's
+    name in parentheses (e.g. "Wall (Interior)") when one exists.
+
+    Used to disambiguate categories whose plain `name` collides with
+    another category elsewhere in the taxonomy — e.g. "wall-interior" and
+    "wall-exterior" both display as "Wall", but their parent categories
+    ("Interior" / "Exterior") differ.
+    """
+    name = _resolve_category_name(category_key)
+
+    try:
+        loader = get_store_loader()
+    except Exception:
+        loader = None
+
+    if loader and category_key:
+        category = loader.resolve_category(str(category_key).lower().strip())
+        if category and category.parent_key:
+            parent_name = _resolve_category_name(category.parent_key)
+            if parent_name and parent_name != name:
+                return f"{name} ({parent_name})"
+
+    return name
+
+
+def _format_category_names(slugs, shown_names: set = None) -> str:
+    """Render a set of category slugs as a human-readable, comma-separated
+    list, switching to parent-disambiguated breadcrumbs only when plain
+    names collide with each other or with names already shown elsewhere
+    in the message. Avoids both "Wall, Wall" and an uninformative
+    "Wall (2 sub-categories, all required)" when names collide.
+    """
+    shown_names = shown_names or set()
+    ordered_slugs = sorted(slugs)
+    plain_names = [_resolve_category_name(s) for s in ordered_slugs]
+
+    collides = len(set(plain_names)) < len(plain_names) or any(n in shown_names for n in plain_names)
+    labels = [_resolve_category_breadcrumb(s) for s in ordered_slugs] if collides else plain_names
+
+    return ", ".join(dict.fromkeys(labels))
+
+
 def _build_attribute_value_summary(attributes: dict) -> str:
     values = []
     for attr_key, attr_val in (attributes or {}).items():
@@ -107,16 +150,17 @@ def _build_search_context_string(entities: ExtractedEntities,  or_pair_breakdown
     desc_parts = []
 
     consumed_cat_slugs, consumed_tag_slugs, consumed_attr = set(), set(), set()
+    shown_category_names = set()
 
     for group in (or_pair_breakdown or []):
-        head_label, head_value, suffix_bits = None, None, []
-        branch_summaries = []
+        head_label, head_value, suffix_bits, branch_descrs = None, None, [], []
         for branch in group:
             terms = branch["terms"]
             if branch["role"] == "category":
                 label = "Category"
-                value = ", ".join(_resolve_category_name(t) for t in terms)
+                value = _format_category_names(terms, shown_category_names)
                 consumed_cat_slugs.update(t.lower() for t in terms)
+                shown_category_names.update(_resolve_category_name(t) for t in terms)
             elif branch["role"] == "tag":
                 label = "Tag"
                 value = ", ".join(_resolve_tag_name(t) for t in terms)
@@ -129,12 +173,23 @@ def _build_search_context_string(entities: ExtractedEntities,  or_pair_breakdown
 
             if head_label is None:
                 head_label, head_value = label, value
-            branch_summaries.append((label.lower(), value))
-            suffix_bits.append(f"{label}: {branch['count']}")
+            
+            by_term = branch.get("by_term")
+            if by_term:
+                if branch["role"] == "category":
+                    term_parts = [f"{_resolve_category_breadcrumb(s)}: {c}" for s, c in by_term.items()]
+                elif branch["role"] == "tag":
+                    term_parts = [f"{_resolve_tag_name(s)}: {c}" for s, c in by_term.items()]
+                else:
+                    term_parts = [f"{_resolve_attribute_term_name(attr_key, s)}: {c}" for s, c in by_term.items()]
+                suffix_bits.append(f"{label}: {branch['count']} ({' • '.join(term_parts)})")
+            else:
+                suffix_bits.append(f"{label}: {branch['count']}")
+            
+            branch_descrs.append(f"{label.lower()} {value}")
 
         if len(group) > 1:
-            parts = ", ".join(f"{lbl} {val}" for lbl, val in branch_summaries)
-            note = f" — Note: Same product may have {parts}; in such cases it is counted once only"
+            note = f" — Note: Same product may have {', '.join(branch_descrs)}; in such cases it is counted once only"
         else:
             note = ""
         desc_parts.append(f"**{head_value}** *({' • '.join(suffix_bits)}{note})*")
@@ -144,11 +199,30 @@ def _build_search_context_string(entities: ExtractedEntities,  or_pair_breakdown
 
     cat_name = getattr(entities, 'category_name', None)
     cat_slugs = getattr(entities, 'target_category_slugs', None) or set()
-    if not (cat_slugs and all(s.lower() in consumed_cat_slugs for s in cat_slugs)):
-        if not cat_name and cat_slugs:
-            cat_name = ", ".join(_resolve_category_name(s) for s in sorted(cat_slugs))
-        if cat_name:
-            desc_parts.append(f"Category: **{cat_name}**")
+    remaining_cat_slugs = {s for s in cat_slugs if s.lower() not in consumed_cat_slugs}
+
+    if remaining_cat_slugs:
+        if remaining_cat_slugs == cat_slugs:
+            if len(remaining_cat_slugs) > 1:
+                # Multiple category slugs with no OR-pair grouping above —
+                # list each one (disambiguated via parent breadcrumb if
+                # their names collide), since a single category_name like
+                # "Wall" would hide that several distinct sub-categories
+                # are actually required.
+                label = _format_category_names(remaining_cat_slugs, shown_category_names)
+            else:
+                label = cat_name or _format_category_names(remaining_cat_slugs, shown_category_names)
+            if label:
+                desc_parts.append(f"Category: **{label}**")
+        else:
+            # Some of this category set is already shown above (e.g. as the
+            # OR-pair head value). The rest are still AND-required — surface
+            # them explicitly instead of silently dropping them, with parent
+            # breadcrumbs where their display names collide with what's
+            # already shown (e.g. "wall-interior" and "wall-exterior" both
+            # display as "Wall").
+            names_str = _format_category_names(remaining_cat_slugs, shown_category_names)
+            desc_parts.append(f"Also requires Category: **{names_str}**")
 
     if getattr(entities, 'attributes', None):
         for attr_name, attr_val in entities.attributes.items():

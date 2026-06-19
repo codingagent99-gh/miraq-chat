@@ -176,14 +176,17 @@ def build_or_pair_conditions(pairs: List[OrPair]) -> Tuple[list, Set[str], Set[s
             or_conds.append(make_condition("product_tag", [tag_slug], "IN"))
             covered_tags.add(tag_slug)
 
-        # Category branches — deduplicated across all pairs in the group
+        # Category branches — deduplicated across all pairs in the group,
+        # combined into ONE multi-term leaf (not one leaf per slug) so the
+        # breakdown counts as a single "Category" branch with per-slug
+        # sub-counts, instead of N separate same-label branches.
         seen_cats: Set[str] = set()
         for pair in group:
             for slug in (pair.cat_slugs or []):
-                if slug not in seen_cats:
-                    or_conds.append(make_condition("product_cat", [slug], "IN"))
-                    seen_cats.add(slug)
-                    covered_cats.add(slug)
+                seen_cats.add(slug)
+                covered_cats.add(slug)
+        if seen_cats:
+            or_conds.append(make_condition("product_cat", sorted(seen_cats), "IN"))
 
         # Attribute branches — one per unique taxonomy in the group
         seen_taxonomies: Set[str] = set()
