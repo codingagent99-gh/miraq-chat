@@ -1240,7 +1240,7 @@ def chat():
             # classifier run — the user sent something off-topic mid-flow.
             if flow_result is None and is_order_flow(current_flow_state):
                 _ctx = _flow_context_message(current_flow_state)
-                return _ft(jsonify({
+                return _ft((jsonify({
                     "success": True,
                     "bot_message": _ctx["bot_message"],
                     "suggestions": _ctx["suggestions"],
@@ -1250,7 +1250,7 @@ def chat():
                     "intent": "unknown",
                     "metadata": {"confidence": 0.0},
                     "pagination": default_pagination(page),
-                }), 200)
+                }), 200))
             if flow_result and flow_result.get("override_message"):
                 message = flow_result["override_message"]
 
@@ -1827,7 +1827,7 @@ def chat():
 
     except Exception as e:
         db.session.rollback()
-        logger.error(f"Pipeline Crash for session {session_id}: {str(e)}")
+        logger.error(f"Pipeline Crash for session {session_id}: {str(e)}", exc_info=True)
 
         error_msg = Message(
             conversation_id=conversation.id,
