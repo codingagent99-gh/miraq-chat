@@ -38,6 +38,7 @@ class BulkOrderLine:
     variation_id: Optional[int]
     customer_id: Optional[str]
     customer_display_name: str
+    is_self_order: bool
     shipping_address: Optional[dict]
     billing_address: Optional[dict]
     is_reorder: bool
@@ -417,6 +418,7 @@ def parse_bulk_order_utterance(
             if resolution:
                 customer_id = resolution["id"]
                 customer_display_name = resolution["display"]
+                is_self_order = False
                 shipping_address = resolution.get("shipping") or {}
                 billing_address = resolution.get("billing") or {}
                 if not shipping_address.get("address_1"):
@@ -424,11 +426,13 @@ def parse_bulk_order_utterance(
             else:
                 customer_id = None
                 customer_display_name = "⚠️ Not found" if pl.email else "⚠️ Email required"
+                is_self_order = False
                 shipping_address = None
                 billing_address = None
         else:
             customer_id = self_customer_id
-            customer_display_name = "My Account"
+            customer_display_name = "Order"
+            is_self_order = True
             shipping_address = None
             billing_address = None
 
@@ -460,6 +464,7 @@ def parse_bulk_order_utterance(
             variation_id=pl.variation_id,
             customer_id=customer_id,
             customer_display_name=customer_display_name,
+            is_self_order=is_self_order,
             shipping_address=shipping_address,
             billing_address=billing_address,
             is_reorder=pl.is_reorder,

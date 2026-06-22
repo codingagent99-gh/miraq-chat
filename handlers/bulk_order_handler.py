@@ -49,14 +49,27 @@ _BULK_STATE_KEYS = (
 )
 
 def handle_cancel_bulk_order(user_context, conversation, page, start_time):
+    pending_lines = user_context.get("pending_bulk_lines", [])
+    is_single_self_order = (
+        len(pending_lines) == 1
+        and pending_lines[0].get("is_self_order")
+    )
+
     for k in _BULK_STATE_KEYS:
         user_context.pop(k, None)
     flag_modified(conversation, "context_data")
     conversation.flow_state = FlowState.IDLE.value
     elapsed = round((time.time() - start_time) * 1000)
+
+    bot_message = (
+        "Order cancelled. What else can I help you with?"
+        if is_single_self_order
+        else "Bulk order cancelled. What else can I help you with?"
+    )
+
     return jsonify({
         "success": True,
-        "bot_message": "Bulk order cancelled. What else can I help you with?",
+        "bot_message": bot_message,
         "intent": "guided_flow",
         "products": [],
         "suggestions": ["Show me products", "Start a bulk order"],
@@ -65,7 +78,6 @@ def handle_cancel_bulk_order(user_context, conversation, page, start_time):
         "flow_state": FlowState.IDLE.value,
         "pagination": default_pagination(page),
     }), 200
-
 
 def handle_bulk_confirmation_unclear(conversation, page, start_time):
     elapsed = round((time.time() - start_time) * 1000)
@@ -194,6 +206,7 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
             "variation_id": l.variation_id,
             "customer_id": l.customer_id,
             "customer_display_name": l.customer_display_name,
+            "is_self_order": l.is_self_order,
             "shipping_address": l.shipping_address,
             "billing_address": l.billing_address,
             "is_reorder": l.is_reorder,
@@ -265,7 +278,8 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
 
         first_line = lines_as_dicts[product_blank_indices[0]]
         customer_hint = (
-            f" for **{first_line['customer_display_name']}**"
+            "" if first_line.get("is_self_order")
+            else f" for **{first_line['customer_display_name']}**"
             if first_line.get("customer_id") else ""
         )
         already_resolved = [l for l in lines_as_dicts if not l.get("unresolved")]
@@ -465,6 +479,7 @@ def _ask_for_bulk_variant(
         "payload": {
             "line_index": line_idx,
             "company": line.get("customer_display_name", ""),
+            "is_self_order": line.get("is_self_order", False),
             "product_name": line.get("product_name", ""),
             "quantity": line.get("quantity", 0),
             "progress": {"current": pos + 1, "total": len(needs_variant_indices)},
@@ -501,8 +516,36 @@ def _ask_for_bulk_variant(
 def _build_bulk_confirmation_response(lines_as_dicts, conversation, user_context, page, start_time):
     resolved_count = sum(1 for l in lines_as_dicts if not l.get("unresolved"))
     unresolved_count = len(lines_as_dicts) - resolved_count
+    
+    # Nothing resolvable at all — re-prompt instead of showing a confusing
+    # confirmation card with 0 orders ready and the user's own raw text
+    # echoed back as a fake "product".
+    if resolved_count == 0:
+        elapsed = round((time.time() - start_time) * 1000)
+        conversation.flow_state = FlowState.AWAITING_BULK_ORDER_INPUT.value
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+        return jsonify({
+            "success": True,
+            "bot_message": (
+                "I couldn't find any products or customer emails in that message. "
+                "Try the format:\n\n"
+                "**Example:**\n"
+                "*Order 20 Harmony White for abc@buildersco.com, 15 Coral Grey for xyz@interiors.com*"
+            ),
+            "intent": "guided_flow",
+            "products": [],
+            "suggestions": ["Cancel"],
+            "session_id": str(conversation.id),
+            "metadata": {
+                "flow_state": FlowState.AWAITING_BULK_ORDER_INPUT.value,
+                "response_time_ms": elapsed,
+            },
+            "flow_state": FlowState.AWAITING_BULK_ORDER_INPUT.value,
+            "pagination": default_pagination(page),
+        }), 200
 
-    # ▼ CHANGED: wrap data inside "payload" key
+    # wrap data inside "payload" key
     action = {
         "type": "SHOW_BULK_ORDER_CONFIRMATION",
         "payload": {
@@ -740,7 +783,8 @@ def handle_bulk_email_reply(message, store_loader, conversation, user_context, p
 
         first_line = lines_as_dicts[blank_after_email[0]]
         customer_hint = (
-            f" for **{first_line['customer_display_name']}**"
+            "" if first_line.get("is_self_order")
+            else f" for **{first_line['customer_display_name']}**"
             if first_line.get("customer_id") else ""
         )
         elapsed = round((time.time() - start_time) * 1000)
@@ -987,8 +1031,9 @@ def handle_bulk_product_reply(message, store_loader, conversation, user_context,
         next_idx = missing_indices[next_pos]
         next_line = lines_as_dicts[next_idx]
         customer_hint = (
-            f" for **{next_line['customer_display_name']}**"
-            if next_line.get("customer_id") else ""
+            "" if first_line.get("is_self_order")
+            else f" for **{first_line['customer_display_name']}**"
+            if first_line.get("customer_id") else ""
         )
         elapsed = round((time.time() - start_time) * 1000)
         return jsonify({
@@ -1104,10 +1149,7 @@ def _prompt_for_quantity(qty_unset, lines_as_dicts, conversation, user_context, 
     elapsed = round((time.time() - start_time) * 1000)
     return jsonify({
         "success":     True,
-        "bot_message": (
-            f"How many **{line['product_name']}** "
-            f"for **{line['customer_display_name']}**?"
-        ),
+        "bot_message": _build_quantity_prompt(line),
         "intent":      "guided_flow",
         "products":    [],
         "suggestions": ["1", "5", "10", "15", "20", "Cancel"],
@@ -1120,6 +1162,12 @@ def _prompt_for_quantity(qty_unset, lines_as_dicts, conversation, user_context, 
         "pagination":  default_pagination(page),
     }), 200
 
+def _build_quantity_prompt(line: dict) -> str:
+    product = line['product_name']
+    customer = line['customer_display_name']
+    if line.get('is_self_order'):
+        return f"How many **{product}** shall I order?"
+    return f"How many **{product}** for **{customer}**?"
 
 # ══════════════════════════════════════════════════════════════
 # ── Public: handle_bulk_quantity_reply ──
@@ -1181,10 +1229,7 @@ def handle_bulk_quantity_reply(message, store_loader, conversation, user_context
         elapsed   = round((time.time() - start_time) * 1000)
         return jsonify({
             "success":     True,
-            "bot_message": (
-                f"How many **{next_line['product_name']}** "
-                f"for **{next_line['customer_display_name']}**?"
-            ),
+            "bot_message": _build_quantity_prompt(next_line),
             "intent":      "guided_flow",
             "products":    [],
             "suggestions": ["1", "5", "10", "15", "20", "Cancel"],
@@ -1526,8 +1571,9 @@ def _advance_to_next_address_confirmation(resolved_lines, idx, conversation, use
     }
 
     bot_message = (
-        f"**Order for {current_line['customer_display_name']}** "
-        f"({idx + 1} of {len(resolved_lines)})\n\n"
+        (f"**Order for {current_line['customer_display_name']}** "
+         if not current_line.get("is_self_order") else "**Your order** ")
+        + f"({idx + 1} of {len(resolved_lines)})\n\n"
         f"📦 {items_text}\n"
         f"📍 Shipping to: {addr_str}\n\n"
         "Confirm this address?"
