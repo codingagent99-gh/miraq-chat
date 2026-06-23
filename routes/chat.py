@@ -1310,11 +1310,6 @@ def chat():
         # Merge phase-1 / phase-2 entity richness
         intent, entities, confidence = _merge_phase_entities(result)
 
-        if intent == Intent.BULK_ORDER and role not in BULK_ORDER_ROLES:
-            intent = Intent.QUICK_ORDER
-            if result is not None:
-                result.intent = intent
-
         # Lock in variant state
         if current_flow_state == FlowState.AWAITING_VARIANT_SELECTION:
             _resolve_variant      = True
@@ -1430,6 +1425,11 @@ def chat():
                     flag_modified(conversation, "context_data")
                     return _ft(clarification_resp)
 
+        if intent == Intent.BULK_ORDER and role not in BULK_ORDER_ROLES:
+            intent = Intent.QUICK_ORDER
+            if result is not None:
+                result.intent = intent
+                
         # ── Step 6: Empty order guard ──
         empty_resp = _check_empty_order(intent, entities, conversation, page, start_time)
         if empty_resp:
