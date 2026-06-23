@@ -370,10 +370,22 @@ class BulkOrderEvaluator(IntentEvaluator):
                 _name_set = {
                     p["name"].lower() for p in loader.products if p.get("name")
                 }
-                resolved_count = sum(
-                    1 for name in _name_set
-                    if re.search(r'\b' + re.escape(name) + r'\b', text, re.I)
-                )
+                # Longest names first: if "aurora mosaic" matches, a shorter
+                # name that's purely a substring of that same span (e.g.
+                # "aurora") shouldn't count as a second, separate product
+                # mention — it's the same word, just a shorter catalog entry.
+                sorted_names = sorted(_name_set, key=len, reverse=True)
+                claimed_spans: list[tuple[int, int]] = []
+                resolved_count = 0
+                for name in sorted_names:
+                    match = re.search(r'\b' + re.escape(name) + r'\b', text, re.I)
+                    if not match:
+                        continue
+                    start, end = match.span()
+                    if any(start < c_end and end > c_start for c_start, c_end in claimed_spans):
+                        continue
+                    claimed_spans.append((start, end))
+                    resolved_count += 1
                 if resolved_count >= 2:
                     return Intent.BULK_ORDER, 0.92
 

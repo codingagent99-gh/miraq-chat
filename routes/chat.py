@@ -1310,6 +1310,11 @@ def chat():
         # Merge phase-1 / phase-2 entity richness
         intent, entities, confidence = _merge_phase_entities(result)
 
+        if intent == Intent.BULK_ORDER and role not in BULK_ORDER_ROLES:
+            intent = Intent.QUICK_ORDER
+            if result is not None:
+                result.intent = intent
+
         # Lock in variant state
         if current_flow_state == FlowState.AWAITING_VARIANT_SELECTION:
             _resolve_variant      = True
@@ -1667,16 +1672,6 @@ def chat():
             return cust_resp
 
         # ── Step 8.5: Bulk order intent (from classifier) ──
-        if intent == Intent.BULK_ORDER and customer_id:
-            if _is_inline_bulk_order(message, store_loader):
-                resp = handle_bulk_order_input(message, store_loader, conversation, user_context, page, start_time,
-                               pre_resolved=entities)
-            else:
-                resp = handle_bulk_order_trigger(conversation, user_context, page, start_time)
-            if resp:
-                return _ft(resp)
-
-        # ── Intercept: ask "who to order for" before any order intent (rep only) ──
         if (
             role in BULK_ORDER_ROLES
             and intent in (Intent.QUICK_ORDER, Intent.PLACE_ORDER, Intent.ORDER_ITEM)
@@ -1686,6 +1681,24 @@ def chat():
             resp = handle_order_for_prompt(conversation, page, start_time)
             if resp:
                 return _ft(resp)
+
+        # ── Intercept: PLACE_ORDER with no product specified — ask what to
+        # order instead of falling through to a literal text search for the
+        # raw command phrase (e.g. "place new order" searching for "place
+        # order" as if it were a product name — guaranteed zero results).
+        if intent == Intent.PLACE_ORDER and not entities.product_id and not entities.product_name:
+            elapsed = round((time.time() - start_time) * 1000)
+            return _ft((jsonify({
+                "success": True,
+                "bot_message": "What would you like to order? You can tell me a product name.",
+                "intent": "guided_flow",
+                "products": [],
+                "suggestions": ["Show me products", "Browse categories"],
+                "session_id": str(conversation.id),
+                "metadata": {"response_time_ms": elapsed},
+                "flow_state": FlowState.AWAITING_PRODUCT_OR_CATEGORY.value,
+                "pagination": default_pagination(page),
+            }), 200))
 
         # ── Step 9: Route through specialized handlers ──
         # ── Email filter: narrow rep's orders to a specific recipient ──
