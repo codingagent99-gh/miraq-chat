@@ -28,6 +28,9 @@ class StoreQueryMixin:
     Mixin providing all query methods for StoreLoader.
     Expects the host class to have all lookup dictionaries populated.
     """
+    
+    attribute_by_key: "Dict[str, CatalogAttribute]"
+    category_by_id: "Dict[int, dict]"
 
     # ─── Category queries ───
 
@@ -150,8 +153,18 @@ class StoreQueryMixin:
     # ─── Neutral catalog queries (Phase 4a — preferred for new code) ───
 
     def resolve_attribute(self, key: str) -> Optional[CatalogAttribute]:
-        """Look up an attribute by its neutral key (e.g. 'color')."""
-        return self.attribute_by_key.get(key.lower().strip())
+        """Look up an attribute by its neutral key (e.g. 'color').
+    
+        Accepts either the raw WC attribute_name ('sample-size') or a
+        human display label ('Sample Size') — multi-word labels use spaces
+        while attribute_by_key is keyed by the hyphenated attribute_name,
+        so spaces are normalized to hyphens before lookup.
+        """
+        normalized = key.lower().strip()
+        attr = self.attribute_by_key.get(normalized)
+        if attr is None:
+            attr = self.attribute_by_key.get(normalized.replace(" ", "-"))
+        return attr
 
     def resolve_attribute_term(self, attr_key: str, term_key_or_name: str) -> Optional[CatalogAttributeTerm]:
         """Look up an attribute term by attr_key + (term key OR display name, case-insensitive)."""

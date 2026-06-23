@@ -267,7 +267,7 @@ def handle_flow_state(
                     "You can tell me the product name and quantity."
                 ),
                 "suggestions": [
-                    "Order 5 Affogato",
+                    "I want to place an order. ",
                     "Show me my last order",
                     "Reorder my previous order",
                 ],
