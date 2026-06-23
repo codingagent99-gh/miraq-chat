@@ -28,7 +28,11 @@ from app_config import (
 from core.actions import build_add_to_cart, build_open_checkout_panel, build_open_cart_panel
 from woo_client import woo_client
 from formatters import format_product, format_custom_product, format_category, _entities_to_dict
-from response_generator import generate_bot_message, generate_suggestions, _resolve_user_placeholders
+from response_generator import (
+    generate_bot_message, generate_suggestions, _resolve_user_placeholders,
+    _resolve_category_breadcrumb, _resolve_tag_name,
+    _resolve_attribute_label, _resolve_attribute_term_name,
+)
 from classifier import classify
 from api_builder import build_api_calls
 from conversation_flow import FlowState, handle_flow_state, is_order_flow, _flow_context_message
@@ -754,6 +758,101 @@ def _execute_api_calls(intent, api_calls, _resolve_variant):
 
 
 # ══════════════════════════════════════════════════════════════
+# ─── HELPER: Per-product matched-filter context (for product card badges) ───
+# ══════════════════════════════════════════════════════════════
+
+def _compute_matched_against(raw_product: dict, formatted_product: dict, entities) -> list[str]:
+    """
+    Builds display labels for the "matched against" badge on the product card —
+    EVERY category, tag, and attribute this product matched, including OR-pair
+    branches (e.g. "Tile Floor" OR "Application: Floor"), not just the plain
+    AND-required filters. Nothing here is capped or summarized — the badge has
+    to reflect the full, accurate match context, not a partial view of it.
+
+    Categories/tags are matched off the RAW product (slug-based — same extraction
+    Step 3.1 already uses in log_matched_products, confirmed correct against
+    production logs). Attributes are matched off the FORMATTED product instead:
+    the raw attrs list from this pipeline comes back with empty options at this
+    stage (Step 3.1's own debug log shows attrs={} even for products with real
+    attribute data), while format_product() reliably resolves name/options by
+    the time formatting is done.
+
+    Attribute term matching uses case-insensitive EXACT equality against each
+    formatted option, not substring containment. Substring matching was tried
+    and reverted: it produced a false positive on "Application" — composite
+    display strings like "Int: Wall, Floor, Wet Area; Ext: Wall" contain the
+    word "Floor" but are NOT the actual taxonomy term match (confirmed against
+    a real response where the aggregate breakdown showed "Application: 0"
+    matched products, while substring matching incorrectly said they had).
+    Net effect: attributes whose formatted options are composite/rolled-up
+    strings (rather than one discrete value per option) won't get a badge for
+    that attribute even when they're part of a genuine OR-pair match — a real
+    gap, but a false "matched" badge would be worse than a missing one.
+
+    entities.attr_tag_or_pairs is read as a list of plain dicts with
+    .get('cat_slugs') / .get('tag_slug') / .get('attr_taxonomy') /
+    .get('attr_term') — confirmed against the existing OR-pair handling
+    earlier in this file (the _detect_explicit_taxonomy_signal block), which
+    accesses it the same way.
+    """
+    labels = []
+
+    p_cat_slugs = {c["slug"].lower() for c in raw_product.get("categories", []) if isinstance(c, dict) and c.get("slug")}
+    p_tag_slugs = {t["slug"].lower() for t in raw_product.get("tags", []) if isinstance(t, dict) and t.get("slug")}
+    formatted_attrs = formatted_product.get("attributes") or []
+
+    def _attr_match(attr_key: str, attr_val) -> str:
+        """Returns the clean "Label: Value" string if this product's formatted
+        attributes contain attr_val under attr_key, else None."""
+        if not attr_val:
+            return None
+        clean_name = _resolve_attribute_label(attr_key)
+        clean_val = _resolve_attribute_term_name(attr_key, attr_val)
+        match = next(
+            (a for a in formatted_attrs
+             if isinstance(a, dict) and a.get("name", "").lower() == clean_name.lower()),
+            None,
+        )
+        if match and any(clean_val.lower() == str(o).lower() for o in match.get("options", [])):
+            return f"{clean_name}: {clean_val}"
+        return None
+
+    # ── Plain AND-required filters ──
+    target_cat_slugs = {s.lower() for s in (getattr(entities, "target_category_slugs", None) or set())}
+    for slug in sorted(p_cat_slugs & target_cat_slugs):
+        labels.append(_resolve_category_breadcrumb(slug))
+
+    target_tag_slugs = {s.lower() for s in (getattr(entities, "tag_slugs", None) or [])}
+    for slug in sorted(p_tag_slugs & target_tag_slugs):
+        labels.append(_resolve_tag_name(slug))
+
+    for attr_key, attr_val in (getattr(entities, "attributes", None) or {}).items():
+        label = _attr_match(attr_key, attr_val)
+        if label:
+            labels.append(label)
+
+    # ── OR-pairs — category branch OR tag branch OR attribute branch ──
+    for op in (getattr(entities, "attr_tag_or_pairs", None) or []):
+        for slug in (op.get("cat_slugs") or []):
+            if slug.lower() in p_cat_slugs:
+                labels.append(_resolve_category_breadcrumb(slug))
+
+        op_tag = op.get("tag_slug")
+        if op_tag and op_tag.lower() in p_tag_slugs:
+            labels.append(_resolve_tag_name(op_tag))
+
+        taxonomy = (op.get("attr_taxonomy") or "").removeprefix("pa_")
+        attr_term = op.get("attr_term")
+        if taxonomy and attr_term:
+            label = _attr_match(taxonomy, attr_term)
+            if label:
+                labels.append(label)
+                
+    logger.warning(f"MATCHED_AGAINST_DEBUG | product_id={raw_product.get('id')} | labels={labels}")
+    return list(dict.fromkeys(labels))  # de-dupe, preserve order
+
+
+# ══════════════════════════════════════════════════════════════
 # ─── HELPER: Build final response ───
 # ══════════════════════════════════════════════════════════════
 
@@ -786,9 +885,11 @@ def _build_final_response(
             if p.get("parent_id"):
                 continue
             if isinstance(p.get("attributes"), dict):
-                products.append(format_custom_product(p))
+                fp = format_custom_product(p)
             else:
-                products.append(format_product(p))
+                fp = format_product(p)
+            fp["matched_against"] = _compute_matched_against(p, fp, entities)
+            products.append(fp)
 
     products   = [p for p in products if p.get("name")]
     pagination = build_pagination(page, api_responses, api_calls_to_execute)
@@ -993,6 +1094,7 @@ def _handle_customer_intents(
 @chat_bp.route("/chat", methods=["POST"])
 @enforce_daily_limit
 def chat():
+    print("XXXXX_THIS_IS_THE_LOCAL_SERVER_XXXXX", flush=True)
     start_time = time.time()
 
     # ── Parse request ──
