@@ -650,7 +650,12 @@ def _wipe_stale_cart(conversation, user_context, current_flow_state):
 def _check_empty_order(intent, entities, conversation, page, start_time):
     if intent == Intent.BULK_ORDER:
         return None   # bulk orders carry no single product_id — skip this guard
-    if intent not in ORDER_CREATE_INTENTS or getattr(entities, "product_id", None):
+
+    # Guard any intent that expects a concrete product.
+    # QUICK_ORDER is intentionally excluded from ORDER_CREATE_INTENTS (it routes
+    # to add-to-cart, not order creation), but it still needs a product to proceed.
+    _order_guard_intents = set(ORDER_CREATE_INTENTS) | {Intent.QUICK_ORDER}
+    if intent not in _order_guard_intents or getattr(entities, "product_id", None):
         return None
 
     p_name  = (getattr(entities, "product_name", None) or "").lower().strip()
@@ -675,7 +680,6 @@ def _check_empty_order(intent, entities, conversation, page, start_time):
         "pagination":  default_pagination(page),
         "flow_state":  FlowState.IDLE.value,
     }))
-
 
 # ══════════════════════════════════════════════════════════════
 # ─── HELPER: Execute API and collect products ───
@@ -1686,7 +1690,7 @@ def chat():
         # order instead of falling through to a literal text search for the
         # raw command phrase (e.g. "place new order" searching for "place
         # order" as if it were a product name — guaranteed zero results).
-        if intent == Intent.PLACE_ORDER and not entities.product_id and not entities.product_name:
+        if intent in (Intent.PLACE_ORDER, Intent.QUICK_ORDER) and not entities.product_id and not entities.product_name:
             elapsed = round((time.time() - start_time) * 1000)
             return _ft((jsonify({
                 "success": True,
@@ -1699,6 +1703,15 @@ def chat():
                 "flow_state": FlowState.AWAITING_PRODUCT_OR_CATEGORY.value,
                 "pagination": default_pagination(page),
             }), 200))
+            
+        # ── BULK_ORDER trigger (natural language path) ──
+        # Handles the case where the classifier or LLM resolved intent=bulk_order
+        # from a natural language message (e.g. "place bulk order") rather than
+        # the __BULK_CANCEL__ / __PRODUCT_REORDER__ magic string paths.
+        if intent == Intent.BULK_ORDER and role in BULK_ORDER_ROLES:
+            resp = handle_bulk_order_trigger(conversation, user_context, page, start_time)
+            if resp:
+                return _ft(resp)
 
         # ── Step 9: Route through specialized handlers ──
         # ── Email filter: narrow rep's orders to a specific recipient ──

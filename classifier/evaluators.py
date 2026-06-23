@@ -346,9 +346,17 @@ class CartCheckoutEvaluator(IntentEvaluator):
 
 class BulkOrderEvaluator(IntentEvaluator):
     _ORDER_VERBS = re.compile(r'\b(order|buy|purchase|reorder|re-order)\b', re.I)
-
+    _BULK_TRIGGER = re.compile(
+        r'\bbulk\s+(?:order|ordering|buy|purchase|buying)\b'
+        r'|\bplace\s+(?:a\s+)?bulk\b',
+        re.I
+    )
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
 
+        # ── Check 0: Explicit bulk intent phrase ──
+        if self._BULK_TRIGGER.search(text):
+            return Intent.BULK_ORDER, 0.93
+        
         # ── Check 1: comma fragments with quantities (existing, unchanged) ──
         fragments = [f.strip() for f in text.split(',') if f.strip()]
         if len(fragments) >= 2:
