@@ -535,10 +535,23 @@ def _build_product_by_tag(e, page) -> list:
     )]
     
 def _build_product_quick_ship(e, page) -> list:
+    attr_filters = resolve_attr_filters(e.attributes)
+    active_or_pairs = list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None
+
+    # Safety net: if _resolve_tag_attribute_overlap didn't fire for any reason,
+    # ensure the query still has at least one quick-ship signal.
+    if not active_or_pairs and not attr_filters:
+        attr_filters = {TAG_SLUG_QUICK_SHIP: "yes"}
+
     return [build_advanced_filter_call(
-        attributes={"quick-ship": "yes"},
+        tags=list(e.tag_slugs) if e.tag_slugs else None,
+        categories=e.target_category_slugs or None,
+        attributes=attr_filters or None,
+        or_pairs=active_or_pairs,
         page=page,
-        description="Quick ship products (pa_quick-ship=yes)",
+        in_stock=e.in_stock,
+        description="Quick ship products",
+        **_common_exclusion_kwargs(e),
     )]
 
 

@@ -1458,7 +1458,7 @@ def chat():
         # intents. Reset happens only via the "New Search" interceptor above.
         _PRODUCT_SEARCH_INTENTS = (
             Intent.PRODUCT_SEARCH, Intent.FILTER_BY_ATTRIBUTE,
-            Intent.CATEGORY_BROWSE, Intent.PRODUCT_LIST, Intent.PRODUCT_BY_TAG,
+            Intent.CATEGORY_BROWSE, Intent.PRODUCT_LIST, Intent.PRODUCT_BY_TAG, Intent.PRODUCT_QUICK_SHIP,
         )
         _did_refine = False
         _turn_new_snapshot = None
