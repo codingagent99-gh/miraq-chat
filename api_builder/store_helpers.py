@@ -47,22 +47,16 @@ def attr_slug_for_label(label: str) -> Optional[str]:
     """
     Resolve a WooCommerce attribute taxonomy slug from an attribute label.
     e.g. "finish" → "pa_finish", "tile size" → "pa_tile-size"
-    Uses live all_attributes_raw — no hardcoded ATTR_* constants needed.
+
+    Delegates to StoreLoader.resolve_attribute(), which already handles both
+    the hyphenated attribute_name form ("colors-2") and the spaced display
+    label form ("Colors 2", "Mosaic Type") — see its docstring for why.
     """
     l = loader()
-    if not l or not l.all_attributes_raw:
+    if not l:
         return None
-    label_lower = label.lower().strip()
-    for attr in l.all_attributes_raw:
-        attr_label = (
-            attr.get("attribute_label")
-            or attr.get("name")
-            or attr.get("attribute_name")
-            or ""
-        ).lower().strip()
-        if attr_label == label_lower:
-            return attr.get("taxonomy")
-    return None
+    attr = l.resolve_attribute(label)
+    return attr.backend_ref.get("taxonomy") if attr else None
 
 
 def resolve_attr_filters(attributes: dict) -> dict:
