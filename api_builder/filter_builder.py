@@ -39,10 +39,14 @@ def _group_categories(cat_slugs: list) -> dict:
     Siblings under the same parent become a single IN (OR within group).
     Categories under different parents become separate AND conditions.
 
-    Descendant slugs are dropped when an ancestor slug is also present.
-    WP_Query tax_query uses include_children=True by default, so querying
-    the ancestor already covers the full subtree — AND-ing in the children
-    creates an over-constrained query that silently drops valid products.
+    Ancestor slugs are dropped when a descendant slug is also present.
+    An ancestor/descendant pair can never end up in the same OR-group
+    (their parent_key_str always differs), so they're always AND'd —
+    and for an AND/intersection, the descendant (narrower) slug already
+    covers the ancestor's constraint: querying just the descendant means
+    every match is automatically inside the ancestor's subtree too, so
+    keeping the broader ancestor instead would silently widen the match
+    to the whole subtree rather than just the requested descendant.
     """
     l = loader()
     slug_list = list(cat_slugs)
@@ -55,22 +59,36 @@ def _group_categories(cat_slugs: list) -> dict:
 
     slug_set = set(slug_list)
 
-    def _has_ancestor_in_set(slug: str) -> bool:
-        """Walk parent_key chain; return True if any ancestor is in slug_set."""
-        visited: set = set()
-        cat = l.category_by_key.get(slug)
-        while cat:
-            pk = cat.parent_key          # already a slug, resolved at load time
-            if not pk or pk in visited:
-                break
-            if pk in slug_set:
-                return True
-            visited.add(pk)
-            cat = l.category_by_key.get(pk)
+    def _is_ancestor_of_another_in_set(slug: str) -> bool:
+        """
+        True if `slug` is an ancestor of some OTHER slug in slug_set —
+        i.e. some other selected category is nested under this one.
+        """
+        for other in slug_set:
+            if other == slug:
+                continue
+            visited: set = set()
+            cat = l.category_by_key.get(other)
+            while cat:
+                pk = cat.parent_key
+                if not pk or pk in visited:
+                    break
+                if pk == slug:
+                    return True
+                visited.add(pk)
+                cat = l.category_by_key.get(pk)
         return False
 
-    # Keep only slugs with no ancestor in the set
-    effective = [s for s in slug_list if not _has_ancestor_in_set(s)]
+    # Keep only slugs that are NOT themselves an ancestor of another
+    # selected slug. An ancestor/descendant pair always ends up in
+    # different parent-groups below (their parent_key_str can never
+    # match), so they're always combined via AND, never OR — meaning
+    # the correct simplification is the intersection, which equals the
+    # narrower (descendant) slug, not the broader (ancestor) one.
+    # e.g. "tile-floor" + "mosaics" (tile-floor is a child of mosaics)
+    # → keep "tile-floor" only; querying just "mosaics" would silently
+    # widen the match to anything in the mosaics subtree, tile-floor or not.
+    effective = [s for s in slug_list if not _is_ancestor_of_another_in_set(s)]
 
     for slug in effective:
         cat_obj = l.category_by_key.get(slug)
@@ -81,7 +99,7 @@ def _group_categories(cat_slugs: list) -> dict:
     if len(effective) < len(slug_list):
         logger.debug(
             f"_group_categories: pruned {set(slug_list) - set(effective)} "
-            f"(covered by ancestor in set)"
+            f"(ancestor of a more specific slug also in the set)"
         )
 
     return groups
