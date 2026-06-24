@@ -252,9 +252,6 @@ def _prune_redundant_attributes(entities: ExtractedEntities):
             tokens2 = normalize_for_tag_compare(slug2.replace("-", " "))
             if tokens2 < tokens1:
                 to_delete.add(label2)
-            elif tokens2 == tokens1:
-                if re.search(r'\d', label2) and not re.search(r'\d', label1):
-                    to_delete.add(label2)
 
     for label in to_delete:
         if label in entities.attributes:
