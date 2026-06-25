@@ -64,7 +64,7 @@ from handlers.search_refinement import (
 from parsers.catalog_parser import _detect_explicit_taxonomy_signal
 from handlers.refinement_choice_handler import build_refinement_prompt, resolve_refinement_choice
 from handlers.no_results_choice_handler import build_no_results_prompt, resolve_no_results_choice
-from config.store_config import SEMANTIC_AUTO_APPLY_THRESHOLD
+from config.store_config import SEMANTIC_AUTO_APPLY_THRESHOLD, ATTRIBUTE_DISAMBIGUATION_GROUPS
 from parsers.catalog_parser import parse_csv_message
 from parsers.address_parser import extract_address, address_summary
 from utils.language_utils import detect_and_translate
@@ -1445,38 +1445,73 @@ def chat():
                 if isinstance(llm_outcome, tuple) and len(llm_outcome) == 4:
                     intent, entities, confidence, result = llm_outcome
 
-        # ── Step 4.5: Size-type ambiguity check ──────────────────────────
-        # "Size" on the storefront maps to three distinct WooCommerce
-        # attributes (Sample Size, Tile Size, Chip Size). If extraction
-        # independently populated 2+ of these with the SAME value, that's
-        # one ambiguous value, not three separate filters — ask which
-        # taxonomy the user meant instead of silently OR-ing all of them.
-        _SIZE_TYPE_LABELS = ['sample size', 'tile size', 'chip size']
-        _size_norm_list = [normalize_for_tag_compare(l) for l in _SIZE_TYPE_LABELS]
-        _size_keys_present = [
-            k for k in entities.attributes
-            if any(normalize_for_tag_compare(k.replace("-", " ")) == s for s in _size_norm_list)
-        ]
-        if len(_size_keys_present) > 1:
-            _values = {entities.attributes[k] for k in _size_keys_present}
-            if len(_values) == 1:
-                _shared_value = _values.pop()
+        # ── Step 4.5: Same-value attribute collision check ──────────────────
+        # Any two (or more) attributes can independently end up holding the EXACT
+        # SAME value purely because extraction matches a value against every
+        # taxonomy whose term list happens to contain it — regardless of whether
+        # the user actually named more than one of them (e.g. "sample size 12x12"
+        # also gets matched as Tile Size; "green" matches both Color and Colors 2;
+        # "mosaic" matches Visual, Product Type, Sample Size, and Mosaic Type all
+        # at once). That's one filter, not several — and if the user explicitly
+        # named exactly one of the colliding attributes, that one wins outright
+        # rather than triggering a clarification prompt.
+        _value_groups: dict = {}
+        for k, v in entities.attributes.items():
+            _value_groups.setdefault(v, []).append(k)
+
+        _msg_tokens = normalize_for_tag_compare(message.lower())
+
+        for _shared_value, _keys_present in list(_value_groups.items()):
+            if len(_keys_present) < 2:
+                continue
+
+            _keys_norm = {k.lower().strip() for k in _keys_present}
+            if not any(_keys_norm <= set(group) for group in ATTRIBUTE_DISAMBIGUATION_GROUPS):
+                continue  # not a known genuine ambiguity — let the OR-merge handle it, no clarification
+
+            _msg_tokens = normalize_for_tag_compare(message.lower())
+            # If one candidate's label is a substring of another's (e.g. "color"
+            # inside "colors 2"), explicit-mention detection is unreliable — the
+            # shorter name appearing in the message doesn't rule out the longer
+            # one, since the longer one's own name contains it too. Treat this
+            # shape of collision as a genuine tie rather than guessing.
+            _has_naming_overlap = any(
+                a != b and (
+                    a.replace("-", " ").strip() in b.replace("-", " ").strip()
+                    or b.replace("-", " ").strip() in a.replace("-", " ").strip()
+                )
+                for a in _keys_present for b in _keys_present
+            )
+
+            _explicitly_named = []
+            if not _has_naming_overlap:
+                _explicitly_named = [
+                    k for k in _keys_present
+                    if normalize_for_tag_compare(k.replace("-", " ")) <= _msg_tokens
+                ]
+
+            if len(_explicitly_named) == 1:
+                _winner = _explicitly_named[0]
+                for k in _keys_present:
+                    if k != _winner:
+                        del entities.attributes[k]
+            else:
                 _candidates = []
-                for k in _size_keys_present:
+                for k in _keys_present:
                     if attr_slug_for_label(k):  # validity check only
                         _candidates.append({
                             "type": "attribute",
                             "taxonomy": k,
                             "slug": _shared_value,
-                            "suggested_name": k.title(),
+                            "suggested_name": _resolve_attribute_label(k),
                             "user_text": _shared_value,
                             "is_negative": False,
                             "score": 1.0,
                         })
                 if len(_candidates) > 1:
-                    for k in _size_keys_present:
+                    for k in _keys_present:
                         del entities.attributes[k]
-                    entities.semantic_matches = [_candidates]
+                    entities.semantic_matches.append(_candidates)
 
         # ── Step 5: Semantic match resolution (auto-apply or clarify) ──
         # Skip entirely when an email lookup is in play: an email address can
@@ -1493,6 +1528,32 @@ def chat():
                 Intent.ORDER_STATUS, Intent.ORDER_TRACKING,
             )
         ):
+            # Prune semantic matches already covered by the two-phase entity
+            # merge. e.g. product_quick_ship sets quick-ship:yes in attributes;
+            # the tag semantic match for 'quick-ship' is then redundant.
+            _resolved_attr_keys = set(entities.attributes.keys())
+            _resolved_tag_slugs = set(entities.tag_slugs)
+
+            def _sem_already_covered(candidate: dict) -> bool:
+                ctype = candidate.get("type")
+                slug  = candidate.get("slug", "")
+                tax   = candidate.get("taxonomy", "")
+                if ctype == "tag":
+                    # Covered if the tag or an attribute with the same key is
+                    # already set (overlap will be OR-paired by consolidation)
+                    return slug in _resolved_tag_slugs or slug in _resolved_attr_keys
+                if ctype == "attribute":
+                    return tax in _resolved_attr_keys
+                return False
+
+            entities.semantic_matches = [
+                group for group in entities.semantic_matches
+                if not all(
+                    _sem_already_covered(c)
+                    for c in (group if isinstance(group, list) else [group])
+                )
+            ]
+
             _rejected = user_context.get("rejected_semantic_terms", [])
             _sem_groups = [
                 [c] if isinstance(c, dict) else list(c)

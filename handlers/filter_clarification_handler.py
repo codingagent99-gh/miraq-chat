@@ -59,10 +59,18 @@ def resolve_filter_clarification(message, user_context, pending_semantic):
 
     if "options" in pending_semantic:
         for opt in pending_semantic["options"]:
-            if opt["suggested_name"].lower() in msg_lower:
+            if opt["suggested_name"].lower() == msg_lower:
                 is_accept = True
                 selected_match = opt
                 break
+        if not is_accept:
+            candidates = [
+                opt for opt in pending_semantic["options"]
+                if opt["suggested_name"].lower() in msg_lower
+            ]
+            if candidates:
+                selected_match = max(candidates, key=lambda o: len(o["suggested_name"]))
+                is_accept = True
 
     if not is_accept and (
         msg_lower == "yes - use these filters"
@@ -76,12 +84,11 @@ def resolve_filter_clarification(message, user_context, pending_semantic):
         if "options" in pending_semantic:
             selected_match = pending_semantic["options"][0]
 
-    is_reject = msg_lower.startswith("no - ") or msg_lower in ["no", "n", "nope"]
+    is_reject = bool(pending_semantic.get("reject_label")) and msg_lower == pending_semantic["reject_label"].lower()
     is_cancel = msg_lower in [
         "cancel", "exit", "stop", "nevermind", "never mind", "abort", "start over"
     ]
-    is_skip = msg_lower in ["skip - use my current filters", "skip", "skip - search without size"]
-
+    is_skip = bool(pending_semantic.get("skip_label")) and msg_lower == pending_semantic["skip_label"].lower()
     if is_cancel:
         user_context.pop("pending_semantic_match", None)
 

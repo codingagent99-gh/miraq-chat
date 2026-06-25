@@ -30,11 +30,10 @@ Public API:
 
 import time
 from typing import Optional
-
+from config.store_config import SINGLE_VALUE_ATTRIBUTES, ATTRIBUTE_DISPLAY_OVERRIDES
 from models import ExtractedEntities
 from classifier.consolidation import consolidate_entities
 from models.domain import Intent
-from config.store_config import SINGLE_VALUE_ATTRIBUTES
 from chat_logger import get_logger
 import re
 logger = get_logger("miraq_chat")
@@ -256,41 +255,53 @@ def clear_active_search(user_context: dict) -> None:
 
 def describe_active_filters(entities: ExtractedEntities) -> str:
     """Readable summary of the active filter set, e.g. 'beige + concrete look, under $500'."""
+    def _norm(s):
+        return re.sub(r'[^a-z0-9]', '', s.lower())
+
     parts = []
+    seen_norm = set()
+
+    def _add(v: str):
+        v = v.strip()
+        if not v:
+            return
+        key = _norm(v)
+        if key in seen_norm:
+            return
+        seen_norm.add(key)
+        parts.append(v)
 
     cat_name = getattr(entities, 'category_name', None)
     if not cat_name and getattr(entities, 'target_category_slugs', None):
         cat_name = ", ".join(s.replace("-", " ").title() for s in sorted(entities.target_category_slugs))
     if cat_name:
-        parts.append(cat_name)
+        _add(cat_name)
 
     for slug in entities.tag_slugs:
-        parts.append(slug.replace("-", " "))
+        _add(slug.replace("-", " "))
 
-    for val in entities.attributes.values():
+    for label, val in entities.attributes.items():
+        override = ATTRIBUTE_DISPLAY_OVERRIDES.get(label.lower().strip())
+        if override:
+            _add(override)
+            continue
         for v in str(val).split(","):
-            v = v.strip().replace("-", " ")
-            if v:
-                parts.append(v)
+            _add(v.replace("-", " "))
 
-    # OR pairs (e.g. WGC colors stored as attr_tag_or_pairs rather than attributes)
-    def _norm(s):
-        return re.sub(r'[^a-z0-9]', '', s.lower())
-
-    seen_or_terms_norm = {_norm(p) for p in parts}
     for op in getattr(entities, "attr_tag_or_pairs", []):
-        term = op.get("attr_term", "")
-        if term:
-            v = term.replace("-", " ").strip()
-            if v and _norm(v) not in seen_or_terms_norm:
-                seen_or_terms_norm.add(_norm(v))
-                parts.append(v)
+        term     = op.get("attr_term", "")
+        taxonomy = (op.get("attr_taxonomy") or op.get("attr_key") or "").lower().strip()
+        override = ATTRIBUTE_DISPLAY_OVERRIDES.get(taxonomy)
+        if override:
+            _add(override)
+        elif term:
+            _add(term.replace("-", " "))
 
-    base = " + ".join(p for p in parts if p)
+    base = " + ".join(parts)
 
     price = ""
     if entities.min_price is not None and entities.max_price is not None:
-        price = f"${entities.min_price:g}\u2013${entities.max_price:g}"
+        price = f"${entities.min_price:g}–${entities.max_price:g}"
     elif entities.max_price is not None:
         price = f"under ${entities.max_price:g}"
     elif entities.min_price is not None:
@@ -320,6 +331,10 @@ def describe_active_filters_labeled(entities: ExtractedEntities) -> str:
 
     # Plain attributes — key is already a display name (e.g. "sample size")
     for key, val in entities.attributes.items():
+        override = ATTRIBUTE_DISPLAY_OVERRIDES.get(key.lower().strip())
+        if override:
+            parts.append((override, ""))
+            continue
         label  = key.replace("-", " ").title()
         values = ", ".join(
             v.strip().replace("-", " ") for v in str(val).split(",") if v.strip()
@@ -331,9 +346,15 @@ def describe_active_filters_labeled(entities: ExtractedEntities) -> str:
     or_by_tax: dict = {}
     or_tax_order: list = []
     for op in getattr(entities, "attr_tag_or_pairs", []):
-        tax  = op.get("attr_key") or op.get("attr_taxonomy", "")
+        tax  = (op.get("attr_key") or op.get("attr_taxonomy", "")).lower().strip()
         term = op.get("attr_term", "").replace("-", " ").strip()
         if not tax or not term:
+            continue
+        override = ATTRIBUTE_DISPLAY_OVERRIDES.get(tax)
+        if override:
+            if override not in or_by_tax:
+                or_by_tax[override] = []
+                or_tax_order.append(override)
             continue
         raw = tax[3:] if tax.startswith("pa_") else tax
         tax_parts = raw.split("-")

@@ -8,7 +8,7 @@ from flask import jsonify
 
 from conversation_flow import FlowState
 from handlers.chat_utils import default_pagination
-
+from handlers.search_refinement import describe_active_filters, describe_active_filters_labeled
 
 def build_semantic_clarification(
     entities,
@@ -40,7 +40,7 @@ def build_semantic_clarification(
     if not valid_term_groups or reject_flow:
         return None
 
-    has_ties = any(len(group) > 1 for group in valid_term_groups)
+    has_ties = len(valid_term_groups[0]) > 1
 
     stashed_semantic_data = {
         "carryover_search_term": entities.search_term,
@@ -71,6 +71,8 @@ def build_semantic_clarification(
     )
 
     suggestion_buttons = []
+    reject_label = None
+    skip_label = None
 
     if has_ties:
         active_group = valid_term_groups[0]
@@ -92,24 +94,37 @@ def build_semantic_clarification(
         if _is_attr_collision:
             shared_value = active_group[0]["slug"]
             type_names = " or ".join(f"**{c['suggested_name']}**" for c in active_group)
-            bot_message = f"You mentioned size **{shared_value}** — did you mean {type_names}?"
+            bot_message = f"You mentioned **{shared_value}** — did you mean {type_names}?"
             for candidate in active_group:
                 suggestion_buttons.append(candidate["suggested_name"])
             if has_strong_filters:
-                suggestion_buttons.append("Skip - search without size")
+                skip_filters = describe_active_filters_labeled(entities).replace("**", "")
+                skip_label = f"Search {skip_filters}"
+                suggestion_buttons.append(skip_label)
         else:
             action_word = "EXCLUDE" if is_negative else "USE"
             bot_message = f"I found multiple matches for '{user_original_term}'. Which one did you mean to {action_word}?"
             for candidate in active_group:
                 verb = "Exclude" if candidate.get("is_negative") else "Use"
                 suggestion_buttons.append(f"{verb} {candidate['suggested_name']}")
-            suggestion_buttons.append(f"No - search for '{user_original_term}'")
+            reject_label = f"Search '{user_original_term}'"
+            suggestion_buttons.append(reject_label)
             if has_strong_filters:
-                suggestion_buttons.append("Skip - use my current filters")
+                skip_filters = describe_active_filters_labeled(entities).replace("**", "")
+                skip_label = f"Search {skip_filters}"
+                suggestion_buttons.append(skip_label)
     else:
-        primary_semantics = [group[0] for group in valid_term_groups]
+        primary_semantics = []
+        deferred_tied_groups = []
+        for group in valid_term_groups:
+            if len(group) > 1:
+                deferred_tied_groups.append(group)
+            else:
+                primary_semantics.append(group[0])
+
         stashed_semantic_data["options"] = [primary_semantics[0]]
         stashed_semantic_data["extra_semantics"] = primary_semantics[1:]
+        stashed_semantic_data["pending_other_semantics"] = deferred_tied_groups
 
         suggested_names = [f["suggested_name"] for f in primary_semantics]
         is_negative = primary_semantics[0].get("is_negative", False)
@@ -121,21 +136,29 @@ def build_semantic_clarification(
             else:
                 bot_message = f"I don't have an exact match for '{primary_semantics[0]['user_text']}', but I do have **{suggested_names[0]}**."
                 suggestion_buttons.append(f"Yes - use {suggested_names[0]}")
-            suggestion_buttons.append(f"No - search for '{primary_semantics[0]['user_text']}'")
+            reject_label = f"Search '{primary_semantics[0]['user_text']}'"
+            suggestion_buttons.append(reject_label)
             if has_strong_filters:
-                suggestion_buttons.append("Skip - use my current filters")
+                skip_filters = describe_active_filters_labeled(entities).replace("**", "")
+                skip_label = f"Search {skip_filters}"
+                suggestion_buttons.append(skip_label)
         else:
             joined_names = " and ".join(suggested_names)
             bot_message = f"I don't have exact matches, but I found **{joined_names}**."
             suggestion_buttons.append("Yes - use these filters")
-            suggestion_buttons.append("No - use my original text")
+            reject_label = "Use my original text"
+            suggestion_buttons.append(reject_label)
             if has_strong_filters:
-                suggestion_buttons.append("Skip - use my current filters")
+                skip_filters = describe_active_filters_labeled(entities).replace("**", "")
+                skip_label = f"Search {skip_filters}"
+                suggestion_buttons.append(skip_label)
 
     suggestion_buttons.append("New Search")
     suggestion_buttons.append("Cancel")
 
     elapsed = time.time() - start_time
+    stashed_semantic_data["reject_label"] = reject_label
+    stashed_semantic_data["skip_label"] = skip_label
     user_context["pending_semantic_match"] = stashed_semantic_data
 
     return jsonify({
@@ -152,4 +175,6 @@ def build_semantic_clarification(
         },
         "flow_state": FlowState.AWAITING_FILTER_CLARIFICATION.value,
         "pagination": default_pagination(page),
-    })
+    })    
+    
+    

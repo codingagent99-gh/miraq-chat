@@ -41,8 +41,7 @@ from flask import jsonify
 from models import ExtractedEntities
 from conversation_flow import FlowState
 from handlers.chat_utils import default_pagination
-from handlers.search_refinement import describe_active_filters_labeled
-
+from handlers.search_refinement import describe_active_filters_labeled, describe_active_filters
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -86,22 +85,24 @@ def build_no_results_prompt(
     """
     new_label     = describe_active_filters_labeled(_entities_from_snapshot(turn_new))
     carried_label = describe_active_filters_labeled(_entities_from_snapshot(active))
+    new_summary     = describe_active_filters(_entities_from_snapshot(turn_new))
+    carried_summary = describe_active_filters(_entities_from_snapshot(active))
 
     if carried_label:
         bot_message = (
-            f"I don't see any products matching **{new_label}** along with "
+            f"I don't see any products matching {new_label} along with "
             f"your current filters ({carried_label})."
         )
         suggestion_buttons = [
-            "Search that filter only",
-            "Remove it, keep my filters",
+            f"Search {new_summary}",
+            f"Search {carried_summary}",
             "New Search",
         ]
     else:
         # No carried-over filters to blame — just this turn's filter alone
-        # returned nothing. Skip the "remove" option since there's nothing
+        # returned nothing. Skip the second option since there's nothing
         # else to fall back to besides a fresh search.
-        bot_message = f"I don't see any products matching **{new_label}**."
+        bot_message = f"I don't see any products matching {new_label}."
         suggestion_buttons = [
             "New Search",
         ]
@@ -120,8 +121,7 @@ def build_no_results_prompt(
         },
         "flow_state":  FlowState.AWAITING_NO_RESULTS_CHOICE.value,
         "pagination":  default_pagination(page),
-    })
-
+    }), 200
 
 def resolve_no_results_choice(
     message: str,
@@ -132,19 +132,24 @@ def resolve_no_results_choice(
     re-search with. Returns None if the message doesn't match the expected
     chip labels (caller falls through to normal classification).
 
-    "Search {new} only"            → drop carried filters, keep only this
-                                      turn's new filter(s).
-    "Remove {new}, keep my filters" → drop this turn's new filter(s), keep
-                                      only the carried-over filters.
+    Both buttons are now phrased as "Search {options}" with a different
+    option set each (this turn's new filter(s) vs. the carried-over
+    filter(s)) — so they can no longer be told apart by a fixed prefix the
+    way "Search..." vs "Remove..." could be. Matching falls back to
+    reconstructing both possible labels from the same snapshots used to
+    build them, and comparing the full string.
     """
     msg      = message.strip()
     turn_new = pending.get("turn_new", {})
     active   = pending.get("active", {})
 
+    new_summary     = describe_active_filters(_entities_from_snapshot(turn_new))
+    carried_summary = describe_active_filters(_entities_from_snapshot(active))
+
     mode = None
-    if msg.lower() == "search that filter only":
+    if msg.lower() == f"search {new_summary}".lower():
         mode = "new_only"
-    elif msg.lower() == "remove it, keep my filters":
+    elif msg.lower() == f"search {carried_summary}".lower():
         mode = "active_only"
 
     if mode is None:

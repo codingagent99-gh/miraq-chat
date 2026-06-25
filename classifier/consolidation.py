@@ -15,7 +15,7 @@ from store_registry import get_store_loader
 from chat_logger import get_logger
 from classifier.utils import normalize_for_tag_compare
 from classifier.extractors import extract_category
-
+from config.store_config import ATTRIBUTE_VALUE_PHRASES
 logger = get_logger("miraq_chat")
 
 PRODUCT_SPECIFIC_INTENTS = {
@@ -27,11 +27,19 @@ PRODUCT_SPECIFIC_INTENTS = {
 def _resolve_tag_attribute_overlap(entities: ExtractedEntities):
     """
     extract_tag and extract_attributes run independently on separately-masked
-    text in classify(), with no cross-checking — so the same input (e.g.
-    "quick ship") can set BOTH tag_slugs=['quick-ship'] AND
-    attributes={'quick-ship': 'yes'} simultaneously. Merge these into a
-    single OR pair so the query becomes (product_tag=X OR pa_X=value)
-    instead of silently using only one of the two taxonomies.
+    text in classify(), with no cross-checking — so the same input can set
+    BOTH a tag AND an attribute referring to the same underlying concept, in
+    two different ways:
+      1. The tag's name equals the attribute's own label/key — e.g. "quick
+         ship" sets tag_slugs=['quick-ship'] AND attributes={'quick-ship':
+         'yes'} (the LABEL matches; "yes" is just a flag value).
+      2. The tag's name is built from the attribute's VALUE — e.g. a
+         "green-tones" tag alongside attributes={'color': 'green'} (the
+         VALUE "green" is a subset of the tag's own tokens; the LABEL
+         "color" has nothing to do with the tag's name).
+    Either shape gets merged into a single OR pair so the query becomes
+    (product_tag=X OR pa_X=value) instead of silently using only one of
+    the two taxonomies.
     """
     if not (entities.tag_slugs and entities.attributes):
         return
@@ -43,16 +51,30 @@ def _resolve_tag_attribute_overlap(entities: ExtractedEntities):
 
         for attr_label, attr_value in list(entities.attributes.items()):
             label_tokens = normalize_for_tag_compare(attr_label.replace("-", " "))
-            if label_tokens != tag_tokens:
+            value_tokens = normalize_for_tag_compare(str(attr_value).replace("-", " "))
+
+            attr_key_norm = attr_label.lower().strip()
+            value_norm = str(attr_value).lower().strip()
+
+            if attr_key_norm in ATTRIBUTE_VALUE_PHRASES:
+                configured_phrase = ATTRIBUTE_VALUE_PHRASES[attr_key_norm].get(value_norm)
+                if configured_phrase:
+                    phrase_tokens = normalize_for_tag_compare(configured_phrase)
+                    label_matches_tag = bool(phrase_tokens) and phrase_tokens == tag_tokens
+                else:
+                    label_matches_tag = False
+            else:
+                label_matches_tag = label_tokens == tag_tokens
+
+            value_matches_tag = bool(value_tokens) and value_tokens <= tag_tokens
+
+            if not (label_matches_tag or value_matches_tag):
                 continue
 
             actual_tax = ""
             if loader and loader.all_attributes_raw:
                 attr_label_norm = attr_label.lower().strip()
                 for a in loader.all_attributes_raw:
-                    # attribute_name is the hyphenated form matching entities.attributes
-                    # dict keys (e.g. "quick-ship"); attribute_label is the human-readable
-                    # form (e.g. "Quick Ship") and won't match for multi-word names.
                     name_raw = (a.get("attribute_name") or "").lower().strip()
                     label_raw = (a.get("attribute_label") or a.get("name") or "").lower().strip()
                     if attr_label_norm in (name_raw, label_raw, label_raw.replace(" ", "-")):
@@ -68,9 +90,6 @@ def _resolve_tag_attribute_overlap(entities: ExtractedEntities):
                 "attr_term": attr_value,
             })
 
-            # Remove tag_slug AND its paired tag_id together — tag_ids and
-            # tag_slugs are parallel lists (merge_tags zips them by index),
-            # so removing only one would misalign them on future merges.
             if tag_slug in entities.tag_slugs:
                 idx = entities.tag_slugs.index(tag_slug)
                 entities.tag_slugs.pop(idx)
@@ -80,10 +99,11 @@ def _resolve_tag_attribute_overlap(entities: ExtractedEntities):
             del entities.attributes[attr_label]
             logger.info(
                 f"_resolve_tag_attribute_overlap: merged tag='{tag_slug}' + "
-                f"attr='{attr_label}:{attr_value}' → OR pair on taxonomy='{actual_tax}'"
+                f"attr='{attr_label}:{attr_value}' → OR pair on taxonomy='{actual_tax}' "
+                f"(matched via {'label' if label_matches_tag else 'value'})"
             )
             break
-        
+  
 def consolidate_entities(intent: Intent, entities: ExtractedEntities, text: str):
     _resolve_product_vs_category(intent, entities)
     _resolve_series_tag_conflict(entities, text)
