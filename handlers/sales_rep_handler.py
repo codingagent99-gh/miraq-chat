@@ -198,7 +198,7 @@ def _fetch_and_show_last_5_orders(customer_data, conversation, user_context, pag
             f"I couldn't find any recent orders for **{display_name}**. "
             "You can place a new order for them now."
         )
-        suggestions = ["Place new order", "Order for someone else", "Cancel"]
+        suggestions = ["Place new order", "Cancel"]
     else:
         bot_message = f"Here are the last {len(orders)} orders for **{display_name}**:\n\n"
         for order in orders:
@@ -218,7 +218,7 @@ def _fetch_and_show_last_5_orders(customer_data, conversation, user_context, pag
                 if pattern and pattern.overdue:
                     bot_message += f"  ⚠️ {pattern.hint}\n"
             bot_message += "\n"
-        suggestions = ["Reorder last order", "Place new order", "Order for someone else"]
+        suggestions = ["Reorder last order", "Place new order"]
 
     elapsed = round((time.time() - start_time) * 1000)
     return jsonify({

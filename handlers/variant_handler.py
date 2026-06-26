@@ -264,6 +264,7 @@ def handle_variant_selection(
         ))
         parent_raw = parent_resp.get("data", {}) if parent_resp.get("success") else {}
         
+    all_variations = [v for v in all_variations if v.get("attributes")]
 
     # Load store_loader once for slug→display-name resolution and the slug lookup
     _sl = None
