@@ -1634,7 +1634,27 @@ def chat():
 
         elif intent in _PRODUCT_SEARCH_INTENTS:
             _active = user_context.get("active_search")
-            if _active and active_search_is_fresh(_active):
+
+            if page > 1 and not _active:
+                # "Load More" with nothing to continue — don't silently run an
+                # unrelated fresh search under what the user thinks is page 2
+                # of results they already saw. Say so instead.
+                conversation.context_data = user_context
+                flag_modified(conversation, "context_data")
+                return _ft((jsonify({
+                    "success": True,
+                    "bot_message": "I don't have a search to continue loading — what would you like to look for?",
+                    "intent": "guided_flow",
+                    "products": [],
+                    "suggestions": ["New Search"],
+                    "session_id": str(conversation.id),
+                    "metadata": {"flow_state": FlowState.IDLE.value},
+                    "flow_state": FlowState.IDLE.value,
+                    "pagination": default_pagination(page),
+                }), 200))
+
+            _active_usable = bool(_active) and (page > 1 or active_search_is_fresh(_active))
+            if _active_usable:
                 conflicts = detect_slot_conflicts(entities, _active)
                 if conflicts:
                     # ── Multi-value slot conflict: ask add-or-replace ──────────
