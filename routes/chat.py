@@ -1090,6 +1090,31 @@ def _handle_customer_intents(
 # ─── MAIN CHAT PIPELINE ───
 # ══════════════════════════════════════════════════════════════
 
+@chat_bp.route("/chat/order-confirmed", methods=["POST"])
+def handle_order_confirmed():
+    data           = request.get_json() or {}
+    session_id_str = data.get("session_id")
+    order_id       = data.get("order_id")
+    msg_text       = f"✅ Order #{order_id} placed."
+
+    if session_id_str:
+        try:
+            conv = Conversation.query.get(uuid.UUID(session_id_str))
+            if conv:
+                db.session.add(Message(
+                    conversation_id=conv.id,
+                    role="bot",
+                    content=msg_text,
+                    intent="order_placed",
+                    metadata_json={},
+                ))
+                db.session.commit()
+        except Exception as exc:
+            logger.warning(f"[order_confirmed] DB write failed: {exc}")
+            db.session.rollback()
+
+    return jsonify({"success": True, "bot_message": msg_text}), 200
+
 @chat_bp.route("/chat/cart-result", methods=["POST"])
 def handle_cart_result():
     data           = request.get_json() or {}
@@ -1106,7 +1131,7 @@ def handle_cart_result():
     else:
         msg_text    = f"⚠️ Couldn't add **{product_name}** to your cart. Please try again."
         out_actions = []
-        suggestions = ["Try again", "View cart", "Browse products"]
+        suggestions = ["View cart", "Browse products"]
         intent      = "error"
 
     if session_id_str:

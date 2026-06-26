@@ -115,7 +115,7 @@ def handle_order_for_email_reply(message, conversation, user_context, page, star
             "bot_message": "Sorry, I couldn't search customers right now. Please try again.",
             "intent":      "guided_flow",
             "products":    [],
-            "suggestions": ["Try again", "Cancel"],
+            "suggestions": ["Cancel"],
             "session_id":  str(conversation.id),
             "metadata": {
                 "flow_state":       FlowState.AWAITING_ORDER_FOR_EMAIL.value,

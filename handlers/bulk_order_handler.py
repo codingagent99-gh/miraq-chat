@@ -1746,8 +1746,8 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
         bot_message = "No orders were placed."
 
     suggestions = ["Show my orders"]
-    if failed_orders:
-        suggestions.append("Try again")
+    # if failed_orders:
+        # suggestions.append("Try again")
     suggestions.append("Place another bulk order")
 
     elapsed = round((time.time() - start_time) * 1000)
