@@ -358,11 +358,10 @@ def _handle_cart_flow(action, user_context, conversation, store_loader, page, st
                 variation_id=vid,
                 variation=variation_attributes,
             )]
-        actions.append(build_open_cart_panel())
 
         return jsonify({
             "success":     True,
-            "bot_message": f"✅ Added **{name}** ×{qty} to your cart. Opening your cart so you can review…",
+            "bot_message": f"Adding **{name}** ×{qty} to your cart…",
             "intent":      Intent.ADD_TO_CART.value,
             "suggestions": ["Proceed to checkout", "Continue shopping", "View cart"],
             "session_id":  str(conversation.id),
@@ -1091,6 +1090,48 @@ def _handle_customer_intents(
 # ─── MAIN CHAT PIPELINE ───
 # ══════════════════════════════════════════════════════════════
 
+@chat_bp.route("/chat/cart-result", methods=["POST"])
+def handle_cart_result():
+    data           = request.get_json() or {}
+    session_id_str = data.get("session_id")
+    success        = bool(data.get("success", False))
+    product_name   = data.get("product_name") or "item"
+    quantity       = int(data.get("quantity") or 1)
+
+    if success:
+        msg_text    = f"✅ Added **{product_name}** ×{quantity} to your cart."
+        out_actions = [build_open_cart_panel()]
+        suggestions = ["Proceed to checkout", "Continue shopping", "View cart"]
+        intent      = Intent.ADD_TO_CART.value
+    else:
+        msg_text    = f"⚠️ Couldn't add **{product_name}** to your cart. Please try again."
+        out_actions = []
+        suggestions = ["Try again", "View cart", "Browse products"]
+        intent      = "error"
+
+    if session_id_str:
+        try:
+            conv = Conversation.query.get(uuid.UUID(session_id_str))
+            if conv:
+                db.session.add(Message(
+                    conversation_id=conv.id,
+                    role="bot",
+                    content=msg_text,
+                    intent=intent,
+                    metadata_json={"actions": out_actions, "suggestions": suggestions},
+                ))
+                db.session.commit()
+        except Exception as exc:
+            logger.warning(f"[cart_result] DB write failed: {exc}")
+            db.session.rollback()
+
+    return jsonify({
+        "success":     True,
+        "bot_message": msg_text,
+        "actions":     out_actions,
+        "suggestions": suggestions,
+    }), 200
+    
 @chat_bp.route("/chat", methods=["POST"])
 @enforce_daily_limit
 def chat():
