@@ -89,9 +89,9 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
         if _DIM_RE.match(name.strip()):
             _dm = re.match(r'^(\d+)["\']?\s*[xX×]\s*(\d+)["\']?$', name.strip())
             flexible_name = rf'{_dm.group(1)}["\']?\s*[xX×]\s*{_dm.group(2)}["\']?'
-            logger.debug(
-                f"[DIM_PATTERN_TRACE] catalog_name={name!r} -> flexible_name={flexible_name!r}"
-            ) 
+            # logger.debug(
+            #     f"[DIM_PATTERN_TRACE] catalog_name={name!r} -> flexible_name={flexible_name!r}"
+            # ) 
         else:
             # Make Phase 1 plural/singular tolerant
             normalized_name = name.replace('-', ' ')
@@ -101,17 +101,17 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
                     parts.append(rf'{re.escape(w[:-1])}s?')
                 else:
                     parts.append(re.escape(w))
-            flexible_name = r'\s+'.join(parts)
+            flexible_name = r'[\s\-]*'.join(parts)
         
         
         pattern = r'(?<![\w-])(' + flexible_name + r')(?![\w-])'
 
         if not re.search(pattern, unmatched_text):
-            if _DIM_RE.match(name.strip()):
-                logger.debug(f"[DIM_PATTERN_TRACE] NO MATCH for {name!r} against text={unmatched_text!r}")
+            # if _DIM_RE.match(name.strip()):
+            #     logger.debug(f"[DIM_PATTERN_TRACE] NO MATCH for {name!r} against text={unmatched_text!r}")
             continue
-        if _DIM_RE.match(name.strip()):
-            logger.debug(f"[DIM_PATTERN_TRACE] MATCHED {name!r} | types_matched={[m[0] for m in matches]}")
+        # if _DIM_RE.match(name.strip()):
+            # logger.debug(f"[DIM_PATTERN_TRACE] MATCHED {name!r} | types_matched={[m[0] for m in matches]}")
 
         types_matched = [m[0] for m in matches]
         is_tag_attr_collision = 'tag' in types_matched and 'attribute' in types_matched

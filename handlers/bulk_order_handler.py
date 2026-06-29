@@ -72,7 +72,7 @@ def handle_cancel_bulk_order(user_context, conversation, page, start_time):
         "bot_message": bot_message,
         "intent": "guided_flow",
         "products": [],
-        "suggestions": ["Show me products", "Start a bulk order"],
+        "suggestions": ["Browse Products", "Start a bulk order"],
         "session_id": str(conversation.id),
         "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": elapsed},
         "flow_state": FlowState.IDLE.value,

@@ -205,7 +205,7 @@ def handle_flow_state(
         if text in exit_phrases or any(text.startswith(p + " ") for p in exit_phrases):
             return {
                 "bot_message": "No problem! I've cancelled that. Is there anything else I can help with? 😊",
-                "suggestions": ["Show me products", "Browse categories"],
+                "suggestions": ["Browse Products", "Browse categories"],
                 "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
                 "pass_through": False,
             }
@@ -245,7 +245,7 @@ def handle_flow_state(
                     "You can tell me a product name, category, or describe what you need."
                 ),
                 "suggestions": [
-                    "Show me products",
+                    "Browse Products",
                     "What categories do you have?",
                     "I'm looking for floor products",
                 ],
@@ -284,7 +284,7 @@ def handle_flow_state(
         if any(kw in text for kw in ["cancel", "stop", "nevermind", "never mind", "quit", "exit"]):
             return {
                 "bot_message": "No problem! Let me know if you need anything else.",
-                "suggestions": ["Show me products", "View my orders"],
+                "suggestions": ["Browse Products", "View my orders"],
                 "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
                 "pass_through": False,
             }
@@ -356,13 +356,13 @@ def handle_flow_state(
         ]):
             return {
                 "bot_message": "No problem! Order cancelled. Is there anything else I can help with?",
-                "suggestions": ["Show me products", "Browse categories"],
+                "suggestions": ["Browse Products", "Browse categories"],
                 "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
                 "pass_through": False,
             }
         # Topic-change detection: user clearly wants to do something else — reset to IDLE
         _topic_change_phrases = [
-            "show me products", "show products", "browse categories",
+            "Browse Products", "show products", "browse categories",
             "what categories", "check my orders", "check orders",
         ]
         if any(ph in text for ph in _topic_change_phrases) or _is_topic_change(text) or text.strip() in ("hello", "hi"):

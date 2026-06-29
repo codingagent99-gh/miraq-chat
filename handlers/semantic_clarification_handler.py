@@ -24,6 +24,14 @@ def build_semantic_clarification(
     """
     if not entities.semantic_matches:
         return None
+    
+    # An already-resolved, exact product name match is a stronger signal
+    # than any fuzzy semantic guess — a literal product like "Oz" also
+    # scoring 0.77-0.80 against unrelated colors/tags isn't a real
+    # ambiguity worth interrupting the user for. Let the exact match win
+    # outright rather than asking them to choose between weaker guesses.
+    if entities.product_id:
+        return None
 
     rejected_list = user_context.get("rejected_semantic_terms", [])
     valid_term_groups = []
