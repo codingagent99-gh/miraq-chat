@@ -167,7 +167,7 @@ def build_advanced_filter_call(
             else:
                 _term = search_term.lower().strip()
                 _stop = {'all', 'products', 'items', 'everything', 'anything',
-                        'show', 'me', 'give', 'find', 'search', 'list', 'get'}
+                        'show', 'me', 'give', 'find', 'search', 'list', 'get', 'browse'}
                 _meaningful = bool(set(_term.split()) - _stop)
                 if _meaningful:
                     body["search"] = _term
