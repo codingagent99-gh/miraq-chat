@@ -11,7 +11,7 @@ Responsible for:
 """
 
 from typing import List, Optional
-
+import re
 
 # ─── Node constructors ───
 
@@ -108,6 +108,18 @@ def serialize_query(
 def _normalize_term(t: str) -> str:
     """Normalize a term for overlap comparison (lowercase, strip trailing 's')."""
     t = str(t).lower().strip()
+    
+    # Dimension-shaped values (e.g. "48-x-48", "48x48", '48"x48"') canonicalize
+    # to one hyphen/quote-free form before comparison, so grouping isn't broken
+    # by which exact spelling of a duplicate catalog slug happens to be first —
+    # same root cause as the pa_tile-size/pa_sample-size duplicate-slug issue
+    # found earlier today. Scoped to strict NxM shape only (requires an actual
+    # "x"/"×" between two digit groups) — can't match a color's version number
+    # like "2.0", since that has no separator digit group at all.
+    dim_m = re.match(r'^(\d+)["\']?[\s\-]*[x×][\s\-]*(\d+)["\']?$', t)
+    if dim_m:
+        return f'{dim_m.group(1)}x{dim_m.group(2)}'
+
     if t.endswith('s') and not t.endswith('ss'):
         return t[:-1]
     return t
