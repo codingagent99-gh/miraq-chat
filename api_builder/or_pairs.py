@@ -59,31 +59,28 @@ def resolve_or_pair(pair: OrPair) -> OrPair:
                 # The PHP endpoint passes it to WP_Tax_Query with field='slug';
                 # WordPress calls sanitize_title('12"x24"') → '12x24' → matches DB slug.
                 _dim_m = re.match(r'^(\d+)[\-\s]*[xX×][\-\s]*(\d+)$', term.strip())
+                resolved_term = None
                 if _dim_m:
-                    term_slug = f'{_dim_m.group(1)}"x{_dim_m.group(2)}"'
+                    candidates = [f'{_dim_m.group(1)}x{_dim_m.group(2)}', term]
                 else:
-                    resolved_term = None
-                    for candidate in filter(None, [
-                        term,
-                        term.replace("-", " "),
-                        re.sub(r"[\s\-]+", "", term),
-                    ]):
+                    candidates = [term, term.replace("-", " "), re.sub(r"[\s\-]+", "", term)]
+                for candidate in filter(None, candidates):
                         resolved_term = l.resolve_attribute_term(attr_key, candidate)
                         if resolved_term:
                             break
 
-                    if resolved_term:
-                        term_slug = (
-                            resolved_term.backend_ref.get("slug")
-                            or resolved_term.key
-                            or term_slug
-                        )
-                    else:
-                        sample = [(t.key, t.name) for t in attr.terms[:8]]
-                        logger.debug(
-                            f"resolve_or_pair: resolution failed for attr='{attr_key}' "
-                            f"term='{term}' | available terms (key/name): {sample}"
-                        )
+                if resolved_term:
+                    term_slug = (
+                        resolved_term.backend_ref.get("slug")
+                        or resolved_term.key
+                        or term_slug
+                    )
+                else:
+                    sample = [(t.key, t.name) for t in attr.terms[:8]]
+                    logger.debug(
+                        f"resolve_or_pair: resolution failed for attr='{attr_key}' "
+                        f"term='{term}' | available terms (key/name): {sample}"
+                    )
 
     return OrPair(
         tag_slug=pair.tag_slug,

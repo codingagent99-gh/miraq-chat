@@ -1100,6 +1100,8 @@ def handle_order_confirmed():
     if session_id_str:
         try:
             conv = Conversation.query.get(uuid.UUID(session_id_str))
+            if not conv:
+                logger.warning(f"[order_confirmed] No Conversation found for session_id={session_id_str}")
             if conv:
                 db.session.add(Message(
                     conversation_id=conv.id,
@@ -1112,6 +1114,8 @@ def handle_order_confirmed():
         except Exception as exc:
             logger.warning(f"[order_confirmed] DB write failed: {exc}")
             db.session.rollback()
+    else:
+        logger.warning("[order_confirmed] Called with no session_id")
 
     return jsonify({"success": True, "bot_message": msg_text}), 200
 

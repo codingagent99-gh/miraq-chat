@@ -289,3 +289,31 @@ def _load_attribute_disambiguation_groups() -> list:
     return [[k.lower().strip() for k in group] for group in _DEFAULT_ATTRIBUTE_DISAMBIGUATION_GROUPS]
 
 ATTRIBUTE_DISAMBIGUATION_GROUPS: list = _load_attribute_disambiguation_groups()
+
+# ═══════════════════════════════════════════════════════════════
+# FUZZY SIZE ATTRIBUTE KEYS  (punctuation/space-insensitive term matching)
+# Attribute keys where StoreLoader.resolve_attribute_term() falls back to a
+# punctuation/space-insensitive comparison when an exact match fails — e.g.
+# matching "12 x 24" against a real term whose name is `12"x24"`. Scoped
+# deliberately to size-style attributes only: this fallback is unsafe for
+# attributes using meaningful decimal/version numbers (e.g. a Colors term
+# like "SELECT 2.0 Onyx Grey" — stripping the period would make "2.0" and
+# "20" indistinguishable, which are different values). List only attributes
+# where blanket punctuation-stripping is confirmed safe.
+# Override via env var FUZZY_SIZE_ATTRIBUTE_KEYS_JSON (JSON array).
+# ═══════════════════════════════════════════════════════════════
+
+_DEFAULT_FUZZY_SIZE_ATTRIBUTE_KEYS = ["sample-size", "tile-size"]
+
+def _load_fuzzy_size_attribute_keys() -> set:
+    raw = os.getenv("FUZZY_SIZE_ATTRIBUTE_KEYS_JSON", "")
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return {str(x).lower().strip() for x in parsed}
+        except Exception:
+            pass
+    return {x.lower().strip() for x in _DEFAULT_FUZZY_SIZE_ATTRIBUTE_KEYS}
+
+FUZZY_SIZE_ATTRIBUTE_KEYS: set = _load_fuzzy_size_attribute_keys()

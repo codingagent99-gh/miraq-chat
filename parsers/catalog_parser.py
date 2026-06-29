@@ -58,9 +58,20 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
     # Group by identical string (preserves length-sorted order)
     grouped_catalog = {}
     for name, match_type, data in catalog_items:
-        if name not in grouped_catalog:
-            grouped_catalog[name] = []
-        grouped_catalog[name].append((match_type, data))
+        # Dimension-shaped names get canonicalized into ONE group key
+        # regardless of quoting/spacing — otherwise `12"x24"` and
+        # `12" x 24"` become two separate competing entries, and whichever
+        # is processed first (by length) consumes the match text and
+        # starves the other, even for input that was an exact match for it.
+        dim_m = _DIM_RE.match(name.strip())
+        if dim_m:
+            _g = re.match(r'^(\d+)["\']?\s*[xX×]\s*(\d+)["\']?$', name.strip())
+            group_key = f'{_g.group(1)}x{_g.group(2)}'
+        else:
+            group_key = name
+        if group_key not in grouped_catalog:
+            grouped_catalog[group_key] = []
+        grouped_catalog[group_key].append((match_type, data))
 
     unmatched_text = msg_lower
 
@@ -68,19 +79,39 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
         if len(name) < 3:
             continue
 
-        # Make Phase 1 plural/singular tolerant
-        normalized_name = name.replace('-', ' ')
-        parts = []
-        for w in normalized_name.split():
-            if w.endswith('s') and not w.endswith('ss') and len(w) > 3:
-                parts.append(rf'{re.escape(w[:-1])}s?')
-            else:
-                parts.append(re.escape(w))
-        flexible_name = r'\s+'.join(parts)
+        # Dimension strings get their own pattern, ignoring quotes/spacing
+        # entirely: sibling size attributes can have genuinely different
+        # term.name formatting for the identical physical size (confirmed —
+        # pa_sample-size stores `12"x24"`, pa_tile-size stores `12 x 24`).
+        # The normal word-split tolerance below only flexes whitespace
+        # BETWEEN tokens a name already has, which can't bridge that gap —
+        # a name with zero internal separators gets zero flex either way.
+        if _DIM_RE.match(name.strip()):
+            _dm = re.match(r'^(\d+)["\']?\s*[xX×]\s*(\d+)["\']?$', name.strip())
+            flexible_name = rf'{_dm.group(1)}["\']?\s*[xX×]\s*{_dm.group(2)}["\']?'
+            logger.debug(
+                f"[DIM_PATTERN_TRACE] catalog_name={name!r} -> flexible_name={flexible_name!r}"
+            ) 
+        else:
+            # Make Phase 1 plural/singular tolerant
+            normalized_name = name.replace('-', ' ')
+            parts = []
+            for w in normalized_name.split():
+                if w.endswith('s') and not w.endswith('ss') and len(w) > 3:
+                    parts.append(rf'{re.escape(w[:-1])}s?')
+                else:
+                    parts.append(re.escape(w))
+            flexible_name = r'\s+'.join(parts)
+        
+        
         pattern = r'(?<![\w-])(' + flexible_name + r')(?![\w-])'
 
         if not re.search(pattern, unmatched_text):
+            if _DIM_RE.match(name.strip()):
+                logger.debug(f"[DIM_PATTERN_TRACE] NO MATCH for {name!r} against text={unmatched_text!r}")
             continue
+        if _DIM_RE.match(name.strip()):
+            logger.debug(f"[DIM_PATTERN_TRACE] MATCHED {name!r} | types_matched={[m[0] for m in matches]}")
 
         types_matched = [m[0] for m in matches]
         is_tag_attr_collision = 'tag' in types_matched and 'attribute' in types_matched
@@ -138,6 +169,7 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
             })
             append_category_name(entities, cat_data.get("name") or "")
         else:
+            attr_candidates: dict = {}
             for match_type, data in matches:
                 if match_type == 'tag':
                     entities.tag_slugs.append(data.get("slug"))
@@ -154,13 +186,23 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
                     append_category_name(entities, data.get("name") or "")
                 elif match_type == 'attribute':
                     attr_name = data['attribute_name']
-                    term_slug = data['slug']
-                    merge_attribute(entities.attributes, attr_name, term_slug)
+                    attr_candidates.setdefault(attr_name, []).append(data['slug'])
+
+            for attr_name, slugs in attr_candidates.items():
+                # Multiple distinct slugs for the SAME taxonomy means duplicate
+                # catalog term rows for what should be one value (e.g. two
+                # Sample Size rows for "12x24": one slugged 12x24, one
+                # 12-x-24). Don't guess which is "correct" and drop the
+                # other — OR all distinct candidates together, same as
+                # sample-size is already OR'd against tile-size.
+                unique_slugs = list(dict.fromkeys(slugs))
+                combined = ",".join(unique_slugs)
+                logger.debug(f"[ATTR_MERGE_TRACE] merging attr_name={attr_name!r} slugs={unique_slugs!r}")
+                merge_attribute(entities.attributes, attr_name, combined)
 
         unmatched_text = re.sub(pattern, " ", unmatched_text)
 
     return entities, unmatched_text
-
 
 # ══════════════════════════════════════════════════════════════
 # PHASE 2: NLP Fallback Merge

@@ -114,11 +114,6 @@ def _normalize_term(t: str) -> str:
 
 
 def merge_cross_taxonomy_overlaps(conditions: list) -> list:
-    """
-    Detect conditions across different taxonomies that target the same
-    normalized term (e.g. 'mosaic' tag + 'mosaic' category) and wrap
-    them in an OR group so either match satisfies the filter.
-    """
     flattened_in = []
     other = []
 
@@ -126,14 +121,12 @@ def merge_cross_taxonomy_overlaps(conditions: list) -> list:
         if cond.get("operator") == "IN" and "terms" in cond and cond["terms"]:
             flattened_in.append(cond)
         elif cond.get("relation") == "OR":
-            # Only flatten OR groups where all sub-conditions share the same base term
             subs = cond.get("conditions", [])
             all_ins = all(
                 sub.get("operator") == "IN" and sub.get("terms")
                 for sub in subs
             )
             base_terms = {_normalize_term(sub["terms"][0]) for sub in subs} if all_ins else set()
-
             if all_ins and len(base_terms) == 1:
                 flattened_in.extend(subs)
             else:
@@ -141,9 +134,27 @@ def merge_cross_taxonomy_overlaps(conditions: list) -> list:
         else:
             other.append(cond)
 
-    # Group flattened IN conditions by their normalized first term
-    term_groups: dict[str, list] = {}
+    # STEP A — collapse multiple conditions for the SAME taxonomy into one,
+    # unioning their terms. Always safe: this has nothing to do with
+    # cross-taxonomy semantic overlap, it just consolidates what should
+    # never have been split in the first place (e.g. duplicate catalog
+    # slugs producing two separate pa_tile-size conditions).
+    by_taxonomy: dict = {}
+    order: list = []
     for cond in flattened_in:
+        tax = cond.get("taxonomy", "")
+        if tax not in by_taxonomy:
+            by_taxonomy[tax] = []
+            order.append(tax)
+        for t in cond.get("terms", []):
+            if t not in by_taxonomy[tax]:
+                by_taxonomy[tax].append(t)
+    consolidated = [make_condition(tax, by_taxonomy[tax], "IN") for tax in order]
+
+    # STEP B — UNCHANGED original logic: cross-taxonomy overlap detection,
+    # still based on the first term only, exactly as conservative as before.
+    term_groups: dict[str, list] = {}
+    for cond in consolidated:
         base = _normalize_term(cond["terms"][0])
         term_groups.setdefault(base, [])
         if cond not in term_groups[base]:
@@ -155,8 +166,8 @@ def merge_cross_taxonomy_overlaps(conditions: list) -> list:
             final.append(group[0])
         else:
             final.append(make_or_group(group))
-
     return final
+
 
 def find_or_groups(node) -> list:
     """

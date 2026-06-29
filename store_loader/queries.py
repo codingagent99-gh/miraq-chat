@@ -11,6 +11,7 @@ import time as _time
 from typing import List, Dict, Optional
 
 from config.store_config import TAG_SLUG_QUICK_SHIP, TAG_SLUG_CHIP_CARD
+from config.store_config import FUZZY_SIZE_ATTRIBUTE_KEYS
 from chat_logger import get_logger
 from models.catalog import (
     CatalogAttribute,
@@ -167,7 +168,6 @@ class StoreQueryMixin:
         return attr
 
     def resolve_attribute_term(self, attr_key: str, term_key_or_name: str) -> Optional[CatalogAttributeTerm]:
-        """Look up an attribute term by attr_key + (term key OR display name, case-insensitive)."""
         attr = self.resolve_attribute(attr_key)
         if not attr:
             return None
@@ -175,6 +175,27 @@ class StoreQueryMixin:
         for term in attr.terms:
             if term.key.lower() == needle or term.name.lower() == needle:
                 return term
+        # Punctuation/space-insensitive fallback — scoped to size attributes
+        # only. Sizes are the one case where blanket stripping is safe: a
+        # real term like `12"x24"` slugs to `12x24` (no separators at all,
+        # since the name has none), but user input often adds spaces the
+        # name never had ("12 x 24"). The same blanket stripping is NOT
+        # safe elsewhere — e.g. Colors uses meaningful decimal version
+        # numbers ("SELECT 2.0 Onyx Grey"), where stripping the period
+        # would make "2.0" and "20" indistinguishable. Scoping this to
+        # sizes avoids that risk rather than trying to detect it generically.
+        if attr_key.lower().strip().removeprefix("pa_") not in FUZZY_SIZE_ATTRIBUTE_KEYS:
+            return None
+
+        needle_norm = re.sub(r"[^a-z0-9]", "", needle)
+        if not needle_norm:
+            return None
+        for term in attr.terms:
+            if re.sub(r"[^a-z0-9]", "", term.key.lower()) == needle_norm:
+                return term
+            if re.sub(r"[^a-z0-9]", "", term.name.lower()) == needle_norm:
+                return term
+
         return None
 
     def resolve_category(self, key: str) -> Optional[CatalogCategory]:
