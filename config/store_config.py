@@ -317,3 +317,22 @@ def _load_fuzzy_size_attribute_keys() -> set:
     return {x.lower().strip() for x in _DEFAULT_FUZZY_SIZE_ATTRIBUTE_KEYS}
 
 FUZZY_SIZE_ATTRIBUTE_KEYS: set = _load_fuzzy_size_attribute_keys()
+
+
+_DEFAULT_GENERIC_WORD_SYNONYMS = {
+    "material": "category",
+    "materials": "categories",
+}
+
+def _load_generic_word_synonyms() -> dict:
+    raw = os.getenv("GENERIC_WORD_SYNONYMS_JSON", "")
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    return dict(_DEFAULT_GENERIC_WORD_SYNONYMS)
+
+GENERIC_WORD_SYNONYMS: dict = _load_generic_word_synonyms()

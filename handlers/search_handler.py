@@ -95,7 +95,22 @@ def handle_empty_results(
         return all_products_raw, None
 
     # ── Pre-check: unrecognized search_term — return local message immediately ──
-    if entities.search_term:
+    _has_other_signals = bool(
+        entities.product_name
+        or entities.category_name
+        or getattr(entities, "target_category_slugs", None)
+        or entities.attributes
+        or entities.tag_slugs
+        or getattr(entities, "attr_tag_or_pairs", None)
+    )
+    if entities.search_term and _has_other_signals:
+        # search_term alongside other real signals means the classifier
+        # genuinely narrowed things down and is just missing this one term —
+        # a confident "we don't carry that" is appropriate. If search_term
+        # is the ONLY thing populated, nothing was actually understood (the
+        # classifier's catch-all fallback dumped the raw text in) — that
+        # case falls through to the LLM retry below instead, regardless of
+        # which specific words made the message unrecognizable.
         _term = entities.search_term
         _cat = entities.category_name or "products"
         _no_results_msg = (

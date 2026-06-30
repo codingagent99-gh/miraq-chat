@@ -15,7 +15,7 @@ import re
 from classifier.consolidation import _resolve_tag_attribute_overlap
 import json
 from classifier.utils import normalize_for_tag_compare
-
+from config.store_config import ATTRIBUTE_DISAMBIGUATION_GROUPS
 from models import ExtractedEntities, ClassifiedResult, WooAPICall
 from app_config import (
     ORDER_INTENTS,
@@ -92,6 +92,21 @@ from handlers.sales_rep_handler import (
     handle_order_for_email_reply,
     handle_order_for_prompt,
 )
+
+import re
+from config.store_config import GENERIC_WORD_SYNONYMS
+
+def _apply_generic_word_synonyms(text: str) -> str:
+    """
+    Swap user-facing vocabulary for the internal word every downstream
+    extractor/classifier already understands (e.g. "material" → "category",
+    since this store's UI calls categories "Material" but the codebase's
+    matching logic everywhere is keyed on the word "category"). Runs once,
+    on the final text, so no individual call site needs its own synonym list.
+    """
+    for user_word, internal_word in GENERIC_WORD_SYNONYMS.items():
+        text = re.sub(rf'\b{re.escape(user_word)}\b', internal_word, text, flags=re.IGNORECASE)
+    return text
 
 logger = get_logger("miraq_chat")
 chat_bp = Blueprint("chat", __name__)
@@ -177,7 +192,26 @@ def _merge_phase_entities(result):
                 None
             )
             if equivalent_key is None:
-                merged_attrs[p1_key] = p1_val
+                # Don't blindly restore a phase-1 key whose disambiguation
+                # sibling is ALREADY present and resolved (e.g. user said
+                # "tile size" explicitly; the precise catalog match correctly
+                # resolved only tile-size, omitting sample-size — phase-1's
+                # older, less precise pass guessed both, but that's not a
+                # loss to restore, it's a deliberate disambiguation phase-2
+                # already made correctly). See ATTRIBUTE_DISAMBIGUATION_GROUPS.
+                p1_key_lower = p1_key.lower().strip()
+                sibling_already_resolved = any(
+                    p1_key_lower in group and any(
+                        normalize_for_tag_compare(k.replace("-", " "))
+                        == normalize_for_tag_compare(sibling.replace("-", " "))
+                        for k in merged_attrs
+                        for sibling in group
+                        if sibling != p1_key_lower
+                    )
+                    for group in ATTRIBUTE_DISAMBIGUATION_GROUPS
+                )
+                if not sibling_already_resolved:
+                    merged_attrs[p1_key] = p1_val
             elif attr_slug_for_label(p1_key) and not attr_slug_for_label(equivalent_key):
                 merged_attrs[p1_key] = merged_attrs.pop(equivalent_key)
 
@@ -188,6 +222,17 @@ def _merge_phase_entities(result):
                 f"→ {merged_attrs}"
             )
         entities.attributes = merged_attrs
+        
+
+        # Re-run tag/attribute overlap resolution — merging phase-1's
+        # attributes on top of phase-2's tag_slugs (set independently by
+        # phase1_catalog_match, which never calls this consolidation step
+        # itself) can introduce a FRESH tag+attribute collision that didn't
+        # exist when either individual pass checked for one on its own
+        # entities (e.g. tag_slugs=['quick-ship'] from catalog match +
+        # attributes['quick-ship']='yes' restored from the NLP pass —
+        # same concept, two representations, never reconciled until now).
+        _resolve_tag_attribute_overlap(entities)
 
     # Restore attribute_term_ids if pass-2 lost them
     if not entities.attribute_term_ids and getattr(phase1, "attribute_term_ids", None):
@@ -1197,6 +1242,13 @@ def chat():
         if was_translated:
             logger.info(f"[LangCheck] translated from '{detected_lang}' | '{message[:100]}'")
 
+    # ── Generic word synonyms (e.g. "material" → "category") ──
+    # Runs on the final English text, after translation, so every downstream
+    # extractor/classifier/keyword-matcher that already understands the
+    # internal word ("category") automatically handles the user's word
+    # ("material") too, with zero changes needed at each individual site.
+    message = _apply_generic_word_synonyms(message)
+
     # ── Session & DB setup ──
     session_id   = resolve_session_id()
     conversation = Conversation.query.get(session_id)
@@ -1499,6 +1551,12 @@ def chat():
         session_history = [{"role": m.role, "message": m.content} for m in conversation.messages[-4:-1]]
 
         if not _resolve_variant:
+            logger.debug(
+                f"[STEP1.5_GATE_TRACE] intent={intent} | confidence={confidence} | "
+                f"product_name={entities.product_name!r} | "
+                f"target_category_slugs={getattr(entities, 'target_category_slugs', None)} | "
+                f"attr_tag_or_pairs={entities.attr_tag_or_pairs}"
+            )
             llm_outcome = run_llm_fallback(
                 message=message, intent=intent, entities=entities, confidence=confidence,
                 session_id=str(conversation.id), session_history=session_history,
@@ -1789,9 +1847,29 @@ def chat():
             _matched_cats = set(getattr(entities, 'target_category_slugs', set())) | collision_cat_slugs
             if _matched_cats:
                 _cat_bases = {s.rstrip('s') for s in _matched_cats} | _matched_cats
-                # User said "category" explicitly — restore it as a standalone filter,
-                # dropping the OR-with-attribute version entirely.
-                entities.target_category_slugs = _matched_cats
+                logger.debug(
+                    f"[CAT_GROUP_TRACE] before: category_groups={entities.category_groups} | "
+                    f"_matched_cats={_matched_cats}"
+                )
+                # User said "category" explicitly — restore it as a standalone
+                # filter, dropping the OR-with-attribute version entirely.
+                # Recovered OR-pair categories are their OWN group, not folded
+                # into whatever's already accumulated — a category pulled out
+                # of an OR-pair because THIS message named it explicitly is a
+                # distinct ask, not a sibling of an earlier turn's category.
+                _preserved_groups = [
+                    g & _matched_cats for g in entities.category_groups if g & _matched_cats
+                ]
+                _already_grouped = set().union(*_preserved_groups) if _preserved_groups else set()
+                _ungrouped = _matched_cats - _already_grouped
+
+                entities.clear_categories()
+                for g in _preserved_groups:
+                    entities.add_category_group(g)
+                if _ungrouped:
+                    entities.add_category_group(_ungrouped)
+                logger.debug(f"[CAT_GROUP_TRACE] after: category_groups={entities.category_groups}")
+
                 entities.attr_tag_or_pairs = [
                     op for op in or_pairs
                     if not any(s in (op.get('cat_slugs') or []) for s in _matched_cats)

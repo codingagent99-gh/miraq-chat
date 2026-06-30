@@ -68,7 +68,18 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
             _g = re.match(r'^(\d+)["\']?\s*[xX×]\s*(\d+)["\']?$', name.strip())
             group_key = f'{_g.group(1)}x{_g.group(2)}'
         else:
-            group_key = name
+            # Same canonicalization, extended to the "{dimension} {label}"
+            # combined catalog entries (e.g. "12"x12" tile size") —
+            # duplicate term rows for the same dimension produce different
+            # exact strings here too ("12" x 12" tile size" vs
+            # "12 x 12 tile size"), so without this they never group
+            # together and only one row's slug survives, same root cause
+            # as the bare-dimension bug fixed earlier today.
+            _dl_m = re.match(r'^(\d+)["\']?\s*[xX×]\s*(\d+)["\']?\s+(.+)$', name.strip())
+            if _dl_m:
+                group_key = f'{_dl_m.group(1)}x{_dl_m.group(2)} {_dl_m.group(3)}'
+            else:
+                group_key = name
         if group_key not in grouped_catalog:
             grouped_catalog[group_key] = []
         grouped_catalog[group_key].append((match_type, data))
@@ -91,7 +102,12 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
             flexible_name = rf'{_dm.group(1)}["\']?\s*[xX×]\s*{_dm.group(2)}["\']?'
             # logger.debug(
             #     f"[DIM_PATTERN_TRACE] catalog_name={name!r} -> flexible_name={flexible_name!r}"
-            # ) 
+            # )
+        elif re.match(r'^\d+["\']?\s*[xX×]\s*\d+["\']?\s+', name.strip()):
+            _dl = re.match(r'^(\d+)["\']?\s*[xX×]\s*(\d+)["\']?\s+(.+)$', name.strip())
+            _dim_part = rf'{_dl.group(1)}["\']?\s*[xX×]\s*{_dl.group(2)}["\']?'
+            _label_part = r'\s+'.join(re.escape(w) for w in _dl.group(3).split())
+            flexible_name = rf'{_dim_part}\s+{_label_part}'
         else:
             # Make Phase 1 plural/singular tolerant
             normalized_name = name.replace('-', ' ')
@@ -182,7 +198,7 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
                 elif match_type == 'category':
                     name_lower = data.get("name", "").lower()
                     all_slugs = getattr(loader, 'category_slugs_by_name', {}).get(name_lower, [data.get("slug")])
-                    entities.target_category_slugs.update(all_slugs)
+                    entities.add_category_group(all_slugs)
                     append_category_name(entities, data.get("name") or "")
                 elif match_type == 'attribute':
                     attr_name = data['attribute_name']
@@ -518,7 +534,7 @@ def _auto_materialize(entities: ExtractedEntities):
             slug = best.get("slug")
 
             if match_type == "category" and slug and not entities.target_category_slugs:
-                entities.target_category_slugs.add(slug)
+                entities.add_category_group([slug])
                 entities.category_name = best.get("suggested_name", slug)
             elif match_type == "tag" and slug and slug not in entities.tag_slugs:
                 entities.tag_slugs.append(slug)
@@ -569,8 +585,25 @@ def resolve_final_intent(
     if resolved_intent.value in ACTION_INTENTS:
         pass
     elif resolved_intent.value in catalog_intent_values or entities.product_id:
-        resolved_intent = Intent.PRODUCT_SEARCH if entities.product_id else Intent.FILTER_BY_ATTRIBUTE
-        final_confidence = max(final_confidence, 0.95)
+        has_real_filters = bool(
+            entities.attributes
+            or getattr(entities, 'attr_tag_or_pairs', None)
+            or getattr(entities, 'target_category_slugs', None)
+            or entities.tag_slugs
+        )
+        if entities.product_id:
+            resolved_intent = Intent.PRODUCT_SEARCH
+            final_confidence = max(final_confidence, 0.95)
+        elif has_real_filters:
+            resolved_intent = Intent.FILTER_BY_ATTRIBUTE
+            final_confidence = max(final_confidence, 0.95)
+        # else: no product_id and nothing to filter by — leave the
+        # original intent/confidence untouched. Forcing FILTER_BY_ATTRIBUTE
+        # at an artificially boosted 0.95 here was masking genuinely
+        # low-signal free-text searches from ever reaching Step 1.5's LLM
+        # fallback gate, which already has a dedicated, correct condition
+        # for exactly this case (PRODUCT_SEARCH + nothing resolved) — it
+        # just never got a chance to run.
 
     return resolved_intent, final_confidence
 

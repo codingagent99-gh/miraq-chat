@@ -69,7 +69,7 @@ def _group_categories(cat_slugs: list) -> dict:
     return groups
 
 def build_advanced_filter_call(
-    tags=None, categories=None, attributes=None,
+    tags=None, categories=None, attributes=None, category_groups=None,
     excluded_tags=None, excluded_categories=None, excluded_attributes=None,
     tag_operator="AND",
     or_pairs=None,
@@ -99,13 +99,7 @@ def build_advanced_filter_call(
         conditions.append(make_condition("product_tag", list(excluded_tags), "NOT IN"))
 
     # ── 4. Categories (include) — skip any already in an OR pair ──
-    if categories:
-        uncovered_cats = [c for c in categories if c not in covered_cats]
-        if uncovered_cats:
-            grouped = _group_categories(uncovered_cats)
-            for slugs in grouped.values():
-                conditions.append(make_condition("product_cat", slugs, "IN"))
-
+    # Categories (include) moved below — see step 8.5.
     # ── 5. Categories (exclude) ──
     if excluded_categories:
         conditions.append(make_condition("product_cat", list(excluded_categories), "NOT IN"))
@@ -122,6 +116,30 @@ def build_advanced_filter_call(
 
     # ── 8. Cross-taxonomy overlap merge ──
     conditions = merge_cross_taxonomy_overlaps(conditions)
+    
+    # ── 8.5. Categories (include) — appended AFTER overlap merge, deliberately
+    #         bypassing it. merge_cross_taxonomy_overlaps' same-taxonomy
+    #         consolidation (built to dedupe catalog-duplicate slugs within
+    #         ONE concept, e.g. duplicate pa_tile-size rows) would otherwise
+    #         blindly re-merge two INTENTIONALLY separate category_groups
+    #         conditions sharing the "product_cat" taxonomy string back into
+    #         one OR'd list — undoing the AND semantics category_groups
+    #         exists to provide. Genuine category/attribute overlaps are
+    #         already resolved upstream into OR-pairs by
+    #         consolidation.py's _resolve_category_attribute_overlap before
+    #         entities ever reach this function, so nothing legitimate is
+    #         lost by skipping this step for categories. ──
+    if category_groups:
+        for group in category_groups:
+            uncovered = [c for c in group if c not in covered_cats]
+            if uncovered:
+                conditions.append(make_condition("product_cat", sorted(uncovered), "IN"))
+    elif categories:
+        uncovered_cats = [c for c in categories if c not in covered_cats]
+        if uncovered_cats:
+            grouped = _group_categories(uncovered_cats)
+            for slugs in grouped.values():
+                conditions.append(make_condition("product_cat", slugs, "IN"))
 
     # ── 9. Price / stock — push as field_type nodes so serialize_query
     #       routes them into body["price"] / body["stock_status"], which both
@@ -230,40 +248,84 @@ def _normalise_attr_value(raw_value) -> str:
 def _build_attribute_conditions(attributes: dict, l) -> list:
     """Convert {taxonomy: value} into query conditions, grouping shared values with OR.
 
-    Supports multi-value attributes expressed as:
-      - a list:             ['white', 'gray']
-      - comma-separated:    'white,gray'
-      - conjunction string: 'white and gray'  /  'white & gray'
-
-    Multiple values for the same taxonomy are emitted as a single IN (OR) condition
-    so the query finds products matching *any* of the requested values.
+    Two layers of OR grouping:
+      1. Multiple values for the same taxonomy → single IN condition
+         (e.g. colors-2: "black,blue" → pa_colors-2 IN [black, blue]).
+      2. A value that resolves under MORE than one taxonomy (e.g. "blue"
+         under both pa_color and pa_colors-2 — discovered from actual
+         resolved data, not a hardcoded taxonomy pair list) gets pulled
+         into its own small OR-of-taxonomies node. Any taxonomy whose
+         entire term list is already covered by such a node is dropped
+         as redundant; one with leftover unique terms (e.g. colors-2
+         also has "black") stays as a full standalone condition.
     """
-    value_groups: dict[str, list] = {}
+    taxonomy_terms: dict[str, list] = {}
     for taxonomy, terms_value in attributes.items():
         raw = _normalise_attr_value(terms_value)
-        key = raw.lower().strip()
-        value_groups.setdefault(key, []).append(taxonomy)
+        raw_terms = [t.strip() for t in raw.split(",") if t.strip()]
+        slug_list = []
+        for raw_term in raw_terms:
+            term_slug = get_attribute_term_slug(taxonomy, raw_term) if l else None
+            resolved = term_slug or raw_term.replace(" ", "-").replace('"', "").replace("'", "")
+            if resolved not in slug_list:
+                slug_list.append(resolved)
+        if slug_list:
+            taxonomy_terms[taxonomy] = slug_list
+
+    if not taxonomy_terms:
+        return []
+
+    # Map each resolved slug -> which taxonomies it appears under.
+    slug_to_taxonomies: dict[str, set] = {}
+    for taxonomy, slugs in taxonomy_terms.items():
+        for slug in slugs:
+            slug_to_taxonomies.setdefault(slug, set()).add(taxonomy)
+
+    # Union-find: cluster taxonomies that share at least one resolved slug.
+    parent = {t: t for t in taxonomy_terms}
+    def find(x):
+        while parent[x] != x:
+            x = parent[x]
+        return x
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for taxes in slug_to_taxonomies.values():
+        taxes = list(taxes)
+        for i in range(1, len(taxes)):
+            union(taxes[0], taxes[i])
+
+    clusters: dict[str, list] = {}
+    for t in taxonomy_terms:
+        clusters.setdefault(find(t), []).append(t)
 
     conditions = []
-    for val_key, taxonomies in value_groups.items():
-        raw_terms = [t.strip() for t in val_key.split(",") if t.strip()]
-        or_conditions = []
-        for taxonomy in taxonomies:
-            slug_list = []
-            for raw_term in raw_terms:
-                term_slug = get_attribute_term_slug(taxonomy, raw_term) if l else None
-                if term_slug:
-                    slug_list.append(term_slug)
-                else:
-                    slug_list.append(
-                        raw_term.replace(" ", "-").replace('"', "").replace("'", "")
-                    )
-            if slug_list:
-                or_conditions.append(make_condition(taxonomy, slug_list, "IN"))
+    for cluster_taxonomies in clusters.values():
+        if len(cluster_taxonomies) == 1:
+            tax = cluster_taxonomies[0]
+            conditions.append(make_condition(tax, taxonomy_terms[tax], "IN"))
+            continue
 
-        if len(or_conditions) == 1:
-            conditions.append(or_conditions[0])
-        elif len(or_conditions) > 1:
-            conditions.append(make_or_group(or_conditions))
+        shared_slugs = {
+            slug for slug, taxes in slug_to_taxonomies.items()
+            if len(taxes & set(cluster_taxonomies)) > 1
+        }
+
+        group_conditions = []
+        for slug in shared_slugs:
+            taxes_for_slug = sorted(slug_to_taxonomies[slug] & set(cluster_taxonomies))
+            inner = [make_condition(t, [slug], "IN") for t in taxes_for_slug]
+            group_conditions.append(make_or_group(inner) if len(inner) > 1 else inner[0])
+
+        for tax in cluster_taxonomies:
+            if not set(taxonomy_terms[tax]) <= shared_slugs:
+                group_conditions.append(make_condition(tax, taxonomy_terms[tax], "IN"))
+
+        conditions.append(
+            group_conditions[0] if len(group_conditions) == 1
+            else make_or_group(group_conditions)
+        )
 
     return conditions

@@ -198,11 +198,12 @@ def merge_into_active_search(entities: ExtractedEntities, active_search: Optiona
             entities.tag_slugs.append(t)
 
     # -- Categories (additive set) --
-    prior_cats = slots.get("categories", [])
-    if prior_cats:
-        if getattr(entities, "target_category_slugs", None) is None:
-            entities.target_category_slugs = set()
-        entities.target_category_slugs.update(prior_cats)
+    prior_groups = [set(g) for g in slots.get("category_groups", [])]
+    current_group_sets = [set(g) for g in entities.category_groups]
+    for prior_group in prior_groups:
+        if prior_group not in current_group_sets:
+            entities.add_category_group(prior_group)
+            current_group_sets.append(prior_group)
 
     # -- Price (single-value: current turn wins; else carry prior) --
     if entities.min_price is None and slots.get("min_price") is not None:
@@ -236,6 +237,7 @@ def _snapshot(entities: ExtractedEntities) -> dict:
             "attributes": dict(entities.attributes),
             "tags": list(entities.tag_slugs),
             "categories": list(getattr(entities, "target_category_slugs", set())),
+            "category_groups": [list(g) for g in getattr(entities, "category_groups", [])],
             "attr_tag_or_pairs": list(getattr(entities, "attr_tag_or_pairs", [])),
             "min_price": entities.min_price,
             "max_price": entities.max_price,

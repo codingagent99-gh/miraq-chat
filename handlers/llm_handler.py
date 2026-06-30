@@ -21,6 +21,20 @@ from handlers.chat_utils import default_pagination
 
 logger = get_logger("miraq_chat")
 
+def _get_missing_entity_hint(intent, entities, order_create_intents, user_context):
+    """Human-readable label for the specific missing field, so the LLM can
+    ask a targeted question instead of a generic one. Returns None when
+    trigger_reason isn't missing_entities (or no specific field applies)."""
+    if intent == Intent.PRODUCT_SEARCH and entities.product_name is None and not getattr(entities, 'target_category_slugs', None) and not entities.attr_tag_or_pairs:
+        return "the product or category name"
+    if intent in order_create_intents and entities.order_item_name is None and entities.product_name is None:
+        last_product_ctx_check = user_context.get("last_product")
+        if not (last_product_ctx_check and last_product_ctx_check.get("id")):
+            return "which product to order"
+    return None
+
+_FALLBACK_SUGGESTIONS = ["Browse Products", "View my orders"]
+
 def run_llm_fallback(
     message: str,
     intent: Intent,
@@ -49,7 +63,8 @@ def run_llm_fallback(
         return None
 
     trigger_reason = _get_trigger_reason(intent, confidence, entities, order_create_intents, user_context)
-
+    missing_entity_hint = _get_missing_entity_hint(intent, entities, order_create_intents, user_context)
+    
     if not LLM_FALLBACK_ENABLED:
         disambig = get_disambiguation_message()
         elapsed = time.time() - start_time
@@ -96,6 +111,7 @@ def run_llm_fallback(
         store_loader=store_loader,
         session_history=session_history,
         entities_summary=entities_summary,
+        missing_entity_hint=missing_entity_hint,
     )
 
     if not llm_result.get("success"):
@@ -134,7 +150,7 @@ def run_llm_fallback(
             "bot_message": llm_result["bot_message"],
             "intent": "conversational",
             "products": [],
-            "suggestions": [],
+            "suggestions": list(_FALLBACK_SUGGESTIONS),
             "session_id": session_id,
             "metadata": llm_metadata,
             "pagination": default_pagination(page),

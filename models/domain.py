@@ -148,6 +148,7 @@ class ExtractedEntities:
     # ──── Category fields ────
     category_name: Optional[str] = None
     target_category_slugs: set = field(default_factory=set)
+    category_groups: List[set] = field(default_factory=list)
 
     # ──── Dynamic attribute matches ────
     # Keyed by attribute_label.lower() from the store's live attribute list.
@@ -259,6 +260,7 @@ class ExtractedEntities:
         return {
             "tags": list(self.tag_slugs) if self.tag_slugs else None,
             "categories": self.target_category_slugs or None,
+            "category_groups": [list(g) for g in self.category_groups] or None,
             "or_pairs": self.get_or_pairs() or None,
             "excluded_tags": list(self.excluded_tags) if self.excluded_tags else None,
             "excluded_categories": list(self.excluded_categories) if self.excluded_categories else None,
@@ -267,6 +269,20 @@ class ExtractedEntities:
             "min_price": self.min_price,
             "max_price": self.max_price,
         }
+    def add_category_group(self, slugs) -> None:
+        """Register one resolved category mention as its own OR'd group,
+        while keeping target_category_slugs as the flat union for any
+        existing code that reads it directly."""
+        slugs = set(slugs)
+        if not slugs:
+            return
+        self.category_groups.append(slugs)
+        self.target_category_slugs.update(slugs)
+
+    def clear_categories(self) -> None:
+        self.target_category_slugs.clear()
+        self.category_groups = []
+        self.category_name = None
 
 
 # ══════════════════════════════════════════════════════════════

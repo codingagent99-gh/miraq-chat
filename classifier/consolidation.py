@@ -118,8 +118,7 @@ def _resolve_product_vs_category(intent: Intent, entities: ExtractedEntities):
     if not (getattr(entities, 'target_category_slugs', set()) and entities.product_id is not None):
         return
     if intent in PRODUCT_SPECIFIC_INTENTS:
-        entities.target_category_slugs.clear()
-        entities.category_name = None
+        entities.clear_categories()
     else:
         entities.product_id = None
 
@@ -156,8 +155,7 @@ def _deduplicate_or_pairs(entities: ExtractedEntities):
 
     handled_cats = {p.get("attr_term") for p in entities.attr_tag_or_pairs if p.get("attr_taxonomy") == "product_cat"}
     if handled_cats and getattr(entities, 'target_category_slugs', set()).intersection(handled_cats):
-        entities.target_category_slugs.clear()
-        entities.category_name = None
+        entities.clear_categories()
 
     loader = get_store_loader()
 
@@ -171,8 +169,7 @@ def _deduplicate_or_pairs(entities: ExtractedEntities):
 
     handled_cats = {p.get("attr_term") for p in entities.attr_tag_or_pairs if p.get("attr_taxonomy") == "product_cat"}
     if handled_cats and getattr(entities, 'target_category_slugs', set()).intersection(handled_cats):
-        entities.target_category_slugs.clear()
-        entities.category_name = None
+        entities.clear_categories()
 
 
 def _resolve_category_attribute_overlap(entities: ExtractedEntities):
@@ -220,6 +217,9 @@ def _resolve_category_attribute_overlap(entities: ExtractedEntities):
             })
             for slug in overlapping_cat_slugs:
                 entities.target_category_slugs.discard(slug)
+                for group in entities.category_groups:
+                    group.discard(slug)
+            entities.category_groups = [g for g in entities.category_groups if g]
             if not entities.target_category_slugs:
                 entities.category_name = None
             del entities.attributes[attr_label]

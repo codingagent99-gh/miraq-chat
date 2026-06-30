@@ -190,9 +190,16 @@ def _build_classifier_context(
 def _build_system_prompt(
     classifier_context: Dict[str, Any],
     session_history: Optional[List[Dict]] = None,
+    trigger_reason: str = "unknown_intent",
+    missing_entity_hint: Optional[str] = None,
 ) -> str:
     """
     Construct a lean intent-only system prompt.
+
+    The ambiguity guidance block adapts by trigger_reason:
+      - unknown_intent:   one fixed, generic block for off-topic/irrelevant messages
+      - low_confidence:   references the classifier's tentative guess directly
+      - missing_entities: asks specifically for the field named by missing_entity_hint
     """
     valid_intents = _VALID_INTENTS
 
@@ -209,10 +216,44 @@ def _build_system_prompt(
             history_lines.append(f"{role}: {content}")
     history_text = "\n".join(history_lines) if history_lines else "none"
 
+    # ── Ambiguity guidance — varies by trigger_reason ──
+    if trigger_reason == "low_confidence":
+        ambiguity_guidance = f"""**Why you were called**: the local classifier tentatively guessed intent
+"{classifier_intent}" but with low confidence ({classifier_confidence:.2f}). If the user's message
+plausibly matches that guess, resolve it confidently (return "intent_resolved" with that intent).
+If it's genuinely unclear even given that guess, return "conversational" and write a bot_message
+that references the guess directly — e.g. "It sounds like you might be looking for {{the guessed
+thing}}, but I'm not totally sure — could you clarify?" Do not invent specifics (product names,
+categories) the classifier didn't already resolve."""
+    elif trigger_reason == "missing_entities":
+        field_label = missing_entity_hint or "a key detail"
+        ambiguity_guidance = f"""**Why you were called**: the classifier resolved intent "{classifier_intent}"
+confidently, but a required detail is missing: {field_label}. If you can infer it from the
+conversation history, return "intent_resolved". Otherwise return "conversational" and write a
+bot_message that asks specifically for {field_label} — a short, direct question, not a generic
+"I'm not sure what you mean" reply.
+
+You cannot extract or return entity values yourself — only an intent label. So "intent_resolved"
+only makes sense if the conversation history already makes {field_label} unambiguous enough
+that re-running the SAME intent would naturally pick it up (e.g. the user clearly named a
+specific product a turn or two ago). The message's general topic sounding like a match for
+"{classifier_intent}" is NOT, by itself, a reason to return "intent_resolved" — that does not
+actually supply the missing {field_label}. If {field_label} isn't genuinely present anywhere in
+the conversation, you must return "conversational" with a targeted question instead."""
+    else:  # unknown_intent — fixed, generic block for off-topic/irrelevant messages
+        ambiguity_guidance = """**Why you were called**: the local classifier could not determine any
+relevant intent for this message — it may be off-topic, small talk, or otherwise unrelated to
+shopping or order support. If you can confidently identify a relevant intent anyway, return
+"intent_resolved". Otherwise return "conversational" with a brief, friendly bot_message
+acknowledging you're not sure how to help with that specific message, in the context of a store
+chatbot."""
+
     prompt = f"""You are an intent classifier for a WooCommerce store chatbot.
 
 Your ONLY job is to determine the user's intent from their message.
 Do NOT extract entities — that is already handled by the local classifier.
+Do NOT generate suggestions, buttons, or options of any kind — the application adds those
+separately based on your intent/fallback_type, never based on anything you write.
 
 **Valid intents** (pick exactly one):
 {valid_intents}
@@ -220,6 +261,8 @@ Do NOT extract entities — that is already handled by the local classifier.
 **Important disambiguation rules:**
 - If the user asks to check if a specific product comes in a certain attribute (e.g., "Do you have 3x3 for Ansel?", "Does the subway tile come in matte?"), use "product_search".
 - If the user asks for a general list of options without specifying what they want (e.g., "What sizes does Ansel come in?", "Show me the colors for this tile"), use "product_attribute_info".
+
+{ambiguity_guidance}
 
 **Classifier context** (what the local classifier already resolved):
 - Intent: {classifier_intent} (confidence: {classifier_confidence:.2f})
@@ -240,13 +283,12 @@ If the user's intent is genuinely unclear even with context, return:
   "intent": "unknown",
   "confidence": 0.0,
   "fallback_type": "conversational",
-  "bot_message": "I wasn't sure what you were looking for. Did you mean:\\n• **Browse products** in a specific category\\n• **Check your order status**\\n• **Search for a specific product**"
+  "bot_message": "..."
 }}
 
 Return ONLY valid JSON. No markdown, no explanation, just the JSON object."""
 
     return prompt
-
 
 # ══════════════════════════════════════════════════════════════
 # LLM CLIENT (Multi-Provider Support)
@@ -472,6 +514,7 @@ def llm_fallback(
     store_loader,
     session_history: Optional[List[Dict]] = None,
     entities_summary: Optional[Dict] = None,
+    missing_entity_hint: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     LLM fallback when classifier fails (UNKNOWN intent, low confidence, or missing entities).
@@ -515,7 +558,7 @@ def llm_fallback(
         )
 
         # Build system prompt with classifier context and conversation history
-        system_prompt = _build_system_prompt(classifier_context, session_history)
+        system_prompt = _build_system_prompt(classifier_context, session_history, trigger_reason, missing_entity_hint)
 
         # User prompt is the sanitized message only
         user_prompt = sanitized_message

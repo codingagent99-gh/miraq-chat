@@ -398,6 +398,7 @@ def _build_category_browse(e, page) -> list:
     return [build_advanced_filter_call(
         tags=list(e.tag_slugs) if e.tag_slugs else None,
         categories=e.target_category_slugs,
+        category_groups=list(e.category_groups) if e.category_groups else None,
         attributes=attr_filters or None,
         page=page,
         excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
@@ -486,6 +487,7 @@ def _build_product_search(e, page, user_message: str = "") -> list:
     return [build_advanced_filter_call(
         tags=list(e.tag_slugs) if e.tag_slugs else None,
         categories=e.target_category_slugs,
+        category_groups=list(e.category_groups) if e.category_groups else None,
         attributes=attr_filters,
         or_pairs=active_or_pairs,
         page=product_page,
@@ -625,6 +627,7 @@ def _build_filter_by_attribute(e, page, user_message: str = "") -> list:
         page=page,
         in_stock=e.in_stock,
         categories=e.target_category_slugs,
+        category_groups=list(e.category_groups) if e.category_groups else None,
         description=f"Filter by {attr_label}: {attr_value}",
         search_term=actual_search,
         product_id=e.product_id,
@@ -663,6 +666,7 @@ def _build_product_variations(e, page) -> list:
         or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
         tags=list(e.tag_slugs) if e.tag_slugs else None,
         categories=e.target_category_slugs,
+        category_groups=list(e.category_groups) if e.category_groups else None,
         excluded_tags=list(e.excluded_tags) if e.excluded_tags else None,
         excluded_categories=list(e.excluded_categories) if e.excluded_categories else None,
         excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None,
