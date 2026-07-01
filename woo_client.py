@@ -7,7 +7,6 @@ import requests as http_requests
 from requests.auth import HTTPBasicAuth
 
 from models import WooAPICall
-from app_config import WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET, WOO_BASE_URL, CUSTOM_API_BASE_URL
 from chat_logger import get_logger, get_api_logger, sanitize_url
 
 logger = get_logger("miraq_chat")
@@ -19,18 +18,8 @@ _BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept":     "application/json",
 }
-
-# Standard WooCommerce REST auth (Basic Auth)
-_WC_AUTH = HTTPBasicAuth(WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET)
-
-# Custom plugin endpoints read credentials from these headers
-# (see WC_Chat_Security::validate_request in class-security.php)
-_CUSTOM_API_HEADERS = {
-    **_BASE_HEADERS,
-    "X-Consumer-Key":    WOO_CONSUMER_KEY,
-    "X-Consumer-Secret": WOO_CONSUMER_SECRET,
-}
-
+# _WC_AUTH and _CUSTOM_API_HEADERS are now built per-call inside execute()
+# from the request-scoped loader, so they carry the correct tenant credentials.
 
 class WooClient:
     """Executes WooCommerce API calls."""
@@ -43,6 +32,25 @@ class WooClient:
         """Execute a single API call and return raw response."""
         import json as _json
         import time as _time
+        from store_registry import get_store_loader
+
+        # Resolve credentials and base URLs from the request-scoped loader so
+        # every call uses the correct tenant — not the process-level env globals.
+        loader = get_store_loader()
+        if loader:
+            _key         = loader.consumer_key
+            _secret      = loader.consumer_secret
+            _woo_base    = loader.base
+            _custom_base = loader.custom_api_base
+        else:
+            # Pre-startup fallback: loader not yet registered (e.g. called during
+            # db.create_all() before initialize_store()). Use env globals.
+            from app_config import WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET, WOO_BASE_URL, CUSTOM_API_BASE_URL
+            _key, _secret = WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET
+            _woo_base, _custom_base = WOO_BASE_URL, CUSTOM_API_BASE_URL
+
+        _wc_auth        = HTTPBasicAuth(_key, _secret)
+        _custom_headers = {**_BASE_HEADERS, "X-Consumer-Key": _key, "X-Consumer-Secret": _secret}
 
         params = dict(api_call.params)
         is_custom_api = api_call.surface == "custom_plugin"
@@ -50,14 +58,14 @@ class WooClient:
         # Resolve relative endpoints to full URLs
         endpoint = api_call.endpoint
         if not endpoint.startswith("http"):
-            base = CUSTOM_API_BASE_URL if is_custom_api else WOO_BASE_URL
+            base = _custom_base if is_custom_api else _woo_base
             endpoint = base.rstrip("/") + endpoint
 
         # Auth strategy:
         #   - custom-api/v1/*  → X-Consumer-Key / X-Consumer-Secret headers
         #   - wc/v3/*          → HTTPBasicAuth (no credentials in query string)
-        auth    = None       if is_custom_api else _WC_AUTH
-        headers = _CUSTOM_API_HEADERS if is_custom_api else {}
+        auth    = None           if is_custom_api else _wc_auth
+        headers = _custom_headers if is_custom_api else {}
 
         # ── Logging ───────────────────────────────────────────────────────────
         sanitized_endpoint = sanitize_url(endpoint)

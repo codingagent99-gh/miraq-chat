@@ -11,6 +11,7 @@ from models.db_models import (
     DEFAULT_CONTEXT,
     Conversation,
     Message,
+    Tenant,
 )
 
 # ── Domain models ──

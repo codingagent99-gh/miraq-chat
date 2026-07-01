@@ -16,14 +16,11 @@ from typing import List, Dict, Optional
 from chat_logger import get_logger
 from models.catalog import CatalogAttribute, CatalogCategory, CatalogTag
 from store_loader.config import (
-    WOO_BASE_URL, CUSTOM_API_BASE_URL,
-    WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET,
     REQUEST_TIMEOUT, BROWSER_HEADERS,
     DEV_CACHE_ENABLED, UPDATE_DEV_CACHE_ENABLED,
     CURRENCY_MAP,
-    ECOMMERCE_BACKEND, SHOPIFY_STORE_DOMAIN,
-    SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET, SHOPIFY_ADMIN_TOKEN,
 )
+from tenant_config import TenantConfig
 from store_loader.cache import BoundedVariationCache
 from store_loader.fetcher import (
     load_from_local_files,
@@ -40,39 +37,86 @@ from store_loader.queries import StoreQueryMixin
 logger = get_logger("miraq_chat")
 
 
+def load_vector_model():
+    """
+    Load the shared SentenceTransformer model once at process startup.
+    Pass the returned object into StoreLoader(vector_model=...) — never
+    call this per-tenant; one instance serves all loaders in the process.
+    """
+    logger.info("Loading Semantic Vector Model (all-MiniLM-L6-v2)...")
+    try:
+        from sentence_transformers import SentenceTransformer
+        if DEV_CACHE_ENABLED:
+            model = SentenceTransformer("all-MiniLM-L6-v2", local_files_only=True)
+            logger.info("Loaded vector model from local HuggingFace cache (dev mode, offline).")
+        else:
+            model = SentenceTransformer("all-MiniLM-L6-v2")
+            logger.info("Loaded vector model (online).")
+        return model
+    except Exception as e:
+        if not DEV_CACHE_ENABLED:
+            logger.warning(
+                f"Could not reach HuggingFace Hub ({type(e).__name__}: {e}). "
+                "Retrying with local disk cache only..."
+            )
+            try:
+                from sentence_transformers import SentenceTransformer
+                model = SentenceTransformer("all-MiniLM-L6-v2", local_files_only=True)
+                logger.info("Loaded vector model from local HuggingFace cache (offline fallback).")
+                return model
+            except Exception as e2:
+                logger.error(
+                    f"Failed to load vector model — not found in local cache either. "
+                    f"Semantic fallback will not be available. ({type(e2).__name__}: {e2})"
+                )
+                return None
+        else:
+            logger.error(
+                f"Failed to load vector model from local cache. "
+                f"Has the model been downloaded yet? Run once with DEV_CACHE=false to fetch it. "
+                f"({type(e).__name__}: {e})"
+            )
+            return None
+
+
 class StoreLoader(StoreQueryMixin):
     """Fetches and caches all WooCommerce / Shopify taxonomy data."""
 
     _CURRENCY_MAP = CURRENCY_MAP
 
-    def __init__(self, app=None):
+    def __init__(self, config: TenantConfig, vector_model, app=None):
         """
         Args:
-            app: Flask app instance, forwarded to ShopifyTokenManager so it
-                 can open app contexts for DB access in background threads.
+            config:       Per-tenant credentials and URLs.
+            vector_model: Shared SentenceTransformer instance, loaded once at startup
+                          by load_vector_model() and injected here — never duplicated
+                          per tenant.
+            app:          Flask app instance, forwarded to ShopifyTokenManager so it
+                          can open app contexts for DB access in background threads.
         """
-        self._flask_app = app
+        self._config      = config
+        self._flask_app   = app
 
-        self.base             = WOO_BASE_URL
-        self.custom_api_base  = CUSTOM_API_BASE_URL
-        self.consumer_key     = WOO_CONSUMER_KEY
-        self.consumer_secret  = WOO_CONSUMER_SECRET
+        self.base             = config.woo_base_url
+        self.custom_api_base  = config.custom_api_base_url
+        self.consumer_key     = config.woo_key
+        self.consumer_secret  = config.woo_secret
         self.timeout          = REQUEST_TIMEOUT
-        self.shopify_domain   = SHOPIFY_STORE_DOMAIN
+        self.shopify_domain   = config.shopify_domain
 
         # ── Shopify token manager ─────────────────────────────────────────────
         # If we have OAuth credentials, use the token manager (auto-refresh).
-        # Fall back to the hardcoded SHOPIFY_ADMIN_TOKEN for local dev.
+        # Fall back to config.shopify_admin_token for local dev.
         self._token_manager = None
-        if ECOMMERCE_BACKEND == "shopify":
-            if SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET:
+        if config.ecommerce_backend == "shopify":
+            if config.shopify_client_id and config.shopify_client_secret:
                 from store_loader.shopify_token_manager import ShopifyTokenManager
                 self._token_manager = ShopifyTokenManager(app=app)
                 logger.info("StoreLoader: Shopify token manager initialised (auto-refresh enabled)")
-            elif SHOPIFY_ADMIN_TOKEN:
+            elif config.shopify_admin_token:
                 logger.warning(
-                    "StoreLoader: SHOPIFY_CLIENT_ID/SECRET not set — "
-                    "falling back to hardcoded SHOPIFY_ADMIN_TOKEN (expires daily!)"
+                    "StoreLoader: shopify_client_id/secret not set — "
+                    "falling back to hardcoded shopify_admin_token (expires daily!)"
                 )
             else:
                 logger.error(
@@ -83,39 +127,9 @@ class StoreLoader(StoreQueryMixin):
         self.session = requests.Session()
         self.session.headers.update(BROWSER_HEADERS)
 
-        # Semantic vector model
-        logger.info("Loading Semantic Vector Model (all-MiniLM-L6-v2)...")
-        try:
-            from sentence_transformers import SentenceTransformer
-            if DEV_CACHE_ENABLED:
-                self.vector_model = SentenceTransformer('all-MiniLM-L6-v2', local_files_only=True)
-                logger.info("Loaded vector model from local HuggingFace cache (dev mode, offline).")
-            else:
-                self.vector_model = SentenceTransformer('all-MiniLM-L6-v2')
-                logger.info("Loaded vector model (online).")
-        except Exception as e:
-            if not DEV_CACHE_ENABLED:
-                logger.warning(
-                    f"Could not reach HuggingFace Hub ({type(e).__name__}: {e}). "
-                    "Retrying with local disk cache only..."
-                )
-                try:
-                    from sentence_transformers import SentenceTransformer
-                    self.vector_model = SentenceTransformer('all-MiniLM-L6-v2', local_files_only=True)
-                    logger.info("Loaded vector model from local HuggingFace cache (offline fallback).")
-                except Exception as e2:
-                    logger.error(
-                        f"Failed to load vector model — not found in local cache either. "
-                        f"Semantic fallback will not be available. ({type(e2).__name__}: {e2})"
-                    )
-                    self.vector_model = None
-            else:
-                logger.error(
-                    f"Failed to load vector model from local cache. "
-                    f"Has the model been downloaded yet? Run once with DEV_CACHE=false to fetch it. "
-                    f"({type(e).__name__}: {e})"
-                )
-                self.vector_model = None
+        # Semantic vector model — loaded once at startup via load_vector_model()
+        # and injected here. Never instantiated per-tenant.
+        self.vector_model = vector_model
 
         self.semantic_dictionary: Dict = {}
         self.semantic_tensors = None
@@ -170,14 +184,14 @@ class StoreLoader(StoreQueryMixin):
         """
         if self._token_manager:
             return self._token_manager.get_token()
-        return SHOPIFY_ADMIN_TOKEN
+        return self._config.shopify_admin_token
 
     # ─── Loading orchestration ───
 
     def load_all(self):
         """Load store data from the configured backend.
 
-        Backend selection (ECOMMERCE_BACKEND env var):
+        Backend selection (config.ecommerce_backend):
           - "shopify"     → live Shopify GraphQL API (always, no dev cache)
           - "woocommerce" → local JSON files when DEV_CACHE=true, else live API
         """
@@ -187,7 +201,7 @@ class StoreLoader(StoreQueryMixin):
 
         try:
             # ── Fetch raw data ────────────────────────────────────────
-            if ECOMMERCE_BACKEND == "shopify":
+            if self._config.ecommerce_backend == "shopify":
                 from store_loader.shopify_fetcher import load_from_shopify
                 data = load_from_shopify(
                     store_domain=self.shopify_domain,
@@ -202,7 +216,7 @@ class StoreLoader(StoreQueryMixin):
                             data["all_attributes_raw"], data["products"],
                         )
                         logger.info("StoreLoader: ✅ Dev cache files updated from Shopify")
-                        
+
                         # Verify the folder was actually created
                         from store_loader.config import DATA_DIR
                         if os.path.isdir(DATA_DIR):
@@ -274,36 +288,38 @@ class StoreLoader(StoreQueryMixin):
         except Exception as e:
             logger.error(f"Webhook sync failed: {e}", exc_info=True)
 
+    def due_for_refresh(self) -> bool:
+        """
+        True if this loader's catalog should be reloaded now. Carries the old
+        cadence so the shared scheduler (refresh_scheduler.py) can decide per
+        loader without owning any timing state itself:
+          - dev mode  → never (catalog is pinned to local cache)
+          - degraded  → retry on the short interval
+          - healthy   → refresh on the normal interval
+        """
+        if DEV_CACHE_ENABLED:
+            return False
+        if self._last_loaded is None:
+            return True  # never successfully loaded — try as soon as scheduled
+        interval = self._retry_interval if self._degraded else self._refresh_interval
+        return (time.time() - self._last_loaded) >= interval
+
     def start_background_refresh(self):
         """
-        Start the background thread that periodically reloads store data.
-        Also boots the Shopify token manager's refresh loop (if active).
+        Boot only the Shopify token-manager refresh loop (if active).
+
+        Catalog refresh is NO LONGER per-loader: a single shared scheduler
+        (refresh_scheduler.py) walks resident loaders and calls load_all() on
+        those whose due_for_refresh() is True. A per-loader daemon thread would
+        hold a strong reference to its loader and defeat LRU eviction in the
+        tenant registry, so it has been removed deliberately.
         """
-        # Start Shopify token auto-refresh
         if self._token_manager:
             self._token_manager.start()
 
         if DEV_CACHE_ENABLED:
             logger.info("StoreLoader: 🛑 Catalog background refresh DISABLED in dev mode")
             return
-
-        if self._refresh_thread and self._refresh_thread.is_alive():
-            return
-
-        def _refresh_loop():
-            while True:
-                interval = self._retry_interval if self._degraded else self._refresh_interval
-                time.sleep(interval)
-                label = "🔁 Degraded load retry" if self._degraded else "🔄 Background refresh"
-                logger.info(f"StoreLoader: {label} — reloading store data...")
-                try:
-                    self.load_all()
-                except Exception as e:
-                    logger.error(f"StoreLoader: {label} failed | error={e}", exc_info=True)
-
-        self._refresh_thread = threading.Thread(target=_refresh_loop, daemon=True)
-        self._refresh_thread.start()
-        logger.info(f"StoreLoader: Catalog refresh scheduled every {self._refresh_interval // 3600}h")
 
     # ─── Private helpers ───
 
@@ -349,7 +365,7 @@ class StoreLoader(StoreQueryMixin):
         self._degraded_reasons = reasons
 
     def _log_load_summary(self):
-        if ECOMMERCE_BACKEND == "shopify":
+        if self._config.ecommerce_backend == "shopify":
             mode = "Live Shopify GraphQL API"
         elif DEV_CACHE_ENABLED:
             mode = "Local Dev Cache"

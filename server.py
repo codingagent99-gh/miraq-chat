@@ -19,8 +19,9 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 
 from app_config import PORT, DEBUG, STORE_NAME, USE_RELOADER
-from store_registry import set_store_loader, get_store_loader
-from store_loader import StoreLoader, DEV_CACHE_ENABLED
+from store_registry import set_store_loader, get_store_loader, register_before_request
+from store_loader import StoreLoader, DEV_CACHE_ENABLED, load_vector_model
+from tenant_config import TenantConfig
 from models import db, Conversation
 
 from routes.chat import chat_bp
@@ -31,6 +32,8 @@ import urllib.parse
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from routes.sales_rep import sales_rep_bp
+from routes.provisioning import provisioning_bp
+
 # ═══════════════════════════════════════════
 # FLASK APP & DATABASE
 # ═══════════════════════════════════════════
@@ -46,16 +49,20 @@ CORS(app,
         "https://staging-91e4-ecom-solutions9857d536fc-ugaqb.wpcomstaging.com",
         "https://silfra-store-4680.myshopify.com"
     ],
+    allow_headers=["Content-Type", "X-MiraQ-Session", "X-MiraQ-License-Id",
+                   "X-WC-Session", "X-WP-Nonce", "Authorization"],
     supports_credentials=True
 )
+
 from flask_migrate import Migrate
 migrate = Migrate(app, db)
+register_before_request(app)
 
 # Configure Database Connection
 database_uri = os.getenv('DATABASE_URL', 'postgresql://postgres:admin@localhost:5432/miraq_chat')
 app.config['SQLALCHEMY_DATABASE_URI'] = database_uri
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
+app.register_blueprint(provisioning_bp)
 def ensure_database_exists(db_uri):
     """
     Connects to the default 'postgres' database to check if our target
@@ -101,8 +108,8 @@ db.init_app(app)
 
 # Create Tables on Startup
 with app.app_context():
-    # Import ShopifyToken here so SQLAlchemy registers it before create_all()
     from models.shopify_token import ShopifyToken  # noqa: F401
+    from models import Tenant                       # noqa: F401
     db.create_all()
 
 # Register blueprints
@@ -195,13 +202,14 @@ def shopify_token_status():
         503  — token is expired or missing
     """
     from models.shopify_token import ShopifyToken
-    from store_loader.config import SHOPIFY_STORE_DOMAIN
+    loader = get_store_loader()
+    shopify_domain = loader.shopify_domain if loader else ""
 
-    row = ShopifyToken.query.get(SHOPIFY_STORE_DOMAIN)
+    row = ShopifyToken.query.get(shopify_domain)
     if not row:
         return jsonify({
             "status": "missing",
-            "store_domain": SHOPIFY_STORE_DOMAIN,
+            "store_domain": shopify_domain,
             "message": "No token found in DB. Has the server started with valid credentials?",
         }), 503
 
@@ -276,16 +284,17 @@ def get_session(session_id):
 @app.route("/widget-config", methods=["GET"])
 def widget_config():
     import requests as req
-    from app_config import WOO_CONSUMER_KEY, _WP_BASE, WOO_CONSUMER_SECRET, BROWSER_HEADERS
+    from app_config import BROWSER_HEADERS
 
     logger = get_logger("miraq_chat")
-    target_url = f"{_WP_BASE}/wp-json/wdget-logo-uploader/v1/data"
+    loader = get_store_loader()
+    target_url = f"{loader._config.wp_base_url}/wp-json/wdget-logo-uploader/v1/data"
 
     try:
         headers = {
             **BROWSER_HEADERS,
-            "X-Consumer-Key":    WOO_CONSUMER_KEY,
-            "X-Consumer-Secret": WOO_CONSUMER_SECRET,
+            "X-Consumer-Key":    loader.consumer_key,
+            "X-Consumer-Secret": loader.consumer_secret,
         }
         resp = req.get(target_url, headers=headers, timeout=10)
         resp.raise_for_status()
@@ -297,6 +306,7 @@ def widget_config():
     except Exception as e:
         logger.error(f"widget_config: Failed — {type(e).__name__}: {e}", exc_info=True)
         return jsonify({"image_url": "", "text": ""}), 200
+
 
 @app.route("/debug-plan")
 def debug_plan():
@@ -355,31 +365,34 @@ def _print_dev_banner():
 
 
 def initialize_store():
-    """
-    Load store data from WooCommerce/Shopify at startup,
-    then start background refresh (and Shopify token manager if applicable).
-
-    The Flask app instance is passed into StoreLoader so the token manager
-    can open app contexts from its background thread.
-    """
-    loader = StoreLoader(app=app)   # ← pass app so token manager can use DB from threads
+    vector_model = load_vector_model()
+    config       = TenantConfig.from_env()
+    loader       = StoreLoader(config=config, vector_model=vector_model, app=app)
     try:
         loader.load_all()
     except Exception as e:
-        logging.getLogger("miraq_chat").error(
-            f"Store loader error at startup: {e}", exc_info=True
-        )
-        logging.getLogger("miraq_chat").warning(
-            "Server will respond with limited functionality until store data loads."
-        )
+        logging.getLogger("miraq_chat").error(f"Store loader error at startup: {e}", exc_info=True)
+        logging.getLogger("miraq_chat").warning("Server will respond with limited functionality until store data loads.")
 
-    # Always register and always start background refresh
     set_store_loader(loader)
-    loader.start_background_refresh()
+    loader.start_background_refresh()   # token mgr only now
+
+    # ── Phase 2: registries + shared scheduler ──
+    from tenant_registry import TenantRegistry
+    from db_engine_registry import DBEngineRegistry
+    from refresh_scheduler import RefreshScheduler
+    from store_registry import init_registries
+
+    tenant_registry = TenantRegistry(vector_model=vector_model, app=app)
+    tenant_registry.set_default_loader(loader)
+    engine_registry = DBEngineRegistry(base_dsn=database_uri)
+    init_registries(tenant_registry, engine_registry)
+
+    scheduler = RefreshScheduler(registry=tenant_registry, app=app)
+    scheduler.start()
 
     if DEV_CACHE_ENABLED and loader._loaded_from_cache:
         _print_dev_banner()
-
 
 if __name__ == "__main__":
     print("=" * 60)
