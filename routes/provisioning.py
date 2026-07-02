@@ -103,6 +103,11 @@ def provision_tenant():
         tenant.license_expires_at = license_expires_at
 
     db.session.commit()
+    
+    # Refresh CORS immediately so the new tenant's domain is allowed
+    # before the background build even starts.
+    import cors_manager as _cors
+    _cors.add_tenant_origin(tenant.site_domain or "")
 
     base_dsn = current_app.config["SQLALCHEMY_DATABASE_URI"]
     try:

@@ -14,9 +14,11 @@ get_store_loader() returns g.store_loader within a request, else the default
 
 from __future__ import annotations
 import os
+from datetime import datetime, timezone
 from flask import g, request, jsonify
 
 from chat_logger import get_logger
+from models.db_models import db
 
 logger = get_logger("miraq_chat")
 
@@ -51,6 +53,27 @@ def get_store_loader():
         return g.store_loader
     except (RuntimeError, AttributeError):
         return _default_loader
+    
+def get_tenant_features() -> dict:
+    """
+    Return the feature flags for the current request's tenant.
+
+    Falls back to all-features-enabled for the default (WGC) tenant
+    so existing behaviour is fully preserved when no licenseId is sent.
+    """
+    try:
+        tenant = g.__dict__.get("tenant")
+        if tenant is not None:
+            return tenant.features or {}
+    except RuntimeError:
+        pass
+    # Default tenant (WGC) or outside request context — all features on.
+    return {
+        "bulk_order":       True,
+        "cs_rep":           True,
+        "thwma_addresses":  True,
+        "thwcfe_fields":    True,
+    }
 
 
 def init_registries(tenant_registry, engine_registry) -> None:
@@ -71,6 +94,8 @@ def get_tenant_registry():
 def register_before_request(app) -> None:
     @app.before_request
     def _resolve_tenant():
+        if request.method == "OPTIONS":
+            return None  # handled by _handle_options in server.py
         path = request.path
 
         if _is_exempt(path):
@@ -95,10 +120,14 @@ def register_before_request(app) -> None:
         if tenant is None:
             logger.warning(f"Unknown license_id={license_id!r} on {path} → 404")
             return jsonify({"success": False, "error": "unknown tenant"}), 404
-        if not tenant.is_active:
-            logger.warning(f"Inactive tenant={license_id!r} ({tenant.status}) → 403")
-            return jsonify({"success": False, "error": "tenant inactive"}), 403
-        
+        # Auto-mark expired tenants before checking is_active.
+        if (tenant.status == "active"
+                and tenant.license_expires_at is not None
+                and datetime.now(timezone.utc) >= tenant.license_expires_at):
+            tenant.status = "expired"
+            db.session.commit()
+            logger.warning(f"Tenant licence expired — auto-marked | license_id={license_id!r}")
+
         if tenant.status == "warming":
             return jsonify({
                 "success": False,
@@ -109,6 +138,11 @@ def register_before_request(app) -> None:
                 "suggestions": [],
                 "metadata": {},
             }), 503
+
+        if not tenant.is_active:
+            logger.warning(f"Inactive tenant={license_id!r} ({tenant.status}) → 403")
+            return jsonify({"success": False, "error": "tenant inactive",
+                            "status": tenant.status}), 403
 
         # Bind loader (rehydrate on miss) and the per-tenant DB engine.
         g.tenant = tenant

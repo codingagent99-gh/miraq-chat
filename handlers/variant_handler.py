@@ -1128,7 +1128,7 @@ def handle_quantity_and_variant_check(
                 ),
                 "intent": intent.value,
                 "products": [],
-                "suggestions": ["Browse catalog", "Show all products"],
+                "suggestions": ["Browse catalog", "Browse Products"],
                 "session_id": session_id,
                 "metadata": {
                     "flow_state": FlowState.IDLE.value,

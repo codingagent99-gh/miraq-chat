@@ -699,12 +699,12 @@ def generate_suggestions(
 
     if intent == Intent.GREETING:
         suggestions = [
-            "Show me all products",
+            "Browse Products",
             "View my orders",
         ]
     elif intent in (Intent.PRODUCT_SEARCH, Intent.PRODUCT_LIST, Intent.CATEGORY_BROWSE):
         if products:
-            suggestions.append("Show me all products")
+            suggestions.append("Browse Products")
             suggestions.append("View my orders")
     elif intent == Intent.PRODUCT_DETAIL:
         if products:
@@ -715,14 +715,14 @@ def generate_suggestions(
             if p_name:
                 suggestions.append(f"Order {p_name}")
                 suggestions.append(f"Show all {p_name} products")
-        suggestions.append("Show me all products")
+        suggestions.append("Browse Products")
     
     elif intent == Intent.FILTER_BY_ATTRIBUTE:
-        suggestions.append("Show me all products")
+        suggestions.append("Browse Products")
         suggestions.append("View my orders")
         
     elif intent == Intent.UPDATE_CUSTOMER:
-        return ["Show me all products", "View my orders"]
+        return ["Browse Products", "View my orders"]
     elif intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.ORDER_STATUS, Intent.ORDER_TRACKING):
         suggestions.append("Reorder my last order")
         suggestions.append("Show me my recent orders")

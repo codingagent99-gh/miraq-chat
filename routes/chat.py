@@ -37,7 +37,7 @@ from classifier import classify
 from api_builder import build_api_calls
 from conversation_flow import FlowState, handle_flow_state, is_order_flow, _flow_context_message
 from chat_logger import get_logger, sanitize_log_string
-from store_registry import get_store_loader
+from store_registry import get_store_loader, get_tenant_features
 from ecommerce import endpoints
 from models.usage_guard import enforce_daily_limit
 
@@ -1220,7 +1220,7 @@ def chat():
             "success":     False,
             "bot_message": "Invalid request. Send JSON with 'message' field.",
             "intent": "error", "products": [],
-            "suggestions": ["Show me all products", "What categories do you have?"],
+            "suggestions": ["Browse Products", "What categories do you have?"],
             "session_id": "", "metadata": {"error": "Invalid JSON body"},
             "pagination": default_pagination(),
         }), 400
@@ -1291,7 +1291,7 @@ def chat():
             "success":     False,
             "bot_message": "Please type a message! Try asking about our products, categories, or your orders.",
             "intent": "error", "products": [],
-            "suggestions": ["Show me all products", "What categories do you have?"],
+            "suggestions": ["Browse Products", "What categories do you have?"],
             "session_id": str(conversation.id), "metadata": {"error": "Empty message"},
             "pagination": default_pagination(page),
         }), 400
@@ -1720,7 +1720,10 @@ def chat():
                     flag_modified(conversation, "context_data")
                     return _ft(clarification_resp)
 
-        if intent == Intent.BULK_ORDER and role not in BULK_ORDER_ROLES:
+        _features = get_tenant_features()
+        if intent == Intent.BULK_ORDER and (
+            role not in BULK_ORDER_ROLES or not _features.get("bulk_order", False)
+        ):
             intent = Intent.QUICK_ORDER
             if result is not None:
                 result.intent = intent
@@ -2201,5 +2204,5 @@ def chat():
             "intent":      "error",
             "bot_message": error_msg.content,
             "products":    [],
-            "suggestions": ["Start over", "Show me all products"],
+            "suggestions": ["Start over", "Browse Products"],
         }), 500

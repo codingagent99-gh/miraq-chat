@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from chat_logger import get_logger
 
 from flask import Flask, jsonify
-from flask_cors import CORS
+import cors_manager as _cors_manager
 
 from app_config import PORT, DEBUG, STORE_NAME, USE_RELOADER
 from store_registry import set_store_loader, get_store_loader, register_before_request
@@ -39,20 +39,23 @@ from routes.provisioning import provisioning_bp
 # ═══════════════════════════════════════════
 
 app = Flask(__name__)
-CORS(app,
-    origins=[
-        "https://wgc.net.in",
-        "https://silfradigital.com",
-        "https://silfratech.in",
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "https://staging-91e4-ecom-solutions9857d536fc-ugaqb.wpcomstaging.com",
-        "https://silfra-store-4680.myshopify.com"
-    ],
-    allow_headers=["Content-Type", "X-MiraQ-Session", "X-MiraQ-License-Id",
-                   "X-WC-Session", "X-WP-Nonce", "Authorization"],
-    supports_credentials=True
-)
+@app.after_request
+def _apply_cors(response):
+    from flask import request as _req
+    origin = _req.headers.get("Origin", "")
+    if origin and _cors_manager.is_allowed(origin):
+        _cors_manager.apply_cors(response, origin)
+    return response
+
+@app.before_request
+def _handle_options():
+    from flask import request as _req, jsonify
+    if _req.method == "OPTIONS":
+        origin = _req.headers.get("Origin", "")
+        resp = jsonify({})
+        if origin and _cors_manager.is_allowed(origin):
+            _cors_manager.apply_cors(resp, origin)
+        return resp, 200
 
 from flask_migrate import Migrate
 migrate = Migrate(app, db)
@@ -111,6 +114,7 @@ with app.app_context():
     from models.shopify_token import ShopifyToken  # noqa: F401
     from models import Tenant                       # noqa: F401
     db.create_all()
+    _cors_manager.refresh_from_db()   # seed dynamic origins from existing tenants
 
 # Register blueprints
 app.register_blueprint(chat_bp)
@@ -143,7 +147,7 @@ def handle_global_exception(e):
         "bot_message": "Oops! I encountered an unexpected Error.",
         "intent": "error",
         "products": [],
-        "suggestions": ["Start over", "Show me all products"],
+        "suggestions": ["Start over", "Browse Products"],
         "metadata": {"error": "Internal Server Error"}
     }), 500
 
