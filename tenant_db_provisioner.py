@@ -74,3 +74,51 @@ def ensure_tenant_database(base_dsn: str, db_name: str) -> bool:
         raise TenantDBProvisionError(f"Failed to create database {db_name!r}: {e}") from e
     finally:
         conn.close()
+        
+def drop_tenant_database(base_dsn: str, db_name: str) -> None:
+    """
+    Terminate active connections and DROP the tenant database.
+    Called only from /deactivate-tenant after both registries are cleared.
+
+    Raises TenantDBProvisionError if the database doesn't exist (idempotent
+    from the caller's point of view — already gone is fine) or on failure.
+    """
+    if not _VALID_DB_NAME.match(db_name or ""):
+        raise TenantDBProvisionError(f"Refusing to drop unsafe db_name: {db_name!r}")
+
+    dsn = _maintenance_dsn(base_dsn)
+    try:
+        conn = psycopg2.connect(dsn)
+    except Exception as e:
+        raise TenantDBProvisionError(f"Could not connect to maintenance DB: {e}") from e
+
+    try:
+        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+        cur = conn.cursor()
+
+        # Check it exists — missing DB is treated as already-deleted (idempotent).
+        cur.execute("SELECT 1 FROM pg_catalog.pg_database WHERE datname = %s", (db_name,))
+        if not cur.fetchone():
+            logger.info(f"TenantDBProvisioner: database already gone | db={db_name}")
+            return
+
+        # Terminate all active connections before dropping — DROP DATABASE fails
+        # if any client is still connected, even with autocommit.
+        cur.execute(
+            """
+            SELECT pg_terminate_backend(pid)
+            FROM pg_stat_activity
+            WHERE datname = %s AND pid <> pg_backend_pid()
+            """,
+            (db_name,)
+        )
+        terminated = cur.rowcount
+        if terminated:
+            logger.info(f"TenantDBProvisioner: terminated {terminated} connection(s) | db={db_name}")
+
+        cur.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(db_name)))
+        logger.info(f"TenantDBProvisioner: ✅ dropped database | db={db_name}")
+    except Exception as e:
+        raise TenantDBProvisionError(f"Failed to drop database {db_name!r}: {e}") from e
+    finally:
+        conn.close()

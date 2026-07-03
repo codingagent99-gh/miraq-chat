@@ -29,6 +29,7 @@ _STRICT = os.getenv("MULTI_TENANT_STRICT", "false").lower() == "true"
 _EXEMPT_PATHS = {
     "/health", "/status", "/widget-config", "/shopify-token-status",
     "/provision-tenant",            # Phase 4 — onboarding, pre-tenant by definition
+    "/deactivate-tenant",
     "/debug-plan",
 }
 _EXEMPT_PREFIXES = ("/static/",)
@@ -82,6 +83,8 @@ def init_registries(tenant_registry, engine_registry) -> None:
     _tenant_registry = tenant_registry
     _engine_registry = engine_registry
 
+def get_engine_registry():
+    return _engine_registry
 
 def _is_exempt(path: str) -> bool:
     return path in _EXEMPT_PATHS or path.startswith(_EXEMPT_PREFIXES)

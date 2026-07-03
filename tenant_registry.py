@@ -154,3 +154,16 @@ class TenantRegistry:
         off a full WooCommerce fetch + vector encode for the same tenant.
         """
         return self._build_lock_for(license_id)
+    
+    def evict(self, license_id: str) -> None:
+        """
+        Remove a tenant's loader from the LRU immediately.
+        Called during teardown before the physical database is dropped.
+        Acquires the build lock so an in-progress rehydration finishes
+        or is prevented from starting before eviction completes.
+        """
+        build_lock = self._build_lock_for(license_id)
+        with build_lock:
+            with self._registry_lock:
+                self._loaders.pop(license_id, None)
+            logger.info(f"TenantRegistry: evicted | tenant={license_id}")

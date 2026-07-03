@@ -33,6 +33,7 @@ import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from routes.sales_rep import sales_rep_bp
 from routes.provisioning import provisioning_bp
+from routes.deactivation import deactivation_bp
 
 # ═══════════════════════════════════════════
 # FLASK APP & DATABASE
@@ -66,6 +67,8 @@ database_uri = os.getenv('DATABASE_URL', 'postgresql://postgres:admin@localhost:
 app.config['SQLALCHEMY_DATABASE_URI'] = database_uri
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.register_blueprint(provisioning_bp)
+app.register_blueprint(deactivation_bp)
+
 def ensure_database_exists(db_uri):
     """
     Connects to the default 'postgres' database to check if our target

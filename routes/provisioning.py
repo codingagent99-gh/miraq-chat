@@ -18,7 +18,7 @@ from models import db, Tenant
 from tenant_crypto import encrypt_secret
 from license_verifier import verify_license_payload, LicenseVerificationError
 from tenant_db_provisioner import ensure_tenant_database, TenantDBProvisionError
-from migration_runner import build_tenant_dsn, run_migrations_for_dsn, MigrationRunError
+from migration_runner import build_tenant_dsn
 
 logger = get_logger("miraq_chat")
 
@@ -47,7 +47,36 @@ def _parse_expiry(raw):
         logger.warning(f"provision-tenant: unparseable expiresAt={raw!r}")
         return None
 
+def _create_tenant_schema(db_name: str, base_dsn: str) -> None:
+    """
+    Create all tables in a brand-new tenant database directly from the
+    SQLAlchemy models via create_all(). This is always in sync with the
+    current model definitions — no migration file needed, no drift possible.
 
+    For future schema changes (ALTER TABLE etc.) after initial provisioning,
+    migration_runner.run_migrations_for_all_tenants() handles those separately.
+    """
+    from flask import Flask
+    from migration_runner import build_tenant_dsn
+    from models import db as _db
+
+    tenant_dsn = build_tenant_dsn(base_dsn, db_name)
+
+    throwaway = Flask(__name__)
+    throwaway.config["SQLALCHEMY_DATABASE_URI"] = tenant_dsn
+    throwaway.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+    _db.init_app(throwaway)
+    with throwaway.app_context():
+        _db.create_all()
+        logger.info(f"provision-tenant: ✅ schema created via create_all | db={db_name}")
+
+    try:
+        with throwaway.app_context():
+            _db.engine.dispose()
+    except Exception:
+        pass
+    
 @provisioning_bp.route("/provision-tenant", methods=["POST"])
 def provision_tenant():
     body = request.get_json(silent=True) or {}
@@ -112,10 +141,9 @@ def provision_tenant():
     base_dsn = current_app.config["SQLALCHEMY_DATABASE_URI"]
     try:
         ensure_tenant_database(base_dsn, tenant.db_name)
-        tenant_dsn = build_tenant_dsn(base_dsn, tenant.db_name)
-        run_migrations_for_dsn(tenant_dsn)
+        _create_tenant_schema(tenant.db_name, base_dsn)
         tenant.schema_migrated_at = datetime.now(timezone.utc)
-    except (TenantDBProvisionError, MigrationRunError) as e:
+    except (TenantDBProvisionError, Exception) as e:
         logger.error(f"provision-tenant: DB setup failed | license_id={license_id} | {e}")
         tenant.status = "provision_failed"
         tenant.last_build_error = str(e)

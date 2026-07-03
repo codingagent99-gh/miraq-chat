@@ -85,6 +85,21 @@ class DBEngineRegistry:
                     )
             return eng
 
+    def dispose_for(self, db_name: str) -> None:
+        """
+        Remove and dispose the engine for a specific tenant database.
+        Called during teardown before DROP DATABASE — ensures no pooled
+        connections are open when the drop runs.
+        """
+        with self._lock:
+            eng = self._engines.pop(db_name, None)
+        if eng is not None:
+            try:
+                eng.dispose()
+                logger.info(f"DBEngineRegistry: disposed engine | db={db_name}")
+            except Exception as e:
+                logger.error(f"DBEngineRegistry: dispose failed | db={db_name} | error={e}", exc_info=True)
+
     def dispose_all(self):
         with self._lock:
             for name, eng in self._engines.items():
