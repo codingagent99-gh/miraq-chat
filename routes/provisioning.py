@@ -161,34 +161,44 @@ def provision_tenant():
 
 
 def _start_background_build(license_id: str, app):
-    """
-    Kick off the slow initial build off the request path. Single-flight via
-    the registry's per-tenant build lock — a double /provision-tenant call
-    (plugin retry) won't start two concurrent builds for the same tenant.
-    """
     import threading
 
     def _build():
-        with app.app_context():
-            from store_registry import get_tenant_registry
-            tenant_registry = get_tenant_registry()
+        logger.info(f"_start_background_build: thread started | license_id={license_id}")
+        try:
+            with app.app_context():
+                logger.info(f"_start_background_build: app context opened | license_id={license_id}")
+                from store_registry import get_tenant_registry
+                tenant_registry = get_tenant_registry()
 
-            tenant = Tenant.query.get(license_id)
-            if tenant is None:
-                logger.error(f"_start_background_build: tenant vanished | license_id={license_id}")
-                return
+                if tenant_registry is None:
+                    logger.error(f"_start_background_build: tenant_registry is None | license_id={license_id}")
+                    return
 
-            with tenant_registry.get_build_lock(license_id):
-                try:
-                    loader = tenant_registry.get_loader(tenant)  # _rehydrate: snapshot-or-live
-                    if loader._degraded:
-                        raise RuntimeError("; ".join(loader._degraded_reasons))
-                    tenant.status = "active"
-                    tenant.last_build_error = None
-                except Exception as e:
-                    logger.error(f"_start_background_build: failed | license_id={license_id} | {e}", exc_info=True)
-                    tenant.status = "provision_failed"
-                    tenant.last_build_error = str(e)
-                db.session.commit()
+                tenant = Tenant.query.get(license_id)
+                if tenant is None:
+                    logger.error(f"_start_background_build: tenant vanished | license_id={license_id}")
+                    return
 
-    threading.Thread(target=_build, daemon=True).start()
+                logger.info(f"_start_background_build: starting build | license_id={license_id} wp_base_url={tenant.wp_base_url}")
+
+                with tenant_registry.get_build_lock(license_id):
+                    try:
+                        loader = tenant_registry.get_loader(tenant)
+                        if loader._degraded:
+                            raise RuntimeError("; ".join(loader._degraded_reasons))
+                        tenant.status = "active"
+                        tenant.last_build_error = None
+                        logger.info(f"_start_background_build: ✅ build complete | license_id={license_id}")
+                    except Exception as e:
+                        logger.error(f"_start_background_build: build failed | license_id={license_id} | {e}", exc_info=True)
+                        tenant.status = "provision_failed"
+                        tenant.last_build_error = str(e)
+                    db.session.commit()
+        except Exception as e:
+            logger.error(f"_start_background_build: OUTER crash | license_id={license_id} | {e}", exc_info=True)
+
+    t = threading.Thread(target=_build, daemon=True)
+    print(f"[THREAD DEBUG] About to start background build thread for {license_id}", flush=True)
+    t.start()
+    logger.info(f"_start_background_build: thread launched | license_id={license_id}")
