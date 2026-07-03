@@ -35,6 +35,11 @@ def deactivate_tenant():
 
     raw_payload   = body.get("raw_payload")
     signature_b64 = body.get("signature")
+    
+    raw_payload   = body.get("raw_payload")
+    signature_b64 = body.get("signature")
+
+    logger.info(f"deactivate-tenant: raw_payload={'present' if raw_payload else 'MISSING'} | signature={'present' if signature_b64 else 'MISSING'}")
 
     if not raw_payload or not signature_b64:
         return jsonify({"success": False, "error": "missing raw_payload/signature"}), 400
