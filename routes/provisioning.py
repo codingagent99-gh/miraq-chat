@@ -197,6 +197,16 @@ def _start_background_build(license_id: str, app):
                     db.session.commit()
         except Exception as e:
             logger.error(f"_start_background_build: OUTER crash | license_id={license_id} | {e}", exc_info=True)
+            # Update status even if we couldn't open the app context properly
+            try:
+                with app.app_context():
+                    tenant = Tenant.query.get(license_id)
+                    if tenant and tenant.status == "warming":
+                        tenant.status = "provision_failed"
+                        tenant.last_build_error = f"Background thread crash: {str(e)}"
+                        db.session.commit()
+            except Exception as inner_e:
+                logger.error(f"_start_background_build: could not update status after crash | {inner_e}")
 
     t = threading.Thread(target=_build, daemon=True)
     print(f"[THREAD DEBUG] About to start background build thread for {license_id}", flush=True)

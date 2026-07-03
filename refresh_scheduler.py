@@ -60,6 +60,27 @@ class RefreshScheduler:
     def _scan_once(self):
         from tenant_snapshot_store import snapshot_store, loader_to_snapshot_dict
 
+        # ── Retry stuck tenants ───────────────────────────────────────────────
+        try:
+            with self._app.app_context():
+                from models import Tenant, db
+                from datetime import datetime, timezone, timedelta
+
+                stuck = Tenant.query.filter(
+                    Tenant.status.in_(["warming", "provision_failed"]),
+                    Tenant.schema_migrated_at.isnot(None),
+                    # Only retry if stuck for more than 10 minutes
+                    Tenant.created_at < datetime.now(timezone.utc) - timedelta(minutes=10)
+                ).all()
+
+                for tenant in stuck:
+                    logger.info(f"RefreshScheduler: retrying stuck tenant | license_id={tenant.license_id} status={tenant.status}")
+                    from routes.provisioning import _start_background_build
+                    _start_background_build(tenant.license_id, self._app)
+        except Exception as e:
+            logger.error(f"RefreshScheduler: stuck tenant sweep failed | {e}", exc_info=True)
+
+        # ── Normal catalog refresh ─────────────────────────────────────────────
         loaders = list(self._registry.resident_loaders())
         for license_id, loader in loaders:
             try:
@@ -73,3 +94,5 @@ class RefreshScheduler:
             except Exception as e:
                 logger.error(f"RefreshScheduler: refresh failed | tenant={license_id} | error={e}", exc_info=True)
         loaders = None
+        
+        
