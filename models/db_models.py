@@ -128,7 +128,7 @@ class Tenant(db.Model):
         db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
     archived_at = db.Column(db.DateTime(timezone=True), nullable=True)
-
+    wp_base_url = db.Column(db.String(500), nullable=True)
     def __repr__(self):
         return (
             f"<Tenant license_id={self.license_id!r} db_name={self.db_name!r} "

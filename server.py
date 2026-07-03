@@ -19,11 +19,9 @@ from flask import Flask, jsonify
 import cors_manager as _cors_manager
 
 from app_config import PORT, DEBUG, STORE_NAME, USE_RELOADER
-from store_registry import set_store_loader, get_store_loader, register_before_request
-from store_loader import StoreLoader, DEV_CACHE_ENABLED, load_vector_model
-from tenant_config import TenantConfig
+from store_registry import get_store_loader, register_before_request
 from models import db, Conversation
-
+from store_loader import load_vector_model
 from routes.chat import chat_bp
 from routes.admin import admin_bp
 from routes.products import products_bp
@@ -372,34 +370,28 @@ def _print_dev_banner():
 
 
 def initialize_store():
+    """
+    Start the shared vector model, registries, and refresh scheduler.
+    No default tenant is loaded — every request must carry X-MiraQ-License-Id.
+    All tenant config (URLs, credentials) lives in the tenants table.
+    """
     vector_model = load_vector_model()
-    config       = TenantConfig.from_env()
-    loader       = StoreLoader(config=config, vector_model=vector_model, app=app)
-    try:
-        loader.load_all()
-    except Exception as e:
-        logging.getLogger("miraq_chat").error(f"Store loader error at startup: {e}", exc_info=True)
-        logging.getLogger("miraq_chat").warning("Server will respond with limited functionality until store data loads.")
 
-    set_store_loader(loader)
-    loader.start_background_refresh()   # token mgr only now
-
-    # ── Phase 2: registries + shared scheduler ──
     from tenant_registry import TenantRegistry
     from db_engine_registry import DBEngineRegistry
     from refresh_scheduler import RefreshScheduler
     from store_registry import init_registries
 
     tenant_registry = TenantRegistry(vector_model=vector_model, app=app)
-    tenant_registry.set_default_loader(loader)
     engine_registry = DBEngineRegistry(base_dsn=database_uri)
     init_registries(tenant_registry, engine_registry)
 
     scheduler = RefreshScheduler(registry=tenant_registry, app=app)
     scheduler.start()
 
-    if DEV_CACHE_ENABLED and loader._loaded_from_cache:
-        _print_dev_banner()
+    logging.getLogger("miraq_chat").info(
+        "initialize_store: registries ready — all tenants served from DB"
+    )
 
 if __name__ == "__main__":
     print("=" * 60)

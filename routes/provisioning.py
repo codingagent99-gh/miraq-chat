@@ -84,6 +84,7 @@ def provision_tenant():
     raw_payload   = body.get("raw_payload")
     signature_b64 = body.get("signature")
     site_domain   = (body.get("site_domain") or "").strip()
+    wp_base_url   = (body.get("wp_base_url") or "").strip().rstrip("/")
     woo_key       = (body.get("woo_key") or "").strip()
     woo_secret    = body.get("woo_secret") or ""
 
@@ -125,7 +126,8 @@ def provision_tenant():
         # db_name intentionally untouched — Phase 4 may already have created a
         # physical database under the original name.
 
-    tenant.site_domain = site_domain or tenant.site_domain
+    tenant.site_domain  = site_domain or tenant.site_domain
+    tenant.wp_base_url  = wp_base_url or tenant.wp_base_url
     tenant.woo_key = woo_key
     tenant.woo_secret_encrypted = encrypt_secret(woo_secret)
     if license_expires_at is not None:

@@ -40,28 +40,11 @@ class TenantRegistry:
         self._build_locks: dict[str, threading.Lock] = {}  # per-tenant single-flight
         self._build_locks_guard = threading.Lock()       # guards _build_locks
 
-        # Phase-1 transition: a pre-seeded default loader (the WGC store) served
-        # when MULTI_TENANT_STRICT is off and no tenant is resolved.
-        self._default_loader: Optional[StoreLoader] = None
-
-    # ── default-loader bridge (Phase-1 compatibility) ──────────────────────────
-
-    def set_default_loader(self, loader: StoreLoader) -> None:
-        self._default_loader = loader
-
-    def default_loader(self) -> Optional[StoreLoader]:
-        return self._default_loader
-
     # ── scheduler interface ────────────────────────────────────────────────────
 
     def resident_loaders(self) -> List[Tuple[str, StoreLoader]]:
-        """Snapshot of currently-resident (license_id, loader) pairs."""
         with self._registry_lock:
-            items = list(self._loaders.items())
-        # Include the default loader so it still gets catalog refreshes.
-        if self._default_loader is not None:
-            items.append(("__default__", self._default_loader))
-        return items
+            return list(self._loaders.items())
 
     # ── resolution ──────────────────────────────────────────────────────────────
 
@@ -118,12 +101,13 @@ class TenantRegistry:
         snapshot once at activation before the tenant is marked 'active'.
         """
         from tenant_snapshot_store import snapshot_store, apply_snapshot_to_loader, loader_to_snapshot_dict
+        _wp_base = (tenant_row.wp_base_url or "").rstrip("/")
 
         config = TenantConfig(
-            wp_base_url=(tenant_row.site_domain or "").rstrip("/"),
-            woo_base_url=f"{(tenant_row.site_domain or '').rstrip('/')}/wp-json/wc/v3",
-            woo_store_api_url=f"{(tenant_row.site_domain or '').rstrip('/')}/wp-json/wc/store/v1",
-            custom_api_base_url=f"{(tenant_row.site_domain or '').rstrip('/')}/wp-json/custom-api/v1",
+            wp_base_url=_wp_base,
+            woo_base_url=f"{_wp_base}/wp-json/wc/v3",
+            woo_store_api_url=f"{_wp_base}/wp-json/wc/store/v1",
+            custom_api_base_url=f"{_wp_base}/wp-json/custom-api/v1",
             woo_key=tenant_row.woo_key or "",
             woo_secret=decrypt_secret(tenant_row.woo_secret_encrypted or ""),
             ecommerce_backend="woocommerce",

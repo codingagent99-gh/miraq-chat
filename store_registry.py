@@ -23,37 +23,27 @@ from models.db_models import db
 logger = get_logger("miraq_chat")
 
 _LICENSE_HEADER = "X-MiraQ-License-Id"
-_STRICT = os.getenv("MULTI_TENANT_STRICT", "false").lower() == "true"
 
-# Routes that must work WITHOUT a resolved tenant.
+# Routes exempt from tenant resolution — no X-MiraQ-License-Id required.
+# These are server-level or pre-tenant endpoints.
 _EXEMPT_PATHS = {
-    "/health", "/status", "/widget-config", "/shopify-token-status",
-    "/provision-tenant",            # Phase 4 — onboarding, pre-tenant by definition
+    "/health", "/status",
+    "/provision-tenant",
     "/deactivate-tenant",
     "/debug-plan",
 }
 _EXEMPT_PREFIXES = ("/static/",)
 
-# Wired once at startup by init_registries() in server.py.
-_default_loader = None
 _tenant_registry = None
 _engine_registry = None
 
 
-def set_store_loader(loader) -> None:
-    """Phase-1 compatible: register the single default (WGC) loader."""
-    global _default_loader
-    _default_loader = loader
-    if _tenant_registry is not None:
-        _tenant_registry.set_default_loader(loader)
-
-
 def get_store_loader():
-    """Request-scoped loader, else the process default (startup/background)."""
+    """Request-scoped loader. Returns None outside a request context."""
     try:
         return g.store_loader
     except (RuntimeError, AttributeError):
-        return _default_loader
+        return None
     
 def get_tenant_features() -> dict:
     """
@@ -69,12 +59,7 @@ def get_tenant_features() -> dict:
     except RuntimeError:
         pass
     # Default tenant (WGC) or outside request context — all features on.
-    return {
-        "bulk_order":       True,
-        "cs_rep":           True,
-        "thwma_addresses":  True,
-        "thwcfe_fields":    True,
-    }
+    return {}
 
 
 def init_registries(tenant_registry, engine_registry) -> None:
@@ -102,20 +87,15 @@ def register_before_request(app) -> None:
         path = request.path
 
         if _is_exempt(path):
-            # Exempt routes use the default loader (e.g. /widget-config reads it).
-            g.store_loader = _default_loader
+            g.store_loader = None
             return None
 
         license_id = request.headers.get(_LICENSE_HEADER, "").strip()
 
         # ── No header ─────────────────────────────────────────────────────────
         if not license_id:
-            if _STRICT:
-                logger.warning(f"Tenant header missing on {path} (strict) → 400")
-                return jsonify({"success": False, "error": "missing tenant"}), 400
-            # Transition: serve the single default tenant (Phase-1 behaviour).
-            g.store_loader = _default_loader
-            return None
+            logger.warning(f"Tenant header missing on {path} → 400")
+            return jsonify({"success": False, "error": "missing tenant"}), 400
 
         # ── Header present — resolve the tenant ──────────────────────────────
         from models import Tenant

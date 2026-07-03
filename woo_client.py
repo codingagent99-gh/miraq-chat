@@ -37,18 +37,15 @@ class WooClient:
         # Resolve credentials and base URLs from the request-scoped loader so
         # every call uses the correct tenant — not the process-level env globals.
         loader = get_store_loader()
-        if loader:
-            _key         = loader.consumer_key
-            _secret      = loader.consumer_secret
-            _woo_base    = loader.base
-            _custom_base = loader.custom_api_base
-        else:
-            # Pre-startup fallback: loader not yet registered (e.g. called during
-            # db.create_all() before initialize_store()). Use env globals.
-            from app_config import WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET, WOO_BASE_URL, CUSTOM_API_BASE_URL
-            _key, _secret = WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET
-            _woo_base, _custom_base = WOO_BASE_URL, CUSTOM_API_BASE_URL
-
+        if not loader:
+            raise RuntimeError(
+                "woo_client.execute(): no tenant loader resolved — "
+                "is X-MiraQ-License-Id missing from the request?"
+            )
+        _key         = loader.consumer_key
+        _secret      = loader.consumer_secret
+        _woo_base    = loader.base
+        _custom_base = loader.custom_api_base
         _wc_auth        = HTTPBasicAuth(_key, _secret)
         _custom_headers = {**_BASE_HEADERS, "X-Consumer-Key": _key, "X-Consumer-Secret": _secret}
 

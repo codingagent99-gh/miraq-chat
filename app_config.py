@@ -16,28 +16,8 @@ load_dotenv()
 # BASE URLs
 # ═══════════════════════════════════════════
 
-_WP_BASE = os.getenv("WP_BASE_URL", "https://wgc.net.in/hn")
-
-# WooCommerce admin REST API  (/wc/v3 — products, orders, customers)
-WOO_BASE_URL = os.getenv(
-    "WOO_BASE_URL",
-    f"{_WP_BASE}/wp-json/wc/v3",
-)
-
-# WooCommerce Store API  (/wc/store/v1 — cart, checkout, session-aware)
-WOO_STORE_API_URL = os.getenv(            # ← was reading WOO_BASE_URL by mistake
-    "WOO_STORE_API_URL",
-    f"{_WP_BASE}/wp-json/wc/store/v1",
-)
-
-# Custom plugin API  (/custom-api/v1 — nonce refresh, etc.)
-CUSTOM_API_BASE_URL = os.getenv(
-    "CUSTOM_API_BASE_URL",
-    f"{_WP_BASE}/wp-json/custom-api/v1",
-)
-
-WOO_CONSUMER_KEY = os.getenv("WOO_CONSUMER_KEY", "")
-WOO_CONSUMER_SECRET = os.getenv("WOO_CONSUMER_SECRET", "")
+# URL and credential globals removed — all tenant config lives in the DB.
+# See TenantConfig built from Tenant row in tenant_registry._rehydrate().
 PORT = int(os.getenv("PORT", 5009))
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 USE_RELOADER = os.getenv("USE_RELOADER", "false")

@@ -81,7 +81,7 @@ class LocalDiskSnapshotStore(SnapshotStore):
         # dies mid-write (atomic on the same filesystem).
         tmp = catalog_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(catalog, f)
+            json.dump(catalog, f, indent=2)   # indent=2 for readability
         os.replace(tmp, catalog_path)
 
         tensors = data.get("semantic_tensors")
@@ -91,10 +91,10 @@ class LocalDiskSnapshotStore(SnapshotStore):
             os.replace(tmp_v, vectors_path)
 
         with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump({"snapshot_built_at": time.time()}, f)
+            json.dump({"snapshot_built_at": time.time()}, f, indent=2)
 
         logger.info(f"SnapshotStore: saved | tenant={license_id} | products={len(catalog['products'])}")
-
+        
     def load(self, license_id: str) -> Optional[dict]:
         d = os.path.join(self._base_dir, license_id)
         catalog_path = os.path.join(d, "catalog.json")
