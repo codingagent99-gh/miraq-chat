@@ -16,7 +16,7 @@ Idempotent: safe to call twice (DB already gone = not an error).
 """
 
 from datetime import datetime, timezone
-
+import json
 from flask import Blueprint, request, jsonify, current_app
 
 from chat_logger import get_logger
@@ -36,8 +36,20 @@ def deactivate_tenant():
     raw_payload   = body.get("raw_payload")
     signature_b64 = body.get("signature")
     
-    raw_payload   = body.get("raw_payload")
-    signature_b64 = body.get("signature")
+    # raw_payload might be the full licensing-server response wrapper
+    # ({kid, payload, signature}) rather than just the inner payload string.
+    # Unwrap it if so.
+    if raw_payload:
+        try:
+            parsed = json.loads(raw_payload)
+            if "payload" in parsed and "licenseId" not in parsed:
+                raw_payload = json.dumps(
+                    parsed["payload"],
+                    separators=(",", ":"),
+                    ensure_ascii=False
+                )
+        except Exception:
+            pass
 
     logger.info(f"deactivate-tenant: raw_payload={'present' if raw_payload else 'MISSING'} | signature={'present' if signature_b64 else 'MISSING'}")
 
