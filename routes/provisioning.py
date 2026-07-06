@@ -18,8 +18,7 @@ from models import db, Tenant
 from tenant_crypto import encrypt_secret
 from license_verifier import verify_license_payload, LicenseVerificationError
 from tenant_db_provisioner import ensure_tenant_database, TenantDBProvisionError
-from migration_runner import build_tenant_dsn
-
+import threading
 logger = get_logger("miraq_chat")
 
 provisioning_bp = Blueprint("provisioning", __name__)
@@ -160,8 +159,15 @@ def provision_tenant():
     return jsonify({"success": True, "license_id": tenant.license_id, "status": tenant.status}), 200
 
 
+_active_builds: set = set()
+_active_builds_lock = threading.Lock()
+
 def _start_background_build(license_id: str, app):
-    import threading
+    with _active_builds_lock:
+        if license_id in _active_builds:
+            logger.info(f"_start_background_build: build already running | license_id={license_id}")
+            return
+        _active_builds.add(license_id)
 
     def _build():
         logger.info(f"_start_background_build: thread started | license_id={license_id}")
@@ -178,6 +184,10 @@ def _start_background_build(license_id: str, app):
                 tenant = Tenant.query.get(license_id)
                 if tenant is None:
                     logger.error(f"_start_background_build: tenant vanished | license_id={license_id}")
+                    return
+
+                if tenant.status == "archived":
+                    logger.info(f"_start_background_build: tenant archived, skipping | license_id={license_id}")
                     return
 
                 logger.info(f"_start_background_build: starting build | license_id={license_id} wp_base_url={tenant.wp_base_url}")
@@ -197,7 +207,6 @@ def _start_background_build(license_id: str, app):
                     db.session.commit()
         except Exception as e:
             logger.error(f"_start_background_build: OUTER crash | license_id={license_id} | {e}", exc_info=True)
-            # Update status even if we couldn't open the app context properly
             try:
                 with app.app_context():
                     tenant = Tenant.query.get(license_id)
@@ -207,8 +216,10 @@ def _start_background_build(license_id: str, app):
                         db.session.commit()
             except Exception as inner_e:
                 logger.error(f"_start_background_build: could not update status after crash | {inner_e}")
+        finally:
+            with _active_builds_lock:
+                _active_builds.discard(license_id)
 
     t = threading.Thread(target=_build, daemon=True)
-    print(f"[THREAD DEBUG] About to start background build thread for {license_id}", flush=True)
     t.start()
     logger.info(f"_start_background_build: thread launched | license_id={license_id}")
