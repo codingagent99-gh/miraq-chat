@@ -69,7 +69,7 @@ class RefreshScheduler:
                 stuck = Tenant.query.filter(
                     Tenant.status.in_(["warming", "provision_failed"]),
                     Tenant.schema_migrated_at.isnot(None),
-                    # Only retry if stuck for more than 10 minutes
+                    Tenant.archived_at.is_(None),
                     Tenant.created_at < datetime.now(timezone.utc) - timedelta(minutes=10)
                 ).all()
 
