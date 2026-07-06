@@ -55,33 +55,20 @@ def _parse_expiry(raw):
 
 
 def _create_tenant_schema(db_name: str, base_dsn: str) -> None:
-    """
-    Create all tables in a brand-new tenant database directly from the
-    SQLAlchemy models via create_all(). Always in sync with current model
-    definitions — no migration file needed, no drift possible.
-    """
     from flask import Flask
     from migration_runner import build_tenant_dsn
     from models import db as _db
-    from flask_migrate import Migrate, stamp
 
-    import os
     tenant_dsn = build_tenant_dsn(base_dsn, db_name)
-    _migrations_dir = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "migrations"
-    )
 
     throwaway = Flask(__name__)
     throwaway.config["SQLALCHEMY_DATABASE_URI"] = tenant_dsn
     throwaway.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
     _db.init_app(throwaway)
-    Migrate(throwaway, _db, directory=_migrations_dir)
-
     with throwaway.app_context():
         _db.create_all()
-        stamp(directory=_migrations_dir)
-        logger.info(f"provision-tenant: ✅ schema created + stamped | db={db_name}")
+        logger.info(f"provision-tenant: ✅ tables created | db={db_name}")
 
     try:
         with throwaway.app_context():
@@ -89,6 +76,49 @@ def _create_tenant_schema(db_name: str, base_dsn: str) -> None:
     except Exception:
         pass
 
+    # Stamp alembic_version directly via psycopg2 — avoids Flask-SQLAlchemy
+    # connection pool hanging on the throwaway app's stamp() call.
+    _stamp_alembic_version(tenant_dsn, db_name)
+
+
+def _stamp_alembic_version(tenant_dsn: str, db_name: str) -> None:
+    """Write the current alembic head revision directly via psycopg2."""
+    import psycopg2
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    import os
+
+    migrations_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "migrations"
+    )
+
+    try:
+        # Get the current head revision from the migration scripts
+        alembic_cfg = Config()
+        alembic_cfg.set_main_option("script_location", migrations_dir)
+        script = ScriptDirectory.from_config(alembic_cfg)
+        head = script.get_current_head()
+
+        if not head:
+            logger.warning(f"provision-tenant: no alembic head found — skipping stamp | db={db_name}")
+            return
+
+        conn = psycopg2.connect(tenant_dsn)
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS alembic_version (
+                version_num VARCHAR(32) NOT NULL,
+                CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)
+            )
+        """)
+        cur.execute("DELETE FROM alembic_version")
+        cur.execute("INSERT INTO alembic_version (version_num) VALUES (%s)", (head,))
+        conn.close()
+        logger.info(f"provision-tenant: ✅ schema created + stamped at {head} | db={db_name}")
+    except Exception as e:
+        logger.error(f"provision-tenant: stamp failed | db={db_name} | {e}", exc_info=True)
+        # Non-fatal — tables are created, stamp is just for future migration tracking
 
 @provisioning_bp.route("/provision-tenant", methods=["POST"])
 def provision_tenant():
