@@ -46,21 +46,19 @@ def get_store_loader():
         return None
     
 def get_tenant_features() -> dict:
-    """
-    Return the feature flags for the current request's tenant.
-
-    Falls back to all-features-enabled for the default (WGC) tenant
-    so existing behaviour is fully preserved when no licenseId is sent.
-    """
     try:
         tenant = g.__dict__.get("tenant")
         if tenant is not None:
-            return tenant.features or {}
-    except RuntimeError:
+            # Access features eagerly and store as plain dict on g
+            # to avoid SQLAlchemy lazy-load failures after session operations
+            features = g.__dict__.get("tenant_features")
+            if features is None:
+                features = dict(tenant.features or {})
+                g.tenant_features = features
+            return features
+    except (RuntimeError, Exception):
         pass
-    # Default tenant (WGC) or outside request context — all features on.
     return {}
-
 
 def init_registries(tenant_registry, engine_registry) -> None:
     """Called once at startup, after the registries are constructed."""
@@ -91,6 +89,7 @@ def register_before_request(app) -> None:
             return None
 
         license_id = request.headers.get(_LICENSE_HEADER, "").strip()
+        logger.info(f"_resolve_tenant: path={path} | license_id={'present:'+license_id[:8] if license_id else 'MISSING'}")
 
         # ── No header ─────────────────────────────────────────────────────────
         if not license_id:
@@ -129,6 +128,7 @@ def register_before_request(app) -> None:
 
         # Bind loader (rehydrate on miss) and the per-tenant DB engine.
         g.tenant = tenant
+        g.tenant_features = dict(tenant.features or {})
         g.store_loader = _tenant_registry.get_loader(tenant)
         g.db_engine = _engine_registry.get_engine(tenant.db_name)
         return None

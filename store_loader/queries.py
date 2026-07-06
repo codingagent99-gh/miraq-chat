@@ -111,7 +111,7 @@ class StoreQueryMixin:
         text_lower = text.lower()
         candidates = []
         
-        logger.debug(f"get_product_for_text: size={len(self.product_by_name_lower)} sample={list(self.product_by_name_lower.keys())[:5]}")  # ← ADD THIS
+        logger.debug(f"get_product_for_text: size={len(self.product_by_name_lower)} sample={list(self.product_by_name_lower.keys())[:5]}")
 
         for name_lower, entry in self.product_by_name_lower.items():
             if re.search(rf'\b{re.escape(name_lower)}\b', text_lower):

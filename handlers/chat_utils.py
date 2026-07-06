@@ -496,7 +496,7 @@ def build_variant_prompt(
     resolved_attributes: dict = None,
     variations_list: list = None,
     display_to_slug: dict = None,
-    resolved_attr_values: list = None,   # ← add this, flat list fallback
+    resolved_attr_values: list = None,   # flat list fallback
 ) -> str:
     """Builds a friendly markdown prompt listing the available variation options."""
 
