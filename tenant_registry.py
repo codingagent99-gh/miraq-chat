@@ -24,21 +24,20 @@ logger = get_logger("miraq_chat")
 
 _MAX_RESIDENT_LOADERS = int(os.getenv("TENANT_LOADER_LRU_SIZE", "35"))
 
+# How long get_loader() waits to acquire the build lock before giving up.
+# Prevents silent hangs when a prior build thread is stuck on an HTTP timeout.
+_BUILD_LOCK_TIMEOUT = 10  # seconds
+
 
 class TenantRegistry:
     def __init__(self, vector_model, app=None):
-        """
-        Args:
-            vector_model: the ONE shared SentenceTransformer (from load_vector_model()).
-            app:          Flask app, forwarded to each StoreLoader.
-        """
         self._vector_model = vector_model
         self._app = app
 
         self._loaders: "OrderedDict[str, StoreLoader]" = OrderedDict()
-        self._registry_lock = threading.Lock()          # guards the OrderedDict
-        self._build_locks: dict[str, threading.Lock] = {}  # per-tenant single-flight
-        self._build_locks_guard = threading.Lock()       # guards _build_locks
+        self._registry_lock = threading.Lock()
+        self._build_locks: dict[str, threading.Lock] = {}
+        self._build_locks_guard = threading.Lock()
 
     # ── scheduler interface ────────────────────────────────────────────────────
 
@@ -49,39 +48,60 @@ class TenantRegistry:
     # ── resolution ──────────────────────────────────────────────────────────────
 
     def get_loader(self, tenant_row) -> StoreLoader:
-        """
-        Return the resident loader for tenant_row.license_id, rehydrating on miss.
-        Single-flight: concurrent misses for the same tenant rebuild once.
-        """
         license_id = tenant_row.license_id
+        logger.info(f"TenantRegistry: get_loader called | tenant={license_id}")
 
         # Fast path — already resident.
         with self._registry_lock:
             loader = self._loaders.get(license_id)
             if loader is not None:
                 self._loaders.move_to_end(license_id)
+                logger.info(f"TenantRegistry: cache hit | tenant={license_id}")
                 return loader
 
-        # Miss — acquire this tenant's build lock (created once, reused).
+        logger.info(f"TenantRegistry: cache miss — acquiring build lock | tenant={license_id}")
+
         build_lock = self._build_lock_for(license_id)
-        with build_lock:
+        acquired = build_lock.acquire(timeout=_BUILD_LOCK_TIMEOUT)
+
+        if not acquired:
+            logger.error(
+                f"TenantRegistry: build lock timeout after {_BUILD_LOCK_TIMEOUT}s | tenant={license_id} "
+                f"— another build thread is likely stuck on an HTTP call"
+            )
+            raise RuntimeError(
+                f"Build lock timeout for tenant {license_id} — "
+                f"a prior build may be stuck. Check for HTTP timeouts in StoreLoader logs."
+            )
+
+        logger.info(f"TenantRegistry: build lock acquired | tenant={license_id}")
+
+        try:
             # Re-check: another thread may have built it while we waited.
             with self._registry_lock:
                 loader = self._loaders.get(license_id)
                 if loader is not None:
                     self._loaders.move_to_end(license_id)
+                    logger.info(f"TenantRegistry: cache hit after lock wait | tenant={license_id}")
                     return loader
 
+            logger.info(f"TenantRegistry: starting _rehydrate | tenant={license_id}")
             loader = self._rehydrate(tenant_row)
+            logger.info(f"TenantRegistry: _rehydrate complete | tenant={license_id}")
 
             with self._registry_lock:
                 self._loaders[license_id] = loader
                 self._loaders.move_to_end(license_id)
-                # Insert-triggered eviction: drop oldest past the cap.
                 while len(self._loaders) > _MAX_RESIDENT_LOADERS:
                     old_id, _old = self._loaders.popitem(last=False)
                     logger.info(f"TenantRegistry: evicted resident loader | tenant={old_id}")
+
+            logger.info(f"TenantRegistry: loader registered in cache | tenant={license_id}")
             return loader
+
+        finally:
+            build_lock.release()
+            logger.info(f"TenantRegistry: build lock released | tenant={license_id}")
 
     def _build_lock_for(self, license_id: str) -> threading.Lock:
         with self._build_locks_guard:
@@ -91,19 +111,19 @@ class TenantRegistry:
                 self._build_locks[license_id] = lock
             return lock
 
-    # ── the Phase-2 / Phase-4 seam ───────────────────────────────────────────────
+    # ── the Phase-4 rehydrate ─────────────────────────────────────────────────
 
     def _rehydrate(self, tenant_row) -> StoreLoader:
-        """
-        PHASE 4: try the persisted snapshot first (seconds, no network calls).
-        Falls back to a live load_all() only if no snapshot exists yet — in
-        steady state this shouldn't fire, since the provisioner builds the
-        snapshot once at activation before the tenant is marked 'active'.
-        """
         from tenant_snapshot_store import snapshot_store, apply_snapshot_to_loader, loader_to_snapshot_dict
-        _wp_base = (tenant_row.wp_base_url or "").rstrip("/")
-        logger.info(f"TenantRegistry: _rehydrate started | tenant={tenant_row.license_id} wp_base={_wp_base}")
 
+        _wp_base = (tenant_row.wp_base_url or "").rstrip("/")
+        logger.info(f"TenantRegistry: _rehydrate started | tenant={tenant_row.license_id} | wp_base={_wp_base}")
+
+        if not _wp_base:
+            logger.error(f"TenantRegistry: wp_base_url is empty | tenant={tenant_row.license_id} — cannot fetch catalog")
+            raise RuntimeError(f"wp_base_url is empty for tenant {tenant_row.license_id}")
+
+        logger.info(f"TenantRegistry: building TenantConfig | tenant={tenant_row.license_id}")
         config = TenantConfig(
             wp_base_url=_wp_base,
             woo_base_url=f"{_wp_base}/wp-json/wc/v3",
@@ -113,45 +133,59 @@ class TenantRegistry:
             woo_secret=decrypt_secret(tenant_row.woo_secret_encrypted or ""),
             ecommerce_backend="woocommerce",
         )
+
+        logger.info(f"TenantRegistry: woo_key={'present' if config.woo_key else 'MISSING'} | tenant={tenant_row.license_id}")
+        logger.info(f"TenantRegistry: woo_secret={'present' if config.woo_secret else 'MISSING'} | tenant={tenant_row.license_id}")
+
+        logger.info(f"TenantRegistry: constructing StoreLoader | tenant={tenant_row.license_id}")
         loader = StoreLoader(config=config, vector_model=self._vector_model, app=self._app)
+        logger.info(f"TenantRegistry: StoreLoader constructed | tenant={tenant_row.license_id}")
+
         logger.info(f"TenantRegistry: checking snapshot | tenant={tenant_row.license_id}")
         snapshot = snapshot_store.load(tenant_row.license_id)
-        logger.info(f"TenantRegistry: snapshot={'found' if snapshot else 'not found'} | tenant={tenant_row.license_id}")
 
         if snapshot is not None:
-            logger.info(f"TenantRegistry: rehydrating tenant={tenant_row.license_id} from snapshot")
+            logger.info(f"TenantRegistry: snapshot found — applying | tenant={tenant_row.license_id} | products={len(snapshot.get('products', []))}")
             apply_snapshot_to_loader(loader, snapshot)
+            logger.info(f"TenantRegistry: snapshot applied | tenant={tenant_row.license_id}")
         else:
-            logger.info(f"TenantRegistry: starting live load | tenant={tenant_row.license_id}")
+            logger.info(f"TenantRegistry: no snapshot — starting live WooCommerce fetch | tenant={tenant_row.license_id}")
+            logger.info(f"TenantRegistry: calling load_all() | tenant={tenant_row.license_id} | url={config.woo_base_url}")
             loader.load_all()
-            logger.info(f"TenantRegistry: live load complete | tenant={tenant_row.license_id} degraded={loader._degraded}")
-            if not loader._degraded:
+            logger.info(
+                f"TenantRegistry: load_all() returned | tenant={tenant_row.license_id} | "
+                f"degraded={loader._degraded} | products={len(loader.products)} | "
+                f"categories={len(loader.categories)}"
+            )
+            if loader._degraded:
+                logger.warning(
+                    f"TenantRegistry: loader degraded after live fetch | tenant={tenant_row.license_id} | "
+                    f"reasons={loader._degraded_reasons}"
+                )
+            else:
+                logger.info(f"TenantRegistry: saving snapshot | tenant={tenant_row.license_id}")
                 snapshot_store.save(tenant_row.license_id, loader_to_snapshot_dict(loader))
-                logger.info(f"TenantRegistry: snapshot persisted after build | tenant={tenant_row.license_id}")
+                logger.info(f"TenantRegistry: snapshot saved | tenant={tenant_row.license_id}")
 
+        logger.info(f"TenantRegistry: starting background refresh | tenant={tenant_row.license_id}")
         loader.start_background_refresh()
+        logger.info(f"TenantRegistry: _rehydrate complete | tenant={tenant_row.license_id}")
         return loader
-    
+
     def get_build_lock(self, license_id: str) -> threading.Lock:
-        """
-        Public accessor so the provisioner can share the exact same per-tenant
-        lock used here for RAM-miss rehydration — preventing a double
-        activation (plugin retry) and a concurrent rehydrate from both kicking
-        off a full WooCommerce fetch + vector encode for the same tenant.
-        """
         return self._build_lock_for(license_id)
-    
+
     def evict(self, license_id: str) -> None:
-        # Try to acquire the build lock with a short timeout so deactivation
-        # isn't blocked by an in-progress build thread. If we can't acquire it
-        # in time, evict anyway — the build thread will finish and find the
-        # tenant archived, then exit cleanly.
+        logger.info(f"TenantRegistry: evict called | tenant={license_id}")
         build_lock = self._build_lock_for(license_id)
         acquired = build_lock.acquire(timeout=2)
         try:
             with self._registry_lock:
-                self._loaders.pop(license_id, None)
-            logger.info(f"TenantRegistry: evicted | tenant={license_id} | lock_acquired={acquired}")
+                removed = self._loaders.pop(license_id, None)
+            logger.info(
+                f"TenantRegistry: evict complete | tenant={license_id} | "
+                f"was_resident={removed is not None} | lock_acquired={acquired}"
+            )
         finally:
             if acquired:
                 build_lock.release()
