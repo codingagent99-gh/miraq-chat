@@ -102,6 +102,7 @@ class TenantRegistry:
         """
         from tenant_snapshot_store import snapshot_store, apply_snapshot_to_loader, loader_to_snapshot_dict
         _wp_base = (tenant_row.wp_base_url or "").rstrip("/")
+        logger.info(f"TenantRegistry: _rehydrate started | tenant={tenant_row.license_id} wp_base={_wp_base}")
 
         config = TenantConfig(
             wp_base_url=_wp_base,
@@ -113,21 +114,22 @@ class TenantRegistry:
             ecommerce_backend="woocommerce",
         )
         loader = StoreLoader(config=config, vector_model=self._vector_model, app=self._app)
-
+        logger.info(f"TenantRegistry: checking snapshot | tenant={tenant_row.license_id}")
         snapshot = snapshot_store.load(tenant_row.license_id)
+        logger.info(f"TenantRegistry: snapshot={'found' if snapshot else 'not found'} | tenant={tenant_row.license_id}")
+
         if snapshot is not None:
             logger.info(f"TenantRegistry: rehydrating tenant={tenant_row.license_id} from snapshot")
             apply_snapshot_to_loader(loader, snapshot)
         else:
-            logger.warning(
-                f"TenantRegistry: no snapshot for tenant={tenant_row.license_id} — live load fallback"
-            )
+            logger.info(f"TenantRegistry: starting live load | tenant={tenant_row.license_id}")
             loader.load_all()
+            logger.info(f"TenantRegistry: live load complete | tenant={tenant_row.license_id} degraded={loader._degraded}")
             if not loader._degraded:
                 snapshot_store.save(tenant_row.license_id, loader_to_snapshot_dict(loader))
                 logger.info(f"TenantRegistry: snapshot persisted after build | tenant={tenant_row.license_id}")
 
-        loader.start_background_refresh()  # token mgr only; catalog via scheduler
+        loader.start_background_refresh()
         return loader
     
     def get_build_lock(self, license_id: str) -> threading.Lock:
