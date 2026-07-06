@@ -140,14 +140,16 @@ class TenantRegistry:
         return self._build_lock_for(license_id)
     
     def evict(self, license_id: str) -> None:
-        """
-        Remove a tenant's loader from the LRU immediately.
-        Called during teardown before the physical database is dropped.
-        Acquires the build lock so an in-progress rehydration finishes
-        or is prevented from starting before eviction completes.
-        """
+        # Try to acquire the build lock with a short timeout so deactivation
+        # isn't blocked by an in-progress build thread. If we can't acquire it
+        # in time, evict anyway — the build thread will finish and find the
+        # tenant archived, then exit cleanly.
         build_lock = self._build_lock_for(license_id)
-        with build_lock:
+        acquired = build_lock.acquire(timeout=2)
+        try:
             with self._registry_lock:
                 self._loaders.pop(license_id, None)
-            logger.info(f"TenantRegistry: evicted | tenant={license_id}")
+            logger.info(f"TenantRegistry: evicted | tenant={license_id} | lock_acquired={acquired}")
+        finally:
+            if acquired:
+                build_lock.release()
