@@ -9,6 +9,7 @@ import time
 from typing import List, Dict, Optional, Tuple
 
 import requests
+from requests.auth import HTTPBasicAuth
 
 from chat_logger import get_logger
 from store_loader.config import (
@@ -151,16 +152,12 @@ def fetch_all_pages(session, url: str, consumer_key: str, consumer_secret: str,
                     extra_params: Dict = None, timeout: int = 30,
                     max_retries: int = 3) -> List[Dict]:
     """Fetch all pages from a paginated WooCommerce REST endpoint."""
+    auth      = HTTPBasicAuth(consumer_key, consumer_secret)
     all_items = []
     page      = 1
 
     while True:
-        params = {
-            "per_page": 100,
-            "page": page,
-            "consumer_key": consumer_key,
-            "consumer_secret": consumer_secret,
-        }
+        params = {"per_page": 100, "page": page}
         if extra_params:
             params.update(extra_params)
 
@@ -168,7 +165,7 @@ def fetch_all_pages(session, url: str, consumer_key: str, consumer_secret: str,
         resp = None
         for attempt in range(max_retries):
             try:
-                resp = session.get(url, headers=_API_HEADERS,
+                resp = session.get(url, auth=auth, headers=_API_HEADERS,
                                    params=params, timeout=timeout)
                 if page == 1:
                     logger.debug(f"RAW RESPONSE [{resp.status_code}]: {resp.text[:500]}")
@@ -198,17 +195,13 @@ def fetch_all_pages_with_total(session, url: str, consumer_key: str, consumer_se
                                extra_params: Dict = None, timeout: int = 30,
                                max_retries: int = 3) -> Tuple[List[Dict], Optional[int]]:
     """Fetch all pages and return (items, expected_total)."""
+    auth           = HTTPBasicAuth(consumer_key, consumer_secret)
     all_items      = []
     page           = 1
     expected_total = None
 
     while True:
-        params = {
-            "per_page": 100,
-            "page": page,
-            "consumer_key": consumer_key,
-            "consumer_secret": consumer_secret,
-        }
+        params = {"per_page": 100, "page": page}
         if extra_params:
             params.update(extra_params)
 
@@ -216,7 +209,7 @@ def fetch_all_pages_with_total(session, url: str, consumer_key: str, consumer_se
         resp = None
         for attempt in range(max_retries):
             try:
-                resp = session.get(url, headers=_API_HEADERS,
+                resp = session.get(url, auth=auth, headers=_API_HEADERS,
                                    params=params, timeout=timeout)
                 resp.raise_for_status()
                 data = resp.json()
@@ -253,9 +246,9 @@ def fetch_currency_symbol(session, base_url: str, consumer_key: str,
     """Fetch the active currency symbol from WooCommerce."""
     logger.info("StoreLoader: Fetching store currency...")
     try:
-        url    = f"{base_url}/data/currencies/current"
-        params = {"consumer_key": consumer_key, "consumer_secret": consumer_secret}
-        resp   = session.get(url, headers=_API_HEADERS, params=params, timeout=timeout)
+        url  = f"{base_url}/data/currencies/current"
+        auth = HTTPBasicAuth(consumer_key, consumer_secret)
+        resp = session.get(url, auth=auth, headers=_API_HEADERS, timeout=timeout)
         resp.raise_for_status()
         data   = resp.json()
         symbol = data.get("symbol")
@@ -281,7 +274,7 @@ def load_from_live_api(session, base_url: str, custom_api_base: str,
         session, base_url, consumer_key, consumer_secret, timeout
     )
 
-    # Attributes — custom endpoint, auth via X-Consumer-Key/X-Consumer-Secret headers
+    # Attributes — custom endpoint, auth via HTTPBasicAuth
     custom_attr_url = f"{custom_api_base}/all-attributes"
     logger.info(f"StoreLoader: Fetching attributes from {custom_attr_url}")
     try:
