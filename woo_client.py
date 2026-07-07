@@ -15,7 +15,7 @@ api_logger = get_api_logger()
 # Minimal headers that pass WordPress.com Atomic's bot detection.
 # Full BROWSER_HEADERS with query-string credentials triggered 429s.
 _BASE_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept":     "application/json",
 }
 # _WC_AUTH and _CUSTOM_API_HEADERS are now built per-call inside execute()
