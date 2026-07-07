@@ -121,6 +121,20 @@ def register_before_request(app) -> None:
                 "metadata": {},
             }), 503
 
+        if tenant.status == "provision_failed":
+            # Allow through with whatever loader is available — the tenant DB
+            # exists and chat history/messages work. Catalog may be empty but
+            # that's better than a hard 403.
+            logger.warning(f"Tenant provision_failed — allowing through degraded | license_id={license_id!r}")
+            g.tenant = tenant
+            g.tenant_features = dict(tenant.features or {})
+            try:
+                g.store_loader = _tenant_registry.get_loader(tenant)
+            except Exception:
+                g.store_loader = None
+            g.db_engine = _engine_registry.get_engine(tenant.db_name)
+            return None
+
         if not tenant.is_active:
             logger.warning(f"Inactive tenant={license_id!r} ({tenant.status}) → 403")
             return jsonify({"success": False, "error": "tenant inactive",
