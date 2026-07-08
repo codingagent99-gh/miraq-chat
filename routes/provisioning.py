@@ -174,6 +174,7 @@ def provision_tenant():
         if tenant.status == "archived":
             tenant.archived_at = None
         tenant.status = "active"
+        tenant.build_attempts = 0
 
     tenant.site_domain  = site_domain or tenant.site_domain
     tenant.wp_base_url  = wp_base_url or tenant.wp_base_url
@@ -294,6 +295,7 @@ def _start_background_build(license_id: str, app):
                         exc_info=True
                     )
                     tenant.status = "provision_failed"
+                    tenant.build_attempts = (tenant.build_attempts or 0) + 1
                     tenant.last_build_error = str(e)
 
                 logger.info(f"_start_background_build: committing status={tenant.status} | license_id={license_id}")

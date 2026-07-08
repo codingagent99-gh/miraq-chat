@@ -123,7 +123,7 @@ class Tenant(db.Model):
     
     last_build_error = db.Column(db.Text, nullable=True)
     schema_migrated_at = db.Column(db.DateTime(timezone=True), nullable=True)
-
+    build_attempts = db.Column(db.Integer, nullable=False, default=0)
     created_at = db.Column(
         db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

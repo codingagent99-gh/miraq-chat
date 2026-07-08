@@ -25,6 +25,8 @@ _API_HEADERS = {
     "Accept":     "application/json",
 }
 
+_PERMANENT_ERROR_CODES = {401, 403, 404, 410}
+
 def _custom_api_headers(consumer_key: str, consumer_secret: str) -> dict:
     """
     Headers for the custom-api/v1/* endpoints.
@@ -172,6 +174,10 @@ def fetch_all_pages(session, url: str, consumer_key: str, consumer_secret: str,
                                    params=params, timeout=timeout)
                 if page == 1:
                     logger.debug(f"RAW RESPONSE [{resp.status_code}]: {resp.text[:500]}")
+                if resp is not None and resp.status_code in _PERMANENT_ERROR_CODES:
+                    logger.error(f"StoreLoader: Permanent {resp.status_code} on {url} — aborting, no retry")
+                    globals().setdefault("_last_permanent_error", None)
+                    return all_items
                 resp.raise_for_status()
                 data = resp.json()
                 break

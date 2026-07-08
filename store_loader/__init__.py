@@ -167,6 +167,8 @@ class StoreLoader(StoreQueryMixin):
         self._last_loaded: Optional[float] = None
         self._refresh_interval: int = 6 * 3600
         self._retry_interval: int = 2 * 60
+        self._consecutive_failures: int = 0
+        self._max_retry_interval: int = 4 * 3600
         self._refresh_thread: Optional[threading.Thread] = None
         self._degraded: bool = False
         self._degraded_reasons: list = []
@@ -301,8 +303,13 @@ class StoreLoader(StoreQueryMixin):
             return False
         if self._last_loaded is None:
             return True  # never successfully loaded — try as soon as scheduled
-        interval = self._retry_interval if self._degraded else self._refresh_interval
-        return (time.time() - self._last_loaded) >= interval
+        if self._degraded:
+            backoff = min(
+                self._retry_interval * (2 ** self._consecutive_failures),
+                self._max_retry_interval
+            )
+            return (time.time() - self._last_loaded) >= backoff
+        return (time.time() - self._last_loaded) >= self._refresh_interval
 
     def start_background_refresh(self):
         """
@@ -360,9 +367,14 @@ class StoreLoader(StoreQueryMixin):
                 )
         if len(self.category_keywords) == 0:
             reasons.append("0 category keywords generated")
-
+        
         self._degraded = len(reasons) > 0
         self._degraded_reasons = reasons
+
+        if self._degraded:
+            self._consecutive_failures += 1
+        else:
+            self._consecutive_failures = 0
 
     def _log_load_summary(self):
         if self._config.ecommerce_backend == "shopify":
