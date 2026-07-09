@@ -287,7 +287,9 @@ def load_from_live_api(session, base_url: str, custom_api_base: str,
         session, base_url, consumer_key, consumer_secret, timeout
     )
 
-    # Attributes — custom endpoint, auth via X-Consumer-Key/X-Consumer-Secret headers
+    # Attributes — custom endpoint, auth via X-Consumer-Key/X-Consumer-Secret headers.
+    # Falls back to WooCommerce core API if the custom endpoint 404s (e.g. the
+    # MiraQ plugin isn't installed/activated on this tenant's store).
     custom_attr_url = f"{custom_api_base}/all-attributes"
     logger.info(f"StoreLoader: Fetching attributes from {custom_attr_url}")
     try:
@@ -298,15 +300,24 @@ def load_from_live_api(session, base_url: str, custom_api_base: str,
         )
         resp.raise_for_status()
         all_attributes_raw = resp.json()
-        attribute_terms = {
-            int(attr["attribute_id"]): attr.get("terms", [])
-            for attr in all_attributes_raw
-            if attr.get("attribute_id")
-        }
     except Exception as e:
-        logger.error(f"StoreLoader: Failed to fetch attributes: {e}")
-        all_attributes_raw = []
-        attribute_terms    = {}
+        logger.warning(
+            f"StoreLoader: custom attributes endpoint failed ({e}) — "
+            f"plugin may not be installed. Falling back to WooCommerce core API."
+        )
+        try:
+            all_attributes_raw = fetch_attributes_via_core_api(
+                session, base_url, consumer_key, consumer_secret, timeout
+            )
+        except Exception as e2:
+            logger.error(f"StoreLoader: core API attribute fallback also failed: {e2}")
+            all_attributes_raw = []
+
+    attribute_terms = {
+        int(attr["attribute_id"]): attr.get("terms", [])
+        for attr in all_attributes_raw
+        if attr.get("attribute_id")
+    }
 
     # Categories
     logger.info("StoreLoader: Fetching categories...")
@@ -338,3 +349,38 @@ def load_from_live_api(session, base_url: str, custom_api_base: str,
         "currency_symbol":    currency_symbol,
         "expected_product_count": expected_product_count,
     }
+
+def fetch_attributes_via_core_api(session, base_url: str, consumer_key: str,
+                                  consumer_secret: str, timeout: int = 30) -> List[Dict]:
+    """
+    Fallback attribute fetch using ONLY WooCommerce core REST endpoints —
+    /products/attributes and /products/attributes/{id}/terms.
+    Used when the custom-api/v1/all-attributes route (plugin-provided) is
+    unavailable, e.g. a store that hasn't had the MiraQ plugin installed.
+    Builds the same shape load_from_live_api() expects: a list of dicts
+    with attribute_id + terms.
+    """
+    logger.info("StoreLoader: Fetching attributes via WooCommerce core API (fallback)")
+    attrs = fetch_all_pages(
+        session, f"{base_url}/products/attributes",
+        consumer_key, consumer_secret, timeout=timeout,
+    )
+
+    all_attributes_raw = []
+    for attr in attrs:
+        attr_id = attr.get("id")
+        if not attr_id:
+            continue
+        terms = fetch_all_pages(
+            session, f"{base_url}/products/attributes/{attr_id}/terms",
+            consumer_key, consumer_secret, timeout=timeout,
+        )
+        all_attributes_raw.append({
+            "attribute_id": attr_id,
+            "name": attr.get("name"),
+            "slug": attr.get("slug"),
+            "terms": terms,
+        })
+
+    logger.info(f"StoreLoader: fetched {len(all_attributes_raw)} attributes via core API fallback")
+    return all_attributes_raw

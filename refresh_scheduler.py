@@ -70,7 +70,8 @@ class RefreshScheduler:
                     Tenant.status.in_(["warming", "provision_failed"]),
                     Tenant.schema_migrated_at.isnot(None),
                     Tenant.archived_at.is_(None),
-                    Tenant.created_at < datetime.now(timezone.utc) - timedelta(minutes=10)
+                    Tenant.build_attempts < 5,   # give up after 5 tries; stop matching this sweep
+                    Tenant.created_at < datetime.now(timezone.utc) - timedelta(minutes=60)
                 ).all()
 
                 for tenant in stuck:
