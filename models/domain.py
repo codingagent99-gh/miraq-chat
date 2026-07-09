@@ -163,7 +163,7 @@ class ExtractedEntities:
 
     # ──── Tags ────
     tag_slugs: List[str] = field(default_factory=list)
-    tag_ids: List[int] = field(default_factory=list)
+    tag_ids: List[int] = field(default_factory=list, metadata={"llm_exclude": "redundant"})  # duplicates tag_slugs
     # "AND" → product must have ALL tags (default).
     # "OR"  → product must have AT LEAST ONE tag.
     tag_operator: str = "AND"
@@ -176,7 +176,7 @@ class ExtractedEntities:
 
     # ──── Attribute term resolution ────
     attribute_slug: Optional[str] = None
-    attribute_term_ids: List[int] = field(default_factory=list)
+    attribute_term_ids: List[int] = field(default_factory=list, metadata={"llm_exclude": "redundant"})  # duplicates attributes
 
     # ──── Filters ────
     on_sale: Optional[bool] = None
@@ -215,16 +215,17 @@ class ExtractedEntities:
     attr_tag_or_pairs: List[dict] = field(default_factory=list)
 
     # ──── Customer update fields ────
-    customer_updates: Dict[str, str] = field(default_factory=dict)
-    billing_updates: Dict[str, str] = field(default_factory=dict)
-    shipping_updates: Dict[str, str] = field(default_factory=dict)
+    customer_updates: Dict[str, str] = field(default_factory=dict, metadata={"llm_exclude": "pii"})
+    billing_updates: Dict[str, str] = field(default_factory=dict, metadata={"llm_exclude": "pii"})
+    shipping_updates: Dict[str, str] = field(default_factory=dict, metadata={"llm_exclude": "pii"})
     customer_fields_requested: List[str] = field(default_factory=list)
 
     # ──── Logical Chunking ────
-    logical_chunks: List[dict] = field(default_factory=list)
+    logical_chunks: List[dict] = field(default_factory=list, metadata={"llm_exclude": "internal"})  # NLP-internal, no user-facing meaning
+
 
     # ──── Semantic Resolution ────
-    semantic_matches: List = field(default_factory=list)
+    semantic_matches: List = field(default_factory=list, metadata={"llm_exclude": "internal"})  # embedding-internal, no user-facing meaning
 
     # ──── Search hints (unresolvable descriptors like "premium", "rustic") ────
     search_hints: List[str] = field(default_factory=list)
