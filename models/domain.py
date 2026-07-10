@@ -234,6 +234,16 @@ class ExtractedEntities:
     cart_items: List[dict] = field(default_factory=list)
     # Populated by chat.py before build_api_calls is called for CHECKOUT.
     # Each item: {product_id, variation_id, qty, name}
+    
+    # ──── Semantic auto-materialize marker ────
+    # Set to True only by _auto_materialize() (catalog_parser.py) when a
+    # semantic-match candidate scored >= AUTO_APPLY_THRESHOLD and was
+    # written directly into attributes/tags/categories THIS turn. Used by
+    # _merge_phase_entities (chat.py) to safely upgrade an UNKNOWN intent
+    # without risking a false positive from carryover state — this field
+    # is never set by any carryover-restoration path, only by a fresh
+    # same-turn semantic resolution.
+    semantic_auto_applied: bool = field(default=False, metadata={"llm_exclude": "internal"})
 
     # ──── Helper methods ────
 

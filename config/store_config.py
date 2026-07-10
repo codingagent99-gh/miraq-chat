@@ -336,3 +336,14 @@ def _load_generic_word_synonyms() -> dict:
     return dict(_DEFAULT_GENERIC_WORD_SYNONYMS)
 
 GENERIC_WORD_SYNONYMS: dict = _load_generic_word_synonyms()
+
+# Known misspellings that embed closer to an unrelated catalog term than to
+# the concept the user actually meant (e.g. "quick chip" lands nearer the
+# chip-card cluster than "quick ship", because "chip" as a literal token
+# dominates the phrase embedding). This is a deliberately narrow, explicit
+# list — only add entries backed by real observed confusion, not
+# speculative typos. Keys are lowercase substrings, matched before the
+# phrase reaches vector search.
+KNOWN_QUERY_TYPO_CORRECTIONS = {
+    "quick chip": "quick ship",
+}

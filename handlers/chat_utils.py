@@ -4,7 +4,8 @@ handlers/chat_utils.py — Shared helper functions used across chat handlers.
 
 import re
 
-from flask import jsonify
+import uuid
+from flask import jsonify, request
 from app_config import DEFAULT_PER_PAGE, get_currency_symbol
 from models import WooAPICall
 from woo_client import woo_client
@@ -363,7 +364,6 @@ def format_order_for_frontend(order: dict) -> dict:
 def build_out_of_stock_response(product_name: str, product_raw: dict, intent, session_id: str, page: int, start_time: float):
     """Generates a standardized 'Out of Stock' Flask response to kill an ordering flow."""
     import time
-    from flask import jsonify
     from conversation_flow import FlowState
     from formatters import format_product
     
@@ -489,6 +489,17 @@ def _compute_variant_options(
             result[axis] = cleaned
 
     return result
+
+
+def resolve_session_id():
+    """Resolves the chat session ID from X-MiraQ-Session header or generates a new one."""
+    miraq_session = request.headers.get("X-MiraQ-Session")
+    if miraq_session:
+        try:
+            return uuid.UUID(miraq_session)
+        except ValueError:
+            logger.warning(f"Invalid X-MiraQ-Session format received: {miraq_session}")
+    return uuid.uuid4()
 
 def build_variant_prompt(
     parent_raw: dict,

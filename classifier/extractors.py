@@ -661,34 +661,43 @@ def extract_stock_status(text: str, entities: ExtractedEntities):
         entities.on_sale = True
 
 
+# Shared with catalog_parser._mask_resolved_entities, so semantic search
+# doesn't re-litigate a price phrase this extractor already resolved
+# (e.g. "priced" scoring 0.6368 against "Sale" in isolation, once a
+# leftover price phrase reached vector search unmasked).
+_PRICE_RANGE_PATTERNS = [
+    r'between\s+\$?(\d+(?:\.\d+)?)\s+(?:and|to|-)\s+\$?(\d+(?:\.\d+)?)',
+    r'\$(\d+(?:\.\d+)?)\s+to\s+\$?(\d+(?:\.\d+)?)',
+    r'\$(\d+(?:\.\d+)?)\s*[-–]\s*\$?(\d+(?:\.\d+)?)',
+]
+_PRICE_MAX_PATTERNS = [
+    r'(?:under|below|less\s+than|cheaper\s+than|max(?:imum)?|at\s+most|up\s+to)\s+\$?(\d+(?:\.\d+)?)',
+    r'\$(\d+(?:\.\d+)?)\s+(?:or\s+)?(?:less|under|below)',
+]
+_PRICE_MIN_PATTERNS = [
+    r'(?:over|above|more\s+than|at\s+least|min(?:imum)?)\s+\$?(\d+(?:\.\d+)?)',
+    r'\$(\d+(?:\.\d+)?)\s+(?:or\s+)?(?:more|above|over)',
+]
+ALL_PRICE_PATTERNS = _PRICE_RANGE_PATTERNS + _PRICE_MAX_PATTERNS + _PRICE_MIN_PATTERNS
+
+
 def extract_price_range(text: str, entities: ExtractedEntities):
     """Extract min/max price filters."""
-    for pattern in [
-        r'between\s+\$?(\d+(?:\.\d+)?)\s+(?:and|to|-)\s+\$?(\d+(?:\.\d+)?)',
-        r'\$(\d+(?:\.\d+)?)\s+to\s+\$?(\d+(?:\.\d+)?)',
-        r'\$(\d+(?:\.\d+)?)\s*[-–]\s*\$?(\d+(?:\.\d+)?)',
-    ]:
+    for pattern in _PRICE_RANGE_PATTERNS:
         m = re.search(pattern, text)
         if m:
             entities.min_price, entities.max_price = float(m.group(1)), float(m.group(2))
             return
-    for pattern in [
-        r'(?:under|below|less\s+than|cheaper\s+than|max(?:imum)?|at\s+most|up\s+to)\s+\$?(\d+(?:\.\d+)?)',
-        r'\$(\d+(?:\.\d+)?)\s+(?:or\s+)?(?:less|under|below)',
-    ]:
+    for pattern in _PRICE_MAX_PATTERNS:
         m = re.search(pattern, text)
         if m:
             entities.max_price = float(m.group(1))
             return
-    for pattern in [
-        r'(?:over|above|more\s+than|at\s+least|min(?:imum)?)\s+\$?(\d+(?:\.\d+)?)',
-        r'\$(\d+(?:\.\d+)?)\s+(?:or\s+)?(?:more|above|over)',
-    ]:
+    for pattern in _PRICE_MIN_PATTERNS:
         m = re.search(pattern, text)
         if m:
             entities.min_price = float(m.group(1))
             return
-
 
 def extract_order_item(text: str, entities: ExtractedEntities):
     """Extract the product name from an order intent."""

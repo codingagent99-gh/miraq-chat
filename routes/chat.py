@@ -14,6 +14,7 @@ from sqlalchemy.orm.attributes import flag_modified
 import re
 from classifier.consolidation import _resolve_tag_attribute_overlap
 import json
+from handlers.chat_utils import resolve_session_id
 from classifier.utils import normalize_for_tag_compare
 from config.store_config import ATTRIBUTE_DISAMBIGUATION_GROUPS
 from models import ExtractedEntities, ClassifiedResult, WooAPICall
@@ -269,6 +270,13 @@ def _merge_phase_entities(result):
         logger.debug(
             f"[EntityMerge] Upgraded intent {_old_intent} → {intent} from phase-1"
         )
+    
+    if intent == Intent.UNKNOWN and entities.semantic_auto_applied:
+        _old_intent = intent
+        intent = Intent.FILTER_BY_ATTRIBUTE
+        confidence = max(confidence, 0.9)
+        result.intent = intent
+        logger.debug(f"[EntityMerge] Upgraded intent {_old_intent} → {intent} — fresh semantic auto-materialize this turn")
 
     return intent, entities, confidence
 
@@ -505,16 +513,6 @@ def _maybe_attach_address_proposal(
 # ══════════════════════════════════════════════════════════════
 # ─── DATABASE SESSION HELPERS ───
 # ══════════════════════════════════════════════════════════════
-
-def resolve_session_id():
-    """Resolves the chat session ID from X-MiraQ-Session header or generates a new one."""
-    miraq_session = request.headers.get("X-MiraQ-Session")
-    if miraq_session:
-        try:
-            return uuid.UUID(miraq_session)
-        except ValueError:
-            logger.warning(f"Invalid X-MiraQ-Session format received: {miraq_session}")
-    return uuid.uuid4()
 
 
 def _finalize_turn(
@@ -1699,16 +1697,17 @@ def chat():
                 and len(_sem_groups[0]) == 1
                 and _sem_groups[0][0].get("score", 0) >= SEMANTIC_AUTO_APPLY_THRESHOLD
             ):
+                _pre_clear_count = len(entities.semantic_matches)
                 _m = _sem_groups[0][0]
                 apply_semantic_match(entities, _m)
                 entities.semantic_matches = []
-                entities.search_term = None  # discard noise leftover (e.g. "filter")
+                entities.search_term = None
                 _auto_applied = True
                 logger.info(
                     f"[SemanticAutoApply] score={_m.get('score', 0):.4f} >= {SEMANTIC_AUTO_APPLY_THRESHOLD}"
-                    f" | applied {_m['type']}:{_m['suggested_name']}"
+                    f" | applied {_m['type']}:{_m['suggested_name']} (slug={_m.get('slug')}, taxonomy={_m.get('taxonomy')})"
+                    f" | raw_semantic_matches_count={_pre_clear_count} before filtering"
                 )
-                _resolve_tag_attribute_overlap(entities)
 
 
             if not _auto_applied:
