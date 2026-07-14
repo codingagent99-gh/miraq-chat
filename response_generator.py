@@ -647,7 +647,7 @@ def generate_bot_message(
         else:
             msg += f"Here are **{count}** products for {search_context}! 📂\n\n"
             
-    elif intent in (Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_SEARCH, Intent.PRODUCT_BY_TAG, Intent.PRODUCT_BY_COLLECTION):
+    elif intent in (Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_SEARCH, Intent.PRODUCT_BY_TAG, Intent.PRODUCT_BY_COLLECTION, Intent.PRODUCT_QUICK_SHIP):
         if search_context:
             _qualifier = " in total" if or_pair_breakdown else ""
             msg += f"Found **{count}** products{_qualifier} for {search_context}! ✨\n\n"

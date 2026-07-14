@@ -435,9 +435,16 @@ def _common_exclusion_kwargs(e) -> dict:
     )
     
 def _build_product_list(e, page) -> list:
+    attr_filters = resolve_attr_filters(e.attributes)
     return [build_advanced_filter_call(
         product_id=e.product_id,
         search_term=e.product_name if not e.product_id else None,
+        categories=list(getattr(e, "target_category_slugs", set())) or None,
+        category_groups=[list(g) for g in getattr(e, "category_groups", [])] or None,
+        tags=list(getattr(e, "tag_slugs", [])) or None,
+        attributes=attr_filters or None,
+        or_pairs=list(getattr(e, "attr_tag_or_pairs", [])) or None,
+        min_price=e.min_price, max_price=e.max_price,
         page=page, in_stock=e.in_stock,
         description=f"List products (Product ID: {e.product_id}, Name: {e.product_name})",
     )]
