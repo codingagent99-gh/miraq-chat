@@ -12,6 +12,7 @@ from models.db_models import (
     Conversation,
     Message,
     Tenant,
+    CatalogSnapshot,
 )
 
 # ── Domain models ──

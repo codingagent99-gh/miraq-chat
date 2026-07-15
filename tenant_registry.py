@@ -132,6 +132,7 @@ class TenantRegistry:
             woo_key=tenant_row.woo_key or "",
             woo_secret=decrypt_secret(tenant_row.woo_secret_encrypted or ""),
             ecommerce_backend="woocommerce",
+            license_id=tenant_row.license_id,
         )
 
         logger.info(f"TenantRegistry: woo_key={'present' if config.woo_key else 'MISSING'} | tenant={tenant_row.license_id}")
@@ -171,6 +172,69 @@ class TenantRegistry:
         loader.start_background_refresh()
         logger.info(f"TenantRegistry: _rehydrate complete | tenant={tenant_row.license_id}")
         return loader
+
+    # ── catalog-push handling ────────────────────────────────────────────────
+
+    def apply_pushed_catalog(self, tenant_row, data: dict) -> None:
+        """
+        Applies a full catalog PUSHED by the WordPress plugin (see
+        class-catalog-push.php) for a tenant. Used instead of a live pull
+        because this host's WAF blocks backend-initiated requests to
+        WooCommerce's REST API — the plugin gathers the data itself and
+        sends it here, so nothing in this method makes a network call.
+
+        If the tenant's loader is already resident, updates it in place.
+        Otherwise builds a fresh loader from the pushed data alone (no
+        network call — unlike _rehydrate()'s no-snapshot fallback, which
+        calls load_all() and would hit the same WAF block) and adds it to
+        the resident cache, so the next chat request for this tenant
+        doesn't have to wait on anything.
+
+        Either way, persists a snapshot afterward so an LRU-evicted loader
+        rehydrates from this data next time instead of attempting (and
+        failing) a live pull.
+        """
+        license_id = tenant_row.license_id
+
+        with self._registry_lock:
+            loader = self._loaders.get(license_id)
+            if loader is not None:
+                self._loaders.move_to_end(license_id)
+
+        if loader is None:
+            _wp_base = (tenant_row.wp_base_url or "").rstrip("/")
+            config = TenantConfig(
+                wp_base_url=_wp_base,
+                woo_base_url=f"{_wp_base}/wp-json/wc/v3",
+                woo_store_api_url=f"{_wp_base}/wp-json/wc/store/v1",
+                custom_api_base_url=f"{_wp_base}/wp-json/custom-api/v1",
+                woo_key=tenant_row.woo_key or "",
+                woo_secret=decrypt_secret(tenant_row.woo_secret_encrypted or ""),
+                ecommerce_backend="woocommerce",
+                license_id=tenant_row.license_id,
+            )
+            loader = StoreLoader(config=config, vector_model=self._vector_model, app=self._app)
+            logger.info(f"TenantRegistry: built fresh loader from pushed catalog | tenant={license_id}")
+
+        loader.apply_pushed_catalog(data)
+
+        if loader._degraded:
+            logger.warning(
+                f"TenantRegistry: pushed catalog left loader degraded — not added to cache | "
+                f"tenant={license_id} | reasons={loader._degraded_reasons}"
+            )
+            return
+
+        with self._registry_lock:
+            self._loaders[license_id] = loader
+            self._loaders.move_to_end(license_id)
+            while len(self._loaders) > _MAX_RESIDENT_LOADERS:
+                old_id, _old = self._loaders.popitem(last=False)
+                logger.info(f"TenantRegistry: evicted resident loader | tenant={old_id}")
+
+        from tenant_snapshot_store import snapshot_store, loader_to_snapshot_dict
+        snapshot_store.save(license_id, loader_to_snapshot_dict(loader))
+        logger.info(f"TenantRegistry: catalog push applied, snapshot saved | tenant={license_id}")
 
     def get_build_lock(self, license_id: str) -> threading.Lock:
         return self._build_lock_for(license_id)

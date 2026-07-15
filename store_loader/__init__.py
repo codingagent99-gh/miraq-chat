@@ -25,6 +25,7 @@ from store_loader.cache import BoundedVariationCache
 from store_loader.fetcher import (
     load_from_local_files,
     load_from_live_api,
+    load_from_backend_db,
     save_to_local_files,
     dump_lookups_for_debugging,
 )
@@ -96,7 +97,7 @@ class StoreLoader(StoreQueryMixin):
         """
         self._config      = config
         self._flask_app   = app
-
+        self.license_id       = config.license_id
         self.base             = config.woo_base_url
         self.custom_api_base  = config.custom_api_base_url
         self.consumer_key     = config.woo_key
@@ -202,6 +203,8 @@ class StoreLoader(StoreQueryMixin):
             return
 
         try:
+            loaded_via_push = False
+
             # ── Fetch raw data ────────────────────────────────────────
             if self._config.ecommerce_backend == "shopify":
                 from store_loader.shopify_fetcher import load_from_shopify
@@ -226,29 +229,43 @@ class StoreLoader(StoreQueryMixin):
                             logger.info(f"StoreLoader: 📁 Cache folder confirmed at '{DATA_DIR}' | files={files}")
                         else:
                             logger.error(f"StoreLoader: ❌ Cache folder NOT found at '{DATA_DIR}' after save")
-            elif DEV_CACHE_ENABLED:
-                data = load_from_local_files()
-                self._loaded_from_cache = True
             else:
-                data = load_from_live_api(
-                    self.session, self.base, self.custom_api_base,
-                    self.consumer_key, self.consumer_secret, self.timeout,
-                )
-                self._loaded_from_cache = False
+                # Pushed data (Postgres, from the WordPress plugin) takes
+                # priority over dev-cache/live-pull when present. A DB
+                # error here (missing app context, connection hiccup) must
+                # NOT fail the whole load — it just means "no push
+                # available," same as a genuinely empty table — so the
+                # lookup is wrapped and any exception falls through.
+                pushed = self._try_load_from_backend_db()
 
-                if UPDATE_DEV_CACHE_ENABLED:
-                    if data["products"] and data["categories"]:
-                        save_to_local_files(
-                            data["categories"], data["tags"],
-                            data["all_attributes_raw"], data["products"],
-                        )
-                        logger.info("StoreLoader: ✅ Dev cache files updated from live API")
-                    else:
-                        logger.warning(
-                            f"StoreLoader: ⚠️  Skipping dev cache update — fetch returned "
-                            f"{len(data['products'])} products / {len(data['categories'])} categories. "
-                            "Existing cache files preserved."
-                        )
+                if pushed is not None:
+                    data = pushed
+                    self._loaded_from_cache = False
+                    loaded_via_push = True
+                    logger.info(f"StoreLoader: 📥 Loaded catalog from plugin push | tenant={self.license_id}")
+                elif DEV_CACHE_ENABLED:
+                    data = load_from_local_files()
+                    self._loaded_from_cache = True
+                else:
+                    data = load_from_live_api(
+                        self.session, self.base, self.custom_api_base,
+                        self.consumer_key, self.consumer_secret, self.timeout,
+                    )
+                    self._loaded_from_cache = False
+
+                    if UPDATE_DEV_CACHE_ENABLED:
+                        if data["products"] and data["categories"]:
+                            save_to_local_files(
+                                data["categories"], data["tags"],
+                                data["all_attributes_raw"], data["products"],
+                            )
+                            logger.info("StoreLoader: ✅ Dev cache files updated from live API")
+                        else:
+                            logger.warning(
+                                f"StoreLoader: ⚠️  Skipping dev cache update — fetch returned "
+                                f"{len(data['products'])} products / {len(data['categories'])} categories. "
+                                "Existing cache files preserved."
+                            )
 
             # ── Apply fetched data ────────────────────────────────────
             self.categories         = data["categories"]
@@ -256,7 +273,15 @@ class StoreLoader(StoreQueryMixin):
             self.products           = data["products"]
             self.all_attributes_raw = data["all_attributes_raw"]
             self.currency_symbol    = data["currency_symbol"]
-            self._expected_product_count = data.get("expected_product_count")
+            # Pushed payloads have no X-WP-Total to compare against — not a
+            # paginated live fetch — so treat the pushed list as
+            # self-consistently authoritative rather than trusting an
+            # expected_product_count key the plugin never actually sends.
+            # Mirrors apply_pushed_catalog()'s identical reasoning below.
+            if loaded_via_push:
+                self._expected_product_count = len(data["products"])
+            else:
+                self._expected_product_count = data.get("expected_product_count")
 
             # ── Build indexes ─────────────────────────────────────────
             build_all_lookups(self)
@@ -289,6 +314,60 @@ class StoreLoader(StoreQueryMixin):
             self.load_all()
         except Exception as e:
             logger.error(f"Webhook sync failed: {e}", exc_info=True)
+
+    def apply_pushed_catalog(self, data: dict) -> None:
+        """
+        Applies a full catalog PUSHED by the WordPress plugin
+        (class-catalog-push.php), bypassing load_from_live_api() entirely.
+
+        Used because this host's WAF blocks backend-initiated requests to
+        WooCommerce's REST API — the plugin gathers the same data itself
+        (internal REST dispatch, never leaves the WP server) and pushes it
+        here instead of us pulling it.
+
+        `data` must have the same shape load_from_live_api() /
+        load_from_local_files() return: categories, tags, products,
+        all_attributes_raw, currency_symbol, and (optionally)
+        expected_product_count.
+        """
+        if not self._lock.acquire(blocking=False):
+            logger.warning("StoreLoader: apply_pushed_catalog() skipped — a load is already in progress.")
+            return
+
+        try:
+            self.categories         = data["categories"]
+            self.tags               = data["tags"]
+            self.products           = data["products"]
+            self.all_attributes_raw = data["all_attributes_raw"]
+            self.currency_symbol    = data.get("currency_symbol", self.currency_symbol)
+            # No X-WP-Total header to compare against here (this isn't a
+            # paginated live fetch) — the pushed product list IS the total,
+            # so treat it as 100% to avoid a false "partial products" flag
+            # in _validate_load().
+            self._expected_product_count = len(data["products"])
+            self._loaded_from_cache = False
+
+            build_all_lookups(self)
+            self._validate_load()
+            self._last_loaded = time.time()
+
+            if self.vector_model:
+                build_semantic_vectors(self)
+
+            if DEV_CACHE_ENABLED:
+                dump_lookups_for_debugging(self)
+
+            self._log_load_summary()
+
+        except Exception as e:
+            self._degraded = True
+            self._degraded_reasons = [str(e)]
+            logger.error(f"StoreLoader: failed to apply pushed catalog: {e}", exc_info=True)
+
+        finally:
+            self._lock.release()
+
+        threading.Thread(target=self._run_scanner_async, daemon=True).start()
 
     def due_for_refresh(self) -> bool:
         """
@@ -375,6 +454,24 @@ class StoreLoader(StoreQueryMixin):
             self._consecutive_failures += 1
         else:
             self._consecutive_failures = 0
+
+    def _try_load_from_backend_db(self) -> Optional[dict]:
+        """
+        Wraps load_from_backend_db() so a DB error (no app context, a
+        connection hiccup, etc.) degrades gracefully to dev-cache/live-pull
+        instead of failing load_all() outright. This path is a preference
+        over live pull, never a hard requirement — live pull must always
+        still work as the safety net.
+        """
+        try:
+            return load_from_backend_db(self.license_id)
+        except Exception as e:
+            logger.warning(
+                f"StoreLoader: load_from_backend_db() failed "
+                f"({type(e).__name__}: {e}) — falling back to dev-cache/live-pull "
+                f"| tenant={self.license_id}"
+            )
+            return None
 
     def _log_load_summary(self):
         if self._config.ecommerce_backend == "shopify":

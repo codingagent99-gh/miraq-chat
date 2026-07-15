@@ -289,6 +289,10 @@ def _start_background_build(license_id: str, app):
                     tenant.status = "active"
                     tenant.last_build_error = None
                     logger.info(f"_start_background_build: ✅ build complete | license_id={license_id}")
+                
+                    from widget_branding import fetch_and_store_widget_branding
+                    fetch_and_store_widget_branding(tenant)
+                
                 except Exception as e:
                     logger.error(
                         f"_start_background_build: build failed | license_id={license_id} | {e}",

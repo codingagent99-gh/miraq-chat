@@ -81,6 +81,27 @@ class RefreshScheduler:
         except Exception as e:
             logger.error(f"RefreshScheduler: stuck tenant sweep failed | {e}", exc_info=True)
 
+        # ── Widget branding refresh ─────────────────────────────────────────
+        # Runs every tick (5 min) but is_widget_branding_stale() gates actual
+        # fetches to once per 24h per tenant — this is what stops the 429s,
+        # replacing "fetch on every widget load" with "fetch once a day".
+        try:
+            with self._app.app_context():
+                from models import Tenant
+                from widget_branding import (
+                    fetch_and_store_widget_branding, is_widget_branding_stale,
+                )
+
+                active_tenants = Tenant.query.filter(
+                    Tenant.status == "active",
+                    Tenant.archived_at.is_(None),
+                ).all()
+                for tenant in active_tenants:
+                    if is_widget_branding_stale(tenant):
+                        fetch_and_store_widget_branding(tenant)
+        except Exception as e:
+            logger.error(f"RefreshScheduler: widget branding sweep failed | {e}", exc_info=True)
+
         # ── Normal catalog refresh ─────────────────────────────────────────────
         loaders = list(self._registry.resident_loaders())
         for license_id, loader in loaders:

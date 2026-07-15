@@ -32,6 +32,7 @@ from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from routes.sales_rep import sales_rep_bp
 from routes.provisioning import provisioning_bp
 from routes.deactivation import deactivation_bp
+from routes.catalog_push import catalog_push_bp
 
 # ═══════════════════════════════════════════
 # FLASK APP & DATABASE
@@ -64,8 +65,6 @@ register_before_request(app)
 database_uri = os.getenv('DATABASE_URL', 'postgresql://postgres:admin@localhost:5432/miraq_chat')
 app.config['SQLALCHEMY_DATABASE_URI'] = database_uri
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.register_blueprint(provisioning_bp)
-app.register_blueprint(deactivation_bp)
 
 def ensure_database_exists(db_uri):
     """
@@ -110,12 +109,14 @@ ensure_database_exists(database_uri)
 # Bind Database to App
 db.init_app(app)
 
-# Create Tables on Startup
+# Seed dynamic CORS origins on startup. Schema creation/updates are owned
+# entirely by Alembic (`flask db upgrade`) — do NOT call db.create_all()
+# here, since it races ahead of migrations on every CLI invocation
+# (including `flask db upgrade` itself, because Flask's CLI imports this
+# module to find `app` before running the migration command).
 with app.app_context():
-    from models.shopify_token import ShopifyToken  # noqa: F401
-    from models import Tenant                       # noqa: F401
-    db.create_all()
     _cors_manager.refresh_from_db()   # seed dynamic origins from existing tenants
+
 
 # Register blueprints
 app.register_blueprint(chat_bp)
@@ -123,6 +124,9 @@ app.register_blueprint(admin_bp)
 app.register_blueprint(products_bp)
 app.register_blueprint(shopify_bp)
 app.register_blueprint(sales_rep_bp)
+app.register_blueprint(provisioning_bp)
+app.register_blueprint(deactivation_bp)
+app.register_blueprint(catalog_push_bp)
 
 # ═══════════════════════════════════════════
 # GLOBAL ERROR HANDLER
@@ -288,30 +292,14 @@ def get_session(session_id):
 
 @app.route("/widget-config", methods=["GET"])
 def widget_config():
-    import requests as req
-    from app_config import BROWSER_HEADERS
-
-    logger = get_logger("miraq_chat")
     loader = get_store_loader()
-    target_url = f"{loader._config.wp_base_url}/wp-json/wdget-logo-uploader/v1/data"
-
-    try:
-        headers = {
-            **BROWSER_HEADERS,
-            "X-Consumer-Key":    loader.consumer_key,
-            "X-Consumer-Secret": loader.consumer_secret,
-        }
-        resp = req.get(target_url, headers=headers, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        return jsonify({
-            "image_url": data.get("image_url", ""),
-            "text":      data.get("text", ""),
-        })
-    except Exception as e:
-        logger.error(f"widget_config: Failed — {type(e).__name__}: {e}", exc_info=True)
+    tenant = getattr(loader, "tenant", None) if loader else None
+    if not tenant:
         return jsonify({"image_url": "", "text": ""}), 200
-
+    return jsonify({
+        "image_url": tenant.widget_logo_url or "",
+        "text":      tenant.widget_header_text or "",
+    })
 
 @app.route("/debug-plan")
 def debug_plan():

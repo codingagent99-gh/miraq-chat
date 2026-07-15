@@ -350,6 +350,68 @@ def load_from_live_api(session, base_url: str, custom_api_base: str,
         "expected_product_count": expected_product_count,
     }
 
+def load_from_backend_db(license_id: str) -> Optional[dict]:
+    """
+    Load the most recent pushed catalog for a tenant from CatalogSnapshot,
+    instead of a live WooCommerce pull. Used on hosts whose WAF blocks
+    backend-initiated requests (see TenantRegistry.apply_pushed_catalog).
+
+    Must be called inside a Flask request/app context (queries the DB via
+    the tenant-routed session — see models.db_models._TenantRoutingSession).
+    Actually reads from the MAIN miraq_chat DB, since CatalogSnapshot is a
+    control-plane table like Tenant, not per-tenant — this works because
+    _TenantRoutingSession only special-cases the bind when g.db_engine is
+    set for per-tenant models; CatalogSnapshot resolves to the default bind
+    regardless of tenant context.
+
+    Returns the same 7-key dict shape as load_from_local_files() /
+    load_from_live_api(), or None if no snapshot row exists yet for this
+    tenant (never raises for "no snapshot" — that's an expected state,
+    not an error).
+    """
+    from models import CatalogSnapshot
+
+    snapshot = (
+        CatalogSnapshot.query
+        .filter_by(license_id=license_id)
+        .order_by(CatalogSnapshot.received_at.desc())
+        .first()
+    )
+
+    if snapshot is None:
+        logger.info(f"StoreLoader: load_from_backend_db — no snapshot row | tenant={license_id}")
+        return None
+
+    payload = dict(snapshot.payload)
+
+    categories         = payload.get("categories") or []
+    tags               = payload.get("tags") or []
+    products            = payload.get("products") or []
+    all_attributes_raw = payload.get("all_attributes_raw") or []
+    currency_symbol    = payload.get("currency_symbol") or "$"
+
+    attribute_terms = {
+        int(attr["attribute_id"]): attr.get("terms", [])
+        for attr in all_attributes_raw
+        if attr.get("attribute_id")
+    }
+
+    logger.info(
+        f"StoreLoader: load_from_backend_db — loaded snapshot | tenant={license_id} | "
+        f"snapshot_id={snapshot.id} | received_at={snapshot.received_at} | "
+        f"products={len(products)} | categories={len(categories)}"
+    )
+
+    return {
+        "categories":         categories,
+        "tags":               tags,
+        "products":           products,
+        "all_attributes_raw": all_attributes_raw,
+        "attribute_terms":    attribute_terms,
+        "currency_symbol":    currency_symbol,
+        "expected_product_count": payload.get("expected_product_count"),
+    }
+
 def fetch_attributes_via_core_api(session, base_url: str, consumer_key: str,
                                   consumer_secret: str, timeout: int = 30) -> List[Dict]:
     """
