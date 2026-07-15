@@ -9,7 +9,7 @@ Handles:
 """
 
 import re
-
+from classifier.utils import normalize_for_tag_compare, tokens_overlap_loose
 from models import Intent, ExtractedEntities
 from store_registry import get_store_loader
 from chat_logger import get_logger
@@ -103,13 +103,66 @@ def _resolve_tag_attribute_overlap(entities: ExtractedEntities):
                 f"(matched via {'label' if label_matches_tag else 'value'})"
             )
             break
-  
+
+
+def _resolve_category_or_pair_overlap(entities: ExtractedEntities):
+    """
+    Catch category overlap with a tag/attribute term that was ALREADY
+    folded into an attr_tag_or_pairs entry by _resolve_tag_attribute_overlap
+    (or by _resolve_category_attribute_overlap, if it claimed a different
+    attribute first). Without this step, a category sharing the same
+    underlying concept as an existing OR pair's attr_term (e.g. category
+    'Mosaics' vs attr_term 'mosaic') stays in target_category_slugs and
+    gets AND'd onto the query separately — turning one ambiguous concept
+    into an over-constrained "(tag OR attr) AND category" query that can
+    return zero results even when any one of the three should have matched.
+
+    Runs AFTER _resolve_tag_attribute_overlap so it can see the OR pair
+    that already formed, rather than racing it for the same attribute.
+    """
+    if not (getattr(entities, 'target_category_slugs', set()) and entities.attr_tag_or_pairs):
+        return
+
+    loader = get_store_loader()
+
+    for cat_slug in list(entities.target_category_slugs):
+        cat_obj = loader.resolve_category(cat_slug) if loader else None
+        cat_name = cat_obj.name.lower() if cat_obj else cat_slug.replace("-", " ")
+        cat_tokens = normalize_for_tag_compare(cat_name)
+
+        for pair in entities.attr_tag_or_pairs:
+            attr_term = pair.get("attr_term")
+            if not attr_term:
+                continue
+            term_tokens = normalize_for_tag_compare(str(attr_term).replace("-", " "))
+
+            if not tokens_overlap_loose(cat_tokens, term_tokens):
+                continue
+
+            pair.setdefault("cat_slugs", [])
+            if cat_slug not in pair["cat_slugs"]:
+                pair["cat_slugs"].append(cat_slug)
+
+            entities.target_category_slugs.discard(cat_slug)
+            for group in entities.category_groups:
+                group.discard(cat_slug)
+            logger.info(
+                f"_resolve_category_or_pair_overlap: folded category='{cat_slug}' "
+                f"into existing OR pair (attr_term='{attr_term}')"
+            )
+            break
+
+    entities.category_groups = [g for g in entities.category_groups if g]
+    if not entities.target_category_slugs:
+        entities.category_name = None
+
 def consolidate_entities(intent: Intent, entities: ExtractedEntities, text: str):
     _resolve_product_vs_category(intent, entities)
     _resolve_series_tag_conflict(entities, text)
     _deduplicate_or_pairs(entities)
     _resolve_category_attribute_overlap(entities)
     _resolve_tag_attribute_overlap(entities)
+    _resolve_category_or_pair_overlap(entities)
     _prune_tag_covered_attrs(entities)
     _prune_redundant_attributes(entities)
 
@@ -191,6 +244,7 @@ def _resolve_category_attribute_overlap(entities: ExtractedEntities):
         overlapping_cat_slugs = [
             cat_slug for cat_slug, c_tokens in cat_tokens_map.items()
             if attr_tokens <= c_tokens or c_tokens <= attr_tokens or attr_slug == cat_slug
+            or tokens_overlap_loose(attr_tokens, c_tokens)
         ]
 
         if not overlapping_cat_slugs:
@@ -200,9 +254,6 @@ def _resolve_category_attribute_overlap(entities: ExtractedEntities):
         if loader and loader.all_attributes_raw:
             attr_label_norm = attr_label.lower().strip()
             for a in loader.all_attributes_raw:
-                # attribute_name is the hyphenated form matching entities.attributes
-                # dict keys (e.g. "quick-ship"); attribute_label is the human-readable
-                # form (e.g. "Quick Ship") and won't match for multi-word names.
                 name_raw = (a.get("attribute_name") or "").lower().strip()
                 label_raw = (a.get("attribute_label") or a.get("name") or "").lower().strip()
                 if attr_label_norm in (name_raw, label_raw, label_raw.replace(" ", "-")):
@@ -223,7 +274,6 @@ def _resolve_category_attribute_overlap(entities: ExtractedEntities):
             if not entities.target_category_slugs:
                 entities.category_name = None
             del entities.attributes[attr_label]
-
 
 def _prune_tag_covered_attrs(entities: ExtractedEntities):
     """Remove attributes and OR pairs whose terms are subsets of exact tag matches."""

@@ -7,16 +7,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── WooCommerce ───────────────────────────────────────────────────────────────
-
-_WP_BASE = os.getenv("WP_BASE_URL", "https://wgc.net.in/hn")
-
-WOO_BASE_URL        = os.getenv("WOO_BASE_URL",        f"{_WP_BASE}/wp-json/wc/v3")
-CUSTOM_API_BASE_URL = os.getenv("CUSTOM_API_BASE_URL", f"{_WP_BASE}/wp-json/custom-api/v1")
-
-WOO_CONSUMER_KEY    = os.getenv("WOO_CONSUMER_KEY", "")
-WOO_CONSUMER_SECRET = os.getenv("WOO_CONSUMER_SECRET", "")
-REQUEST_TIMEOUT     = 30
+REQUEST_TIMEOUT = 30
 
 # ── Dev cache ─────────────────────────────────────────────────────────────────
 

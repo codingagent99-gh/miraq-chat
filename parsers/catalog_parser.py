@@ -14,6 +14,8 @@ from utils.entity_helpers import (
     append_category_name, merge_attribute, merge_tags, merge_entities,
     clean_leftovers, STOP_WORDS,
 )
+from classifier.extractors import ALL_PRICE_PATTERNS
+from config.store_config import KNOWN_QUERY_TYPO_CORRECTIONS
 from classifier.consolidation import _resolve_tag_attribute_overlap
 from typing import Optional
 logger = get_logger("miraq_chat")
@@ -384,6 +386,17 @@ def _mask_resolved_entities(text: str, entities: ExtractedEntities) -> str:
 
     masked = text.lower()
 
+    if entities.min_price is not None or entities.max_price is not None:
+        for pattern in ALL_PRICE_PATTERNS:
+            masked = re.sub(pattern, ' ', masked, flags=re.IGNORECASE)
+
+        # Residual price-descriptor vocabulary that sits OUTSIDE the matched
+        # trigger phrase (e.g. "priced" in "priced less than $13" — the regex
+        # above only anchors on "less than $13", not the word describing it).
+        # Once price is resolved, these words carry no independent search
+        # intent and are safe to strip unconditionally.
+        masked = re.sub(r'\b(?:priced?|pricing|cost(?:ing)?)\b', ' ', masked, flags=re.IGNORECASE)
+
     # Pass 1: plural-tolerant exact match.
     for token in tokens:
         pattern = create_flexible_pattern(token)
@@ -445,10 +458,34 @@ def phase3_semantic_search(
                 phrase = term_string.strip()
                 if not phrase:
                     return unmatched
+                
+                # Known-typo correction — see KNOWN_QUERY_TYPO_CORRECTIONS docstring.
+                # Substring match (not exact-equals) so this still fires when the
+                # leftover phrase has extra words around it, not just a bare 2-word match.
+                _phrase_lower = phrase.lower()
+                for typo, correction in KNOWN_QUERY_TYPO_CORRECTIONS.items():
+                    if typo in _phrase_lower:
+                        corrected = _phrase_lower.replace(typo, correction)
+                        logger.info(f"[SemanticSearch] typo correction applied: {phrase!r} → {corrected!r}")
+                        phrase = corrected
+                        break
 
                 user_vector = loader.vector_model.encode(phrase, convert_to_tensor=True)
                 cosine_scores = util.cos_sim(user_vector, loader.semantic_tensors)[0]
                 top_results = torch.topk(cosine_scores, k=3)
+
+                # Log the full top-3 BEFORE threshold filtering — this is the only
+                # point in the pipeline where sub-threshold near-misses are visible;
+                # once filtered into `candidates` below, anything under
+                # SEMANTIC_THRESHOLD is discarded with no trace.
+                _top3_debug = [
+                    (loader.semantic_keys[idx], round(score.item(), 4))
+                    for score, idx in zip(top_results[0], top_results[1])
+                ]
+                logger.info(
+                    f"[SemanticSearch] phrase={phrase!r} | is_negative={is_negative} | "
+                    f"threshold={SEMANTIC_THRESHOLD} | top3={_top3_debug}"
+                )
 
                 candidates = []
                 for score, idx in zip(top_results[0], top_results[1]):
@@ -471,6 +508,15 @@ def phase3_semantic_search(
                             w_vector = loader.vector_model.encode(word, convert_to_tensor=True)
                             w_scores = util.cos_sim(w_vector, loader.semantic_tensors)[0]
                             w_top = torch.topk(w_scores, k=3)
+
+                            _w_top3_debug = [
+                                (loader.semantic_keys[idx], round(score.item(), 4))
+                                for score, idx in zip(w_top[0], w_top[1])
+                            ]
+                            logger.info(
+                                f"[SemanticSearch] word={word!r} (fallback) | "
+                                f"threshold={SEMANTIC_THRESHOLD} | top3={_w_top3_debug}"
+                            )
 
                             w_candidates = []
                             for w_score, w_idx in zip(w_top[0], w_top[1]):
@@ -549,12 +595,13 @@ def _auto_materialize(entities: ExtractedEntities):
                     entities.attributes[taxonomy] = slug
 
             entities.search_term = None
+            entities.semantic_auto_applied = True
         else:
             surviving_matches.append(candidates)
 
     entities.semantic_matches = surviving_matches
 
-    # NEW — re-run tag/attribute overlap detection now that a semantic
+    # re-run tag/attribute overlap detection now that a semantic
     # auto-applied tag (e.g. "Quick Ship") may exist alongside an attribute
     # extracted earlier in the pipeline that was already independently set.
     _resolve_tag_attribute_overlap(entities)

@@ -9,6 +9,7 @@ import time
 from typing import List, Dict, Optional, Tuple
 
 import requests
+from requests.auth import HTTPBasicAuth
 
 from chat_logger import get_logger
 from store_loader.config import (
@@ -153,16 +154,12 @@ def fetch_all_pages(session, url: str, consumer_key: str, consumer_secret: str,
                     extra_params: Dict = None, timeout: int = 30,
                     max_retries: int = 3) -> List[Dict]:
     """Fetch all pages from a paginated WooCommerce REST endpoint."""
+    auth      = HTTPBasicAuth(consumer_key, consumer_secret)
     all_items = []
     page      = 1
 
     while True:
-        params = {
-            "per_page": 100,
-            "page": page,
-            "consumer_key": consumer_key,
-            "consumer_secret": consumer_secret,
-        }
+        params = {"per_page": 100, "page": page}
         if extra_params:
             params.update(extra_params)
 
@@ -170,13 +167,14 @@ def fetch_all_pages(session, url: str, consumer_key: str, consumer_secret: str,
         resp = None
         for attempt in range(max_retries):
             try:
-                resp = session.get(url, headers=_API_HEADERS,
+                resp = session.get(url, auth=auth, headers=_API_HEADERS,
                                    params=params, timeout=timeout)
                 if page == 1:
                     logger.debug(f"RAW RESPONSE [{resp.status_code}]: {resp.text[:500]}")
                 if resp is not None and resp.status_code in _PERMANENT_ERROR_CODES:
-                    logger.error(f"StoreLoader: Permanent {resp.status_code} on {url} — aborting, no retry")
-                    globals().setdefault("_last_permanent_error", None)
+                    logger.error(
+                        f"StoreLoader: Permanent {resp.status_code} on {url} — aborting, no retry"
+                    )
                     return all_items
                 resp.raise_for_status()
                 data = resp.json()
@@ -204,17 +202,13 @@ def fetch_all_pages_with_total(session, url: str, consumer_key: str, consumer_se
                                extra_params: Dict = None, timeout: int = 30,
                                max_retries: int = 3) -> Tuple[List[Dict], Optional[int]]:
     """Fetch all pages and return (items, expected_total)."""
+    auth           = HTTPBasicAuth(consumer_key, consumer_secret)
     all_items      = []
     page           = 1
     expected_total = None
 
     while True:
-        params = {
-            "per_page": 100,
-            "page": page,
-            "consumer_key": consumer_key,
-            "consumer_secret": consumer_secret,
-        }
+        params = {"per_page": 100, "page": page}
         if extra_params:
             params.update(extra_params)
 
@@ -222,8 +216,13 @@ def fetch_all_pages_with_total(session, url: str, consumer_key: str, consumer_se
         resp = None
         for attempt in range(max_retries):
             try:
-                resp = session.get(url, headers=_API_HEADERS,
+                resp = session.get(url, auth=auth, headers=_API_HEADERS,
                                    params=params, timeout=timeout)
+                if resp is not None and resp.status_code in _PERMANENT_ERROR_CODES:
+                    logger.error(
+                        f"StoreLoader: Permanent {resp.status_code} on {url} — aborting, no retry"
+                    )
+                    return all_items, expected_total
                 resp.raise_for_status()
                 data = resp.json()
                 break
@@ -259,9 +258,9 @@ def fetch_currency_symbol(session, base_url: str, consumer_key: str,
     """Fetch the active currency symbol from WooCommerce."""
     logger.info("StoreLoader: Fetching store currency...")
     try:
-        url    = f"{base_url}/data/currencies/current"
-        params = {"consumer_key": consumer_key, "consumer_secret": consumer_secret}
-        resp   = session.get(url, headers=_API_HEADERS, params=params, timeout=timeout)
+        url  = f"{base_url}/data/currencies/current"
+        auth = HTTPBasicAuth(consumer_key, consumer_secret)
+        resp = session.get(url, auth=auth, headers=_API_HEADERS, timeout=timeout)
         resp.raise_for_status()
         data   = resp.json()
         symbol = data.get("symbol")
@@ -287,9 +286,7 @@ def load_from_live_api(session, base_url: str, custom_api_base: str,
         session, base_url, consumer_key, consumer_secret, timeout
     )
 
-    # Attributes — custom endpoint, auth via X-Consumer-Key/X-Consumer-Secret headers.
-    # Falls back to WooCommerce core API if the custom endpoint 404s (e.g. the
-    # MiraQ plugin isn't installed/activated on this tenant's store).
+    # Attributes — custom endpoint, auth via HTTPBasicAuth
     custom_attr_url = f"{custom_api_base}/all-attributes"
     logger.info(f"StoreLoader: Fetching attributes from {custom_attr_url}")
     try:
@@ -300,24 +297,15 @@ def load_from_live_api(session, base_url: str, custom_api_base: str,
         )
         resp.raise_for_status()
         all_attributes_raw = resp.json()
+        attribute_terms = {
+            int(attr["attribute_id"]): attr.get("terms", [])
+            for attr in all_attributes_raw
+            if attr.get("attribute_id")
+        }
     except Exception as e:
-        logger.warning(
-            f"StoreLoader: custom attributes endpoint failed ({e}) — "
-            f"plugin may not be installed. Falling back to WooCommerce core API."
-        )
-        try:
-            all_attributes_raw = fetch_attributes_via_core_api(
-                session, base_url, consumer_key, consumer_secret, timeout
-            )
-        except Exception as e2:
-            logger.error(f"StoreLoader: core API attribute fallback also failed: {e2}")
-            all_attributes_raw = []
-
-    attribute_terms = {
-        int(attr["attribute_id"]): attr.get("terms", [])
-        for attr in all_attributes_raw
-        if attr.get("attribute_id")
-    }
+        logger.error(f"StoreLoader: Failed to fetch attributes: {e}")
+        all_attributes_raw = []
+        attribute_terms    = {}
 
     # Categories
     logger.info("StoreLoader: Fetching categories...")
@@ -349,100 +337,3 @@ def load_from_live_api(session, base_url: str, custom_api_base: str,
         "currency_symbol":    currency_symbol,
         "expected_product_count": expected_product_count,
     }
-
-def load_from_backend_db(license_id: str) -> Optional[dict]:
-    """
-    Load the most recent pushed catalog for a tenant from CatalogSnapshot,
-    instead of a live WooCommerce pull. Used on hosts whose WAF blocks
-    backend-initiated requests (see TenantRegistry.apply_pushed_catalog).
-
-    Must be called inside a Flask request/app context (queries the DB via
-    the tenant-routed session — see models.db_models._TenantRoutingSession).
-    Actually reads from the MAIN miraq_chat DB, since CatalogSnapshot is a
-    control-plane table like Tenant, not per-tenant — this works because
-    _TenantRoutingSession only special-cases the bind when g.db_engine is
-    set for per-tenant models; CatalogSnapshot resolves to the default bind
-    regardless of tenant context.
-
-    Returns the same 7-key dict shape as load_from_local_files() /
-    load_from_live_api(), or None if no snapshot row exists yet for this
-    tenant (never raises for "no snapshot" — that's an expected state,
-    not an error).
-    """
-    from models import CatalogSnapshot
-
-    snapshot = (
-        CatalogSnapshot.query
-        .filter_by(license_id=license_id)
-        .order_by(CatalogSnapshot.received_at.desc())
-        .first()
-    )
-
-    if snapshot is None:
-        logger.info(f"StoreLoader: load_from_backend_db — no snapshot row | tenant={license_id}")
-        return None
-
-    payload = dict(snapshot.payload)
-
-    categories         = payload.get("categories") or []
-    tags               = payload.get("tags") or []
-    products            = payload.get("products") or []
-    all_attributes_raw = payload.get("all_attributes_raw") or []
-    currency_symbol    = payload.get("currency_symbol") or "$"
-
-    attribute_terms = {
-        int(attr["attribute_id"]): attr.get("terms", [])
-        for attr in all_attributes_raw
-        if attr.get("attribute_id")
-    }
-
-    logger.info(
-        f"StoreLoader: load_from_backend_db — loaded snapshot | tenant={license_id} | "
-        f"snapshot_id={snapshot.id} | received_at={snapshot.received_at} | "
-        f"products={len(products)} | categories={len(categories)}"
-    )
-
-    return {
-        "categories":         categories,
-        "tags":               tags,
-        "products":           products,
-        "all_attributes_raw": all_attributes_raw,
-        "attribute_terms":    attribute_terms,
-        "currency_symbol":    currency_symbol,
-        "expected_product_count": payload.get("expected_product_count"),
-    }
-
-def fetch_attributes_via_core_api(session, base_url: str, consumer_key: str,
-                                  consumer_secret: str, timeout: int = 30) -> List[Dict]:
-    """
-    Fallback attribute fetch using ONLY WooCommerce core REST endpoints —
-    /products/attributes and /products/attributes/{id}/terms.
-    Used when the custom-api/v1/all-attributes route (plugin-provided) is
-    unavailable, e.g. a store that hasn't had the MiraQ plugin installed.
-    Builds the same shape load_from_live_api() expects: a list of dicts
-    with attribute_id + terms.
-    """
-    logger.info("StoreLoader: Fetching attributes via WooCommerce core API (fallback)")
-    attrs = fetch_all_pages(
-        session, f"{base_url}/products/attributes",
-        consumer_key, consumer_secret, timeout=timeout,
-    )
-
-    all_attributes_raw = []
-    for attr in attrs:
-        attr_id = attr.get("id")
-        if not attr_id:
-            continue
-        terms = fetch_all_pages(
-            session, f"{base_url}/products/attributes/{attr_id}/terms",
-            consumer_key, consumer_secret, timeout=timeout,
-        )
-        all_attributes_raw.append({
-            "attribute_id": attr_id,
-            "name": attr.get("name"),
-            "slug": attr.get("slug"),
-            "terms": terms,
-        })
-
-    logger.info(f"StoreLoader: fetched {len(all_attributes_raw)} attributes via core API fallback")
-    return all_attributes_raw

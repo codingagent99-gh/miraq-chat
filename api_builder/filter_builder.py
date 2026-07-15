@@ -10,7 +10,7 @@ import json
 from typing import List, Optional
 
 from models import WooAPICall
-from app_config import CUSTOM_API_BASE_URL, DEFAULT_PER_PAGE
+from app_config import DEFAULT_PER_PAGE
 from chat_logger import get_logger
 
 from api_builder.query_tree import (
@@ -27,11 +27,8 @@ from api_builder.store_helpers import (
     attr_slug_for_label,
     get_attribute_term_slug,
 )
-from store_loader.config import ECOMMERCE_BACKEND
 
 logger = get_logger("miraq_chat")
-CUSTOM_API_BASE = CUSTOM_API_BASE_URL
-
 
 def _group_categories(cat_slugs: list) -> dict:
     """
@@ -79,6 +76,8 @@ def build_advanced_filter_call(
     variation_page=None,
 ) -> WooAPICall:
 
+    _l = loader()
+    _ecommerce_backend = (_l._config.ecommerce_backend if _l else "woocommerce")
     conditions = []
 
     # ── 1. OR pairs FIRST — so we know which tags/cats are already covered ──
@@ -168,7 +167,7 @@ def build_advanced_filter_call(
             body["variation_page"] = variation_page
 
     elif search_term:
-        if ECOMMERCE_BACKEND == "shopify":
+        if _ecommerce_backend == "shopify":
             # Shopify executor does in-memory name/tag/variant matching — always
             # write the term. It cannot "return arbitrary products" because the
             # haystack search in _apply_body() is a strict substring filter.
@@ -201,7 +200,7 @@ def build_advanced_filter_call(
 
     logger.debug(f"api_builder: Advanced filter body: {json.dumps(body)}")
     
-    if ECOMMERCE_BACKEND == "shopify":
+    if _ecommerce_backend == "shopify":
         return WooAPICall(
             method="POST",
             endpoint="shopify-graphql",       # logical name, never fetched
@@ -212,9 +211,10 @@ def build_advanced_filter_call(
             requires_resolution=requires_resolution or [],
         )
 
+    _custom_api_base = _l.custom_api_base if _l else ""
     return WooAPICall(
         method="POST",
-        endpoint=f"{CUSTOM_API_BASE}/products-advanced-new",
+        endpoint=f"{_custom_api_base}/products-advanced-new",
         params={},
         body=body,
         description=description or "Advanced product filter",
