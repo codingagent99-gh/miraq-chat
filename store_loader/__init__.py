@@ -247,10 +247,22 @@ class StoreLoader(StoreQueryMixin):
                     data = load_from_local_files()
                     self._loaded_from_cache = True
                 else:
-                    data = load_from_live_api(
-                        self.session, self.base, self.custom_api_base,
-                        self.consumer_key, self.consumer_secret, self.timeout,
+                    # LIVE PULL DISABLED for push-only mode.
+                    # Returns an empty catalog when no push has arrived yet — the guard
+                    # below prevents this from overwriting previously-pushed data on
+                    # scheduler ticks. Revert this block to re-enable pull.
+                    logger.warning(
+                        f"StoreLoader: ⚠️  Live pull disabled — no push received yet | "
+                        f"tenant={self.license_id}. Returning empty catalog; awaiting push."
                     )
+                    data = {
+                        "categories":              [],
+                        "tags":                    [],
+                        "products":                [],
+                        "all_attributes_raw":      [],
+                        "currency_symbol":         "$",
+                        "expected_product_count":  0,
+                    }
                     self._loaded_from_cache = False
 
                     if UPDATE_DEV_CACHE_ENABLED:
@@ -266,6 +278,19 @@ class StoreLoader(StoreQueryMixin):
                                 f"{len(data['products'])} products / {len(data['categories'])} categories. "
                                 "Existing cache files preserved."
                             )
+
+            # ── Guard: don't overwrite good data with empty data ────
+            # In push-only mode, load_all() returns an empty dict when no push
+            # has arrived yet. If we ALREADY have products loaded (from a
+            # previous push), applying the empty result would wipe that state —
+            # which happens every 5 min from RefreshScheduler's tick. Skip
+            # instead, keeping the pushed data authoritative until the next push.
+            if not data["products"] and not data["categories"] and self.products:
+                logger.info(
+                    f"StoreLoader: skipping apply — empty catalog returned but "
+                    f"{len(self.products)} products already loaded | tenant={self.license_id}"
+                )
+                return
 
             # ── Apply fetched data ────────────────────────────────────
             self.categories         = data["categories"]
