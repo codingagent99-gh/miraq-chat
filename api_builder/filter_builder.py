@@ -18,6 +18,7 @@ from api_builder.query_tree import (
     make_or_group,
     make_price_condition,
     make_stock_condition,
+    make_sale_condition,
     serialize_query,
     merge_cross_taxonomy_overlaps,
 )
@@ -73,7 +74,7 @@ def build_advanced_filter_call(
     page=1, per_page=DEFAULT_PER_PAGE, description="",
     min_price=None, max_price=None, search_term=None,
     product_id=None, requires_resolution=None, in_stock=None,
-    variation_page=None,
+    variation_page=None, on_sale=None,
 ) -> WooAPICall:
 
     _l = loader()
@@ -150,6 +151,9 @@ def build_advanced_filter_call(
         conditions.append(make_stock_condition("instock"))
     elif in_stock is False:
         conditions.append(make_stock_condition("outofstock"))
+        
+    if on_sale is True:
+        conditions.append(make_sale_condition())
 
     # ── Serialize ──
     body = serialize_query(conditions, page, per_page)

@@ -90,7 +90,7 @@ def _normalize_variation_attrs(variation: dict) -> dict:
     return result
 
 
-# ═════════════════════════════════���════════════════════════════
+# ═════════════════════════════════   ════════════════════════════
 # INTENT → API CALL ROUTER
 # ══════════════════════════════════════════════════════════════
 
@@ -435,16 +435,9 @@ def _common_exclusion_kwargs(e) -> dict:
     )
     
 def _build_product_list(e, page) -> list:
-    attr_filters = resolve_attr_filters(e.attributes)
     return [build_advanced_filter_call(
         product_id=e.product_id,
         search_term=e.product_name if not e.product_id else None,
-        categories=list(getattr(e, "target_category_slugs", set())) or None,
-        category_groups=[list(g) for g in getattr(e, "category_groups", [])] or None,
-        tags=list(getattr(e, "tag_slugs", [])) or None,
-        attributes=attr_filters or None,
-        or_pairs=list(getattr(e, "attr_tag_or_pairs", [])) or None,
-        min_price=e.min_price, max_price=e.max_price,
         page=page, in_stock=e.in_stock,
         description=f"List products (Product ID: {e.product_id}, Name: {e.product_name})",
     )]
@@ -713,7 +706,16 @@ def _build_discount_inquiry(e, page) -> list:
             page=page,
             description=f"Check on-sale status for product '{e.product_name or e.product_id}'",
         )]
-    return [endpoints.list_products_on_sale(
+    # Route through the advanced filter engine (not the bare on-sale
+    # endpoint) so category/price filters the shopper also specified
+    # ("search sale, tile, under $13") aren't silently dropped — mirrors
+    # _build_bulk_discount below.
+    return [build_advanced_filter_call(
+        categories=getattr(e, "target_category_slugs", None),
+        category_groups=getattr(e, "category_groups", None),
+        min_price=e.min_price,
+        max_price=e.max_price,
+        on_sale=True,
         page=page,
         per_page=DEFAULT_PER_PAGE,
         description="List products on sale",

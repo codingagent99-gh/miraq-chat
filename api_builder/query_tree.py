@@ -39,6 +39,9 @@ def make_stock_condition(stock_status: str) -> dict:
     """A stock-status leaf node."""
     return {"field_type": "stock_status", "value": stock_status}
 
+def make_sale_condition(on_sale: bool = True) -> dict:
+    """An on-sale leaf node."""
+    return {"field_type": "on_sale", "value": on_sale}
 
 def make_search_condition(search_term: str) -> dict:
     """A free-text search leaf node."""
@@ -71,6 +74,7 @@ def serialize_query(
     Conditions may include special field_type leaves:
       - {"field_type": "price", "min": ..., "max": ...}  → body["price"]
       - {"field_type": "stock_status", "value": ...}     → body["stock_status"]
+      - {"field_type": "on_sale", "value": ...}          → body["on_sale"]
       - {"field_type": "search", "value": ...}           → body["search"]
     All other conditions are routed into body["filters"].
     """
@@ -89,6 +93,8 @@ def serialize_query(
                 body["price"] = price
         elif ft == "stock_status":
             body["stock_status"] = cond["value"]
+        elif ft == "on_sale":
+            body["on_sale"] = cond["value"]
         elif ft == "search":
             body["search"] = cond["value"]
         else:

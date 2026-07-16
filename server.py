@@ -37,7 +37,7 @@ from routes.catalog_push import catalog_push_bp
 # ═══════════════════════════════════════════
 # FLASK APP & DATABASE
 # ═══════════════════════════════════════════
-
+logger = get_logger(__name__)
 app = Flask(__name__)
 @app.after_request
 def _apply_cors(response):
@@ -57,6 +57,7 @@ def _handle_options():
             _cors_manager.apply_cors(resp, origin)
         return resp, 200
 
+ 
 from flask_migrate import Migrate
 migrate = Migrate(app, db)
 register_before_request(app)
@@ -127,7 +128,13 @@ app.register_blueprint(sales_rep_bp)
 app.register_blueprint(provisioning_bp)
 app.register_blueprint(deactivation_bp)
 app.register_blueprint(catalog_push_bp)
-
+try:
+    from routes.webhook_routes import webhook_routes_bp
+    app.register_blueprint(webhook_routes_bp)
+    logger.info("Webhook routes (plugin catalog push) blueprint registered")
+except ImportError as e:
+    logger.warning(f"Webhook routes blueprint not available: {e}")
+   
 # ═══════════════════════════════════════════
 # GLOBAL ERROR HANDLER
 # ═══════════════════════════════════════════
