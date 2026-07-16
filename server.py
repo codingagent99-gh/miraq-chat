@@ -129,8 +129,8 @@ app.register_blueprint(provisioning_bp)
 app.register_blueprint(deactivation_bp)
 app.register_blueprint(catalog_push_bp)
 try:
-    from routes.webhook_routes import webhook_routes_bp
-    app.register_blueprint(webhook_routes_bp)
+    from routes.webhook_routes import webhook_bp
+    app.register_blueprint(webhook_bp)
     logger.info("Webhook routes (plugin catalog push) blueprint registered")
 except ImportError as e:
     logger.warning(f"Webhook routes blueprint not available: {e}")
