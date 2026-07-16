@@ -102,19 +102,27 @@ class RefreshScheduler:
         except Exception as e:
             logger.error(f"RefreshScheduler: widget branding sweep failed | {e}", exc_info=True)
 
-        # ── Normal catalog refresh ─────────────────────────────────────────────
-        loaders = list(self._registry.resident_loaders())
-        for license_id, loader in loaders:
-            try:
-                if loader.due_for_refresh():
-                    label = "🔁 Degraded retry" if loader._degraded else "🔄 Refresh"
-                    logger.info(f"RefreshScheduler: {label} — tenant={license_id}")
-                    loader.load_all()
-                    if license_id != "__default__" and not loader._degraded:
-                        snapshot_store.save(license_id, loader_to_snapshot_dict(loader))
-                        logger.info(f"RefreshScheduler: snapshot updated | tenant={license_id}")
-            except Exception as e:
-                logger.error(f"RefreshScheduler: refresh failed | tenant={license_id} | error={e}", exc_info=True)
-        loaders = None
+       # ── Normal catalog refresh ─────────────────────────────────────────────
+        # Wrapped in app_context() because loader.load_all() reaches into the
+        # tenant DB via _try_load_from_backend_db() (which needs Flask's
+        # SQLAlchemy session, and therefore an app context). Matches the same
+        # pattern the two sweeps above already use.
+        try:
+            with self._app.app_context():
+                loaders = list(self._registry.resident_loaders())
+                for license_id, loader in loaders:
+                    try:
+                        if loader.due_for_refresh():
+                            label = "🔁 Degraded retry" if loader._degraded else "🔄 Refresh"
+                            logger.info(f"RefreshScheduler: {label} — tenant={license_id}")
+                            loader.load_all()
+                            if license_id != "__default__" and not loader._degraded:
+                                snapshot_store.save(license_id, loader_to_snapshot_dict(loader))
+                                logger.info(f"RefreshScheduler: snapshot updated | tenant={license_id}")
+                    except Exception as e:
+                        logger.error(f"RefreshScheduler: refresh failed | tenant={license_id} | error={e}", exc_info=True)
+                loaders = None
+        except Exception as e:
+            logger.error(f"RefreshScheduler: catalog refresh sweep failed | {e}", exc_info=True)
         
         
