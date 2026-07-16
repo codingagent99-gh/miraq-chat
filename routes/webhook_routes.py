@@ -69,7 +69,8 @@ def woocommerce_catalog_push(license_id):
         logger.warning(f"CatalogPush: malformed or empty payload | tenant={license_id}")
         return jsonify({"error": "malformed payload"}), 400
 
-    registry = current_app.config["TENANT_REGISTRY"]  # TODO: adjust to however app.py exposes this
+    from store_registry import get_tenant_registry
+    registry = get_tenant_registry()
 
     def _apply():
         try:
