@@ -25,7 +25,7 @@ the same multi-worker bug in a different language).
 
 import hmac
 import threading
-
+from flask import g
 from flask import Blueprint, current_app, jsonify, request
 
 from chat_logger import get_logger
@@ -34,18 +34,6 @@ from tenant_crypto import decrypt_secret
 logger = get_logger("miraq_chat")
 
 webhook_bp = Blueprint("webhooks", __name__)
-
-
-def _get_tenant_row(license_id: str):
-    """Look up the tenant DB row by license_id.
-
-    TODO: written against an assumed `from models import Tenant` shape with
-    a `.query.filter_by(license_id=...)` call, mirroring the fields
-    tenant_registry.py's _rehydrate() reads off tenant_row (woo_key,
-    woo_secret_encrypted, wp_base_url). Adjust to your actual model/session.
-    """
-    from models import Tenant  # noqa: adjust import path if different
-    return Tenant.query.filter_by(license_id=license_id).first()
 
 
 def _verify_credentials(tenant_row) -> bool:
@@ -61,10 +49,13 @@ def _verify_credentials(tenant_row) -> bool:
 
     return hmac.compare_digest(key, expected_key) and hmac.compare_digest(secret, expected_secret or "")
 
-
 @webhook_bp.route("/webhooks/woocommerce/<license_id>/catalog-push", methods=["POST"])
 def woocommerce_catalog_push(license_id):
-    tenant_row = _get_tenant_row(license_id)
+    # _resolve_tenant (in store_registry.py) already looked up the tenant
+    # and stashed it in g.tenant — reuse that instead of doing a duplicate
+    # query, which was going through _TenantRoutingSession and hitting the
+    # tenant's own DB (where the 'tenants' table doesn't exist).
+    tenant_row = g.tenant
     if tenant_row is None:
         logger.warning(f"CatalogPush: unknown tenant | license_id={license_id}")
         return jsonify({"error": "unknown tenant"}), 404
