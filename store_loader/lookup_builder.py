@@ -19,7 +19,7 @@ from models.catalog import (
     CatalogTag,
 )
 from store_loader.config import ECOMMERCE_BACKEND
-
+from config.store_config import ATTRIBUTE_VALUE_PHRASES
 logger = get_logger("miraq_chat")
 
 
@@ -368,16 +368,27 @@ def build_semantic_vectors(loader):
     for attr in loader.all_attributes_raw:
         taxonomy = attr.get("attribute_name", "") or attr.get("taxonomy", "")
         for term in attr.get("terms", []):
-            clean_name = term.get("name", "").replace("-", " ").lower()
+            term_slug = term.get("slug", "")
+            term_name = term.get("name", "")
+            # Some attribute term values are too generic on their own to be a
+            # meaningful semantic anchor (e.g. pa_quick-ship's "Yes"/"No").
+            # ATTRIBUTE_VALUE_PHRASES already maps {attr_key: {term_value:
+            # natural_phrase}} for exactly this case in the deterministic
+            # extractor — reuse it here so the vector index has an actual
+            # findable phrase ("quick ship") instead of the bare word "yes",
+            # letting fuzzy/typo'd input reach it too.
+            phrase_override = ATTRIBUTE_VALUE_PHRASES.get(taxonomy, {}).get(term_name.lower())
+            clean_name = phrase_override.lower() if phrase_override else term_name.replace("-", " ").lower()
+
             corpus_texts.append(clean_name)
-            loader.semantic_keys.append(term["slug"])
-            loader.semantic_dictionary[term["slug"]] = {
-                "suggested_name": term.get("name"),
+            loader.semantic_keys.append(term_slug)
+            loader.semantic_dictionary[term_slug] = {
+                "suggested_name": term_name,
                 "type": "attribute",
                 "taxonomy": taxonomy,
-                "slug": term["slug"]
+                "slug": term_slug
             }
-            
+    logger.info(f"[DEBUG quick-ship] corpus entry for 'yes'/pa_quick-ship: {[t for t, k in zip(corpus_texts, loader.semantic_keys) if k == 'yes']}")        
     # Categories
     for name_lower, cat in loader.category_by_name_lower.items():
         if cat.get("count", 0) > 0 and cat.get("slug") != "uncategorized":

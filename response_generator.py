@@ -460,6 +460,24 @@ def generate_bot_message(
             f"I couldn't find **{product_name}** in our catalog to check its {target} options. "
             f"Try searching for it by name, or ask: *'Show me {product_name} products'*"
         )
+    
+    # ── Discount inquiry for a specific product ──
+    if intent == Intent.DISCOUNT_INQUIRY and (entities.product_id or entities.product_name):
+        target = entities.product_name or "that product"
+        if page_count == 0:
+            return f"I couldn't find **{target}** in our catalog to check its sale status."
+        p = products[0]
+        name = p.get("name", target)
+        price = float(p.get("price") or 0)
+        sale_price = p.get("sale_price")
+        if p.get("on_sale") and sale_price and float(sale_price) > 0:
+            return (
+                f"Yes! 🏷️ **{name}** is on sale for {CS}{float(sale_price):.2f} "
+                f"(regular {CS}{price:.2f})."
+            )
+        elif p.get("on_sale"):
+            return f"Yes! 🏷️ **{name}** is currently on sale at {CS}{price:.2f}."
+        return f"No, **{name}** isn't currently on sale. It's priced at {CS}{price:.2f}."
 
     # ── No products found ──
     if page_count == 0:
@@ -699,12 +717,12 @@ def generate_suggestions(
 
     if intent == Intent.GREETING:
         suggestions = [
-            "Show me all products",
+            "Browse Products",
             "View my orders",
         ]
     elif intent in (Intent.PRODUCT_SEARCH, Intent.PRODUCT_LIST, Intent.CATEGORY_BROWSE):
         if products:
-            suggestions.append("Show me all products")
+            suggestions.append("Browse Products")
             suggestions.append("View my orders")
     elif intent == Intent.PRODUCT_DETAIL:
         if products:
@@ -715,14 +733,14 @@ def generate_suggestions(
             if p_name:
                 suggestions.append(f"Order {p_name}")
                 suggestions.append(f"Show all {p_name} products")
-        suggestions.append("Show me all products")
+        suggestions.append("Browse Products")
     
     elif intent == Intent.FILTER_BY_ATTRIBUTE:
-        suggestions.append("Show me all products")
+        suggestions.append("Browse Products")
         suggestions.append("View my orders")
         
     elif intent == Intent.UPDATE_CUSTOMER:
-        return ["Show me all products", "View my orders"]
+        return ["Browse Products", "View my orders"]
     elif intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.ORDER_STATUS, Intent.ORDER_TRACKING):
         suggestions.append("Reorder my last order")
         suggestions.append("Show me my recent orders")

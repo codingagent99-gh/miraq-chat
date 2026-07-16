@@ -7,7 +7,7 @@ or a Flask response directly for conversational/disambiguation cases.
 """
 
 from flask import jsonify
-
+import dataclasses
 from models import Intent, ExtractedEntities, ClassifiedResult
 from conversation_flow import FlowState
 from app_config import (
@@ -22,10 +22,16 @@ from handlers.chat_utils import default_pagination
 logger = get_logger("miraq_chat")
 
 def _get_missing_entity_hint(intent, entities, order_create_intents, user_context):
-    """Human-readable label for the specific missing field, so the LLM can
-    ask a targeted question instead of a generic one. Returns None when
-    trigger_reason isn't missing_entities (or no specific field applies)."""
-    if intent == Intent.PRODUCT_SEARCH and entities.product_name is None and not getattr(entities, 'target_category_slugs', None) and not entities.attr_tag_or_pairs:
+    if (
+        intent == Intent.PRODUCT_SEARCH
+        and entities.product_name is None
+        and not getattr(entities, 'target_category_slugs', None)
+        and not entities.attr_tag_or_pairs
+        and entities.in_stock is None
+        and entities.on_sale is None
+        and entities.min_price is None
+        and entities.max_price is None
+    ):
         return "the product or category name"
     if intent in order_create_intents and entities.order_item_name is None and entities.product_name is None:
         last_product_ctx_check = user_context.get("last_product")
@@ -35,6 +41,24 @@ def _get_missing_entity_hint(intent, entities, order_create_intents, user_contex
 
 _FALLBACK_SUGGESTIONS = ["Browse Products", "View my orders"]
 
+def _build_entities_summary(entities: ExtractedEntities) -> dict:
+    """
+    Summary of everything the classifier resolved, for the LLM fallback
+    prompt. A field is included unless its declaration in ExtractedEntities
+    (models/domain.py) marks it excluded via metadata — see that class's
+    docstring. There is no separate list to keep in sync here.
+    """
+    summary = {}
+    for f in dataclasses.fields(entities):
+        if "llm_exclude" in f.metadata:
+            continue
+        value = getattr(entities, f.name)
+        if value is None:
+            continue
+        if isinstance(value, (list, set, dict)) and not value:
+            continue
+        summary[f.name] = sorted(value) if isinstance(value, set) else value
+    return summary
 def run_llm_fallback(
     message: str,
     intent: Intent,
@@ -92,15 +116,7 @@ def run_llm_fallback(
         f"original_intent={intent.value} | confidence={confidence:.2f} | message={message!r}"
     )
 
-    # Build a compact entities summary from the classifier's ExtractedEntities
-    _entity_keys = [
-        "product_name", "category_name", "attributes", "tag_slugs",
-        "order_id", "order_item_name", "search_term",
-    ]
-    entities_summary = {
-        k: getattr(entities, k) for k in _entity_keys
-        if getattr(entities, k)
-    }
+    entities_summary = _build_entities_summary(entities)
 
     llm_result = llm_fallback(
         user_message=message,
@@ -231,14 +247,22 @@ def _should_trigger_llm(intent, confidence, entities, order_create_intents, user
         return True
     if should_disambiguate(intent.value, confidence):
         return True
-    if intent == Intent.PRODUCT_SEARCH and entities.product_name is None and not getattr(entities, 'target_category_slugs', None) and not entities.attr_tag_or_pairs:
+    if (
+        intent == Intent.PRODUCT_SEARCH
+        and entities.product_name is None
+        and not getattr(entities, 'target_category_slugs', None)
+        and not entities.attr_tag_or_pairs
+        and entities.in_stock is None
+        and entities.on_sale is None
+        and entities.min_price is None
+        and entities.max_price is None
+    ):
         return True
     if intent in order_create_intents and entities.order_item_name is None and entities.product_name is None:
         last_product_ctx_check = user_context.get("last_product")
         if not (last_product_ctx_check and last_product_ctx_check.get("id")):
             return True
     return False
-
 
 def _get_trigger_reason(intent, confidence, entities, order_create_intents, user_context) -> str:
     if intent.value == "unknown":

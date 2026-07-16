@@ -463,6 +463,7 @@ def _build_product_search(e, page, user_message: str = "") -> list:
         or e.target_category_slugs
         or attr_filters
         or active_or_pairs
+        or e.in_stock is not None
     )
     if not has_taxonomy and actual_search:
         logger.info(
@@ -477,6 +478,11 @@ def _build_product_search(e, page, user_message: str = "") -> list:
         )]
     # ────────────────────────────────────────────────────────────────────────
 
+    stock_only = e.in_stock is not None and not (
+        e.product_id or e.tag_slugs or e.target_category_slugs or attr_filters or active_or_pairs
+    )
+    if stock_only:
+        actual_search = None
     # When a specific product_id is resolved, the endpoint finds that product
     # on page 1 of the product list — always. Passing page=2 moves past it
     # and returns nothing. Instead, keep the product query on page=1 and pass
@@ -693,6 +699,13 @@ def _build_product_variations(e, page) -> list:
 # ─── Discounts ───
 
 def _build_discount_inquiry(e, page) -> list:
+    if e.product_id or e.product_name:
+        return [build_advanced_filter_call(
+            product_id=e.product_id,
+            search_term=e.product_name if not e.product_id else None,
+            page=page,
+            description=f"Check on-sale status for product '{e.product_name or e.product_id}'",
+        )]
     return [endpoints.list_products_on_sale(
         page=page,
         per_page=DEFAULT_PER_PAGE,
