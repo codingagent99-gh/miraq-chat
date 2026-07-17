@@ -23,6 +23,7 @@ class TenantConfig:
     woo_key: str
     woo_secret: str
     license_id: str = ""
+    tenant_id: str = ""
 
     # Backend selector
     ecommerce_backend: str = "woocommerce"  # "woocommerce" | "shopify"

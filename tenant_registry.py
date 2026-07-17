@@ -132,6 +132,7 @@ class TenantRegistry:
             woo_secret=decrypt_secret(tenant_row.woo_secret_encrypted or ""),
             ecommerce_backend="woocommerce",
             license_id=tenant_row.license_id,
+            tenant_id=str(tenant_row.tenant_id),
         )
 
         logger.info(f"TenantRegistry: woo_key={'present' if config.woo_key else 'MISSING'} | tenant={tenant_row.license_id}")
@@ -211,6 +212,7 @@ class TenantRegistry:
                 woo_secret=decrypt_secret(tenant_row.woo_secret_encrypted or ""),
                 ecommerce_backend="woocommerce",
                 license_id=tenant_row.license_id,
+                tenant_id=str(tenant_row.tenant_id),
             )
             loader = StoreLoader(config=config, vector_model=self._vector_model, app=self._app)
             logger.info(f"TenantRegistry: built fresh loader from pushed catalog | tenant={tenant_id}")

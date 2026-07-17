@@ -98,6 +98,7 @@ class StoreLoader(StoreQueryMixin):
         self._config      = config
         self._flask_app   = app
         self.license_id       = config.license_id
+        self.tenant_id        = config.tenant_id
         self.base             = config.woo_base_url
         self.custom_api_base  = config.custom_api_base_url
         self.consumer_key     = config.woo_key
@@ -489,7 +490,7 @@ class StoreLoader(StoreQueryMixin):
         still work as the safety net.
         """
         try:
-            return load_from_backend_db(self.license_id)
+            return load_from_backend_db(self.tenant_id)
         except Exception as e:
             logger.warning(
                 f"StoreLoader: load_from_backend_db() failed "

@@ -350,7 +350,7 @@ def load_from_live_api(session, base_url: str, custom_api_base: str,
         "expected_product_count": expected_product_count,
     }
 
-def load_from_backend_db(license_id: str) -> Optional[dict]:
+def load_from_backend_db(tenant_id: str) -> Optional[dict]:
     """
     Load the most recent pushed catalog for a tenant from CatalogSnapshot,
     instead of a live WooCommerce pull. Used on hosts whose WAF blocks
@@ -373,13 +373,13 @@ def load_from_backend_db(license_id: str) -> Optional[dict]:
 
     snapshot = (
         CatalogSnapshot.query
-        .filter_by(license_id=license_id)
+        .filter_by(tenant_id=tenant_id)
         .order_by(CatalogSnapshot.received_at.desc())
         .first()
     )
 
     if snapshot is None:
-        logger.info(f"StoreLoader: load_from_backend_db — no snapshot row | tenant={license_id}")
+        logger.info(f"StoreLoader: load_from_backend_db — no snapshot row | tenant={tenant_id}")
         return None
 
     payload = dict(snapshot.payload)
@@ -397,7 +397,7 @@ def load_from_backend_db(license_id: str) -> Optional[dict]:
     }
 
     logger.info(
-        f"StoreLoader: load_from_backend_db — loaded snapshot | tenant={license_id} | "
+        f"StoreLoader: load_from_backend_db — loaded snapshot | tenant={tenant_id} | "
         f"snapshot_id={snapshot.id} | received_at={snapshot.received_at} | "
         f"products={len(products)} | categories={len(categories)}"
     )
