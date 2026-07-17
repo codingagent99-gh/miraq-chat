@@ -77,6 +77,11 @@ def woocommerce_catalog_push(license_id):
     # so it needs the real app object to push one before touching db.session.
     app = current_app._get_current_object()
 
+    # Capture identity now (request thread). The background thread re-queries
+    # by tenant_id — the stable PK — rather than the license_id path segment,
+    # matching the tenant_id-keyed registry (Phase 5).
+    tenant_id = tenant_row.tenant_id
+
     def _apply():
         try:
             registry.apply_pushed_catalog(tenant_row, payload)
@@ -99,17 +104,25 @@ def woocommerce_catalog_push(license_id):
         # sees status already 'active' and no-ops.
         with app.app_context():
             try:
-                fresh_tenant = Tenant.query.filter_by(license_id=license_id).first()
+                fresh_tenant = Tenant.query.get(tenant_id)
                 if fresh_tenant is None:
                     logger.error(f"CatalogPush: tenant disappeared before status flip | tenant={license_id}")
                     return
-                if fresh_tenant.status != "provision_failed":
-                    # Already active (or warming/archived) — nothing to recover.
-                    # Also the idempotency guard: a second push after the
-                    # first already flipped this to 'active' lands here and
-                    # no-ops.
+                if fresh_tenant.status not in ("provision_failed", "warming"):
+                    # Already active (routine refresh) or archived — nothing to
+                    # recover. Also the idempotency guard: a second push after the
+                    # first already flipped this to 'active' lands here and no-ops.
                     return
 
+                # A successful catalog-push means this tenant is serving. Recover
+                # from BOTH transitional states:
+                #   provision_failed — the background build already failed (e.g. a
+                #     WAF'd host blocking the live pull), and this push is the data.
+                #   warming — a freshly activated (often free) tenant whose push
+                #     arrived before/instead of a successful live build. Without
+                #     this, the tenant could stick in 'warming' forever even though
+                #     the loader is now fully populated from the pushed catalog.
+                prev_status = fresh_tenant.status
                 fresh_tenant.status = "active"
                 fresh_tenant.last_build_error = None
                 # RefreshScheduler's stuck-tenant retry loop gives up once
@@ -118,7 +131,7 @@ def woocommerce_catalog_push(license_id):
                 # degradation gets its own full retry budget.
                 fresh_tenant.build_attempts = 0
                 db.session.commit()
-                logger.info(f"CatalogPush: recovered tenant from provision_failed | tenant={license_id}")
+                logger.info(f"CatalogPush: recovered tenant from {prev_status} → active | tenant={license_id}")
             except Exception as e:
                 # Deliberately separate from the apply's own try/except above:
                 # the push already succeeded and the loader is populated, so

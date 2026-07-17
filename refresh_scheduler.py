@@ -77,7 +77,7 @@ class RefreshScheduler:
                 for tenant in stuck:
                     logger.info(f"RefreshScheduler: retrying stuck tenant | license_id={tenant.license_id} status={tenant.status}")
                     from routes.provisioning import _start_background_build
-                    _start_background_build(tenant.license_id, self._app)
+                    _start_background_build(tenant.tenant_id, self._app)
         except Exception as e:
             logger.error(f"RefreshScheduler: stuck tenant sweep failed | {e}", exc_info=True)
 
@@ -110,17 +110,17 @@ class RefreshScheduler:
         try:
             with self._app.app_context():
                 loaders = list(self._registry.resident_loaders())
-                for license_id, loader in loaders:
+                for tenant_id, loader in loaders:
                     try:
                         if loader.due_for_refresh():
                             label = "🔁 Degraded retry" if loader._degraded else "🔄 Refresh"
-                            logger.info(f"RefreshScheduler: {label} — tenant={license_id}")
+                            logger.info(f"RefreshScheduler: {label} — tenant={tenant_id}")
                             loader.load_all()
-                            if license_id != "__default__" and not loader._degraded:
-                                snapshot_store.save(license_id, loader_to_snapshot_dict(loader))
-                                logger.info(f"RefreshScheduler: snapshot updated | tenant={license_id}")
+                            if tenant_id != "__default__" and not loader._degraded:
+                                snapshot_store.save(tenant_id, loader_to_snapshot_dict(loader))
+                                logger.info(f"RefreshScheduler: snapshot updated | tenant={tenant_id}")
                     except Exception as e:
-                        logger.error(f"RefreshScheduler: refresh failed | tenant={license_id} | error={e}", exc_info=True)
+                        logger.error(f"RefreshScheduler: refresh failed | tenant={tenant_id} | error={e}", exc_info=True)
                 loaders = None
         except Exception as e:
             logger.error(f"RefreshScheduler: catalog refresh sweep failed | {e}", exc_info=True)

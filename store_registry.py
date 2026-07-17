@@ -29,6 +29,7 @@ _LICENSE_HEADER = "X-MiraQ-License-Id"
 _EXEMPT_PATHS = {
     "/health", "/status",
     "/provision-tenant",
+    "/activate-free",
     "/deactivate-tenant",
     "/debug-plan",
 }
@@ -98,7 +99,7 @@ def register_before_request(app) -> None:
 
         # ── Header present — resolve the tenant ──────────────────────────────
         from models import Tenant
-        tenant = Tenant.query.get(license_id)
+        tenant = Tenant.query.filter_by(license_id=license_id).first()
         if tenant is None:
             logger.warning(f"Unknown license_id={license_id!r} on {path} → 404")
             return jsonify({"success": False, "error": "unknown tenant"}), 404

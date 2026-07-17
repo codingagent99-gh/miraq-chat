@@ -110,7 +110,9 @@ class Tenant(db.Model):
     """
     __tablename__ = "tenants"
 
-    license_id = db.Column(db.String(128), primary_key=True)
+    tenant_id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    license_id = db.Column(db.String(128), nullable=True, unique=True, index=True)
+    plan = db.Column(db.String(20), nullable=False, default="free", index=True)
     db_name = db.Column(db.String(63), nullable=False, unique=True)
     site_domain = db.Column(db.String(255), nullable=True, index=True)
 
@@ -137,8 +139,8 @@ class Tenant(db.Model):
     
     def __repr__(self):
         return (
-            f"<Tenant license_id={self.license_id!r} db_name={self.db_name!r} "
-            f"status={self.status!r}>"
+            f"<Tenant tenant_id={self.tenant_id!r} license_id={self.license_id!r} "
+            f"db_name={self.db_name!r} status={self.status!r}>"
         )
 
     @property
@@ -164,9 +166,9 @@ class CatalogSnapshot(db.Model):
     __tablename__ = "catalog_snapshots"
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    license_id = db.Column(
-        db.String(128),
-        db.ForeignKey("tenants.license_id"),
+    tenant_id = db.Column(
+        UUID(as_uuid=True),
+        db.ForeignKey("tenants.tenant_id"),
         nullable=False,
         index=True,
     )
@@ -183,6 +185,6 @@ class CatalogSnapshot(db.Model):
 
     def __repr__(self):
         return (
-            f"<CatalogSnapshot license_id={self.license_id!r} "
+            f"<CatalogSnapshot tenant_id={self.tenant_id!r} "
             f"received_at={self.received_at!r} products={self.product_count}>"
         )

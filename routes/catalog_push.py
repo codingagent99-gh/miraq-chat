@@ -55,7 +55,7 @@ def tenant_catalog_push():
         return jsonify({"success": False, "error": "payload missing non-empty 'products' list"}), 400
 
     snapshot = CatalogSnapshot(
-        license_id=tenant.license_id,
+        tenant_id=tenant.tenant_id,
         payload=data,
         product_count=len(products),
         payload_bytes=content_length,
@@ -71,6 +71,7 @@ def tenant_catalog_push():
     return jsonify({
         "success": True,
         "license_id": tenant.license_id,
+        "tenant_id": str(tenant.tenant_id),
         "snapshot_id": snapshot.id,
         "product_count": len(products),
     }), 200

@@ -68,7 +68,8 @@ def deactivate_tenant():
     if not license_id:
         return jsonify({"success": False, "error": "payload missing licenseId"}), 400
 
-    tenant = Tenant.query.get(license_id)
+    tenant = Tenant.query.filter_by(license_id=license_id).first()
+
     if tenant is None:
         # Already gone — idempotent 200.
         logger.info(f"deactivate-tenant: tenant not found (already removed?) | license_id={license_id}")
@@ -86,7 +87,7 @@ def deactivate_tenant():
         from store_registry import get_tenant_registry, get_engine_registry
         registry = get_tenant_registry()
         if registry:
-            registry.evict(license_id)
+            registry.evict(str(tenant.tenant_id))
             logger.info(f"deactivate-tenant: loader evicted | license_id={license_id}")
 
         engine_registry = get_engine_registry()
@@ -115,6 +116,13 @@ def deactivate_tenant():
     except Exception as e:
         logger.error(f"deactivate-tenant: failed to archive row | license_id={license_id} | {e}", exc_info=True)
         return jsonify({"success": False, "error": f"archive failed: {e}"}), 500
+
+    # ── 4. Best-effort snapshot cleanup ───────────────────────────────────────
+    # delete() is self-guarding (logs and returns on failure), so a leftover
+    # snapshot never blocks a completed teardown. Keyed by tenant_id, matching
+    # how snapshots are stored since the re-key.
+    from tenant_snapshot_store import snapshot_store
+    snapshot_store.delete(str(tenant.tenant_id))
 
     return jsonify({
         "success":    True,

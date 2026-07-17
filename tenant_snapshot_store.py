@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import json
 import time
+import shutil
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -41,7 +42,8 @@ class SnapshotStore(ABC):
     def load(self, license_id: str) -> Optional[dict]: ...
     @abstractmethod
     def exists(self, license_id: str) -> bool: ...
-
+    @abstractmethod
+    def delete(self, tenant_id: str) -> None: ...
 
 class LocalDiskSnapshotStore(SnapshotStore):
     """
@@ -113,6 +115,29 @@ class LocalDiskSnapshotStore(SnapshotStore):
     def exists(self, license_id: str) -> bool:
         return os.path.exists(os.path.join(self._base_dir, license_id, "catalog.json"))
 
+    def delete(self, tenant_id: str) -> None:
+        """
+        Best-effort removal of a tenant's snapshot directory on teardown.
+        Non-fatal by design: the caller has already dropped the physical DB by
+        this point, so a leftover snapshot dir is cosmetic, not a correctness
+        issue. Logs and returns on failure rather than raising — e.g. a Windows
+        file lock on vectors.pt must not fail an otherwise-complete teardown.
+
+        Param is named tenant_id (not license_id like the other methods) because
+        since the tenant_id re-key, callers pass str(tenant_id) as the key.
+        """
+        d = os.path.join(self._base_dir, tenant_id)
+        if not os.path.isdir(d):
+            logger.info(f"SnapshotStore: delete — nothing to remove | tenant={tenant_id}")
+            return
+        try:
+            shutil.rmtree(d)
+            logger.info(f"SnapshotStore: deleted snapshot dir | tenant={tenant_id}")
+        except Exception as e:
+            logger.error(
+                f"SnapshotStore: delete failed (non-fatal) | tenant={tenant_id} | error={e}",
+                exc_info=True,
+            )
 
 def loader_to_snapshot_dict(loader) -> dict:
     """Extract exactly the fields save() persists from a live StoreLoader."""
