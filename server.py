@@ -299,8 +299,8 @@ def get_session(session_id):
 
 @app.route("/widget-config", methods=["GET"])
 def widget_config():
-    loader = get_store_loader()
-    tenant = getattr(loader, "tenant", None) if loader else None
+    from flask import g
+    tenant = g.__dict__.get("tenant")
     if not tenant:
         return jsonify({"image_url": "", "text": ""}), 200
     return jsonify({
