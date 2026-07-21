@@ -339,6 +339,9 @@ def activate_free():
         # Re-activation: keep tenant_id, db_name, and the existing license_id
         # (site_token) — the plugin already has it saved, do not regenerate.
         logger.info(f"activate-free: re-activating tenant | tenant_id={tenant_uuid} current_status={tenant.status}")
+       
+        if tenant.status == "archived":
+            tenant.archived_at = None
         tenant.status = "active"
         tenant.build_attempts = 0
 
