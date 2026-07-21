@@ -173,8 +173,6 @@ def woocommerce_branding_push(license_id):
     etc.). Push makes the common case instant; the scheduled pull is what
     keeps it self-healing.
 
-    Unlike catalog-push, this is just two column writes — no vector
-    rebuilding, no need to push work off the request thread.
     """
     tenant_row = g.tenant
     if tenant_row is None:
@@ -190,12 +188,31 @@ def woocommerce_branding_push(license_id):
         logger.warning(f"BrandingPush: malformed payload | tenant={license_id}")
         return jsonify({"error": "malformed payload"}), 400
 
-    from datetime import datetime, timezone
+    image_url = payload.get("image_url", "") or ""
+    text      = payload.get("text", "") or ""
 
-    tenant_row.widget_logo_url          = payload.get("image_url", "") or ""
-    tenant_row.widget_header_text       = payload.get("text", "") or ""
-    tenant_row.widget_config_fetched_at = datetime.now(timezone.utc)
-    db.session.commit()
+    # Captured here, in the request thread, where current_app resolves —
+    # matches woocommerce_catalog_push()'s _apply() above exactly.
+    app = current_app._get_current_object()
+    tenant_id = tenant_row.tenant_id
 
-    logger.info(f"BrandingPush: updated | tenant={license_id}")
-    return jsonify({"status": "ok"}), 200
+    def _apply():
+        from datetime import datetime, timezone
+        with app.app_context():
+            try:
+                fresh_tenant = Tenant.query.get(tenant_id)
+                if fresh_tenant is None:
+                    logger.error(f"BrandingPush: tenant disappeared before write | tenant={license_id}")
+                    return
+                fresh_tenant.widget_logo_url          = image_url
+                fresh_tenant.widget_header_text       = text
+                fresh_tenant.widget_config_fetched_at = datetime.now(timezone.utc)
+                db.session.commit()
+                logger.info(f"BrandingPush: updated | tenant={license_id}")
+            except Exception as e:
+                db.session.rollback()
+                logger.error(f"BrandingPush: write failed | tenant={license_id} | {e}", exc_info=True)
+
+    threading.Thread(target=_apply, daemon=True).start()
+
+    return jsonify({"status": "accepted"}), 202
