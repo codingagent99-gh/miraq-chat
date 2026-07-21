@@ -157,3 +157,45 @@ def woocommerce_catalog_push(license_id):
         f"attributes={len(payload.get('all_attributes_raw', []))}"
     )
     return jsonify({"status": "accepted"}), 202
+
+
+@webhook_bp.route("/webhooks/woocommerce/<license_id>/branding-push", methods=["POST"])
+def woocommerce_branding_push(license_id):
+    """
+    Receives an immediate widget-branding push from the plugin's Branding
+    tab (see wc_chat_widget_render_branding_tab() in miraQ-chat-widget.php),
+    fired right after a successful save.
+
+    This replaces waiting on RefreshScheduler's ≤24h widget-branding sweep
+    (widget_branding.py) as the primary path — that sweep still runs and
+    stays in place as a fallback, so a branding change still eventually
+    lands even if this push fails outright (site briefly down, WAF blip,
+    etc.). Push makes the common case instant; the scheduled pull is what
+    keeps it self-healing.
+
+    Unlike catalog-push, this is just two column writes — no vector
+    rebuilding, no need to push work off the request thread.
+    """
+    tenant_row = g.tenant
+    if tenant_row is None:
+        logger.warning(f"BrandingPush: unknown tenant | license_id={license_id}")
+        return jsonify({"error": "unknown tenant"}), 404
+
+    if not _verify_credentials(tenant_row):
+        logger.warning(f"BrandingPush: invalid credentials | tenant={license_id}")
+        return jsonify({"error": "unauthorized"}), 401
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        logger.warning(f"BrandingPush: malformed payload | tenant={license_id}")
+        return jsonify({"error": "malformed payload"}), 400
+
+    from datetime import datetime, timezone
+
+    tenant_row.widget_logo_url          = payload.get("image_url", "") or ""
+    tenant_row.widget_header_text       = payload.get("text", "") or ""
+    tenant_row.widget_config_fetched_at = datetime.now(timezone.utc)
+    db.session.commit()
+
+    logger.info(f"BrandingPush: updated | tenant={license_id}")
+    return jsonify({"status": "ok"}), 200
