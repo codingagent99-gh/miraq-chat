@@ -61,6 +61,20 @@ def tenant_catalog_push():
         payload_bytes=content_length,
     )
     db.session.add(snapshot)
+    db.session.flush()  # assign snapshot.id before pruning
+
+    # Keep only the latest snapshot per tenant. Nothing reads history here
+    # (see module docstring) — the eventual read path only ever wants "this
+    # tenant's current catalog." Without this, every push accumulates a new
+    # JSONB row up to 25MB, forever, for every active tenant.
+    pruned = (
+        CatalogSnapshot.query
+        .filter(CatalogSnapshot.tenant_id == tenant.tenant_id, CatalogSnapshot.id != snapshot.id)
+        .delete(synchronize_session=False)
+    )
+    if pruned:
+        logger.info(f"tenant-catalog-push: pruned {pruned} older snapshot(s) | license_id={tenant.license_id}")
+
     db.session.commit()
 
     logger.info(

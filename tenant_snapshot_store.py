@@ -37,33 +37,33 @@ _SNAPSHOT_DIR = os.getenv("TENANT_SNAPSHOT_DIR", os.path.join(os.getcwd(), ".ten
 
 class SnapshotStore(ABC):
     @abstractmethod
-    def save(self, license_id: str, data: dict) -> None: ...
+    def save(self, tenant_id: str, data: dict) -> None:
     @abstractmethod
-    def load(self, license_id: str) -> Optional[dict]: ...
+    def load(self, tenant_id: str) -> Optional[dict]:
     @abstractmethod
-    def exists(self, license_id: str) -> bool: ...
+    def exists(self, tenant_id: str) -> bool:
     @abstractmethod
     def delete(self, tenant_id: str) -> None: ...
 
 class LocalDiskSnapshotStore(SnapshotStore):
     """
     Per tenant, under TENANT_SNAPSHOT_DIR:
-      <license_id>/catalog.json  — raw data + semantic_keys/dictionary (JSON-safe)
-      <license_id>/vectors.pt    — semantic_tensors (torch.save)
-      <license_id>/meta.json     — snapshot_built_at, for observability
+      <tenant_id>/catalog.json  — raw data + semantic_keys/dictionary (JSON-safe)
+      <tenant_id>/vectors.pt    — semantic_tensors (torch.save)
+      <tenant_id>/meta.json     — snapshot_built_at, for observability
     """
 
     def __init__(self, base_dir: str = _SNAPSHOT_DIR):
         self._base_dir = base_dir
         os.makedirs(self._base_dir, exist_ok=True)
 
-    def _tenant_dir(self, license_id: str) -> str:
-        d = os.path.join(self._base_dir, license_id)
+    def _tenant_dir(self, tenant_id: str) -> str:
+        d = os.path.join(self._base_dir, tenant_id)
         os.makedirs(d, exist_ok=True)
         return d
 
-    def save(self, license_id: str, data: dict) -> None:
-        d = self._tenant_dir(license_id)
+    def save(self, tenant_id: str, data: dict) -> None:
+        d = self._tenant_dir(tenant_id)
         catalog_path = os.path.join(d, "catalog.json")
         vectors_path = os.path.join(d, "vectors.pt")
         meta_path = os.path.join(d, "meta.json")
@@ -95,10 +95,10 @@ class LocalDiskSnapshotStore(SnapshotStore):
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump({"snapshot_built_at": time.time()}, f, indent=2)
 
-        logger.info(f"SnapshotStore: saved | tenant={license_id} | products={len(catalog['products'])}")
+        logger.info(f"SnapshotStore: saved | tenant={tenant_id} | products={len(catalog['products'])}")
         
-    def load(self, license_id: str) -> Optional[dict]:
-        d = os.path.join(self._base_dir, license_id)
+    def load(self, tenant_id: str) -> Optional[dict]:
+        d = os.path.join(self._base_dir, tenant_id)
         catalog_path = os.path.join(d, "catalog.json")
         vectors_path = os.path.join(d, "vectors.pt")
         if not os.path.exists(catalog_path):
@@ -109,11 +109,11 @@ class LocalDiskSnapshotStore(SnapshotStore):
             catalog["semantic_tensors"] = torch.load(vectors_path) if os.path.exists(vectors_path) else None
             return catalog
         except Exception as e:
-            logger.error(f"SnapshotStore: load failed | tenant={license_id} | error={e}", exc_info=True)
+            logger.error(f"SnapshotStore: load failed | tenant={tenant_id} | error={e}", exc_info=True)
             return None
 
-    def exists(self, license_id: str) -> bool:
-        return os.path.exists(os.path.join(self._base_dir, license_id, "catalog.json"))
+    def exists(self, tenant_id: str) -> bool:
+        return os.path.exists(os.path.join(self._base_dir, tenant_id, "catalog.json"))
 
     def delete(self, tenant_id: str) -> None:
         """

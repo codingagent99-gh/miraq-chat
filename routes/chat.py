@@ -249,7 +249,7 @@ def _merge_phase_entities(result):
     if not entities.lookup_email and getattr(phase1, "lookup_email", None):
         entities.lookup_email = phase1.lookup_email
         logger.debug(
-            f"[EntityMerge] Restored lookup_email={phase1.lookup_email!r} from phase-1 entities"
+            f"[EntityMerge] Restored lookup_email=<redacted> from phase-1 entities"
         )
 
     # Restore date range if pass-2 lost it (same masking risk as lookup_email).
@@ -1238,7 +1238,7 @@ def chat():
     else:
         message, was_translated, detected_lang = detect_and_translate(message)
         if was_translated:
-            logger.info(f"[LangCheck] translated from '{detected_lang}' | '{message[:100]}'")
+            logger.info(f"[LangCheck] translated from '{detected_lang}' | length={len(message)} chars")
 
     # ── Generic word synonyms (e.g. "material" → "category") ──
     # Runs on the final English text, after translation, so every downstream
@@ -1278,9 +1278,8 @@ def chat():
     if user_context is not conversation.context_data:
         conversation.context_data = user_context
 
-    truncated_msg = message[:100] + "..." if len(message) > 100 else message
     logger.info(
-        f'POST /chat | session={session_id} | message="{sanitize_log_string(truncated_msg)}" '
+        f'POST /chat | session={session_id} | message_length={len(message)} '
         f"| customer_id={customer_id} | flow_state={conversation.flow_state}"
     )
 

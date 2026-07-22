@@ -123,6 +123,22 @@ def deactivate_tenant():
     # how snapshots are stored since the re-key.
     from tenant_snapshot_store import snapshot_store
     snapshot_store.delete(str(tenant.tenant_id))
+    
+    # Also prune any CatalogSnapshot row(s) left in the control-plane DB —
+    # these are separate from the snapshot_store above (disk-based loader
+    # cache) and would otherwise stay orphaned forever, still FK'd to a now-
+    # archived tenant.
+    
+    try:
+        from models import CatalogSnapshot
+        deleted = CatalogSnapshot.query.filter_by(tenant_id=tenant.tenant_id).delete(synchronize_session=False)
+        db.session.commit()
+        if deleted:
+            logger.info(f"deactivate-tenant: pruned {deleted} catalog snapshot(s) | license_id={license_id}")
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"deactivate-tenant: catalog snapshot cleanup failed (non-fatal) | license_id={license_id} | {e}", exc_info=True)
+
 
     return jsonify({
         "success":    True,

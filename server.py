@@ -308,29 +308,6 @@ def widget_config():
         "text":      tenant.widget_header_text or "",
     })
 
-@app.route("/debug-plan")
-def debug_plan():
-    from models.chat_usage import CustomerPlan
-    from models import db
-    try:
-        raw = db.session.execute(db.text("SELECT * FROM customer_plans WHERE id = 1")).fetchone()
-        raw_result = str(raw)
-    except Exception as e:
-        raw_result = str(e)
-    try:
-        db_name = db.session.execute(db.text("SELECT current_database()")).scalar()
-    except Exception as e:
-        db_name = str(e)
-    plan = CustomerPlan.query.filter_by(id=1).first()
-    return {
-        "connected_database": db_name,
-        "database_url_from_config": app.config.get("SQLALCHEMY_DATABASE_URI", "not set"),
-        "raw_sql_result": raw_result,
-        "plan_exists": plan is not None,
-        "is_premium": getattr(plan, "is_premium", None),
-        "is_active_premium": getattr(plan, "is_active_premium", None),
-    }
-   
 # ═══════════════════════════════════════════
 # STARTUP
 # ═══════════════════════════════════════════

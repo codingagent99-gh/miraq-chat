@@ -31,7 +31,6 @@ _EXEMPT_PATHS = {
     "/provision-tenant",
     "/activate-free",
     "/deactivate-tenant",
-    "/debug-plan",
 }
 _EXEMPT_PREFIXES = ("/static/",)
 
