@@ -25,6 +25,14 @@ def fetch_and_store_widget_branding(tenant: Tenant) -> bool:
     Non-fatal on failure — caller just leaves the previous (or empty)
     value in place and tries again next cycle.
     """
+    # Branding is a licensed-plan feature — the plugin's Branding tab is
+    # hidden entirely for free-tier sites (see class-widget.php /
+    # miraQ-chat-widget.php), so there is nothing meaningful to fetch here
+    # for a free tenant, and no point burning a request/log line on it.
+    if tenant.plan == "free":
+        logger.debug(f"widget_branding: skipping — free plan | license_id={tenant.license_id}")
+        return False
+
     if not tenant.wp_base_url or not tenant.woo_key or not tenant.woo_secret_encrypted:
         logger.warning(
             f"widget_branding: tenant missing wp_base_url/woo creds — skipping | "
@@ -59,6 +67,9 @@ def fetch_and_store_widget_branding(tenant: Tenant) -> bool:
 
 
 def is_widget_branding_stale(tenant: Tenant) -> bool:
+    if tenant.plan == "free":
+        return False
+
     if tenant.widget_config_fetched_at is None:
         return True
     age = datetime.now(timezone.utc) - tenant.widget_config_fetched_at
