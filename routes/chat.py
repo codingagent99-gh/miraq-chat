@@ -1344,6 +1344,22 @@ def chat():
 
         _wipe_stale_cart(conversation, user_context, current_flow_state)
 
+        # ── Typo correction (pre-classification) ─────────────────────────────
+        if (
+            current_flow_state in (FlowState.IDLE, FlowState.AWAITING_ANYTHING_ELSE)
+            and not message.startswith("__")
+            and not re.match(r"(?i)^no\s*-\s*search\s*for\s*['\"]", message)
+        ):
+            from utils.typo_correction import correct_message
+            _corrected, _typo_corrections = correct_message(message, store_loader)
+            if _typo_corrections:
+                message = _corrected
+                user_msg.metadata_json = {
+                    "typo_corrections": _typo_corrections,
+                    "corrected_message": _corrected,
+                }
+                db.session.commit()
+
         # ── Product reorder intercept ──   ← MOVE HERE (after current_flow_state is set)
         if message.startswith("__PRODUCT_REORDER__"):
             try:
