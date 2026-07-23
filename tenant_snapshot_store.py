@@ -37,11 +37,11 @@ _SNAPSHOT_DIR = os.getenv("TENANT_SNAPSHOT_DIR", os.path.join(os.getcwd(), ".ten
 
 class SnapshotStore(ABC):
     @abstractmethod
-    def save(self, tenant_id: str, data: dict) -> None:
+    def save(self, tenant_id: str, data: dict) -> None: ...
     @abstractmethod
-    def load(self, tenant_id: str) -> Optional[dict]:
+    def load(self, tenant_id: str) -> Optional[dict]: ...
     @abstractmethod
-    def exists(self, tenant_id: str) -> bool:
+    def exists(self, tenant_id: str) -> bool: ...
     @abstractmethod
     def delete(self, tenant_id: str) -> None: ...
 
