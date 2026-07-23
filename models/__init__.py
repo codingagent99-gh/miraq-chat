@@ -35,5 +35,5 @@ from models.catalog import (
 # ── Shopify token (auto-refresh OAuth token storage) ──
 from models.shopify_token import ShopifyToken
 
-from models.chat_usage import ChatUsage, CustomerPlan
+from models.chat_usage import ChatUsage
 from models import db

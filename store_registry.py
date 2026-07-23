@@ -106,9 +106,10 @@ def register_before_request(app) -> None:
         if (tenant.status == "active"
                 and tenant.license_expires_at is not None
                 and datetime.now(timezone.utc) >= tenant.license_expires_at):
-            tenant.status = "expired"
+            tenant.plan = "free"
+            tenant.license_expires_at = None
             db.session.commit()
-            logger.warning(f"Tenant licence expired — auto-marked | license_id={license_id!r}")
+            logger.info(f"Tenant license expired — downgraded to free | license_id={license_id!r}")
 
         if tenant.status == "warming":
             return jsonify({
@@ -130,7 +131,11 @@ def register_before_request(app) -> None:
             g.tenant_features = dict(tenant.features or {})
             try:
                 g.store_loader = _tenant_registry.get_loader(tenant)
-            except Exception:
+            except Exception as e:
+                logger.error(
+                    f"provision_failed tenant — get_loader() raised | license_id={license_id!r} | {e}",
+                    exc_info=True,
+                )
                 g.store_loader = None
             g.db_engine = _engine_registry.get_engine(tenant.db_name)
             return None
