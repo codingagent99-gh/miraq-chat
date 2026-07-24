@@ -33,7 +33,7 @@ from routes.sales_rep import sales_rep_bp
 from routes.provisioning import provisioning_bp
 from routes.deactivation import deactivation_bp
 from routes.catalog_push import catalog_push_bp
-
+from routes.test_fuzzy import test_fuzzy_bp
 # ═══════════════════════════════════════════
 # FLASK APP & DATABASE
 # ═══════════════════════════════════════════
@@ -128,6 +128,7 @@ app.register_blueprint(sales_rep_bp)
 app.register_blueprint(provisioning_bp)
 app.register_blueprint(deactivation_bp)
 app.register_blueprint(catalog_push_bp)
+app.register_blueprint(test_fuzzy_bp)
 try:
     from routes.webhook_routes import webhook_bp
     app.register_blueprint(webhook_bp)
