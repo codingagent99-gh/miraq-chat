@@ -33,6 +33,28 @@ def fetch_product_order_history(product_id: int, role: str) -> list:
     return []
 
 
+def _extract_variation_attributes(item: dict) -> list[dict]:
+    """Pull human-readable variation attributes (e.g. Size: 12"x24", Color:
+    Beige) off a WooCommerce line item's meta_data. Internal/hidden meta
+    (keys starting with "_", e.g. "_reduced_stock") is excluded — only
+    entries WooCommerce marks with a display_key/display_value are kept.
+
+    Duplicated from handlers/chat_utils.py rather than imported, to avoid
+    adding a new cross-module import (this file is deliberately kept free
+    of imports from chat_utils/chat.py to sidestep circular imports).
+    """
+    out = []
+    for meta in item.get("meta_data", []) or []:
+        key = meta.get("key", "") or ""
+        if key.startswith("_"):
+            continue
+        display_key = meta.get("display_key") or key
+        display_value = meta.get("display_value") or meta.get("value")
+        if display_key and display_value:
+            out.append({"attribute": str(display_key), "value": str(display_value)})
+    return out
+
+
 def format_product_orders_for_action(orders: list) -> list:
     out = []
     for o in orders:
@@ -51,6 +73,7 @@ def format_product_orders_for_action(orders: list) -> list:
                 "product_id":   item.get("product_id"),
                 "variation_id": item.get("variation_id") or 0,
                 "quantity":     item.get("quantity", 1),
+                "variation_attributes": _extract_variation_attributes(item),
             }
             for item in o.get("line_items", [])
         ]
@@ -64,4 +87,3 @@ def format_product_orders_for_action(orders: list) -> list:
             "items":                 items,
         })
     return out
-

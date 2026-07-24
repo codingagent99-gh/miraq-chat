@@ -326,6 +326,24 @@ def fetch_unit_price(product_id, variation_id=None) -> str:
     return "N/A"
 
 
+def _extract_variation_attributes(item: dict) -> list[dict]:
+    """Pull human-readable variation attributes (e.g. Size: 12"x24", Color:
+    Beige) off a WooCommerce line item's meta_data. Internal/hidden meta
+    (keys starting with "_", e.g. "_reduced_stock") is excluded — only
+    entries WooCommerce marks with a display_key/display_value are kept.
+    """
+    out = []
+    for meta in item.get("meta_data", []) or []:
+        key = meta.get("key", "") or ""
+        if key.startswith("_"):
+            continue
+        display_key = meta.get("display_key") or key
+        display_value = meta.get("display_value") or meta.get("value")
+        if display_key and display_value:
+            out.append({"attribute": str(display_key), "value": str(display_value)})
+    return out
+
+
 def format_order_for_frontend(order: dict) -> dict:
     """Map WooCommerce order dict to the frontend Order interface."""
     line_items = order.get("line_items", [])
@@ -336,6 +354,8 @@ def format_order_for_frontend(order: dict) -> dict:
             "price": float(item.get("price", 0) or 0),
             "total": float(item.get("total", 0) or 0),
             "sku": item.get("sku", ""),
+            "variation_id": item.get("variation_id") or None,
+            "variation_attributes": _extract_variation_attributes(item),
         }
         for item in line_items
     ]
