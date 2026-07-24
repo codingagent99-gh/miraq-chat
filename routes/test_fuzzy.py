@@ -1,9 +1,23 @@
 """
-routes/test_fuzzy.py — Standalone, tenant-free test endpoint for
-typo_correction.py.
+routes/test_fuzzy.py — Test endpoint for typo_correction.py.
 
-No loader, no DB, no X-MiraQ-License-Id. correct_message() only ever reads
-three things off the "loader" it's given:
+Two vocab sources, picked automatically:
+
+  1. TENANT (default) — if the request carries X-MiraQ-License-Id and that
+     tenant's real store_loader is healthy, correct_message() runs against
+     the loader's actual fuzzy_vocab_terms / fuzzy_vocab_types /
+     fuzzy_protected_words — the same object chat.py uses at line ~1354.
+     This is what you want for "does this typo get fixed against tenant X's
+     real catalog" questions.
+
+  2. FAKE (opt-in) — pass a "vocab" block in the body to bypass the tenant
+     entirely and test against a throwaway vocab. No X-MiraQ-License-Id
+     needed for this path. Useful for isolating typo_correction.py's logic
+     from any particular tenant's data (e.g. reproducing the tile/tiles tie
+     deterministically without depending on what's actually in a catalog).
+
+correct_message() only ever reads three things off the "loader" it's given,
+so both paths just need to supply an object with these three attributes:
 
     loader.fuzzy_vocab_terms     -> list[str]      candidates for fuzzy matching
     loader.fuzzy_vocab_types     -> dict[str, str]  term -> "category"|"tag"|
@@ -13,19 +27,16 @@ three things off the "loader" it's given:
                                                      keys, and the vocab terms
                                                      themselves)
 
-So we build a throwaway object with just those three attributes, either from
-a small built-in default vocab or from a "vocab" block you pass in the body.
-
     POST /test/fuzzy-search
+    Headers: X-MiraQ-License-Id: <license_id>   (only used if no "vocab" body key)
     Body:
         {
           "message": "showme tilse in kicthen",
+          "debug": true,
 
-          // optional — omit to use DEFAULT_TEST_VOCAB below
+          // optional — if present, bypasses the tenant loader entirely
           "vocab": {
             "category": ["kitchen", "bathroom", "living room"],
-            "tag": ["glossy", "matte"],
-            "attribute": ["white", "black", "grey"],
             "product_word": ["tile", "tiles"]
           },
           "protected_words": ["show", "me", "in", "the", "a"]
@@ -36,6 +47,7 @@ from flask import Blueprint, request, jsonify
 from rapidfuzz import process
 from rapidfuzz.distance import DamerauLevenshtein
 
+from store_registry import get_store_loader
 from utils.typo_correction import (
     correct_message,
     _TOKEN_SPLIT_RE,
@@ -45,7 +57,8 @@ from utils.typo_correction import (
 
 test_fuzzy_bp = Blueprint("test_fuzzy", __name__)
 
-# Minimal built-in vocab so the endpoint works with just {"message": "..."}
+# Minimal built-in vocab so the endpoint still works with no tenant and no
+# "vocab" override — kept as an explicit last-resort fallback, never silent.
 DEFAULT_TEST_VOCAB = {
     "category": ["kitchen", "bathroom", "living room", "outdoor"],
     "tag": ["glossy", "matte", "textured", "polished"],
@@ -131,12 +144,33 @@ def test_fuzzy_search():
     if not message:
         return jsonify({"success": False, "error": "Send JSON with a 'message' field."}), 400
 
-    vocab = body.get("vocab") or DEFAULT_TEST_VOCAB
-    protected_words = body.get("protected_words")
-    if protected_words is None:
-        protected_words = DEFAULT_PROTECTED_WORDS
+    vocab_source = None
+    loader = None
 
-    loader = _FakeLoader(vocab, protected_words)
+    if "vocab" in body:
+        # Explicit opt-in: bypass the tenant entirely.
+        protected_words = body.get("protected_words")
+        if protected_words is None:
+            protected_words = DEFAULT_PROTECTED_WORDS
+        loader = _FakeLoader(body["vocab"], protected_words)
+        vocab_source = "custom"
+    else:
+        # Default path: real tenant loader, resolved from X-MiraQ-License-Id
+        # by register_before_request() same as every other route.
+        real_loader = get_store_loader()
+        if real_loader is not None and getattr(real_loader, "fuzzy_vocab_terms", None):
+            loader = real_loader
+            vocab_source = "tenant"
+
+    if loader is None:
+        # No usable tenant loader (missing/invalid license header, degraded
+        # tenant, or empty vocab) and no explicit override given — fall back
+        # to the built-in vocab, but say so plainly rather than silently
+        # testing against data the caller didn't ask for.
+        protected_words = body.get("protected_words") or DEFAULT_PROTECTED_WORDS
+        loader = _FakeLoader(DEFAULT_TEST_VOCAB, protected_words)
+        vocab_source = "default_fallback"
+
     corrected, corrections = correct_message(message, loader)
 
     response = {
@@ -145,8 +179,17 @@ def test_fuzzy_search():
         "corrected_message": corrected,
         "changed": corrected != message,
         "corrections": corrections,
-        "vocab_used": "custom" if "vocab" in body else "default",
+        "vocab_used": vocab_source,
     }
+    if vocab_source == "tenant":
+        response["vocab_term_count"] = len(loader.fuzzy_vocab_terms)
+    if vocab_source == "default_fallback":
+        response["warning"] = (
+            "No tenant loader available (missing/invalid X-MiraQ-License-Id, "
+            "or tenant is degraded with no fuzzy vocab) — tested against the "
+            "built-in default vocab instead. Pass a valid license header to "
+            "test real catalog data."
+        )
 
     if body.get("debug"):
         response["debug"] = _debug_tokens(message, loader)
