@@ -647,7 +647,7 @@ def generate_bot_message(
         else:
             msg += f"Here are **{count}** products for {search_context}! 📂\n\n"
             
-    elif intent in (Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_SEARCH, Intent.PRODUCT_BY_TAG, Intent.PRODUCT_BY_COLLECTION):
+    elif intent in (Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_SEARCH, Intent.PRODUCT_BY_TAG, Intent.PRODUCT_BY_COLLECTION, Intent.PRODUCT_QUICK_SHIP):
         if search_context:
             _qualifier = " in total" if or_pair_breakdown else ""
             msg += f"Found **{count}** products{_qualifier} for {search_context}! ✨\n\n"
@@ -906,6 +906,27 @@ def _generate_attribute_info_message(products: List[dict], entities: ExtractedEn
         f"Try: *'What variations does {product_name} come in?'*"
     )
 
+def _extract_variation_attributes(item: dict) -> list[dict]:
+    """Pull human-readable variation attributes (e.g. Size: 12"x24", Color:
+    Beige) off a WooCommerce line item's meta_data. Internal/hidden meta
+    (keys starting with "_", e.g. "_reduced_stock") is excluded — only
+    entries WooCommerce marks with a display_key/display_value are kept.
+
+    Duplicated from handlers/chat_utils.py rather than imported, to avoid
+    a new cross-module import between response_generator.py and chat_utils.py.
+    """
+    out = []
+    for meta in item.get("meta_data", []) or []:
+        key = meta.get("key", "") or ""
+        if key.startswith("_"):
+            continue
+        display_key = meta.get("display_key") or key
+        display_value = meta.get("display_value") or meta.get("value")
+        if display_key and display_value:
+            out.append({"attribute": str(display_key), "value": str(display_value)})
+    return out
+
+
 def format_order_detail(order: dict) -> str:
     """Format a single order into a rich detail message."""
     CS = get_currency_symbol()
@@ -957,7 +978,12 @@ def format_order_detail(order: dict) -> str:
             qty = item.get("quantity", 1)
             item_total = item.get("total", "0")
             sku = item.get("sku", "")
+            variation_text = " · ".join(
+                v["value"] for v in _extract_variation_attributes(item)
+            )
             msg += f"  • {name}"
+            if variation_text:
+                msg += f" ({variation_text})"
             if sku:
                 msg += f" _(SKU: {sku})_"
             msg += f" × {qty} — {currency}{item_total}\n"
