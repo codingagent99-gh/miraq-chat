@@ -304,16 +304,55 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
 
     # Check Stock Status Before Reordering!
     product_ids = [item["product_id"] for item in source_line_items if item.get("product_id")]
-    
+
     from app_config import ECOMMERCE_BACKEND
+
+    out_of_stock_items = []
+
+    if product_ids and ECOMMERCE_BACKEND == "shopify":
+        # Shopify has no check_stock endpoint wired, but the store loader
+        # already holds availableForSale for every variant in memory — so the
+        # same protection the Woo path gets costs nothing here. Without this,
+        # Shopify reorders of sold-out items went through silently.
+        # Availability is keyed by variant where the line item has one
+        # (variant-level stock is authoritative); otherwise any in-stock
+        # variant keeps the product orderable.
+        try:
+            from store_registry import get_store_loader
+            _loader = get_store_loader()
+            _avail = {}
+            for _p in (getattr(_loader, "products", None) or []):
+                _p_gid = _p.get("_shopify_gid") or _p.get("id")
+                _p_any = False
+                for _v in (_p.get("variations") or []):
+                    _v_gid = _v.get("_shopify_gid") or _v.get("id")
+                    _v_in  = bool(_v.get("in_stock"))
+                    if _v_gid:
+                        _avail[str(_v_gid)] = _v_in
+                    _p_any = _p_any or _v_in
+                if _p_gid:
+                    _avail[str(_p_gid)] = _p_any
+
+            for item in source_line_items:
+                _check_id = item.get("variation_id") or item.get("product_id")
+                # Unknown ids (e.g. a product deleted since the order) are
+                # NOT treated as out of stock — Shopify re-validates at
+                # checkout, and blocking on a cache miss would be worse UX
+                # than letting the order attempt proceed.
+                if _avail.get(str(_check_id)) is False:
+                    out_of_stock_items.append(item.get("name", "An item"))
+        except Exception as _stock_exc:
+            logger.warning(
+                f"Step 3.5: Shopify availability check skipped | error={_stock_exc}"
+            )
+
     if product_ids and ECOMMERCE_BACKEND != "shopify":
         stock_call = endpoints.check_stock(
             product_ids=product_ids,
             description="Check stock status for reorder items",
         )
         stock_resp = woo_client.execute(stock_call)
-        
-        out_of_stock_items = []
+
         if stock_resp.get("success"):
             data = stock_resp.get("data", {})
             current_products = data.get("products", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
@@ -331,25 +370,27 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
                 if stock_map.get(check_id) == "outofstock":
                     out_of_stock_items.append(item.get("name", "An item"))
                     
-        if out_of_stock_items:
-            if start_time is None: 
-                start_time = time.time()
-                
-            elapsed = time.time() - start_time
-            oos_names = ", ".join(out_of_stock_items)
-            
-            # Block the order and notify the user!
-            return jsonify({
-                "success": True,
-                "bot_message": f"I'm sorry, but I cannot duplicate this order because the following items are currently out of stock: **{oos_names}**.",
-                "intent": intent.value,
-                "products": [],
-                "suggestions": ["Show my orders", "Browse products", "Cancel"],
-                "session_id": session_id,
-                "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": round(elapsed * 1000)},
-                "flow_state": FlowState.IDLE.value,
-                "pagination": default_pagination(page)
-            }), 200
+    # Shared by both backends: Woo fills out_of_stock_items from the live
+    # check_stock call above, Shopify from the in-memory availability map.
+    if out_of_stock_items:
+        if start_time is None:
+            start_time = time.time()
+
+        elapsed = time.time() - start_time
+        oos_names = ", ".join(out_of_stock_items)
+
+        # Block the order and notify the user!
+        return jsonify({
+            "success": True,
+            "bot_message": f"I'm sorry, but I cannot duplicate this order because the following items are currently out of stock: **{oos_names}**.",
+            "intent": intent.value,
+            "products": [],
+            "suggestions": ["Show my orders", "Browse products", "Cancel"],
+            "session_id": session_id,
+            "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": round(elapsed * 1000)},
+            "flow_state": FlowState.IDLE.value,
+            "pagination": default_pagination(page)
+        }), 200
 
 
     # ─── Standard Reorder Logic (Only executes if everything is in stock) ───

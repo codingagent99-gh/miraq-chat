@@ -250,6 +250,7 @@ def _build_reorder(e, page, customer_id=None, role=None) -> list:
             return [build_fetch_order_call(
                 order_id=e.order_id,
                 description=f"Shopify: fetch order #{e.order_id} for reorder",
+                customer_id=customer_id or "CURRENT_USER_ID",
             )]
         return [build_last_order_call(
             customer_id=customer_id or "CURRENT_USER_ID",
@@ -826,6 +827,7 @@ def _build_order_tracking(e, page, customer_id=None, role=None) -> list:
             return [build_fetch_order_call(
                 order_id=e.order_id,
                 description=f"Shopify: get order #{e.order_id} details",
+                customer_id=customer_id or "CURRENT_USER_ID",
             )]
         return [build_order_history_call(
             customer_id=customer_id or "CURRENT_USER_ID",

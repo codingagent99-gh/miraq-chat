@@ -10,11 +10,22 @@ Called from api_builder/__init__.py order builders when ECOMMERCE_BACKEND=shopif
 
 from models import WooAPICall
 
+# Placeholder written by the builders when the customer has not been resolved
+# yet. Must stay in sync with ShopifyOrdersExecutor's guard.
+PLACEHOLDER_CUSTOMER_ID = "CURRENT_USER_ID"
+
 
 def _customer_gid(customer_id) -> str:
-    """Convert a numeric Shopify customer ID to a GID string."""
+    """Convert a numeric Shopify customer ID to a GID string.
+
+    The ``CURRENT_USER_ID`` placeholder is returned untouched. Wrapping it
+    produced ``gid://shopify/Customer/CURRENT_USER_ID``, which silently
+    defeated the executor's "not logged in" guard (an equality check against
+    the bare placeholder) and sent a malformed GID to Shopify, turning a
+    graceful empty result into a GraphQL error.
+    """
     s = str(customer_id)
-    if s.startswith("gid://"):
+    if s == PLACEHOLDER_CUSTOMER_ID or s.startswith("gid://"):
         return s
     return f"gid://shopify/Customer/{s}"
 
@@ -80,19 +91,30 @@ def build_last_order_call(
 def build_fetch_order_call(
     order_id,
     description: str = "",
+    customer_id=None,
 ) -> WooAPICall:
     """
-    Build a call to fetch a single order by ID (numeric or GID).
+    Build a call to fetch a single order by NAME (e.g. "1001") or GID.
     Used by ORDER_TRACKING, ORDER_STATUS, and handle_order_detail.
+
+    customer_id is REQUIRED for the order to be returned: the executor only
+    releases order contents when the order belongs to that customer. Passing
+    None (or an unresolved placeholder) yields an empty result by design —
+    the Admin API can read any order in the store, so ownership must be
+    proven rather than assumed.
     """
+    body = {
+        "_op":      "fetch_order",
+        "order_id": str(order_id),
+    }
+    if customer_id is not None:
+        body["customer_gid"] = _customer_gid(customer_id)
+
     return WooAPICall(
         method="GET",
         endpoint="orders",
         params={},
-        body={
-            "_op":      "fetch_order",
-            "order_id": str(order_id),
-        },
+        body=body,
         description=description or f"Shopify: fetch order id={order_id}",
         surface="shopify_orders",
     )

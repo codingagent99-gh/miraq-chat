@@ -61,6 +61,11 @@ logger = get_logger("miraq_chat")
 
 API_VERSION = "2024-10"
 
+# Must stay in sync with shopify_order_calls.PLACEHOLDER_CUSTOMER_ID.
+# Defined locally rather than imported to keep the executor free of a
+# dependency on the call-builder module.
+_PLACEHOLDER_CUSTOMER_ID = "CURRENT_USER_ID"
+
 # ══════════════════════════════════════════════════════════════
 # Currency code → symbol map  (mirrors shopify_fetcher.py)
 # ══════════════════════════════════════════════════════════════
@@ -125,6 +130,49 @@ query CustomerOrders($customer_gid: ID!, $first: Int!, $after: String) {
                 product  { id }
                 variant  { id }
               }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+# Look an order up by the human-facing order NAME (e.g. "#1001").
+# This is what a customer types; the GID numeric is Shopify's internal id and
+# is unrelated to the order name, so a name query is the correct primary path.
+_ORDER_BY_NAME_GQL = """
+query OrderByName($query: String!) {
+  orders(first: 5, query: $query, sortKey: PROCESSED_AT, reverse: true) {
+    edges {
+      node {
+        id
+        name
+        displayFinancialStatus
+        displayFulfillmentStatus
+        processedAt
+        currencyCode
+        totalPriceSet         { shopMoney { amount } }
+        subtotalPriceSet      { shopMoney { amount } }
+        totalShippingPriceSet { shopMoney { amount } }
+        paymentGatewayNames
+        customer { id }
+        shippingAddress {
+          firstName lastName
+          address1 address2
+          city province zip country
+        }
+        lineItems(first: 50) {
+          edges {
+            node {
+              title
+              quantity
+              originalUnitPriceSet { shopMoney { amount } }
+              discountedTotalSet   { shopMoney { amount } }
+              sku
+              product  { id }
+              variant  { id }
             }
           }
         }
@@ -378,11 +426,17 @@ class ShopifyOrdersExecutor:
         # call.endpoint — it does not touch call.body for shopify_orders calls.
         # We therefore do the substitution here: if the placeholder is still
         # present the customer is not logged in and we return empty gracefully.
-        if (op == "list_customer_orders"
-                and body.get("customer_gid") == "CURRENT_USER_ID"):
+        #
+        # The check covers ALL customer-scoped ops (not just list) and matches
+        # on containment: the placeholder used to arrive wrapped as
+        # "gid://shopify/Customer/CURRENT_USER_ID", which made an equality
+        # check dead code. shopify_order_calls no longer wraps it, and this
+        # stays tolerant in case any caller still does.
+        _cust = str(body.get("customer_gid") or "")
+        if _PLACEHOLDER_CUSTOMER_ID in _cust:
             logger.warning(
-                "[ShopifyOrders] customer_gid still CURRENT_USER_ID at execute time — "
-                "customer not logged in or placeholder not resolved"
+                f"[ShopifyOrders] op={op}: customer_gid unresolved ({_cust!r}) — "
+                "customer not logged in; returning empty"
             )
             return self._empty_result(body)
 
@@ -485,33 +539,88 @@ class ShopifyOrdersExecutor:
 
     def _fetch_single_order(self, body: dict, token: str) -> dict:
         """
-        Fetch a single order by GID or numeric ID.
+        Fetch a single order the customer typed a number for.
 
         body keys:
-            order_id  str|int  — Shopify order GID or numeric ID
+            order_id      str|int  — order NAME ("1001"/"#1001") or a GID
+            customer_gid  str      — REQUIRED; the order is only returned if it
+                                     belongs to this customer
+
+        Lookup order:
+          1. Explicit GID  → order(id:) directly.
+          2. Anything else → treated as the order NAME first
+             (orders(query: "name:#1001")), because that is what a customer
+             reads off a confirmation email. Only if that finds nothing do we
+             fall back to interpreting the digits as an internal id.
+
+        Ownership: Shopify's Admin API can read ANY order in the store, and
+        format_order_detail() renders whatever it is handed (name, address,
+        line items, total). Without this check, "track order 1002" would
+        disclose another customer's order. An unowned or unresolvable order
+        returns the same empty result, so the response cannot be used to probe
+        which order numbers exist.
         """
         raw_id = body.get("order_id")
         if not raw_id:
             logger.warning("[ShopifyOrders] fetch_order: no order_id in body")
             return self._empty_result(body)
 
-        order_gid = _to_order_gid(str(raw_id))
-
-        data  = _gql(_FETCH_ORDER_GQL, {"order_gid": order_gid}, token)
-        node  = data.get("order")
-
-        if not node:
-            logger.warning(f"[ShopifyOrders] fetch_order: order not found | gid={order_gid}")
+        customer_gid = body.get("customer_gid")
+        if not customer_gid or _PLACEHOLDER_CUSTOMER_ID in str(customer_gid):
+            # Not logged in (or placeholder unresolved) — we cannot prove
+            # ownership, so we must not return order contents.
+            logger.warning(
+                "[ShopifyOrders] fetch_order: no resolved customer_gid — "
+                "refusing to return order details"
+            )
             return self._empty_result(body)
 
-        order = _normalise_order(node)
-        return {
-            "orders":   [order],
-            "total":    1,
-            "pages":    1,
-            "page":     1,
-            "per_page": 1,
-        }
+        raw = str(raw_id).strip()
+        node = None
+
+        if raw.startswith("gid://"):
+            data = _gql(_FETCH_ORDER_GQL, {"order_gid": raw}, token)
+            node = data.get("order")
+        else:
+            name = raw if raw.startswith("#") else f"#{raw}"
+            data = _gql(_ORDER_BY_NAME_GQL, {"query": f"name:{name}"}, token)
+            edges = ((data.get("orders") or {}).get("edges")) or []
+            # query is a prefix/fuzzy match on Shopify's side — require exact
+            # equality so "#100" cannot return "#1001".
+            for edge in edges:
+                candidate = edge.get("node") or {}
+                if (candidate.get("name") or "").strip() == name:
+                    node = candidate
+                    break
+            if node is None:
+                logger.info(
+                    f"[ShopifyOrders] fetch_order: no order named {name!r} — "
+                    "falling back to id interpretation"
+                )
+                data = _gql(_FETCH_ORDER_GQL, {"order_gid": _to_order_gid(raw)}, token)
+                node = data.get("order")
+
+        if not node:
+            logger.warning(f"[ShopifyOrders] fetch_order: order not found | input={raw!r}")
+            return self._empty_result(body)
+
+        owner_gid = ((node.get("customer") or {}).get("id")) or ""
+        if _same_id(owner_gid, customer_gid):
+            order = _normalise_order(node)
+            return {
+                "orders":   [order],
+                "total":    1,
+                "pages":    1,
+                "page":     1,
+                "per_page": 1,
+            }
+
+        logger.warning(
+            "[ShopifyOrders] fetch_order: ownership check FAILED — "
+            f"order={node.get('name')!r} belongs to {owner_gid!r}, "
+            f"requester={customer_gid!r} — returning empty"
+        )
+        return self._empty_result(body)
 
     # ── private: helpers ─────────────────────────────────────
 
@@ -609,9 +718,21 @@ class ShopifyOrdersExecutor:
         draft_id = draft.get("id", "")
 
         # ── Complete draft → real order ──
+        # paymentPending is passed EXPLICITLY. Shopify's draftOrderComplete
+        # defaults it to false, which marks the resulting order as PAID via a
+        # manual payment — i.e. every chat reorder would record revenue that
+        # was never collected. The WooCommerce path deliberately creates the
+        # reorder unpaid (`set_paid: False`, DEFAULT_PAYMENT_METHOD), so
+        # paymentPending=true is the behaviour-matching AND financially safe
+        # choice: the order is created awaiting payment.
+        #
+        # VERIFY (open item C5): confirm against current Shopify docs that
+        # draftOrderComplete(paymentPending:) still carries these semantics,
+        # then confirm on the dev store that a chat reorder lands as
+        # "Payment pending" — NOT "Paid" — in the Shopify admin.
         complete_mutation = """
-        mutation CompleteDraftOrder($id: ID!) {
-          draftOrderComplete(id: $id) {
+        mutation CompleteDraftOrder($id: ID!, $paymentPending: Boolean) {
+          draftOrderComplete(id: $id, paymentPending: $paymentPending) {
             draftOrder {
               order { id name }
             }
@@ -619,7 +740,11 @@ class ShopifyOrdersExecutor:
           }
         }
         """
-        complete_data   = _gql(complete_mutation, {"id": draft_id}, token)
+        complete_data   = _gql(
+            complete_mutation,
+            {"id": draft_id, "paymentPending": True},
+            token,
+        )
         complete_result = (complete_data.get("draftOrderComplete") or {})
         complete_errors = complete_result.get("userErrors") or []
 
@@ -658,6 +783,18 @@ class ShopifyOrdersExecutor:
 # ══════════════════════════════════════════════════════════════
 # Helpers
 # ══════════════════════════════════════════════════════════════
+
+def _same_id(a, b) -> bool:
+    """Compare two Shopify ids that may be GIDs or bare numerics.
+
+    "gid://shopify/Customer/42" and "42" refer to the same customer; callers
+    pass whichever form they hold. Empty/None never matches, so a missing id
+    can never satisfy an ownership check.
+    """
+    a_s = str(a or "").strip().split("/")[-1]
+    b_s = str(b or "").strip().split("/")[-1]
+    return bool(a_s) and bool(b_s) and a_s == b_s
+
 
 def _to_order_gid(raw: str) -> str:
     """Convert a numeric ID string or existing GID to a Shopify Order GID."""
