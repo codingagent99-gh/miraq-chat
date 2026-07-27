@@ -7,7 +7,10 @@ import requests as http_requests
 from requests.auth import HTTPBasicAuth
 
 from models import WooAPICall
-from app_config import WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET, WOO_BASE_URL, CUSTOM_API_BASE_URL
+from app_config import (
+    WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET, WOO_BASE_URL, CUSTOM_API_BASE_URL,
+    ECOMMERCE_BACKEND,
+)
 from chat_logger import get_logger, get_api_logger, sanitize_url
 
 logger = get_logger("miraq_chat")
@@ -43,6 +46,34 @@ class WooClient:
         """Execute a single API call and return raw response."""
         import json as _json
         import time as _time
+
+        # ── Shopify backstop ──────────────────────────────────────────────────
+        # On a Shopify deployment no WooCommerce request is ever legitimate.
+        # ShopifyEndpoints returns surface="shopify_admin" stubs whose endpoint
+        # paths are placeholders; executing them would resolve against
+        # WOO_BASE_URL and hit an unrelated store.
+        #
+        # This guard lives here (not only in chat.py's dispatcher) because
+        # ~25 call sites across handlers, parsers and routes call woo_client
+        # directly, bypassing that dispatcher. execute_all() delegates here
+        # too, so this is the one place that provably covers all of them.
+        #
+        # Returning the standard failure envelope — rather than raising —
+        # means every existing caller's `if result.get("success")` branch
+        # degrades safely with no other change.
+        if ECOMMERCE_BACKEND == "shopify":
+            logger.warning(
+                "WooClient: blocked WooCommerce call on Shopify deployment | "
+                f"{api_call.method} {api_call.endpoint} | "
+                f"surface={getattr(api_call, 'surface', '')} | "
+                f"description={api_call.description!r}"
+            )
+            return {
+                "success": False,
+                "data": [],
+                "error": "unsupported_on_shopify",
+                "unsupported_on_shopify": True,
+            }
 
         params = dict(api_call.params)
         is_custom_api = api_call.surface == "custom_plugin"

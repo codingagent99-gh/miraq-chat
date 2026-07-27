@@ -24,6 +24,7 @@ from app_config import (
     ORDER_CREATE_INTENTS,
     CLASSIFIER_PROVIDER_TAG,
     BULK_ORDER_ROLES,
+    ECOMMERCE_BACKEND,
     get_currency_symbol,
 )
 from core.actions import build_add_to_cart, build_open_checkout_panel, build_open_cart_panel
@@ -40,6 +41,10 @@ from conversation_flow import FlowState, handle_flow_state, is_order_flow, _flow
 from chat_logger import get_logger, sanitize_log_string
 from store_registry import get_store_loader
 from ecommerce import endpoints
+from ecommerce.unsupported import (
+    find_unsupported_call,
+    message_for as unsupported_message_for,
+)
 from models.usage_guard import enforce_daily_limit
 
 from handlers.chat_utils import default_pagination, build_pagination, format_order_for_frontend
@@ -472,22 +477,26 @@ def _maybe_attach_address_proposal(
         if not parsed:
             return
 
-        # Fetch the customer's saved billing/shipping for the "existing_on_file" field
+        # Fetch the customer's saved billing/shipping for the "existing_on_file" field.
+        # Skipped on Shopify: fetch_customer is an unimplemented shopify_admin
+        # stub (the woo_client backstop would block it anyway). The proposal
+        # still works — it just has no address on file to compare against.
         existing = None
-        try:
-            from woo_client import woo_client as _woo
-            cust_resp = _woo.execute(endpoints.fetch_customer(
-                customer_id=customer_id,
-                description="Fetch customer address for PROPOSE_CHECKOUT_ADDRESS",
-            ))
-            if cust_resp.get("success") and isinstance(cust_resp.get("data"), dict):
-                _billing  = cust_resp["data"].get("billing", {})
-                _shipping = cust_resp["data"].get("shipping", {})
-                existing  = _shipping if (_shipping.get("address_1") or _shipping.get("city")) else (
-                    _billing if (_billing.get("address_1") or _billing.get("city")) else None
-                )
-        except Exception:
-            pass  # proceed without existing address
+        if ECOMMERCE_BACKEND != "shopify":
+            try:
+                from woo_client import woo_client as _woo
+                cust_resp = _woo.execute(endpoints.fetch_customer(
+                    customer_id=customer_id,
+                    description="Fetch customer address for PROPOSE_CHECKOUT_ADDRESS",
+                ))
+                if cust_resp.get("success") and isinstance(cust_resp.get("data"), dict):
+                    _billing  = cust_resp["data"].get("billing", {})
+                    _shipping = cust_resp["data"].get("shipping", {})
+                    existing  = _shipping if (_shipping.get("address_1") or _shipping.get("city")) else (
+                        _billing if (_billing.get("address_1") or _billing.get("city")) else None
+                    )
+            except Exception:
+                pass  # proceed without existing address
 
         action = build_propose_checkout_address(parsed=parsed, existing_on_file=existing)
         actions = response_data.get("actions")
@@ -1070,7 +1079,13 @@ def _build_final_response(
     _sr_role    = _sr_ctx.get("role", "")
     _sr_actions = response.get("actions", [])
 
-    if _sr_role in BULK_ORDER_ROLES and customer_id and products:
+    # Rep-only affordances are WooCommerce-only: the bulk-order and CS-rep
+    # flows they open depend on custom-plugin endpoints with no Shopify
+    # implementation. Suppress them entirely rather than surfacing buttons
+    # that dead-end (SHOW_PRODUCT_RECENT_ORDERS also triggers a Woo call).
+    _sr_rep_features = ECOMMERCE_BACKEND != "shopify"
+
+    if _sr_rep_features and _sr_role in BULK_ORDER_ROLES and customer_id and products:
         _sr_actions.append({"type": "SHOW_RECENTLY_ORDERED_BUTTON", "payload": {}})
 
         # Product order history — only when a specific product resolved
@@ -1088,7 +1103,7 @@ def _build_final_response(
                     },
                 })
 
-    if customer_id:
+    if _sr_rep_features and customer_id:
         _sr_actions.append({"type": "SHOW_BULK_ORDER_BUTTON", "payload": {}})
 
     if _sr_actions:
@@ -1756,6 +1771,30 @@ def chat():
                     flag_modified(conversation, "context_data")
                     return _ft(clarification_resp)
 
+        # Shopify: BULK_ORDER bypasses build_api_calls entirely (see the
+        # `_resolve_variant or intent == Intent.BULK_ORDER` branch below), so
+        # the unsupported-intent guard there would never see it. Answer here
+        # instead of letting the bulk flow start and fail mid-way.
+        if intent == Intent.BULK_ORDER and ECOMMERCE_BACKEND == "shopify":
+            _msg, _sugg = unsupported_message_for(Intent.BULK_ORDER)
+            logger.info("Shopify: BULK_ORDER unsupported — returning guidance")
+            elapsed = round((time.time() - start_time) * 1000)
+            return _ft((jsonify({
+                "success":     True,
+                "bot_message": _msg,
+                "intent":      intent.value,
+                "products":    [],
+                "suggestions": _sugg,
+                "session_id":  str(conversation.id),
+                "metadata": {
+                    "response_time_ms": elapsed,
+                    "unsupported_on_shopify": True,
+                },
+                "flow_state":  FlowState.IDLE.value,
+                "pagination":  default_pagination(page),
+                "actions":     [],
+            }), 200))
+
         if intent == Intent.BULK_ORDER and role not in BULK_ORDER_ROLES:
             intent = Intent.QUICK_ORDER
             if result is not None:
@@ -1986,6 +2025,37 @@ def chat():
             )
             if customer_id:
                 _resolve_user_placeholders(api_calls, customer_id)
+
+            # ── Shopify: unsupported-intent guard ─────────────────────────────
+            # Calls carrying a Woo-only surface (shopify_admin stubs, or a
+            # leaked admin/custom_plugin call) cannot be fulfilled here. The
+            # woo_client backstop already guarantees no request is sent; this
+            # turns that into a clear answer instead of an empty-results reply.
+            if ECOMMERCE_BACKEND == "shopify":
+                _unsupported = find_unsupported_call(api_calls)
+                if _unsupported is not None:
+                    _msg, _sugg = unsupported_message_for(intent)
+                    logger.info(
+                        f"Shopify: intent={intent.value} unsupported | "
+                        f"surface={getattr(_unsupported, 'surface', '')} | "
+                        f"endpoint={_unsupported.endpoint} — returning guidance"
+                    )
+                    elapsed = round((time.time() - start_time) * 1000)
+                    return _ft((jsonify({
+                        "success":     True,
+                        "bot_message": _msg,
+                        "intent":      intent.value,
+                        "products":    [],
+                        "suggestions": _sugg,
+                        "session_id":  str(conversation.id),
+                        "metadata": {
+                            "response_time_ms": elapsed,
+                            "unsupported_on_shopify": True,
+                        },
+                        "flow_state":  FlowState.IDLE.value,
+                        "pagination":  default_pagination(page),
+                        "actions":     [],
+                    }), 200))
 
             # ── Propagate resolved_attr_values for variant pre-filtering ──────
             # _build_product_variations stamps resolved_attr_values into the
