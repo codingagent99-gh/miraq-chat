@@ -311,7 +311,14 @@ class WooAPICall:
     body: Optional[dict] = None
     description: str = ""
     requires_resolution: List[str] = field(default_factory=list)
-    surface: Literal["admin", "custom_plugin"] = "admin"
+    surface: Literal[
+        "admin",            # WooCommerce REST (wc/v3)
+        "custom_plugin",    # MiraQ WordPress plugin endpoints (custom-api/v1)
+        "shopify_graphql",  # ShopifyGraphQLExecutor (product search)
+        "shopify_orders",   # ShopifyOrdersExecutor (order intents)
+        "shopify_admin",    # ShopifyEndpoints stubs — NOT dispatched yet (Phase 2 guards these)
+        "loader_memory",    # Served from the in-memory StoreLoader, no HTTP call
+    ] = "admin"
     user_message: str = ""
     session_id: str = ""
 

@@ -351,6 +351,21 @@ def _build_quick_order(e, page) -> list:
     )
 
     if not has_taxonomy and search_term:
+        if ECOMMERCE_BACKEND == "shopify":
+            # Same rationale as _build_product_search: the shopify_admin
+            # search_products stub is undispatched; the GraphQL executor's
+            # post-filter handles free text. Keep the resolution step so the
+            # quick-order flow continues identically.
+            logger.info(
+                f"_build_quick_order: No taxonomy signals for '{search_term}' — "
+                "routing to Shopify GraphQL in-memory text search"
+            )
+            return [build_advanced_filter_call(
+                search_term=search_term,
+                page=page,
+                description=f"Shopify text search for '{search_term}' (quick order)",
+                requires_resolution=["create_order_from_product"],
+            )]
         # No taxonomy match — the custom filter endpoint will return garbage.
         # Fall back to standard WooCommerce text search.
         logger.info(f"_build_quick_order: No taxonomy signals for '{search_term}', falling back to WooCommerce text search")
@@ -374,8 +389,30 @@ def _build_quick_order(e, page) -> list:
 
 # ─── Categories ───
 
+def _loader_memory_call(op: str, description: str) -> WooAPICall:
+    """Build a call served from the in-memory StoreLoader (no HTTP).
+
+    Used on Shopify, where the list_categories/list_tags endpoints are
+    undispatched shopify_admin stubs but the loader already holds the full
+    collection/tag lists. Dispatched in chat.py::_execute_api_calls.
+    """
+    return WooAPICall(
+        method="GET",
+        endpoint=f"loader/{op}",   # logical name, never fetched
+        params={},
+        body={"_op": op},
+        surface="loader_memory",
+        description=description,
+    )
+
+
 def _build_category_browse(e, page) -> list:
     if not e.target_category_slugs:
+        if ECOMMERCE_BACKEND == "shopify":
+            return [_loader_memory_call(
+                "list_categories",
+                "List all Shopify collections (no category specified, in-memory)",
+            )]
         return [endpoints.list_categories(
             page=page,
             per_page=100,
@@ -412,6 +449,10 @@ def _build_category_browse(e, page) -> list:
 
 
 def _build_category_list(e, page) -> list:
+    if ECOMMERCE_BACKEND == "shopify":
+        return [_loader_memory_call(
+            "list_categories", "List all Shopify collections (in-memory)",
+        )]
     return [endpoints.list_categories(
         page=page,
         per_page=100,
@@ -466,6 +507,21 @@ def _build_product_search(e, page, user_message: str = "") -> list:
         or e.in_stock is not None
     )
     if not has_taxonomy and actual_search:
+        if ECOMMERCE_BACKEND == "shopify":
+            # Shopify has no search_products endpoint wired — but the GraphQL
+            # executor's post-filter does substring matching over title + tags
+            # + variant option values (filter_builder always writes
+            # body["search"] on Shopify). Route there instead of the
+            # shopify_admin stub, which nothing dispatches.
+            logger.info(
+                f"_build_product_search: No taxonomy signals for '{actual_search}' — "
+                "routing to Shopify GraphQL in-memory text search"
+            )
+            return [build_advanced_filter_call(
+                search_term=actual_search,
+                page=page,
+                description=f"Shopify text search for '{actual_search}'",
+            )]
         logger.info(
             f"_build_product_search: No taxonomy signals for '{actual_search}' — "
             "falling back to WooCommerce text search"
@@ -573,6 +629,11 @@ def _build_related_products(e, page) -> list:
 
 
 def _build_product_catalog(e, page) -> list:
+    if ECOMMERCE_BACKEND == "shopify":
+        return [
+            _loader_memory_call("list_categories", "All Shopify collections (in-memory)"),
+            _loader_memory_call("list_tags",       "All Shopify tags (in-memory)"),
+        ]
     return [
         endpoints.list_categories(
             page=page,

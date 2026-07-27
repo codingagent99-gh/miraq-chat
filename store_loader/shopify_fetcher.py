@@ -197,7 +197,7 @@ def _normalise_collection(c: dict, idx: int) -> dict:
     }
 
 
-def _normalise_product(p: dict, idx: int) -> dict:
+def _normalise_product(p: dict, idx: int, store_domain: str = "") -> dict:
     """Shopify product → Woo-shaped product dict consumed by lookup_builder."""
     variants = [edge["node"] for edge in (p.get("variants") or {}).get("edges", [])]
     images   = [edge["node"] for edge in (p.get("images")   or {}).get("edges", [])]
@@ -251,7 +251,7 @@ def _normalise_product(p: dict, idx: int) -> dict:
         "sale_price":    "",
         "stock_status":  "instock" if (p.get("totalInventory") or 0) > 0 else "outofstock",
         "in_stock":      (p.get("totalInventory") or 0) > 0,
-        "permalink":     f"https://{p.get('handle','')}",  # frontend rewrites
+        "permalink":     f"https://{store_domain}/products/{p.get('handle','')}",
         "categories": [
             {
                 "id":   i + 1,
@@ -406,7 +406,7 @@ def fetch_single_product(
                 f"product(id={product_gid}) returned null — product may not exist"
             )
             return None
-        normalised = _normalise_product(raw, idx=0)
+        normalised = _normalise_product(raw, idx=0, store_domain=store_domain)
         logger.info(
             f"ShopifyFetcher.fetch_single_product: fetched '{normalised.get('name')}' "
             f"with {len(normalised.get('variations', []))} variations"
@@ -465,7 +465,7 @@ def load_from_shopify(store_domain: str, admin_token: str) -> dict:
     raw_products = _drain_connection(
         session, store_domain, admin_token, _PRODUCTS_QUERY, "products"
     )
-    products = [_normalise_product(p, i) for i, p in enumerate(raw_products)]
+    products = [_normalise_product(p, i, store_domain=store_domain) for i, p in enumerate(raw_products)]
 
     # 4. Aggregate attributes + tags from products
     all_attributes_raw = _aggregate_attributes(products)

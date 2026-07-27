@@ -207,6 +207,49 @@ def _fetch_from_collection(collection_id: str, tag_query: str, token: str,
     return products
 
 
+def _loader_product_to_gql_shape(p: dict) -> dict:
+    """StoreLoader (Woo-shaped) product → the _normalize() GraphQL shape.
+
+    Lets the Layer-2 post-filter and _to_woo_shape run unchanged over the
+    in-memory catalog when a query has no native Layer-1 narrowing (no tag
+    query, no collection). The loader holds the ENTIRE catalog (fully drained
+    at boot by shopify_fetcher), so this path has no _MAX_FETCH ceiling.
+
+    Loader products carry a synthetic numeric ``id`` with the GID in
+    ``_shopify_gid``; the GraphQL shape (and everything downstream, including
+    GID-sniffing) expects the GID as ``id``, so map it here. Variation dicts
+    already use GIDs as ``id``.
+    """
+    return {
+        "id":     p.get("_shopify_gid") or p.get("id"),
+        "title":  p.get("name", ""),
+        "handle": p.get("slug", ""),
+        "tags":   [t.get("name", "") for t in (p.get("tags") or []) if isinstance(t, dict)],
+        "status": (p.get("status") or "active").upper(),
+        "images": [
+            {"url": img.get("src", ""), "alt": img.get("alt", "")}
+            for img in (p.get("images") or []) if isinstance(img, dict)
+        ],
+        "collections": [
+            {"id": c.get("id"), "handle": c.get("slug", ""), "title": c.get("name", "")}
+            for c in (p.get("categories") or []) if isinstance(c, dict)
+        ],
+        "variants": [
+            {
+                "id":               v.get("_shopify_gid") or v.get("id"),
+                "title":            "",
+                "price":            v.get("price", ""),
+                "availableForSale": bool(v.get("in_stock")),
+                "selectedOptions": [
+                    {"name": a.get("name", ""), "value": a.get("option", "")}
+                    for a in (v.get("attributes") or []) if isinstance(a, dict)
+                ],
+            }
+            for v in (p.get("variations") or []) if isinstance(v, dict)
+        ],
+    }
+
+
 def _deduplicate(product_lists: list) -> list:
     seen = {}
     for products in product_lists:
@@ -277,28 +320,31 @@ def _convert_condition(c: dict) -> Optional[dict]:
     if not terms:
         return None
 
-    # NOT IN → wrap in a negation group (invert with outer AND NOT)
-    # We represent NOT IN as a group with negated type for _evaluate to handle.
-    # Simplest: _evaluate already handles operator=NOT IN at taxonomy level,
-    # but our _evaluate here (from shopify_products.py) doesn't have that.
-    # We skip NOT IN conditions — they're exclusions and rare in the chat path.
-    if operator == "NOT IN":
-        return None
+    # NOT IN → same typed node with negate=True. _evaluate() inverts the
+    # membership result; _build_tag_query / _extract_collections /
+    # _collection_relation all skip negated nodes so exclusions are enforced
+    # ONLY in the Python post-filter (never at the Shopify fetch layer).
+    # Previously these conditions were silently dropped, so refinement
+    # exclusions ("not glossy") returned wrong results without any error.
+    negate = (operator == "NOT IN")
 
     inner_rel = "OR"  # filter_builder IN conditions are always OR within the term list
 
     # ── tag ──
     if taxonomy == "product_tag":
-        return {"type": "tag", "values": terms, "relation": inner_rel}
-
+        node = {"type": "tag", "values": terms, "relation": inner_rel}
     # ── collection ──
-    if taxonomy == "product_cat":
-        return {"type": "collection", "values": terms, "relation": inner_rel}
-
+    elif taxonomy == "product_cat":
+        node = {"type": "collection", "values": terms, "relation": inner_rel}
     # ── variant option (everything else) ──
     # taxonomy is the attribute key, e.g. "finish", "size", "pa_color" → strip pa_
-    attr_name = taxonomy.removeprefix("pa_").replace("-", " ").title()
-    return {"type": "option", "name": attr_name, "values": terms, "relation": inner_rel}
+    else:
+        attr_name = taxonomy.removeprefix("pa_").replace("-", " ").title()
+        node = {"type": "option", "name": attr_name, "values": terms, "relation": inner_rel}
+
+    if negate:
+        node["negate"] = True
+    return node
 
 
 # ══════════════════════════════════════════════════════════════
@@ -309,6 +355,8 @@ def _build_tag_query(node: dict) -> Optional[str]:
     if "type" in node:
         if node["type"] != "tag":
             return None
+        if node.get("negate"):
+            return None   # exclusions are enforced in the Python post-filter only
         values = node.get("values", [])
         if not values:
             return None
@@ -342,7 +390,7 @@ def _has_mixed_or(node: dict) -> bool:
 def _extract_collections(node: dict) -> list:
     found = []
     if "type" in node:
-        if node["type"] == "collection":
+        if node["type"] == "collection" and not node.get("negate"):
             found.extend(node.get("values", []))
         return found
     for c in node.get("conditions", []):
@@ -354,7 +402,7 @@ def _collection_relation(node: dict) -> Optional[str]:
     if "type" in node:
         return None
     conditions = node.get("conditions", [])
-    if any(c.get("type") == "collection" for c in conditions):
+    if any(c.get("type") == "collection" and not c.get("negate") for c in conditions):
         return node.get("relation", "AND").upper()
     for c in conditions:
         r = _collection_relation(c)
@@ -369,22 +417,36 @@ def _collection_relation(node: dict) -> Optional[str]:
 
 def _evaluate(node: dict, product: dict, variant: dict) -> bool:
     if "type" in node:
-        t = node["type"]
+        t      = node["type"]
+        negate = bool(node.get("negate"))
+
+        def _norm(s: str) -> str:
+            # Normalise both sides: lowercase + replace hyphens with spaces
+            # so "glossy-finish" matches "Glossy Finish" from Shopify GraphQL
+            return s.lower().replace("-", " ").replace("_", " ").strip()
 
         if t == "tag":
             rel          = node.get("relation", "OR").upper()
-            # Normalise both sides: lowercase + replace hyphens with spaces
-            # so "glossy-finish" matches "Glossy Finish" from Shopify GraphQL
-            def _norm(s: str) -> str:
-                return s.lower().replace("-", " ").replace("_", " ").strip()
             product_tags = {_norm(tag) for tag in product.get("tags", [])}
             matches      = [_norm(v) in product_tags for v in node.get("values", [])]
-            return any(matches) if rel == "OR" else all(matches)
+            result       = any(matches) if rel == "OR" else all(matches)
 
-        if t == "collection":
-            return True  # enforced at fetch level
+        elif t == "collection":
+            if not negate:
+                result = True  # positive filter enforced at fetch level
+            else:
+                # Negated collections are NOT enforced at fetch (see
+                # _extract_collections), so membership must be evaluated here.
+                # result = "is a member"; the shared inversion below turns it
+                # into the exclusion.
+                wanted = {_norm(v) for v in node.get("values", [])}
+                have   = set()
+                for c in product.get("collections", []):
+                    have.add(_norm(c.get("handle", "")))
+                    have.add(_norm(c.get("title", "")))
+                result = bool(wanted & have)
 
-        if t == "option":
+        elif t == "option":
             rel       = node.get("relation", "OR").upper()
             opt_name  = node["name"].lower()
             opt_vals  = {v.lower() for v in node.get("values", [])}
@@ -393,20 +455,23 @@ def _evaluate(node: dict, product: dict, variant: dict) -> bool:
                 for o in variant.get("selectedOptions", [])
             }
             var_val = var_opts.get(opt_name)
-            return var_val in opt_vals if var_val is not None else False
+            result  = var_val in opt_vals if var_val is not None else False
 
-        if t == "price":
-            price = float(variant.get("price", 0))
+        elif t == "price":
+            price  = float(variant.get("price", 0))
+            result = True
             if "min" in node and price < float(node["min"]):
-                return False
+                result = False
             if "max" in node and price > float(node["max"]):
-                return False
-            return True
+                result = False
 
-        if t == "available":
-            return variant.get("availableForSale", False) == node.get("value", True)
+        elif t == "available":
+            result = variant.get("availableForSale", False) == node.get("value", True)
 
-        return True
+        else:
+            result = True
+
+        return (not result) if negate else result
 
     if "conditions" in node:
         rel = node.get("relation", "AND").upper()
@@ -522,7 +587,7 @@ def _to_woo_shape(gql_product: dict) -> dict:
         "sale_price":    "",
         "in_stock":      any_in_stock,
         "stock_status":  "instock" if any_in_stock else "outofstock",
-        "permalink":     f"https://{gql_product['handle']}",
+        "permalink":     f"https://{SHOPIFY_STORE_DOMAIN}/products/{gql_product['handle']}",
         "categories": [
             {"id": i + 1, "name": c["title"], "slug": c["handle"]}
             for i, c in enumerate(gql_product.get("collections", []))
@@ -624,8 +689,22 @@ class ShopifyGraphQLExecutor:
         )
 
         if not collections:
-            logger.info("[ShopifyGQL] Layer1: no collection filter — querying full catalog")
-            raw = _fetch_products(tag_query, token)
+            loader_products = getattr(self._loader, "products", None) if self._loader else None
+            if not tag_query and loader_products:
+                # No native narrowing at all → a live fetch would be a
+                # full-catalog scan truncated at _MAX_FETCH (250). The loader
+                # already holds the COMPLETE catalog in memory (refreshed by
+                # RefreshScheduler), so filter that instead: no ceiling, no
+                # API cost. Freshness is bounded by the loader refresh cycle;
+                # tag/collection-narrowed queries below remain fully live.
+                logger.info(
+                    f"[ShopifyGQL] Layer1: no native narrowing — using in-memory "
+                    f"catalog ({len(loader_products)} products, no fetch cap)"
+                )
+                raw = [_loader_product_to_gql_shape(p) for p in loader_products]
+            else:
+                logger.info("[ShopifyGQL] Layer1: no collection filter — querying full catalog")
+                raw = _fetch_products(tag_query, token)
 
         elif len(collections) == 1:
             gid = self._slug_to_gid(collections[0])
@@ -676,6 +755,7 @@ class ShopifyGraphQLExecutor:
         pages  = max(1, -(-total // per_page)) if total else 0
         start  = (page - 1) * per_page
         sliced = woo_products[start: start + per_page]
+        self._attach_loader_details(sliced)
 
         logger.info(
             f"[ShopifyGQL] result | total={total} pages={pages} "
@@ -699,6 +779,31 @@ class ShopifyGraphQLExecutor:
         if not token_row or token_row.is_expired:
             raise RuntimeError("Shopify Admin token missing or expired")
         return token_row.access_token
+
+    def _attach_loader_details(self, woo_products: list) -> list:
+        """Fill description/short_description from the store-loader copy.
+
+        The live GraphQL queries deliberately omit descriptionHtml (kept light
+        for search), so _to_woo_shape leaves them empty. The loader's bulk
+        fetch DOES load descriptions — join them in for the returned page so
+        product-detail answers aren't blank. In-place; returns the list.
+        """
+        loader_products = getattr(self._loader, "products", None) if self._loader else None
+        if not (woo_products and loader_products):
+            return woo_products
+        by_gid = {
+            p.get("_shopify_gid"): p
+            for p in loader_products if p.get("_shopify_gid")
+        }
+        for wp in woo_products:
+            src = by_gid.get(wp.get("_shopify_gid") or wp.get("id"))
+            if not src:
+                continue
+            if not wp.get("description"):
+                wp["description"] = src.get("description", "")
+            if not wp.get("short_description"):
+                wp["short_description"] = src.get("short_description", "")
+        return woo_products
 
     def _slug_to_gid(self, slug: str) -> str:
         """
@@ -750,6 +855,7 @@ class ShopifyGraphQLExecutor:
         pages  = max(1, -(-total // per_page)) if total else 0
         start  = (page - 1) * per_page
         sliced = woo_products[start: start + per_page]
+        self._attach_loader_details(sliced)
 
         return {
             "products": sliced,

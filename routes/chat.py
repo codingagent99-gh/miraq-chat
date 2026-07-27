@@ -731,6 +731,35 @@ def _check_empty_order(intent, entities, conversation, page, start_time):
 # ─── HELPER: Execute API and collect products ───
 # ══════════════════════════════════════════════════════════════
 
+def _execute_loader_memory_call(call) -> list:
+    """Serve catalog metadata straight from the in-memory StoreLoader.
+
+    Handles surface="loader_memory" calls built by api_builder's Shopify
+    branches (CATEGORY_LIST / CATEGORY_BROWSE without slug / PRODUCT_CATALOG).
+    Returns the same list-of-dicts shape the WooCommerce list_categories /
+    list_tags responses produce, so downstream formatting is untouched.
+    """
+    loader = get_store_loader()
+    if not loader:
+        return []
+    op = (getattr(call, "body", None) or {}).get("_op", "")
+    if op == "list_categories":
+        return [
+            {"id": c.get("id"), "name": c.get("name", ""), "slug": c.get("slug", ""),
+             "count": c.get("count", 0), "parent": c.get("parent", 0)}
+            for c in (loader.categories or [])
+            if c.get("slug") != "uncategorized"
+        ]
+    if op == "list_tags":
+        return [
+            {"id": t.get("id"), "name": t.get("name", ""), "slug": t.get("slug", ""),
+             "count": t.get("count", 0)}
+            for t in (loader.tags or [])
+        ]
+    logger.warning(f"_execute_loader_memory_call: unknown op {op!r}")
+    return []
+
+
 def _execute_api_calls(intent, api_calls, _resolve_variant):
     if _resolve_variant:
         return [], [], [], []
@@ -743,10 +772,18 @@ def _execute_api_calls(intent, api_calls, _resolve_variant):
     # ── split by surface ─────────────────────────────────────────────
     shopify_calls       = [c for c in api_calls_to_execute if getattr(c, "surface", "") == "shopify_graphql"]
     shopify_order_calls = [c for c in api_calls_to_execute if getattr(c, "surface", "") == "shopify_orders"]
+    loader_memory_calls = [c for c in api_calls_to_execute if getattr(c, "surface", "") == "loader_memory"]
     woo_calls           = [c for c in api_calls_to_execute
-                           if getattr(c, "surface", "") not in ("shopify_graphql", "shopify_orders")]
+                           if getattr(c, "surface", "") not in ("shopify_graphql", "shopify_orders", "loader_memory")]
 
     api_responses = woo_client.execute_all(woo_calls)
+
+    for call in loader_memory_calls:
+        try:
+            api_responses.append({"success": True, "data": _execute_loader_memory_call(call), "call": call})
+        except Exception as exc:
+            logger.error(f"loader_memory call failed: {exc}", exc_info=True)
+            api_responses.append({"success": False, "error": str(exc), "call": call})
 
     if shopify_order_calls:
         from api_builder.shopify_orders_executor import ShopifyOrdersExecutor
