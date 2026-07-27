@@ -15,7 +15,8 @@ from flask import jsonify
 from models import Intent
 from conversation_flow import FlowState
 from handlers.chat_utils import default_pagination
-from core.actions import build_add_to_cart, build_open_cart_panel
+from core.actions import build_open_cart_panel
+from ecommerce.cart_actions import build_cart_add_action
 
 logger = logging.getLogger("miraq_chat")
 
@@ -72,6 +73,34 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
             )
             return None
 
+        # The action shape is backend-specific: Shopify carts are keyed by
+        # VARIANT, so a bare product id cannot be added. build_cart_add_action
+        # resolves the variant (explicit → attribute match → single-variant
+        # product) and returns None when the choice is genuinely ambiguous.
+        from store_registry import get_store_loader
+        action, err = build_cart_add_action(
+            product_id=product_id,
+            quantity=qty,
+            name=name,
+            variation_id=variation_id,
+            resolved_attrs=user_context.get("resolved_attributes") or {},
+            store_loader=get_store_loader(),
+            # Woo path here has never attached a variation payload (and
+            # building one would add an API call) — keep that exactly.
+            build_variation_payload=False,
+        )
+
+        if action is None:
+            # Ambiguous variant — fall through to the search/variant pipeline,
+            # which prompts the shopper to choose. Returning a broken action
+            # here would fail silently in the browser instead.
+            logger.info(
+                "handle_cart_intent: ADD_TO_CART could not resolve a variant "
+                f"for product_id={product_id!r} (reason={err}) — "
+                "falling through to variant selection"
+            )
+            return None
+
         return _resp(
             bot_message = f"Adding **{name}** to your cart... 🛒",
             suggestions = ["Browse products", "Go to cart", "Checkout"],
@@ -80,12 +109,7 @@ def handle_cart_intent(intent, entities, user_context, conversation, page, start
                 "variation_id": variation_id,  # None is fine — frontend guards it
                 "quantity":     qty,
             },
-            actions     = [build_add_to_cart(
-                product_id   = product_id,
-                quantity     = qty,
-                name         = name,
-                variation_id = variation_id,
-            )],
+            actions     = [action],
         )
 
     # ── REMOVE_FROM_CART ──────────────────────────────────────────────────────

@@ -27,7 +27,7 @@ from app_config import (
     ECOMMERCE_BACKEND,
     get_currency_symbol,
 )
-from core.actions import build_add_to_cart, build_open_checkout_panel, build_open_cart_panel
+from core.actions import build_open_checkout_panel, build_open_cart_panel
 from woo_client import woo_client
 from formatters import format_product, format_custom_product, format_category, _entities_to_dict
 from response_generator import (
@@ -41,6 +41,7 @@ from conversation_flow import FlowState, handle_flow_state, is_order_flow, _flow
 from chat_logger import get_logger, sanitize_log_string
 from store_registry import get_store_loader
 from ecommerce import endpoints
+from ecommerce.cart_actions import build_cart_add_action
 from ecommerce.unsupported import (
     find_unsupported_call,
     message_for as unsupported_message_for,
@@ -394,28 +395,41 @@ def _handle_cart_flow(action, user_context, conversation, store_loader, page, st
         if not pid:
             return None
 
-        _is_shopify = isinstance(vid, str) and vid.startswith("gid://")
-        if _is_shopify:
-            from core.actions import build_shopify_add_to_cart
-            actions = [build_shopify_add_to_cart(
-                variant_gid=vid,
-                quantity=qty,
-                name=name,
-            )]
-        else:
-            variation_attributes = endpoints.build_cart_variation_payload(
-                product_id=pid,
-                variant_id=vid,
-                resolved_attrs=resolved,
-                store_loader=store_loader,
+        # Backend decides the action shape. Previously this branched on the
+        # VARIATION id being a GID, so a Shopify simple product (no variation
+        # id) fell into the Woo branch and shipped a product GID in the
+        # variant slot — an add that always failed in the browser.
+        _action, _err = build_cart_add_action(
+            product_id=pid,
+            quantity=qty,
+            name=name,
+            variation_id=vid,
+            resolved_attrs=resolved,
+            store_loader=store_loader,
+        )
+
+        if _action is None:
+            # Several variants and nothing selects between them. Ask rather
+            # than guess — silently adding the wrong size/colour is worse.
+            logger.info(
+                f"confirm_add_to_cart: unresolved variant | product={pid!r} "
+                f"reason={_err}"
             )
-            actions = [build_add_to_cart(
-                product_id=pid,
-                quantity=qty,
-                name=name,
-                variation_id=vid,
-                variation=variation_attributes,
-            )]
+            return jsonify({
+                "success":     True,
+                "bot_message": (
+                    f"I need to know which version of **{name}** you'd like "
+                    "before I add it to your cart."
+                ),
+                "intent":      Intent.ADD_TO_CART.value,
+                "suggestions": ["Show me the options", "Cancel"],
+                "session_id":  str(conversation.id),
+                "pagination":  default_pagination(page),
+                "flow_state":  FlowState.AWAITING_VARIANT_SELECTION.value,
+                "actions":     [],
+            })
+
+        actions = [_action]
 
         return jsonify({
             "success":     True,
