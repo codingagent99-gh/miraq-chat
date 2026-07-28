@@ -1273,7 +1273,6 @@ def handle_cart_result():
 @chat_bp.route("/chat", methods=["POST"])
 @enforce_daily_limit
 def chat():
-    print("XXXXX_THIS_IS_THE_LOCAL_SERVER_XXXXX", flush=True)
     start_time = time.time()
 
     # ── Parse request ──
@@ -1291,6 +1290,40 @@ def chat():
 
     message = body.get("message", "").strip()
     page    = int(body.get("page", 1))
+
+    # ── Platform validation ───────────────────────────────────────────────
+    # The widget reports which platform its bundle was built for. A mismatch
+    # means a widget is pointed at the wrong backend — e.g. a Shopify
+    # storefront talking to a WooCommerce deployment. Every answer from here
+    # on would be about the wrong catalogue, and cart/order actions would
+    # reference ids that don't exist on the other side, so reject the request
+    # outright rather than serving plausible-looking nonsense.
+    #
+    # This is validation, NOT selection: the backend is chosen per deployment
+    # by ECOMMERCE_BACKEND (imported at module load in several modules), so a
+    # per-request switch would be a lie. Absent field = older widget = allowed.
+    _claimed_platform = (body.get("platform") or "").strip().lower()
+    if _claimed_platform and _claimed_platform != ECOMMERCE_BACKEND:
+        logger.error(
+            f"POST /chat | platform mismatch | widget={_claimed_platform!r} "
+            f"backend={ECOMMERCE_BACKEND!r} — rejecting request"
+        )
+        return jsonify({
+            "success":     False,
+            "bot_message": (
+                "This store's chat assistant isn't configured correctly. "
+                "Please let the store owner know — no action was taken."
+            ),
+            "intent": "error", "products": [],
+            "suggestions": [],
+            "session_id": body.get("session_id") or "",
+            "metadata": {
+                "error": "platform_mismatch",
+                "widget_platform": _claimed_platform,
+                "backend_platform": ECOMMERCE_BACKEND,
+            },
+            "pagination": default_pagination(),
+        }), 400
 
     # ── Language detection ──
     # Skip translation during variant selection — the user is typing back

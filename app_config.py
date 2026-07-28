@@ -142,6 +142,32 @@ DEFAULT_PAYMENT_METHOD_TITLE = "Cash on Delivery"
 # Supported values: "woocommerce", "shopify"
 ECOMMERCE_BACKEND = os.getenv("ECOMMERCE_BACKEND", "woocommerce").lower()
 
+# ── Shopify customer identity ─────────────────────────────────────────────
+#   "app_proxy" (default, required in production)
+#       Trust only Shopify's App Proxy: verify the HMAC signature and use the
+#       signed `logged_in_customer_id`. A browser-supplied customer_id is
+#       ignored entirely.
+#
+#   "insecure_client_claim" (development only)
+#       Trust the customer_id the browser sends. This lets ANY caller read ANY
+#       customer's orders and saved addresses. It exists so the widget can be
+#       developed before the Shopify app proxy is configured, and it must be
+#       chosen explicitly — the default is never the insecure one.
+SHOPIFY_CUSTOMER_AUTH = os.getenv("SHOPIFY_CUSTOMER_AUTH", "app_proxy").lower()
+
+# Replay window for signed proxy requests, in seconds (0 disables the check).
+SHOPIFY_PROXY_MAX_AGE = int(os.getenv("SHOPIFY_PROXY_MAX_AGE", "900"))
+
+if ECOMMERCE_BACKEND == "shopify" and SHOPIFY_CUSTOMER_AUTH != "app_proxy":
+    # Loud, once, at startup — in addition to the per-request warning.
+    import logging as _logging
+    _logging.getLogger("miraq_chat").error(
+        "⚠️  SHOPIFY_CUSTOMER_AUTH=%s — customer identity is NOT verified. "
+        "Any caller can impersonate any customer and read their orders and "
+        "addresses. This must never be used in production.",
+        SHOPIFY_CUSTOMER_AUTH,
+    )
+
 # ═══════════════════════════════════════════
 # API DEFAULTS  (move from settings.py)
 # ═══════════════════════════════════════════

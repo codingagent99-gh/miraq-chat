@@ -16,6 +16,7 @@ dateparser
 # ── True Semantic AI Engine (Replaced Fuzzy) ──
 sentence-transformers>=2.5.0
 torch>=2.2.0
+rapidfuzz
 
 # ─────────────────────────────────────────────
 # Development & Testing

@@ -9,6 +9,9 @@ from chat_logger import get_logger
 from store_loader.config import SHOPIFY_STORE_DOMAIN
 from models.shopify_token import ShopifyToken
 from ecommerce.shopify_endpoints import ShopifyEndpoints
+from ecommerce.shopify_proxy import resolve_shopify_customer_id
+from app_config import SHOPIFY_CUSTOMER_AUTH, SHOPIFY_PROXY_MAX_AGE
+from store_loader.config import SHOPIFY_CLIENT_SECRET
 
 logger = get_logger("miraq_chat")
 shopify_bp = Blueprint("shopify", __name__)
@@ -52,15 +55,30 @@ query GetCustomerAddresses($id: ID!) {
 @shopify_bp.route("/customer-addresses", methods=["GET"])
 def get_customer_addresses():
     """
-    Returns saved addresses for a logged-in Shopify customer.
+    Returns saved addresses for the CURRENTLY AUTHENTICATED Shopify customer.
     Called by ShopifyCheckoutPanel on mount to pre-fill the shipping form.
 
-    Query params:
-        customer_id (int) — Shopify numeric customer ID passed from Liquid.
+    Identity comes from Shopify's signed App Proxy parameters, never from the
+    request: this endpoint returns names, phone numbers and postal addresses,
+    so honouring a caller-supplied ``customer_id`` (as it previously did) let
+    anyone enumerate the store's customer PII.
     """
-    customer_id = request.args.get("customer_id", "").strip()
+    customer_id, proxy_error = resolve_shopify_customer_id(
+        request.args,
+        mode=SHOPIFY_CUSTOMER_AUTH,
+        client_secret=SHOPIFY_CLIENT_SECRET,
+        # Only consulted in the development-only insecure mode.
+        claimed_customer_id=request.args.get("customer_id", "").strip(),
+        max_age_seconds=SHOPIFY_PROXY_MAX_AGE or None,
+    )
+
+    if proxy_error:
+        logger.error(f"customer-addresses: proxy verification failed ({proxy_error})")
+        return jsonify({"error": "unverified_request"}), 403
+
     if not customer_id:
-        return jsonify({"error": "customer_id is required"}), 400
+        # Guest — not an error, simply nothing saved to offer.
+        return jsonify({"addresses": [], "default_address_id": None})
 
     # Retrieve the stored Admin API token
     token_row = ShopifyToken.query.get(SHOPIFY_STORE_DOMAIN)
