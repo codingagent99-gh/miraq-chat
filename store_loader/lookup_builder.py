@@ -316,7 +316,74 @@ def build_all_lookups(loader):
         loader.all_attributes_raw,
         loader.tag_by_name_lower,
     )
+    
+    # Fuzzy typo-correction vocabulary (utils/typo_correction.py)
+    build_fuzzy_vocab(loader)
+        
+        
+# ══════════════════════════════════════════════════════════════
+# FUZZY TYPO-CORRECTION VOCABULARY
+# ══════════════════════════════════════════════════════════════
 
+def build_fuzzy_vocab(loader):
+    """
+    Build the search space for pre-classification typo correction:
+
+        loader.fuzzy_vocab_types     — {term: type} for catalog terms only
+                                        (category | tag | attribute | product_word)
+        loader.fuzzy_protected_words — frozenset of words NEVER corrected
+                                        (stop/noise/synonym words + all catalog terms)
+        loader.fuzzy_vocab_terms     — list over catalog terms ∪ protected words;
+                                        the combined space matters: a misspelled
+                                        glue word must be able to win against a
+                                        catalog term ("shwo"→"show", not →"shower")
+
+    Multi-word catalog names are indexed as their individual words
+    (product names especially) — token-level correction fixes each word,
+    then Phase 1's longest-match reassembles the phrase.
+    """
+    from utils.entity_helpers import STOP_WORDS
+    from config.store_config import GENERIC_NOISE_WORDS, GENERIC_WORD_SYNONYMS
+
+    vocab_types: dict = {}
+
+    def _add(term: str, vtype: str):
+        for word in re.split(r"[\s\-_/&]+", term.lower().strip()):
+            word = word.strip()
+            # <4 chars is below the correction threshold; digits are skipped
+            # by the corrector anyway (dimensions, counts).
+            if len(word) >= 4 and word.isalpha() and word not in vocab_types:
+                vocab_types[word] = vtype
+
+    for name, data in loader.category_by_name_lower.items():
+        if data.get("count", 0) > 0 and data.get("slug") != "uncategorized":
+            _add(name, "category")
+    for name, data in loader.tag_by_name_lower.items():
+        if data.get("count", 0) > 0:
+            _add(name, "tag")
+    for attr in loader.all_attributes_raw or []:
+        label = attr.get("attribute_label") or attr.get("name") or ""
+        if label:
+            _add(label, "attribute")
+        for term in attr.get("terms", []):
+            _add(term.get("name", ""), "attribute")
+    for name in loader.product_by_name_lower:
+        _add(name, "product_word")
+
+    protected = set(vocab_types)
+    protected.update(w.lower() for w in STOP_WORDS)
+    protected.update(w.lower() for w in GENERIC_NOISE_WORDS)
+    protected.update(w.lower() for w in GENERIC_WORD_SYNONYMS)
+    protected.update(w.lower() for w in GENERIC_WORD_SYNONYMS.values())
+
+    loader.fuzzy_vocab_types = vocab_types
+    loader.fuzzy_protected_words = frozenset(protected)
+    loader.fuzzy_vocab_terms = list(protected)  # superset: catalog ∪ glue words
+
+    logger.info(
+        f"lookup_builder: fuzzy vocab built | catalog_terms={len(vocab_types)} | "
+        f"total_search_space={len(loader.fuzzy_vocab_terms)}"
+    )
 
 # ══════════════════════════════════════════════════════════════
 # SEMANTIC VECTOR BUILDER
