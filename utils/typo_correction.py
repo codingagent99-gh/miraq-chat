@@ -16,10 +16,14 @@ Design principles (see chat for full rationale):
     nearest catalog term ("shower").
   - Damerau-Levenshtein distance (transposition = 1 edit — the most common
     typo type), with length-scaled budgets (Elasticsearch AUTO rule):
-    len < 4 → never corrected; len 4-6 → 1 edit; len 7+ → 2 edits.
-  - Ambiguity refusal: if two candidates tie at the same distance, do NOT
-    guess — leave the token alone for Phase 3 semantic search / the
-    clarification-chip flow to handle.
+    len < 4 → never corrected; len 4-6 → 2 edits; len 7+ → 3 edits.
+  - Ambiguity escalation: if two-or-more CATALOG terms tie at the same
+    distance, do NOT guess — the token is left as-is in corrected_message
+    and reported via the `ambiguities` return value so the caller
+    (handlers/typo_clarification_handler.py) can ask "did you mean X or
+    Y?" as a clarification chip and splice the answer back in. Ties among
+    protected/glue words only are still silently skipped — not worth
+    interrupting the user for.
   - KNOWN_QUERY_TYPO_CORRECTIONS (store_config.py) is applied FIRST as a
     manual override — it exists for real-word typos ("quick chip" → "quick
     ship") that edit distance structurally cannot catch, because the typo is
@@ -31,7 +35,8 @@ shorter than 4 characters.
 """
 
 import re
-from typing import Optional
+from collections import namedtuple
+from typing import Optional, Union
 
 from rapidfuzz import process
 from rapidfuzz.distance import DamerauLevenshtein
@@ -47,6 +52,15 @@ _TOKEN_SPLIT_RE = re.compile(r"(\W+)")  # keep separators so text reassembles ex
 
 _MIN_CORRECTABLE_LEN = 4
 
+# A single unambiguous winner — applied immediately, no user involved.
+_Correction = namedtuple("_Correction", "term distance vocab_type")
+
+# Two or more CATALOG terms (category/tag/attribute/product_word) tied at the
+# same distance. Ties that only involve protected/glue words are NOT surfaced
+# here — asking "did you mean 'show' or 'shoe'?" for a stop word isn't worth
+# interrupting the user for, so those still resolve to a silent no-op.
+_Ambiguity = namedtuple("_Ambiguity", "candidates distance")
+
 
 def _max_edits_for(token: str) -> int:
     """Length-scaled edit budget (Elasticsearch AUTO fuzziness rule)."""
@@ -54,64 +68,85 @@ def _max_edits_for(token: str) -> int:
     if n < _MIN_CORRECTABLE_LEN:
         return 0
     if n <= 6:
-        return 1
-    return 2
+        return 2
+    return 3
 
 
-def _correct_token(token: str, loader) -> Optional[tuple]:
+def _correct_token(token: str, loader) -> Optional[Union[_Correction, _Ambiguity]]:
     """
-    Return (corrected_term, distance, vocab_type) for one OOV token,
-    or None if no unambiguous correction within the edit budget exists.
-    vocab_type is "protected" when the winner is a glue/stop word (the
-    caller substitutes it and lets normal stop-word stripping remove it),
-    else the catalog type ("category" | "tag" | "attribute" | "product_word").
+    Return a _Correction for one OOV token when there's a single unambiguous
+    winner, an _Ambiguity when two-or-more CATALOG terms tie for best at the
+    same distance (caller can turn this into a clarification chip), or None
+    when there's nothing worth acting on (no match, or the tie is only among
+    protected/glue words).
     """
     max_edits = _max_edits_for(token)
     if max_edits == 0:
         return None
 
-    # extract() over the combined search space; we need the top TWO to
-    # detect ties, which extractOne can't reveal.
+    # extract() over the combined search space; pull more than 1 so we can
+    # detect ties, which extractOne can't reveal. limit=4 caps how many chip
+    # options a runaway tie could produce.
     matches = process.extract(
         token,
         loader.fuzzy_vocab_terms,
         scorer=DamerauLevenshtein.distance,
         score_cutoff=max_edits,
-        limit=2,
+        limit=4,
     )
     if not matches:
         return None
 
     best_term, best_dist, _ = matches[0]
+    tied_terms = [m[0] for m in matches if m[1] == best_dist]
 
-    # Ambiguity refusal: a second candidate at the SAME distance means we
-    # can't know which the user meant — don't guess, let Phase 3 /
-    # clarification chips handle it.
-    if len(matches) > 1 and matches[1][1] == best_dist:
+    if len(tied_terms) > 1:
+        catalog_tied = [
+            t for t in tied_terms
+            if loader.fuzzy_vocab_types.get(t, "protected") != "protected"
+        ]
+        if len(catalog_tied) < 2:
+            # Tie is only among glue/stop words (or one catalog + one glue
+            # word, where the glue word isn't a real competing meaning) —
+            # not worth a clarification chip. Don't guess; just skip it.
+            logger.debug(
+                f"[TypoFix] ambiguous (non-catalog) — not correcting | token={token!r} | "
+                f"tied candidates={tied_terms} at distance {best_dist}"
+            )
+            return None
         logger.debug(
-            f"[TypoFix] ambiguous — not correcting | token={token!r} | "
-            f"tied candidates={[m[0] for m in matches]} at distance {best_dist}"
+            f"[TypoFix] ambiguous catalog tie — deferring to clarification | "
+            f"token={token!r} | tied candidates={catalog_tied} at distance {best_dist}"
         )
-        return None
+        return _Ambiguity(candidates=catalog_tied, distance=best_dist)
 
     vocab_type = loader.fuzzy_vocab_types.get(best_term, "protected")
-    return best_term, best_dist, vocab_type
+    return _Correction(term=best_term, distance=best_dist, vocab_type=vocab_type)
 
 
-def correct_message(message: str, loader) -> tuple[str, list]:
+def correct_message(message: str, loader) -> tuple[str, list, list]:
     """
     Correct misspelled catalog/glue words in `message`.
 
-    Returns (corrected_message, corrections) where corrections is a list of
-    {"original", "corrected", "distance", "type"} dicts — empty when nothing
-    was changed. The original message is returned untouched when the loader
-    is missing or has no fuzzy vocabulary (e.g. degraded/still-warming
-    tenant), so this is always safe to call.
+    Returns (corrected_message, corrections, ambiguities):
+      - corrections: list of {"original", "corrected", "distance", "type"}
+        dicts for every unambiguous fix that was applied — empty when
+        nothing changed.
+      - ambiguities: list of {"original", "candidates", "distance"} dicts,
+        one per token that tied between two-or-more catalog terms. These
+        tokens are left AS-IS in corrected_message (not corrected, not
+        removed) so the caller can build a clarification chip and splice
+        the user's chosen candidate into corrected_message afterward.
+
+    The original message is returned untouched (with both lists empty) when
+    the loader is missing or has no fuzzy vocabulary (e.g. degraded/
+    still-warming tenant), so this is always safe to call.
     """
     if not message or loader is None or not getattr(loader, "fuzzy_vocab_terms", None):
-        return message, []
+        return message, [], []
 
     corrections: list = []
+    ambiguities: list = []
     working = message
 
     # ── Manual override pass (real-word typos edit distance can't see) ──
@@ -145,11 +180,19 @@ def correct_message(message: str, loader) -> tuple[str, list]:
         if result is None:
             continue
 
-        corrected_term, dist, vocab_type = result
-        parts[i] = corrected_term
+        if isinstance(result, _Ambiguity):
+            # Leave parts[i] untouched — the token stays exactly as the user
+            # typed it in corrected_message, ready to be substituted once
+            # the clarification chip is answered.
+            ambiguities.append(
+                {"original": token, "candidates": result.candidates, "distance": result.distance}
+            )
+            continue
+
+        parts[i] = result.term
         changed = True
         corrections.append(
-            {"original": token, "corrected": corrected_term, "distance": dist, "type": vocab_type}
+            {"original": token, "corrected": result.term, "distance": result.distance, "type": result.vocab_type}
         )
 
     corrected_message = "".join(parts) if changed else working
@@ -159,5 +202,10 @@ def correct_message(message: str, loader) -> tuple[str, list]:
             f"[TypoFix] applied {len(corrections)} correction(s) | "
             + " ; ".join(f"{c['original']!r}→{c['corrected']!r}({c['type']})" for c in corrections)
         )
+    if ambiguities:
+        logger.info(
+            f"[TypoFix] {len(ambiguities)} ambiguous catalog tie(s) deferred to clarification | "
+            + " ; ".join(f"{a['original']!r}→{a['candidates']}" for a in ambiguities)
+        )
 
-    return corrected_message, corrections
+    return corrected_message, corrections, ambiguities

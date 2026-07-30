@@ -534,6 +534,42 @@ def _maybe_attach_address_proposal(
 
 
 # ══════════════════════════════════════════════════════════════
+# ─── TYPO CORRECTION NOTE ───
+# ══════════════════════════════════════════════════════════════
+
+def _build_typo_correction_note(corrections: list, found_results: bool = True) -> str:
+    """
+    Render a short, honest note when we silently corrected misspelled terms
+    before searching — so the shopper knows we didn't find their exact
+    words, and what we substituted instead, rather than just showing
+    results with no explanation.
+
+    `found_results` controls phrasing only (deterministic, no LLM call —
+    we already know both the correction pairs and the search outcome by
+    the time this runs, so a template is enough): when the corrected
+    search still came back empty, generate_bot_message() will already say
+    "I couldn't find any products matching X" right below this note, so we
+    switch to "I corrected X to Y" instead of "couldn't find X" to avoid
+    saying "couldn't find" twice in the same response.
+
+    Skips "manual_override" entries in the note text alongside fuzzy ones
+    using the same "original -> corrected" pairing; distance is irrelevant
+    to the shopper so it's omitted.
+    """
+    if not corrections:
+        return ""
+    if len(corrections) == 1:
+        c = corrections[0]
+        if found_results:
+            return f"Couldn't find \"{c['original']}\" — showing results for **{c['corrected']}** instead."
+        return f"I corrected \"{c['original']}\" to **{c['corrected']}**."
+    pairs = ", ".join(f"\"{c['original']}\" → **{c['corrected']}**" for c in corrections)
+    if found_results:
+        return f"Couldn't find an exact match for a couple of terms, so I corrected: {pairs}."
+    return f"I corrected a couple of terms: {pairs}."
+
+
+# ══════════════════════════════════════════════════════════════
 # ─── DATABASE SESSION HELPERS ───
 # ══════════════════════════════════════════════════════════════
 
@@ -545,6 +581,7 @@ def _finalize_turn(
     _proposal_message=None,
     _proposal_customer_id=None,
     _proposal_flow_state=None,
+    _typo_corrections=None,
 ):
     """
     Interceptor: Extracts bot message from Flask response, saves to DB,
@@ -572,6 +609,13 @@ def _finalize_turn(
             _proposal_customer_id,
             current_flow_state=_proposal_flow_state,
         )
+
+    # 0.5. Prepend a note when this turn silently corrected misspelled terms.
+    if _typo_corrections and data.get("bot_message"):
+        _found_results = bool(data.get("products")) or bool(data.get("categories"))
+        _typo_note = _build_typo_correction_note(_typo_corrections, found_results=_found_results)
+        if _typo_note:
+            data["bot_message"] = f"{_typo_note}\n\n{data['bot_message']}"
 
     combined_metadata = data.get("metadata", {}).copy()
     combined_metadata["products"]    = data.get("products", [])
@@ -1428,12 +1472,14 @@ def chat():
         store_loader = get_store_loader()
 
         def _ft(resp):
-            """Local alias: wraps _finalize_turn with address-proposal context."""
+            """Local alias: wraps _finalize_turn with address-proposal context and,
+            if this turn corrected any misspelled terms, a note about it."""
             return _finalize_turn(
                 conversation, resp,
                 _proposal_message=message,
                 _proposal_customer_id=customer_id,
                 _proposal_flow_state=current_flow_state,
+                _typo_corrections=_typo_corrections,
             )
 
         # ── Resolve flow state ──
@@ -1444,6 +1490,30 @@ def chat():
 
         _wipe_stale_cart(conversation, user_context, current_flow_state)
 
+        # Bound before the typo-correction block below so _ft can always read
+        # it, even when that block's guard condition is False this turn (e.g.
+        # a "__"-prefixed control message) or hasn't run yet.
+        _typo_corrections: list = []
+
+        # ── Typo-ambiguity clarification resolution ───────────────────────────
+        # Answers a chip we asked last turn ("did you mean X or Y?"). Resolves
+        # to plain message text (not entities — see typo_clarification_handler
+        # docstring) and falls through into normal typo correction below, on
+        # the *resolved* message, so the rest of the sentence still gets fixed.
+        if (
+            current_flow_state == FlowState.AWAITING_FILTER_CLARIFICATION
+            and user_context.get("pending_typo_clarification")
+        ):
+            from handlers.typo_clarification_handler import resolve_typo_clarification
+            _resolved_message = resolve_typo_clarification(
+                message, user_context, user_context["pending_typo_clarification"]
+            )
+            if _resolved_message is not None:
+                message                  = _resolved_message
+                current_flow_state       = FlowState.IDLE
+                conversation.flow_state  = FlowState.IDLE.value
+                user_context["flow_state"] = FlowState.IDLE.value
+
         # ── Typo correction (pre-classification) ─────────────────────────────
         if (
             current_flow_state in (FlowState.IDLE, FlowState.AWAITING_ANYTHING_ELSE)
@@ -1451,7 +1521,7 @@ def chat():
             and not re.match(r"(?i)^no\s*-\s*search\s*for\s*['\"]", message)
         ):
             from utils.typo_correction import correct_message
-            _corrected, _typo_corrections = correct_message(message, store_loader)
+            _corrected, _typo_corrections, _typo_ambiguities = correct_message(message, store_loader)
             if _typo_corrections:
                 message = _corrected
                 user_msg.metadata_json = {
@@ -1459,6 +1529,21 @@ def chat():
                     "corrected_message": _corrected,
                 }
                 db.session.commit()
+
+            if _typo_ambiguities:
+                # _corrected already has any unambiguous fixes applied and the
+                # tied token left as-is — that's exactly the base text to chip
+                # on and splice into. v1: surface only the first tie per turn
+                # (see typo_clarification_handler docstring).
+                from handlers.typo_clarification_handler import build_typo_clarification
+                _typo_clarification_resp = build_typo_clarification(
+                    _typo_ambiguities[0], _corrected, user_context, str(conversation.id), page, start_time,
+                )
+                conversation.context_data = user_context
+                conversation.flow_state   = FlowState.AWAITING_FILTER_CLARIFICATION.value
+                flag_modified(conversation, "context_data")
+                db.session.commit()
+                return _ft(_typo_clarification_resp)
 
         # ── Product reorder intercept ──   ← MOVE HERE (after current_flow_state is set)
         if message.startswith("__PRODUCT_REORDER__"):
