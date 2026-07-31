@@ -19,6 +19,13 @@ logger = get_logger("miraq_chat")
 class IntentEvaluator(ABC):
     """Abstract base class for all intent evaluators."""
 
+    # Every word this evaluator's regexes match on. Unioned into the fuzzy
+    # corrector's protected set at vocab-build time so a shopper typing
+    # "bulk order" is never rewritten to the nearest catalog term.
+    # Subclasses MUST declare this; audit_keyword_drift() fails the build if
+    # a regex literal is missing from it.
+    KEYWORDS: frozenset = frozenset()
+
     @abstractmethod
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
         """Returns (Intent, confidence) if a match is found, else (None, 0.0)."""
@@ -31,6 +38,21 @@ class IntentEvaluator(ABC):
 
 
 class OrderActionEvaluator(IntentEvaluator):
+    # Vocabulary this evaluator's regexes key off. Must never be typo-corrected
+    # — see classifier/keywords.py. Kept in sync by audit_keyword_drift().
+    KEYWORDS = frozenset({
+        "about", "add", "after", "again", "apr", "aug", "before", "between",
+        "bought", "browse", "buy", "cart", "check", "checkout", "complement",
+        "day", "dec", "detail", "details", "did", "display", "during", "feb",
+        "fetch", "find", "get", "goes", "had", "have", "history", "info",
+        "item", "items", "jan", "jul", "jun", "last", "latest", "list", "look",
+        "mar", "match", "may", "month", "most", "nov", "oct", "open", "order",
+        "ordered", "orders", "pair", "past", "previous", "previously",
+        "product", "products", "provide", "purchase", "purchases", "recent",
+        "related", "reorder", "repeat", "search", "see", "sep", "should",
+        "show", "similar", "something", "status", "tell", "track", "tracking",
+        "view", "want", "week", "what", "where", "which", "year",
+    })
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
         if re.search(r"\b(repeat|reorder|re-order|order\s*again)\b", text):
             entities.reorder = True
@@ -138,6 +160,9 @@ class OrderActionEvaluator(IntentEvaluator):
 
 
 class AccountActionsEvaluator(IntentEvaluator):
+    KEYWORDS = frozenset({
+        "bookmark", "later", "save", "wishlist",
+    })
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
         if re.search(r"\bsave\b.*\blater\b|\bbookmark\b", text):
             return Intent.SAVE_FOR_LATER, 0.87
@@ -151,6 +176,10 @@ class AccountActionsEvaluator(IntentEvaluator):
 
 
 class DiscountEvaluator(IntentEvaluator):
+    KEYWORDS = frozenset({
+        "bulk", "clearance", "code", "coupon", "deals", "discount", "promo",
+        "promotions", "sale",
+    })
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
         if re.search(r"\bcoupon\b|\bpromo\s*code\b|\bdiscount\s*code\b", text):
             return Intent.COUPON_INQUIRY, 0.91
@@ -163,6 +192,12 @@ class DiscountEvaluator(IntentEvaluator):
 
 
 class ProductDetailEvaluator(IntentEvaluator):
+    KEYWORDS = frozenset({
+        "about", "also", "available", "colors", "come", "complement", "does",
+        "finishes", "goes", "how", "immediate", "like", "match", "may", "now",
+        "options", "pair", "quick", "related", "ship", "similar", "sizes",
+        "tell", "variants", "variations", "what", "which",
+    })
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
         if entities.product_name and re.search(r"\b(what|which|how|tell|about)\b", text):
             loader = get_store_loader()
@@ -235,6 +270,11 @@ class ProductDetailEvaluator(IntentEvaluator):
 
 
 class CatalogSearchEvaluator(IntentEvaluator):
+    KEYWORDS = frozenset({
+        "about", "all", "categor", "category", "categories", "cost", "detail",
+        "get", "how", "info", "list", "more", "much", "price", "products",
+        "see", "show", "specification", "specs", "tell", "what",
+    })
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
         if entities.product_id and entities.attributes:
             return Intent.PRODUCT_VARIATIONS, 0.93
@@ -280,6 +320,10 @@ class CatalogSearchEvaluator(IntentEvaluator):
 
 
 class GeneralFallbackEvaluator(IntentEvaluator):
+    KEYWORDS = frozenset({
+        "catalog", "catalogue", "categories", "collection", "have", "kinds",
+        "offer", "portfolio", "range", "sell", "types", "varieties",
+    })
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
         if re.search(r"\b(catalog|catalogue|collection|range|portfolio)\b", text):
             return Intent.PRODUCT_CATALOG, 0.90
@@ -315,6 +359,12 @@ class GeneralFallbackEvaluator(IntentEvaluator):
 
 
 class CartCheckoutEvaluator(IntentEvaluator):
+    KEYWORDS = frozenset({
+        "add", "cart", "change", "check", "checkout", "complete", "delete",
+        "drop", "open", "order", "out", "place", "proceed", "put", "qty",
+        "quantity", "remove", "see", "set", "show", "take", "throw", "toss",
+        "update", "view",
+    })
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
 
         # VIEW_CART
@@ -345,6 +395,10 @@ class CartCheckoutEvaluator(IntentEvaluator):
         return None, 0.0
 
 class BulkOrderEvaluator(IntentEvaluator):
+    KEYWORDS = frozenset({
+        "bulk", "buy", "buying", "order", "ordering", "place", "purchase",
+        "reorder",
+    })
     _ORDER_VERBS = re.compile(r'\b(order|buy|purchase|reorder|re-order)\b', re.I)
     _BULK_TRIGGER = re.compile(
         r'\bbulk\s+(?:order|ordering|buy|purchase|buying)\b'
@@ -439,4 +493,25 @@ DEFAULT_EVALUATORS = [
 
 def get_default_pipeline() -> ClassifierPipeline:
     """Return a ClassifierPipeline with the default evaluator chain."""
+    _run_keyword_audit_once()
     return ClassifierPipeline(DEFAULT_EVALUATORS)
+
+
+_KEYWORD_AUDIT_DONE = False
+
+
+def _run_keyword_audit_once() -> None:
+    """
+    Verify every regex literal in this module is declared in its evaluator's
+    KEYWORDS, so the typo corrector will leave it alone. Logs an error on
+    drift; the test suite calls audit_keyword_drift(strict=True) to fail CI.
+    """
+    global _KEYWORD_AUDIT_DONE
+    if _KEYWORD_AUDIT_DONE:
+        return
+    _KEYWORD_AUDIT_DONE = True
+    try:
+        from classifier.keywords import audit_keyword_drift
+        audit_keyword_drift()
+    except Exception as exc:
+        logger.warning(f"Keyword drift audit skipped: {exc}")

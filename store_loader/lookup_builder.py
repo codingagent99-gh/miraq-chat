@@ -380,6 +380,17 @@ def build_fuzzy_vocab(loader):
     # — see CONTROL_PHRASE_WORDS in utils/typo_correction.py for why.
     protected.update(CONTROL_PHRASE_WORDS)
 
+    # Every word the intent classifier's regexes key off ("bulk", "qty",
+    # "specs", ...). Derived from the evaluators themselves rather than
+    # hand-listed, so adding an evaluator can't silently reintroduce the
+    # "bulk order -> did you mean bark/back/dusk?" class of bug.
+    # See classifier/keywords.py.
+    try:
+        from classifier.keywords import get_classifier_keywords
+        protected.update(get_classifier_keywords())
+    except Exception as exc:          # never block vocab build on this
+        logger.error(f"build_fuzzy_vocab: classifier keyword union failed: {exc}")
+
     loader.fuzzy_vocab_types = vocab_types
     loader.fuzzy_protected_words = frozenset(protected)
     loader.fuzzy_vocab_terms = list(protected)  # superset: catalog ∪ glue words
