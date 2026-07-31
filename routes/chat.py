@@ -37,7 +37,7 @@ from response_generator import (
 )
 from classifier import classify
 from api_builder import build_api_calls
-from conversation_flow import FlowState, handle_flow_state, is_order_flow, _flow_context_message
+from conversation_flow import FlowState, handle_flow_state, is_order_flow, _flow_context_message, is_bare_exit
 from chat_logger import get_logger, sanitize_log_string
 from store_registry import get_store_loader
 from ecommerce import endpoints
@@ -1490,6 +1490,43 @@ def chat():
 
         _wipe_stale_cart(conversation, user_context, current_flow_state)
 
+        # ── Bare cancel in IDLE / AWAITING_ANYTHING_ELSE ──────────────────────
+        # conversation_flow's escape hatch deliberately skips these two states,
+        # and they are exactly the two states where typo correction runs — so
+        # without this, "cancel" was corrected to the nearest catalog term
+        # ("panel") and searched as a product. IDLE is not a no-op state either:
+        # active_search filter accumulation survives here, so cancel has real
+        # work to do — it resets the same way New Search does.
+        #
+        # Placed AFTER flow-state resolution (needs current_flow_state) and
+        # BEFORE typo correction (must see the raw word). Clarification states
+        # are excluded: their own handlers own the cancel chip.
+        if (
+            current_flow_state in (FlowState.IDLE, FlowState.AWAITING_ANYTHING_ELSE)
+            and is_bare_exit(message)
+        ):
+            clear_active_search(user_context)
+            conversation.context_data  = user_context
+            conversation.flow_state    = FlowState.IDLE.value
+            user_context["flow_state"] = FlowState.IDLE.value
+            flag_modified(conversation, "context_data")
+            db.session.commit()
+            logger.info(
+                f"Bare exit word in {current_flow_state.value} — reset to idle | "
+                f"session={conversation.id} | message={message!r}"
+            )
+            return jsonify({
+                "success": True,
+                "bot_message": "No problem — I've cleared that. What would you like to look for?",
+                "intent": "new_search",
+                "products": [],
+                "suggestions": ["Browse Products", "View my orders"],
+                "session_id": str(conversation.id),
+                "metadata": {"flow_state": FlowState.IDLE.value},
+                "flow_state": FlowState.IDLE.value,
+                "pagination": default_pagination(page),
+            }), 200
+
         # Bound before the typo-correction block below so _ft can always read
         # it, even when that block's guard condition is False this turn (e.g.
         # a "__"-prefixed control message) or hasn't run yet.
@@ -1504,10 +1541,35 @@ def chat():
             current_flow_state == FlowState.AWAITING_FILTER_CLARIFICATION
             and user_context.get("pending_typo_clarification")
         ):
-            from handlers.typo_clarification_handler import resolve_typo_clarification
+            from handlers.typo_clarification_handler import (
+                resolve_typo_clarification,
+                TYPO_CLARIFICATION_CANCELLED,
+            )
             _resolved_message = resolve_typo_clarification(
                 message, user_context, user_context["pending_typo_clarification"]
             )
+
+            # Cancel: exit the chip WITHOUT reprocessing the text. Feeding
+            # the still-ambiguous token back into correct_message() below is
+            # what re-raised the identical prompt on every turn.
+            if _resolved_message is TYPO_CLARIFICATION_CANCELLED:
+                conversation.context_data  = user_context
+                conversation.flow_state    = FlowState.IDLE.value
+                user_context["flow_state"] = FlowState.IDLE.value
+                flag_modified(conversation, "context_data")
+                db.session.commit()
+                return jsonify({
+                    "success": True,
+                    "bot_message": "No problem — what would you like to search for?",
+                    "intent": "new_search",
+                    "products": [],
+                    "suggestions": ["Browse Products", "View my orders"],
+                    "session_id": str(conversation.id),
+                    "metadata": {"flow_state": FlowState.IDLE.value},
+                    "flow_state": FlowState.IDLE.value,
+                    "pagination": default_pagination(page),
+                }), 200
+
             if _resolved_message is not None:
                 message                  = _resolved_message
                 current_flow_state       = FlowState.IDLE
@@ -1521,7 +1583,10 @@ def chat():
             and not re.match(r"(?i)^no\s*-\s*search\s*for\s*['\"]", message)
         ):
             from utils.typo_correction import correct_message
-            _corrected, _typo_corrections, _typo_ambiguities = correct_message(message, store_loader)
+            _corrected, _typo_corrections, _typo_ambiguities = correct_message(
+                message, store_loader,
+                suppressed_tokens=user_context.get("typo_suppressed_tokens", []),
+            )
             if _typo_corrections:
                 message = _corrected
                 user_msg.metadata_json = {

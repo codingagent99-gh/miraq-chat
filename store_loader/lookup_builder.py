@@ -344,6 +344,7 @@ def build_fuzzy_vocab(loader):
     """
     from utils.entity_helpers import STOP_WORDS
     from config.store_config import GENERIC_NOISE_WORDS, GENERIC_WORD_SYNONYMS
+    from utils.typo_correction import CONTROL_PHRASE_WORDS
 
     vocab_types: dict = {}
 
@@ -375,6 +376,9 @@ def build_fuzzy_vocab(loader):
     protected.update(w.lower() for w in GENERIC_NOISE_WORDS)
     protected.update(w.lower() for w in GENERIC_WORD_SYNONYMS)
     protected.update(w.lower() for w in GENERIC_WORD_SYNONYMS.values())
+    # Conversational control vocabulary ("cancel", "browse", "checkout", ...)
+    # — see CONTROL_PHRASE_WORDS in utils/typo_correction.py for why.
+    protected.update(CONTROL_PHRASE_WORDS)
 
     loader.fuzzy_vocab_types = vocab_types
     loader.fuzzy_protected_words = frozenset(protected)
@@ -486,4 +490,3 @@ def build_semantic_vectors(loader):
                 logger.error(f"Failed to save semantic vector cache: {e}")
 
     logger.info(f"Generated {len(corpus_texts)} vectors in {round(time.time() - start_time, 2)}s")
-    

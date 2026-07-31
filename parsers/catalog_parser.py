@@ -445,7 +445,7 @@ def phase3_semantic_search(
     if (cleaned_pos_text or cleaned_neg_text) and loader:
         import torch
         from sentence_transformers import util
-        SEMANTIC_THRESHOLD = 0.55
+        SEMANTIC_THRESHOLD = 0.7
 
         if not hasattr(loader, 'semantic_tensors') or loader.semantic_tensors is None:
             if cleaned_pos_text:

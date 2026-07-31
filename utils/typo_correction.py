@@ -52,6 +52,39 @@ _TOKEN_SPLIT_RE = re.compile(r"(\W+)")  # keep separators so text reassembles ex
 
 _MIN_CORRECTABLE_LEN = 4
 
+# ── Control / chip vocabulary — NEVER corrected ────────────────────────────
+# These are the words that carry conversational control meaning: the exit
+# words, the flow verbs the classifier regexes key off ("browse", "view",
+# "track", "checkout"), and the words used in our own suggestion chips.
+#
+# They are OOV against catalog vocab, >=4 chars, and frequently sit within
+# 1-2 edits of a real catalog term ("cancel"->"panel", "browse"->"brown",
+# "skip"->"ship", "back"->"black", "view"->"new"), so without this set the
+# corrector silently rewrites them and the downstream regex/flow match
+# never fires. Adding them here ALSO makes them correction *targets*, so a
+# genuinely misspelled control word ("cancle") now resolves to "cancel"
+# instead of being force-fitted to the nearest product term.
+CONTROL_PHRASE_WORDS = frozenset({
+    # exit / cancel
+    "cancel", "cancelled", "exit", "stop", "quit", "nevermind", "abort",
+    "start", "over", "close", "reset", "clear",
+    # cart / checkout / order lifecycle
+    "cart", "checkout", "check", "place", "order", "orders", "ordering",
+    "reorder", "purchase", "buy", "confirm", "confirmed", "track",
+    "tracking", "status", "history", "invoice", "receipt", "refund",
+    "return", "returns", "cancelation", "cancellation",
+    # navigation / chips
+    "browse", "view", "load", "more", "back", "next", "previous", "skip",
+    "done", "continue", "select", "choose", "change", "edit", "update",
+    "remove", "delete", "add", "again", "here", "there",
+    # our own chip labels
+    "filters", "filter", "original", "text", "exclude", "use", "using",
+    "these", "categories", "category",
+    # account / support
+    "email", "address", "shipping", "billing", "payment", "account",
+    "help", "support", "agent", "human", "quantity", "price", "total",
+})
+
 # A single unambiguous winner — applied immediately, no user involved.
 _Correction = namedtuple("_Correction", "term distance vocab_type")
 
@@ -124,7 +157,7 @@ def _correct_token(token: str, loader) -> Optional[Union[_Correction, _Ambiguity
     return _Correction(term=best_term, distance=best_dist, vocab_type=vocab_type)
 
 
-def correct_message(message: str, loader) -> tuple[str, list, list]:
+def correct_message(message: str, loader, suppressed_tokens=None) -> tuple[str, list, list]:
     """
     Correct misspelled catalog/glue words in `message`.
 
@@ -138,12 +171,20 @@ def correct_message(message: str, loader) -> tuple[str, list, list]:
         removed) so the caller can build a clarification chip and splice
         the user's chosen candidate into corrected_message afterward.
 
+    `suppressed_tokens` is an iterable of lowercase tokens the shopper has
+    already declined correction for this session (they pressed "Search
+    'urah'"). Those tokens are passed through verbatim and are NOT
+    re-surfaced as ambiguities — without this, rejecting a chip just
+    re-triggers the same chip on the next turn, forever.
+
     The original message is returned untouched (with both lists empty) when
     the loader is missing or has no fuzzy vocabulary (e.g. degraded/
     still-warming tenant), so this is always safe to call.
     """
     if not message or loader is None or not getattr(loader, "fuzzy_vocab_terms", None):
         return message, [], []
+
+    _suppressed = {t.lower() for t in (suppressed_tokens or ())}
 
     corrections: list = []
     ambiguities: list = []
@@ -168,6 +209,8 @@ def correct_message(message: str, loader) -> tuple[str, list, list]:
             not token
             or not token.isalpha()          # skips digits, mixed, @, punctuation-glued
             or len(token) < _MIN_CORRECTABLE_LEN
+            or token in _suppressed          # shopper already declined this one
+            or token in CONTROL_PHRASE_WORDS  # conversational control word
             or token in loader.fuzzy_protected_words
             # Plural/singular of a protected word is NOT a typo — Phase 1's
             # matcher is already plural-tolerant; "tiles" must not become "tile".

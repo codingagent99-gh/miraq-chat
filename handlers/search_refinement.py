@@ -251,8 +251,17 @@ def save_active_search(user_context: dict, entities: ExtractedEntities) -> None:
 
 
 def clear_active_search(user_context: dict) -> None:
-    """Drop the active search (New Search pressed, or context gone stale)."""
+    """Drop the active search (New Search pressed, or context gone stale).
+
+    "New Search" is documented as the GUARANTEED reset (see routes/chat.py),
+    so it must also drop the two per-conversation decline lists. Both are
+    append-only and were previously never cleared by anything, which meant a
+    single dismissal silently suppressed that suggestion for the entire life
+    of the conversation — including across New Search.
+    """
     user_context.pop("active_search", None)
+    user_context.pop("rejected_semantic_terms", None)
+    user_context.pop("typo_suppressed_tokens", None)
 
 
 def describe_active_filters(entities: ExtractedEntities) -> str:

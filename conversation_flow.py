@@ -54,6 +54,29 @@ _ORDER_FLOW_STATES = {
     FlowState.AWAITING_BULK_QUANTITY,
 }
 
+# Bare exit vocabulary. Shared by the in-flow escape hatch below and by the
+# IDLE/ANYTHING_ELSE interceptor in routes/chat.py, so "cancel" means the
+# same thing everywhere instead of being redefined in four places.
+EXIT_PHRASES = frozenset({
+    "cancel", "exit", "stop", "quit", "nevermind", "never mind",
+    "abort", "start over",
+})
+
+
+def is_bare_exit(text: str) -> bool:
+    """
+    True only for a STANDALONE exit word.
+
+    Deliberately stricter than the in-flow check, which also accepts
+    "<exit word> ..." prefixes. In IDLE there is no flow to escape, so a
+    longer phrase is far more likely to be a real request that merely
+    starts with one of these words — "cancel my order #4405" is an order
+    cancellation, not a request to reset the chat. Those must reach the
+    classifier untouched.
+    """
+    return text.strip().lower().rstrip("!.?") in EXIT_PHRASES
+
+
 # Keywords that signal a topic change away from the current flow
 _TOPIC_CHANGE_KEYWORDS = {
     "show", "search", "find", "browse", "display", "list",
@@ -201,7 +224,7 @@ def handle_flow_state(
     if state not in (FlowState.IDLE, FlowState.AWAITING_ANYTHING_ELSE):
         # Exact matches or starts-with to prevent accidental triggers 
         # (e.g., we want to catch "cancel order" but not "I want to order cancela tiles")
-        exit_phrases = ["cancel", "exit", "stop", "quit", "nevermind", "never mind", "abort", "start over"]
+        exit_phrases = sorted(EXIT_PHRASES)
         if text in exit_phrases or any(text.startswith(p + " ") for p in exit_phrases):
             return {
                 "bot_message": "No problem! I've cancelled that. Is there anything else I can help with? 😊",

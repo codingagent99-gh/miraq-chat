@@ -33,6 +33,13 @@ from handlers.chat_utils import default_pagination
 
 _CANCEL_WORDS = {"cancel", "exit", "stop", "nevermind", "never mind", "abort", "start over"}
 
+# Sentinel: the shopper backed out of the chip entirely. Distinct from the
+# reject path, which still wants a search run on the original spelling.
+# Returning base_message for BOTH is what caused the infinite re-prompt:
+# the caller reset flow_state to IDLE and fed the still-ambiguous token
+# straight back into correct_message(), which re-raised the same tie.
+TYPO_CLARIFICATION_CANCELLED = object()
+
 
 def build_typo_clarification(ambiguity, corrected_message, user_context, session_id, page, start_time):
     """
@@ -88,14 +95,26 @@ def resolve_typo_clarification(message: str, user_context: dict, pending_typo: d
     """
     Resolve the shopper's response to a typo-ambiguity chip prompt.
 
-    Returns the message text to re-run through typo correction + Phase 1
-    classification: either `base_message` with the chosen candidate spliced
-    in for `original_token`, or `base_message` unchanged on reject/cancel
-    (the original spelling is left in place for Phase 3 semantic search to
-    take a shot at). Returns None if the message doesn't match any expected
-    response, in which case the caller should leave pending state untouched
-    and fall through to normal handling (same contract as
-    resolve_filter_clarification).
+    Returns one of:
+      - str                          — message text to re-run through typo
+                                       correction + Phase 1 classification:
+                                       `base_message` with the chosen
+                                       candidate spliced in, or (on reject)
+                                       `base_message` unchanged so Phase 3
+                                       semantic search can take a shot at
+                                       the original spelling.
+      - TYPO_CLARIFICATION_CANCELLED — shopper backed out; the caller must
+                                       NOT reprocess the text, just return
+                                       to idle.
+      - None                         — message doesn't match any expected
+                                       response; caller leaves pending state
+                                       untouched and falls through to normal
+                                       handling (same contract as
+                                       resolve_filter_clarification).
+
+    On reject, `original_token` is recorded in
+    user_context["typo_suppressed_tokens"] so the next correction pass
+    leaves it alone instead of re-raising the identical chip.
     """
     msg_lower = message.lower().strip()
     original = pending_typo["original_token"]
@@ -117,8 +136,15 @@ def resolve_typo_clarification(message: str, user_context: dict, pending_typo: d
 
     user_context.pop("pending_typo_clarification", None)
 
+    if is_cancel:
+        return TYPO_CLARIFICATION_CANCELLED
+
     if selected:
         return _word_boundary_sub(original, selected, base_message)
 
-    # Reject / cancel: leave the original spelling in place.
+    # Reject: run the search on the original spelling, and remember that this
+    # token was declined so the corrector doesn't immediately re-chip it.
+    _suppressed = user_context.setdefault("typo_suppressed_tokens", [])
+    if original.lower() not in _suppressed:
+        _suppressed.append(original.lower())
     return base_message
