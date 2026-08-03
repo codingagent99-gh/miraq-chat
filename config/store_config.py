@@ -347,3 +347,71 @@ GENERIC_WORD_SYNONYMS: dict = _load_generic_word_synonyms()
 KNOWN_QUERY_TYPO_CORRECTIONS = {
     "quick chip": "quick ship",
 }
+
+
+# ═══════════════════════════════════════════════════════════════
+# BULK ORDER — REQUIRED ADDRESS FIELD FLOOR
+# ═══════════════════════════════════════════════════════════════
+# The minimum set of address fields that MUST be present before a bulk order
+# line can be confirmed and placed.
+#
+# Why a static floor exists at all, when the site already publishes its real
+# required flags at /custom-api/v1/checkout-fields:
+#   THWCFE (the checkout field editor plugin) evaluates its conditional-display
+#   rules when woocommerce_checkout_fields runs. In a REST context there is no
+#   session and no cart, so conditions can evaluate false and the field is
+#   STRIPPED from the response even though the live checkout renders it — this
+#   is the same problem the widget works around in hooks/useCheckoutFields.ts
+#   by re-injecting billing_field_type when /order-types is non-empty.
+#   A purely-live required set therefore silently shrinks, which would disable
+#   the validation gate exactly when a plugin conditional misfires.
+#
+# utils/checkout_fields.get_required_fields() returns the UNION of this floor
+# and the live response. The live fetch may only ADD required fields, never
+# remove them.
+#
+# Keys are short form keys (group prefix stripped), matching the shape the
+# widget's address panel posts back in __BULK_ADDR__ — see
+# hooks/useCheckoutFields.formKey(). "meta" holds the CS custom fields, which
+# are order meta rather than WooCommerce address fields and so are never
+# covered by an address-level check.
+#
+# Deliberately NOT required: address_2, phone, order_notes.
+_DEFAULT_BULK_ADDRESS_REQUIRED_FLOOR = {
+    "billing": [
+        "first_name", "last_name", "company", "country",
+        "address_1", "city", "state", "postcode", "email",
+    ],
+    "shipping": [
+        "first_name", "last_name", "company", "country",
+        "address_1", "city", "state", "postcode", "email",
+    ],
+    "meta": ["billing_field_type", "billing_project", "project_rep"],
+}
+
+
+def _load_bulk_address_required_floor() -> dict:
+    """
+    Env override: BULK_ADDRESS_REQUIRED_FLOOR_JSON, a JSON object with any of
+    the keys "billing" / "shipping" / "meta" mapping to a list of field keys.
+    Groups absent from the override keep their default. A group set to an empty
+    list is honoured — that is how a tenant switches a group off deliberately.
+    """
+    raw = os.getenv("BULK_ADDRESS_REQUIRED_FLOOR_JSON", "")
+    merged = {k: list(v) for k, v in _DEFAULT_BULK_ADDRESS_REQUIRED_FLOOR.items()}
+    if not raw:
+        return merged
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return merged
+    if not isinstance(parsed, dict):
+        return merged
+    for group in ("billing", "shipping", "meta"):
+        value = parsed.get(group)
+        if isinstance(value, list):
+            merged[group] = [str(k) for k in value]
+    return merged
+
+
+BULK_ADDRESS_REQUIRED_FLOOR: dict = _load_bulk_address_required_floor()

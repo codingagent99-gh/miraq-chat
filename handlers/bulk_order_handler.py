@@ -36,6 +36,13 @@ from conversation_flow import FlowState
 from chat_logger import get_logger
 from handlers.chat_utils import default_pagination
 from parsers.bulk_order_parser import parse_bulk_order_utterance, BulkOrderLine
+from utils.checkout_fields import (
+    count_missing,
+    format_missing_fields,
+    get_required_fields,
+    has_errors,
+    validate_bulk_address,
+)
 import re
 import difflib
 logger = get_logger("miraq_chat")
@@ -117,6 +124,63 @@ def _get(line, key, default=None):
     if isinstance(line, dict):
         return line.get(key, default)
     return getattr(line, key, default)
+
+
+# ══════════════════════════════════════════════════════════════
+# ── Helper: effective address for a bulk line ──
+# ══════════════════════════════════════════════════════════════
+
+def _merge_address_block(base, override):
+    """
+    Merge a panel override onto a base address block.
+
+    A key ABSENT from the override keeps its base value; a key PRESENT with an
+    empty string CLEARS it.
+
+    The previous behaviour skipped empty override values entirely ("don't let
+    blank panel fields wipe real data"), which meant a rep could not blank a
+    field at all: clearing it in the panel silently restored the stale value,
+    and the validation gate would then pass on data the rep had deliberately
+    removed. Honouring empties is safe because the panel prefills from the same
+    _pick()-generated payload the base came from, so unedited fields round-trip
+    to identical values. If _pick is ever narrowed to emit fewer keys than the
+    raw address block holds, revisit this.
+
+    None is treated as "absent" rather than "clear", so a malformed payload
+    can't wipe an address.
+    """
+    merged = dict(base or {})
+    for key, value in (override or {}).items():
+        if value is None:
+            continue
+        merged[key] = value
+    return merged
+
+
+def _effective_address_for_line(line, address_overrides, line_idx, rep_email):
+    """
+    Return (billing, shipping) for one bulk line: the base address blocks with
+    the per-line panel override merged in, and project_rep defaulted to the
+    logged-in rep.
+
+    This is the ONLY place bulk address merging happens. The validation gate,
+    the card prefill and _create_all_confirmed_orders all call it, so they
+    cannot drift apart — a line that passes validation is guaranteed to be the
+    same line that gets posted to WooCommerce.
+
+    The project_rep default is applied HERE, before validation, because order
+    creation auto-fills it from the logged-in rep. Validating before applying it
+    would block on a field that would have been populated anyway.
+    """
+    override = (address_overrides or {}).get(str(line_idx)) or {}
+    billing = _merge_address_block(_get(line, "billing_address"), override.get("billing"))
+    shipping = _merge_address_block(_get(line, "shipping_address"), override.get("shipping"))
+
+    if not str(billing.get("project_rep") or "").strip():
+        billing["project_rep"] = rep_email or ""
+
+    return billing, shipping
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1348,6 +1412,22 @@ def handle_bulk_address_confirmation_reply(action, message, conversation, user_c
 
     # Step 3: Address confirmed — use address as-is
     if action == "bulk_address_confirmed":
+        # ── Validation gate ──
+        # POST /wc/v3/orders performs no address validation of its own, so this
+        # is the only thing standing between "Confirm" on a card reading "No
+        # address on file" and a live order with an empty billing block.
+        billing, shipping = _effective_address_for_line(
+            current_line,
+            user_context.get("bulk_address_overrides", {}),
+            idx,
+            user_context.get("rep_email", ""),
+        )
+        errors = validate_bulk_address(billing, shipping, get_required_fields())
+        if has_errors(errors):
+            return _reprompt_address_with_errors(
+                resolved_lines, idx, conversation, user_context, page, start_time, errors,
+            )
+
         current_line["address_confirmed"] = True
         user_context["bulk_current_line_index"] = idx + 1
         conversation.context_data = user_context
@@ -1374,11 +1454,27 @@ def handle_bulk_address_confirmation_reply(action, message, conversation, user_c
         edited_billing = parsed.get("billing") or {}
         edited_shipping = parsed.get("shipping") or {}
 
+        # Persist the override BEFORE validating, so a rejected save doesn't
+        # throw away what the rep just typed — the re-prompt prefills from the
+        # effective address, which reads through this override.
         overrides = user_context.setdefault("bulk_address_overrides", {})
         overrides[str(idx)] = {
             "billing": edited_billing,
             "shipping": edited_shipping,
         }
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+
+        # ── Validation gate ──
+        billing, shipping = _effective_address_for_line(
+            current_line, overrides, idx, user_context.get("rep_email", ""),
+        )
+        errors = validate_bulk_address(billing, shipping, get_required_fields())
+        if has_errors(errors):
+            return _reprompt_address_with_errors(
+                resolved_lines, idx, conversation, user_context, page, start_time, errors,
+            )
+
         current_line["address_confirmed"] = True
         user_context.pop("bulk_awaiting_address_text", None)
         user_context["bulk_current_line_index"] = idx + 1
@@ -1388,40 +1484,50 @@ def handle_bulk_address_confirmation_reply(action, message, conversation, user_c
             resolved_lines, idx + 1, conversation, user_context, page, start_time
         )
 
-    # Step 4: Rep wants to change the address — set sub-state flag, re-prompt
+    # Step 4: Rep wants to change the address — re-show the card so the inline
+    # edit panel is the entry point.
+    #
+    # This used to set bulk_awaiting_address_text and ask the rep to type a
+    # free-text address. That path could not produce a valid address by
+    # construction — it wrote the whole typed string into address_1 and left
+    # city/state/postcode/country empty — so with required-field validation in
+    # place it would reject every time. The structured panel is now the only
+    # edit surface.
     elif action == "bulk_address_change":
-        user_context["bulk_awaiting_address_text"] = True
+        user_context.pop("bulk_awaiting_address_text", None)
         conversation.context_data = user_context
         flag_modified(conversation, "context_data")
-        elapsed = round((time.time() - start_time) * 1000)
-        return jsonify({
-            "success": True,
-            "bot_message": "Please type the new shipping address:",
-            "intent": "guided_flow",
-            "products": [],
-            "suggestions": ["Skip this order", "Cancel"],
-            "session_id": str(conversation.id),
-            "metadata": {
-                "flow_state": FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value,
-                "response_time_ms": elapsed,
-            },
-            "flow_state": FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value,
-            "pagination": default_pagination(page),
-        }), 200
+        return _build_address_card_response(
+            resolved_lines, idx, conversation, user_context, page, start_time,
+        )
 
-    # Step 5: Rep has typed a new address (legacy free-text path)
+    # Step 5: Legacy free-text override.
+    #
+    # Retired (see Step 4) but kept reachable so any session already in the
+    # bulk_awaiting_address_text sub-state when this shipped can still complete
+    # rather than dead-ending. It runs through the same validation gate as every
+    # other path, so it cannot create a blank-address order; in practice it will
+    # reject and route the rep to the panel.
     elif action == "bulk_address_override_text":
         user_context.pop("bulk_awaiting_address_text", None)
         overrides = user_context.setdefault("bulk_address_overrides", {})
         overrides[str(idx)] = {
             "shipping": {
                 "address_1": message.strip(),
-                "city": "",
-                "state": "",
-                "postcode": "",
-                "country": "",
             },
         }
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+
+        billing, shipping = _effective_address_for_line(
+            current_line, overrides, idx, user_context.get("rep_email", ""),
+        )
+        errors = validate_bulk_address(billing, shipping, get_required_fields())
+        if has_errors(errors):
+            return _reprompt_address_with_errors(
+                resolved_lines, idx, conversation, user_context, page, start_time, errors,
+            )
+
         current_line["address_confirmed"] = True
         user_context["bulk_current_line_index"] = idx + 1
         conversation.context_data = user_context
@@ -1463,6 +1569,10 @@ def handle_bulk_address_confirmation_reply(action, message, conversation, user_c
 # ══════════════════════════════════════════════════════════════
 
 def _advance_to_next_address_confirmation(resolved_lines, idx, conversation, user_context, page, start_time):
+    """
+    Walk forward to the next line still needing address confirmation and show
+    its card. When every line has been confirmed or skipped, place the orders.
+    """
     # Step 1: Skip already-processed lines
     while idx < len(resolved_lines):
         line = resolved_lines[idx]
@@ -1473,6 +1583,45 @@ def _advance_to_next_address_confirmation(resolved_lines, idx, conversation, use
     if idx >= len(resolved_lines):
         return _create_all_confirmed_orders(user_context, conversation, page, start_time)
 
+    return _build_address_card_response(
+        resolved_lines, idx, conversation, user_context, page, start_time,
+    )
+
+
+def _reprompt_address_with_errors(
+    resolved_lines, idx, conversation, user_context, page, start_time, errors
+):
+    """
+    Re-show the SAME line's address card after validation rejected it.
+
+    Deliberately does NOT advance bulk_current_line_index and does NOT set
+    address_confirmed — the rep stays on this line until the address is valid or
+    they skip it.
+    """
+    return _build_address_card_response(
+        resolved_lines, idx, conversation, user_context, page, start_time,
+        validation_errors=errors,
+    )
+
+
+def _build_address_card_response(
+    resolved_lines, idx, conversation, user_context, page, start_time,
+    validation_errors=None,
+):
+    """
+    Build the SHOW_BULK_ADDRESS_CONFIRMATION card for resolved_lines[idx].
+
+    Shared by the normal advance path and the validation re-prompt so the two
+    can't drift. When `validation_errors` is supplied the card is rendered in
+    its blocked form: the errors ride along in the payload, the bot message
+    names what's missing, and "Yes, confirm" is REMOVED from the suggestion
+    chips.
+
+    That last part matters: conversation_flow.py maps any reply matching
+    yes|yeah|confirm|ok|sure|correct to the bulk_address_confirmed action, so
+    leaving the chip on screen would invite the rep straight back into the
+    rejection they just hit.
+    """
     current_line = resolved_lines[idx]
     user_context["bulk_current_line_index"] = idx
     conversation.context_data = user_context
@@ -1506,16 +1655,26 @@ def _advance_to_next_address_confirmation(resolved_lines, idx, conversation, use
                 flag_modified(conversation, "context_data")
         except Exception as exc:
             logger.warning(
-                f"_advance_to_next_address_confirmation | failed to fetch address "
+                f"_build_address_card_response | failed to fetch address "
                 f"for customer_id={current_line.get('customer_id')} | error={exc}"
             )
 
+    # Prefill from the EFFECTIVE address, not the raw base blocks, so a rep who
+    # saved a partial edit and got rejected sees their own values back in the
+    # panel instead of the original ones.
+    effective_billing, effective_shipping = _effective_address_for_line(
+        current_line,
+        user_context.get("bulk_address_overrides", {}),
+        idx,
+        user_context.get("rep_email", ""),
+    )
+
     addr_parts = [
-        shipping_block.get("address_1", ""),
-        shipping_block.get("address_2", ""),
-        shipping_block.get("city", ""),
-        shipping_block.get("state", ""),
-        shipping_block.get("postcode", ""),
+        effective_shipping.get("address_1", ""),
+        effective_shipping.get("address_2", ""),
+        effective_shipping.get("city", ""),
+        effective_shipping.get("state", ""),
+        effective_shipping.get("postcode", ""),
     ]
     addr_str = ", ".join(p for p in addr_parts if p) or "No address on file"
 
@@ -1540,44 +1699,68 @@ def _advance_to_next_address_confirmation(resolved_lines, idx, conversation, use
     def _pick(block, fields):
         return {f: (block or {}).get(f, "") for f in fields}
 
-    billing_payload = _pick(billing_block, _BILLING_FIELDS)
-    shipping_payload = _pick(shipping_block, _SHIPPING_FIELDS)
+    billing_payload = _pick(effective_billing, _BILLING_FIELDS)
+    shipping_payload = _pick(effective_shipping, _SHIPPING_FIELDS)
 
-    # Default "Your Rep" to the logged-in rep's email so the dropdown is
-    # pre-selected from the start, unless the company record already has one.
-    if not billing_payload.get("project_rep"):
-        billing_payload["project_rep"] = user_context.get("rep_email", "")
+    # project_rep is already defaulted to the logged-in rep inside
+    # _effective_address_for_line, so the dropdown arrives pre-selected.
 
     # ▼ emit a structured action so React can render the address card + panel
+    payload = {
+        "customer_name": current_line["customer_display_name"],
+        "items_text": items_text,
+        # Legacy read-only summary fields (kept for back-compat).
+        "address": {
+            "address_1": effective_shipping.get("address_1", ""),
+            "address_2": effective_shipping.get("address_2", ""),
+            "city":      effective_shipping.get("city", ""),
+            "state":     effective_shipping.get("state", ""),
+            "postcode":  effective_shipping.get("postcode", ""),
+        },
+        "addr_str": addr_str,
+        # Full structured blocks for the editable panel prefill.
+        "billing": billing_payload,
+        "shipping": shipping_payload,
+        "progress": {"current": idx + 1, "total": len(resolved_lines)},
+    }
+    if has_errors(validation_errors):
+        payload["validation_errors"] = validation_errors
+
     address_action = {
         "type": "SHOW_BULK_ADDRESS_CONFIRMATION",
-        "payload": {
-            "customer_name": current_line["customer_display_name"],
-            "items_text": items_text,
-            # Legacy read-only summary fields (kept for back-compat).
-            "address": {
-                "address_1": shipping_block.get("address_1", ""),
-                "address_2": shipping_block.get("address_2", ""),
-                "city":      shipping_block.get("city", ""),
-                "state":     shipping_block.get("state", ""),
-                "postcode":  shipping_block.get("postcode", ""),
-            },
-            "addr_str": addr_str,
-            # Full structured blocks for the editable panel prefill.
-            "billing": billing_payload,
-            "shipping": shipping_payload,
-            "progress": {"current": idx + 1, "total": len(resolved_lines)},
-        },
+        "payload": payload,
     }
 
-    bot_message = (
-        (f"**Order for {current_line['customer_display_name']}** "
-         if not current_line.get("is_self_order") else "**Your order** ")
-        + f"({idx + 1} of {len(resolved_lines)})\n\n"
-        f"📦 {items_text}\n"
-        f"📍 Shipping to: {addr_str}\n\n"
-        "Confirm this address?"
-    )
+    header = (
+        f"**Order for {current_line['customer_display_name']}** "
+        if not current_line.get("is_self_order") else "**Your order** "
+    ) + f"({idx + 1} of {len(resolved_lines)})\n\n"
+
+    if has_errors(validation_errors):
+        missing_count = count_missing(validation_errors)
+        bot_message = (
+            header
+            + f"📦 {items_text}\n"
+            + f"📍 Shipping to: {addr_str}\n\n"
+            + f"⚠️ This order is missing {missing_count} required "
+            + ("field" if missing_count == 1 else "fields")
+            + f": {format_missing_fields(validation_errors)}.\n\n"
+            + "Please update the address, or skip this order."
+        )
+        suggestions = ["Change address", "Skip this order"]
+        logger.info(
+            f"bulk_order | address validation blocked line {idx} "
+            f"({current_line.get('customer_display_name')}) | "
+            f"missing={format_missing_fields(validation_errors)}"
+        )
+    else:
+        bot_message = (
+            header
+            + f"📦 {items_text}\n"
+            + f"📍 Shipping to: {addr_str}\n\n"
+            + "Confirm this address?"
+        )
+        suggestions = ["Yes, confirm", "Change address", "Skip this order"]
 
     elapsed = round((time.time() - start_time) * 1000)
     return jsonify({
@@ -1585,8 +1768,8 @@ def _advance_to_next_address_confirmation(resolved_lines, idx, conversation, use
         "bot_message": bot_message,
         "intent": "guided_flow",
         "products": [],
-        "suggestions": ["Yes, confirm", "Change address", "Skip this order"],
-        "actions": [address_action],                          # ← NEW
+        "suggestions": suggestions,
+        "actions": [address_action],
         "session_id": str(conversation.id),
         "metadata": {
             "flow_state": FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value,
@@ -1623,23 +1806,36 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
         if not line.get("address_confirmed"):
             continue
 
-        override = address_overrides.get(str(line_idx)) or {}
-        override_billing = override.get("billing") or {}
-        override_shipping = override.get("shipping") or {}
-        
-        def _merge(base, override):
-            base = dict(base or {})
-            for k, v in (override or {}).items():
-                if v not in (None, ""):       # don't let blank panel fields wipe real data
-                    base[k] = v
-            return base
+        rep_email = user_context.get("rep_email", "")
 
-        billing = _merge(line.get("billing_address"), override_billing)
-        shipping = _merge(line.get("shipping_address"), override_shipping)
+        # Same merge path the validation gate used — see
+        # _effective_address_for_line. Sharing it is what guarantees the line
+        # that passed validation is the line that gets posted.
+        billing, shipping = _effective_address_for_line(
+            line, address_overrides, line_idx, rep_email,
+        )
+
+        # ── Defence in depth ──
+        # The gate in handle_bulk_address_confirmation_reply should already have
+        # caught this. Re-checking here means any future path that sets
+        # address_confirmed without going through that gate still cannot create
+        # a blank-address order — it lands in the failed list instead.
+        _errors = validate_bulk_address(billing, shipping, get_required_fields())
+        if has_errors(_errors):
+            failed_orders.append({
+                "customer": line["customer_display_name"],
+                "product": line["product_name"],
+                "error": f"Missing required address fields: {format_missing_fields(_errors)}",
+            })
+            logger.warning(
+                f"bulk_order | refused to create order for {line['customer_display_name']} "
+                f"| missing={format_missing_fields(_errors)}"
+            )
+            continue
 
         # ── Custom CS fields → order meta (not address-block fields) ──
-        # project_rep defaults to the logged-in rep's email when still blank.
-        rep_email = user_context.get("rep_email", "")
+        # project_rep is already defaulted to the logged-in rep inside
+        # _effective_address_for_line.
         project_rep  = billing.get("project_rep") or rep_email
         project_name = billing.get("billing_project") or ""
         field_type   = billing.get("billing_field_type") or ""
@@ -1678,10 +1874,12 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
             payload["customer_note"] = order_notes
         billing  = {k: v for k, v in billing.items() if v}
         shipping = {k: v for k, v in shipping.items() if v}
-        if billing.get("address_1"):
-            payload["billing"] = billing
-        if shipping.get("address_1"):
-            payload["shipping"] = shipping
+        # Attached unconditionally. The old code attached only when address_1
+        # was present, which is exactly how "no address" turned into a
+        # successful order with an empty billing block rather than a failure.
+        # Validation above guarantees both blocks are complete by this point.
+        payload["billing"] = billing
+        payload["shipping"] = shipping
 
         order_call = endpoints.create_order(
             payload=payload,

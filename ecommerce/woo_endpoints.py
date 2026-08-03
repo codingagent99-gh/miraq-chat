@@ -92,6 +92,27 @@ class WooEndpoints:
             requires_resolution=requires_resolution or [],
         )
 
+    def fetch_checkout_fields(
+        self,
+        description: str = "",
+        requires_resolution: Optional[List[str]] = None,
+    ) -> WooAPICall:
+        """GET /checkout-fields — WC checkout field definitions (custom_plugin surface).
+
+        Returns the checkout fields grouped by "billing" / "shipping" / "order",
+        each field carrying label / required / type / priority. Consumed by
+        utils/checkout_fields.get_required_fields() to enrich (never shrink) the
+        static required-field floor.
+        """
+        return WooAPICall(
+            method="GET",
+            endpoint="/checkout-fields",
+            params={},
+            surface="custom_plugin",
+            description=description or "Fetch checkout field definitions",
+            requires_resolution=requires_resolution or [],
+        )
+
     def list_categories(
         self,
         page: int,
