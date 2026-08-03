@@ -1582,7 +1582,7 @@ def chat():
             and not message.startswith("__")
             and not re.match(r"(?i)^no\s*-\s*search\s*for\s*['\"]", message)
         ):
-            from utils.typo_correction import correct_message
+            from utils.typo_correction import correct_message, find_mos_confusions
             _corrected, _typo_corrections, _typo_ambiguities = correct_message(
                 message, store_loader,
                 suppressed_tokens=user_context.get("typo_suppressed_tokens", []),
@@ -1594,6 +1594,20 @@ def chat():
                     "corrected_message": _corrected,
                 }
                 db.session.commit()
+
+            # ── "mos" confirmation guard ──
+            # Runs on _corrected (the exact text entity extraction is about to
+            # see) rather than the raw message, so it catches BOTH the
+            # uncorrected case ("mosiah" survived the edit-distance budget)
+            # and the mis-corrected case (the corrector confidently rewrote it
+            # to some other "mos" term). Prepended so it always wins the
+            # one-chip-per-turn slot over a regular edit-distance tie.
+            _mos_confusions = find_mos_confusions(
+                _corrected,
+                suppressed_tokens=user_context.get("typo_suppressed_tokens", []),
+            )
+            if _mos_confusions:
+                _typo_ambiguities = _mos_confusions + _typo_ambiguities
 
             if _typo_ambiguities:
                 # _corrected already has any unambiguous fixes applied and the

@@ -54,7 +54,11 @@ def build_typo_clarification(ambiguity, corrected_message, user_context, session
     original = ambiguity["original"]
     candidates = ambiguity["candidates"]
 
-    bot_message = f"I found multiple matches for '{original}'. Which did you mean?"
+    # Single-candidate guards (e.g. the "mos" confirmation) read as a
+    # confirmation, not a disambiguation, so they carry their own wording.
+    bot_message = ambiguity.get("prompt") or (
+        f"I found multiple matches for '{original}'. Which did you mean?"
+    )
 
     reject_label = f"Search '{original}'"
     suggestion_buttons = list(candidates) + [reject_label, "Cancel"]

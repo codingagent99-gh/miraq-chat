@@ -157,6 +157,77 @@ def _correct_token(token: str, loader) -> Optional[Union[_Correction, _Ambiguity
     return _Correction(term=best_term, distance=best_dist, vocab_type=vocab_type)
 
 
+# ── "mos" confusion guard ─────────────────────────────────────────────────
+# Hard rule, independent of edit distance: any word containing "mos" that
+# isn't already a "mosaic" word gets a confirmation chip before entity
+# extraction runs.
+#
+# Why this can't be left to the fuzzy corrector: the length-scaled edit
+# budget is computed against the WHOLE token, so a long misspelling that
+# happens to share a short prefix ("mosiah" -> "mosaic" is 2 edits, but
+# "piazza mosiah" tokenised and scored against a vocab full of 2-edit
+# neighbours) either loses to a closer unrelated term or never clears
+# score_cutoff at all. This guard fires on the substring, so recall is
+# 100% for the "mos-" family and the cost of a false positive is one
+# tappable chip the shopper can dismiss.
+_MOS_TARGET = "mosaic"
+_MOS_WORD_RE = re.compile(r"[A-Za-z]+")
+
+# Words that contain "mos" but should never prompt. Empty by default so the
+# rule behaves exactly as specified; add ordinary English carriers here
+# ("most", "almost", "mostly") if the chip starts firing on normal prose.
+MOS_CONFUSION_EXEMPT = frozenset()
+
+
+def find_mos_confusions(message: str, suppressed_tokens=None) -> list:
+    """
+    Return ambiguity-shaped dicts (same contract as correct_message()'s third
+    return value) for every distinct word in `message` that contains "mos"
+    but is not itself a mosaic word.
+
+    Words containing "mosaic" as a substring — "mosaic", "mosaics",
+    "mosaic-tile" — are already correct and skipped.
+
+    `suppressed_tokens` is honoured for the same reason correct_message()
+    honours it: once the shopper has pressed "Search 'mosiah'", re-raising
+    the identical chip on the next turn is an infinite prompt loop, not a
+    confirmation. This is the one bound on "always".
+    """
+    if not message:
+        return []
+
+    _suppressed = {t.lower() for t in (suppressed_tokens or ())}
+    seen: set = set()
+    confusions: list = []
+
+    for word in _MOS_WORD_RE.findall(message):
+        token = word.lower()
+        if (
+            "mos" not in token
+            or _MOS_TARGET in token          # mosaic / mosaics / mosaic-anything
+            or token in MOS_CONFUSION_EXEMPT
+            or token in _suppressed          # shopper already declined this one
+            or token in seen                 # same word twice in one message
+        ):
+            continue
+        seen.add(token)
+        confusions.append({
+            "original": token,
+            "candidates": [_MOS_TARGET],
+            "distance": None,
+            "prompt": f"Just to confirm — did you mean '{_MOS_TARGET}'?",
+        })
+
+    if confusions:
+        logger.info(
+            "[TypoFix] mos-guard raised %d confirmation(s) | %s",
+            len(confusions),
+            " ; ".join(repr(c["original"]) for c in confusions),
+        )
+
+    return confusions
+
+
 def correct_message(message: str, loader, suppressed_tokens=None) -> tuple[str, list, list]:
     """
     Correct misspelled catalog/glue words in `message`.
