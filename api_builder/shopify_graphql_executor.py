@@ -119,6 +119,34 @@ query ($collectionId: ID!, $first: Int!, $after: String) {
 # Helpers (mirror shopify_products.py exactly)
 # ══════════════════════════════════════════════════════════════
 
+def _slugify(s: str) -> str:
+    """
+    Slug normalisation. MUST stay byte-identical to
+    store_loader/shopify_fetcher._slugify and
+    api_builder/shopify_executor._slugify.
+
+    Why it matters here: shopify_fetcher bakes _slugify(option value) into
+    term["slug"], lookup_builder copies that into term.key, and the classifier
+    puts term.key into the filter conditions. So filter terms are ALWAYS slugs.
+    The variant data coming back from GraphQL carries raw display values. The
+    only way the two can be compared is to run the raw value through the same
+    function that produced the slug — see the "option" branch of _evaluate().
+
+    If this ever diverges from the fetcher's version, every attribute filter
+    silently stops matching, and the catalog must be re-fetched to repair it
+    (slugs are baked in at fetch time, not computed on read).
+    """
+    return (
+        (s or "")
+        .strip()
+        .lower()
+        .replace("'", "")
+        .replace('"', "")
+        .replace("/", "-")
+        .replace(" ", "-")
+    )
+
+
 def _gql(query, variables, token):
     resp = http_requests.post(
         f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-10/graphql.json",
@@ -278,7 +306,7 @@ def _build_shopify_filter_tree(conditions: list) -> dict:
     Target shapes for _evaluate():
         {"type": "tag",        "values": [...], "relation": "OR"}
         {"type": "collection", "values": [...], "relation": "OR"}
-        {"type": "option",     "name": "Finish", "values": [...], "relation": "OR"}
+        {"type": "option",     "key": "finish", "values": [...], "relation": "OR"}
         {"type": "price",      "min": N, "max": N}
         {"type": "available",  "value": True}
         {"relation": "AND"|"OR", "conditions": [...]}   ← group
@@ -339,8 +367,21 @@ def _convert_condition(c: dict) -> Optional[dict]:
     # ── variant option (everything else) ──
     # taxonomy is the attribute key, e.g. "finish", "size", "pa_color" → strip pa_
     else:
-        attr_name = taxonomy.removeprefix("pa_").replace("-", " ").title()
-        node = {"type": "option", "name": attr_name, "values": terms, "relation": inner_rel}
+        attr_key = taxonomy.removeprefix("pa_")
+        node = {
+            "type": "option",
+            # Carry the slug itself, not a display name rebuilt from it.
+            # The old code did .replace("-", " ").title() to reconstruct
+            # "Tile Size" from "tile-size", which round-trips fine for simple
+            # names but not for any option whose name contained punctuation:
+            # "Chip/Tile Size" slugs to "chip-tile-size" and rebuilds as
+            # "Chip Tile Size", which never matches. _evaluate() now slugifies
+            # the Shopify option name instead, so the comparison is symmetric.
+            "key": attr_key,
+            "name": attr_key.replace("-", " ").title(),  # kept for logging/debug
+            "values": terms,
+            "relation": inner_rel,
+        }
 
     if negate:
         node["negate"] = True
@@ -447,15 +488,32 @@ def _evaluate(node: dict, product: dict, variant: dict) -> bool:
                 result = bool(wanted & have)
 
         elif t == "option":
-            rel       = node.get("relation", "OR").upper()
-            opt_name  = node["name"].lower()
-            opt_vals  = {v.lower() for v in node.get("values", [])}
-            var_opts  = {
-                o["name"].lower(): o["value"].lower()
+            # No `relation` handling: a variant holds exactly one value per
+            # option, so a multi-value option filter is inherently OR, which is
+            # what the membership test below does. (The pre-existing code read
+            # node["relation"] here and never used it.)
+            # Both sides are slugified so a filter term like "12x24" can match
+            # the raw Shopify option value '12"x24"'.
+            #
+            # This branch previously compared node["values"] (slugs, straight
+            # from term.key) against selectedOptions[].value (raw display
+            # strings) with nothing but .lower(). Single-word values such as
+            # "Honed" or "Matte" happen to be identical in both forms, so
+            # finish and colour filters worked and hid the bug — but every
+            # size value carries quotes, dots, slashes or parentheses that
+            # slugification rewrites, so no size filter could ever match.
+            # Note the sibling "tag" and "collection" branches above already
+            # bridge the two forms via _norm(); this one was simply missed.
+            # _norm() alone would not be enough here: it maps hyphens to
+            # spaces but leaves quotes and dots untouched.
+            opt_key = node.get("key") or _slugify(node.get("name", ""))
+            opt_vals = {_slugify(v) for v in node.get("values", [])}
+            var_opts = {
+                _slugify(o.get("name", "")): _slugify(o.get("value", ""))
                 for o in variant.get("selectedOptions", [])
             }
-            var_val = var_opts.get(opt_name)
-            result  = var_val in opt_vals if var_val is not None else False
+            var_val = var_opts.get(opt_key)
+            result = var_val in opt_vals if var_val is not None else False
 
         elif t == "price":
             price  = float(variant.get("price", 0))
