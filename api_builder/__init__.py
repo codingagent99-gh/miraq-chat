@@ -567,19 +567,25 @@ def _build_product_detail(e, page, user_message: str = "") -> list:
     search = e.product_name or (user_message if not e.product_id else None)
     if not search and not e.product_id:
         return []   # nothing to work with — let fallback handle it
+    product_page = 1 if e.product_id else page
+    variation_page = page if (e.product_id and page > 1) else None
     return [build_advanced_filter_call(
         product_id=e.product_id,
         search_term=search,
-        page=page,
+        page=product_page,
+        variation_page=variation_page,
         description=f"Get details for product '{search}'",
     )]
 
 
 def _build_product_attr_info(e, page) -> list:
+    product_page = 1 if e.product_id else page
+    variation_page = page if (e.product_id and page > 1) else None
     return [build_advanced_filter_call(
         product_id=e.product_id,
         search_term=e.product_name if not e.product_id else None,
-        page=page,
+        page=product_page,
+        variation_page=variation_page,
         description=f"Fetch product '{e.product_name}' for attribute info",
     )]
 
@@ -725,6 +731,9 @@ def _extract_resolved_attr_values(attributes: dict) -> list:
 
 def _build_product_variations(e, page) -> list:
     attr_filters = resolve_attr_filters(e.attributes)
+    
+    product_page = 1 if e.product_id else page
+    variation_page = page if (e.product_id and page > 1) else None
 
     # Build the filter call as before
     call = build_advanced_filter_call(
@@ -739,7 +748,7 @@ def _build_product_variations(e, page) -> list:
         excluded_categories=list(e.excluded_categories) if e.excluded_categories else None,
         excluded_attributes=e.excluded_attributes if hasattr(e, 'excluded_attributes') else None,
         tag_operator=e.tag_operator,
-        page=page, in_stock=e.in_stock,
+        page=product_page, variation_page=variation_page, in_stock=e.in_stock,
         description=f"Get specific variations for '{e.product_name or 'Series'}'",
     )
 
