@@ -34,7 +34,7 @@ from app_config import (
 )
 from conversation_flow import FlowState
 from chat_logger import get_logger
-from handlers.chat_utils import default_pagination
+from handlers.chat_utils import default_pagination, _get_safe_options
 from parsers.bulk_order_parser import parse_bulk_order_utterance, BulkOrderLine
 from utils.checkout_fields import (
     count_missing,
@@ -516,9 +516,9 @@ def _ask_for_bulk_variant(
 
     attr_axes: dict = {}
     for var in variations:
-        for attr in var.get("attributes", []):
-            name = attr.get("name", "")
-            option = attr.get("option", "")
+        # _get_safe_options normalises both the custom flat-dict shape and
+        # the standard WC list-of-dicts shape, and drops blank options.
+        for name, option in _get_safe_options(var.get("attributes", [])).items():
             if name and option:
                 attr_axes.setdefault(name, set()).add(option)
 
@@ -530,7 +530,7 @@ def _ask_for_bulk_variant(
     variation_list = [
         {
             "id": var["id"],
-            "attributes": {a["name"]: a["option"] for a in var.get("attributes", [])},
+            "attributes": _get_safe_options(var.get("attributes", [])),
         }
         for var in variations
     ]

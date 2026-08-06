@@ -18,6 +18,7 @@ from woo_client import woo_client
 from ecommerce import endpoints
 from chat_logger import get_logger
 from app_config import BULK_ORDER_ROLES
+from handlers.chat_utils import normalize_spelling_variants
 
 logger = get_logger("miraq_chat")
 
@@ -308,10 +309,12 @@ def parse_bulk_order_utterance(
             data = var_result.get("data", [])
             _variant_cache[pl.product_id] = data if isinstance(data, list) else []
 
-        hint_lower = pl.variant_hint.lower()
+        hint_lower = normalize_spelling_variants(pl.variant_hint)
         for var in _variant_cache[pl.product_id]:
             for attr in var.get("attributes", []):
-                if hint_lower in attr.get("option", "").lower():
+                # Normalise BOTH sides — this catalog mixes US and UK spellings
+                # ("ADAMS Gray" vs "Aurora - Misty Grey").
+                if hint_lower in normalize_spelling_variants(attr.get("option", "")):
                     pl.variation_id = var["id"]
                     break
             if pl.variation_id:

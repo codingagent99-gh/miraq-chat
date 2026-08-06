@@ -2373,7 +2373,22 @@ def chat():
         # from a natural language message (e.g. "place bulk order") rather than
         # the __BULK_CANCEL__ / __PRODUCT_REORDER__ magic string paths.
         if intent == Intent.BULK_ORDER and role in BULK_ORDER_ROLES:
-            resp = handle_bulk_order_trigger(conversation, user_context, page, start_time)
+            # If the triggering message ALREADY carries the order lines
+            # (e.g. "Order Harmony Moon, Adams Grey, Aurora Taupe"), parse it now.
+            # Prompting would throw that message away and ask the rep to retype
+            # exactly what they just sent.
+            if _is_inline_bulk_order(message, store_loader):
+                logger.info(
+                    "BULK_ORDER: trigger message contains inline order lines — "
+                    "parsing directly instead of prompting for input."
+                )
+                conversation.flow_state = FlowState.AWAITING_BULK_ORDER_INPUT.value
+                resp = handle_bulk_order_input(
+                    message, store_loader, conversation, user_context,
+                    page, start_time, pre_resolved=entities,
+                )
+            else:
+                resp = handle_bulk_order_trigger(conversation, user_context, page, start_time)
             if resp:
                 return _ft(resp)
 

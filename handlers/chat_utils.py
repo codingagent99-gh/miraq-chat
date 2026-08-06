@@ -80,6 +80,77 @@ def _resolve_attribute_term_name(attr_name: str, raw_value, store_loader=None) -
     return value
 
 
+def _resolve_option_display_name(attr_name: str, option: str, store_loader=None) -> str:
+    """
+    Resolve a WooCommerce variation option value to its canonical display name.
+    """
+    if not attr_name or not option:
+        return option
+    loader = store_loader if store_loader is not None else _get_store_loader_safe()
+    if not loader:
+        return option
+    try:
+        display_name = _resolve_attribute_term_name(attr_name, option, loader)
+        if display_name:
+            return display_name
+    except Exception:
+        pass
+    return option
+
+
+def _get_safe_options(attrs, store_loader=None):
+    """
+    Return {attribute_display_name: option_display_name} from variation attrs.
+
+    Tolerates both variation attribute shapes so callers never have to branch:
+      - custom compact API : {"pa_colors": "ADAMS Graphite", "pa_finish": ""}
+      - standard WC API    : [{"name": "Colors", "option": "ADAMS Graphite"}]
+
+    Blank options are dropped, and anything unexpected yields {} rather than
+    raising — iterating a dict yields str keys, which is what made naive
+    `[a.get("option") for a in attrs]` callers crash on the custom shape.
+    """
+    if isinstance(attrs, dict):
+        return {
+            _attribute_display_name(k, store_loader): _resolve_option_display_name(k, str(v), store_loader).replace("-", " ").title()
+            for k, v in attrs.items()
+            if v
+        }
+    elif isinstance(attrs, list):
+        result = {}
+        for a in attrs:
+            if not isinstance(a, dict) or not a.get("name") or not a.get("option"):
+                continue
+            name = a.get("name", "")
+            option = a.get("option", "")
+            option = _resolve_option_display_name(name, option, store_loader)
+            result[name] = option
+        return result
+    return {}
+
+
+_SPELLING_VARIANTS = {
+    "grey": "gray",
+    "colour": "color",
+    "colours": "colors",
+}
+
+
+def normalize_spelling_variants(text: str) -> str:
+    """
+    Canonicalise UK/US spelling variants so matching is spelling-agnostic.
+
+    This must be applied to BOTH sides of a comparison, never as a one-way
+    rewrite of user input: this catalog is genuinely mixed — Adams ships
+    "ADAMS Gray" (US) while Aurora ships "Aurora - Misty Grey" (UK) — so
+    rewriting only the user's word fixes one product and breaks the other.
+    """
+    s = str(text or "").lower()
+    for variant, canonical in _SPELLING_VARIANTS.items():
+        s = re.sub(rf"\b{variant}\b", canonical, s)
+    return s
+
+
 def _normalize_attribute_lookup_name(attr_name: str) -> str:
     raw = str(attr_name or "").strip().lower().replace("_", " ")
     if raw.startswith("pa_"):

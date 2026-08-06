@@ -21,6 +21,8 @@ from handlers.chat_utils import (
     _compute_variant_options,
     _attribute_display_name,
     _resolve_attribute_term_name,
+    _resolve_option_display_name,
+    _get_safe_options,
     _variation_matches_resolved_neutral,
     score_variation_against_text,
     _STRIP_QUOTES_RE,
@@ -33,44 +35,6 @@ from store_registry import get_store_loader
 from ecommerce import endpoints
 
 logger = get_logger("miraq_chat")
-
-
-def _resolve_option_display_name(attr_name: str, option: str, store_loader) -> str:
-    """
-    Resolve a WooCommerce variation option value to its canonical display name.
-    """
-    if not store_loader or not attr_name or not option:
-        return option
-    try:
-        display_name = _resolve_attribute_term_name(attr_name, option, store_loader)
-        if display_name:
-            return display_name
-    except Exception:
-        pass
-    return option
-
-
-def _get_safe_options(attrs, store_loader=None):
-    """
-    Return {attribute_display_name: option_display_name} from variation attrs.
-    """
-    if isinstance(attrs, dict):
-        return {
-            _attribute_display_name(k, store_loader): _resolve_option_display_name(k, str(v), store_loader).replace("-", " ").title()
-            for k, v in attrs.items()
-            if v
-        }
-    elif isinstance(attrs, list):
-        result = {}
-        for a in attrs:
-            if not isinstance(a, dict) or not a.get("name") or not a.get("option"):
-                continue
-            name = a.get("name", "")
-            option = a.get("option", "")
-            option = _resolve_option_display_name(name, option, store_loader)
-            result[name] = option
-        return result
-    return {}
 
 
 def _slugify(s: str) -> str:
@@ -632,6 +596,63 @@ def _seed_resolved_from_entities(entities, variations: list, store_loader) -> di
     return seeded
 
 
+def _variation_images_for_resolved(variations: list, resolved: dict, store_loader) -> list:
+    """
+    Return the image(s) of the variation that explicitly matches every axis the
+    user has already resolved (e.g. {'Colors': 'Adams Graphite'}), so the product
+    card shows the colour they actually named instead of the generic parent shot.
+
+    Wildcard variations — axis present but blank — are deliberately skipped: a
+    blank axis means "any", not "this colour", and its image is the parent one.
+
+    Returns [] when nothing matches or the match has no image of its own, so the
+    caller simply keeps the existing parent images.
+    """
+    from formatters import variation_image_urls
+
+    if not resolved or not variations:
+        return []
+
+    # resolved values and _get_safe_options values are both display names produced
+    # by the same helper, so comparing them slugified is apples-to-apples.
+    resolved_norm = {
+        _slugify(axis): _slugify(val)
+        for axis, val in resolved.items()
+        if axis and val
+    }
+    if not resolved_norm:
+        return []
+
+    matches = []
+    for var in variations:
+        if not isinstance(var, dict):
+            continue
+        opts = _get_safe_options(var.get("attributes", []), store_loader)
+        opts_norm = {_slugify(k): _slugify(v) for k, v in opts.items() if v}
+        # .get() returns None for a blank/absent axis → wildcards never match
+        if all(opts_norm.get(axis) == val for axis, val in resolved_norm.items()):
+            matches.append(var)
+
+    if not matches:
+        return []
+
+    in_stock_first = [
+        v for v in matches
+        if v.get("stock_status") != "outofstock" and v.get("in_stock") is not False
+    ] or matches
+
+    for var in in_stock_first:
+        imgs = variation_image_urls(var)
+        if imgs:
+            logger.info(
+                f"Variant image override: using variation {var.get('id')} image(s) "
+                f"for resolved={resolved}"
+            )
+            return imgs
+
+    return []
+
+
 def handle_variation_product(
     intent,
     entities,
@@ -730,7 +751,7 @@ def handle_variation_product(
             if len(matched_variations) == 1:
                 logger.info(
                     f"Step 3.7: Matched variation id={matched_variation.get('id')} | "
-                    f"attrs={[a.get('option') for a in matched_variation.get('attributes', [])]}"
+                    f"attrs={list(_get_safe_options(matched_variation.get('attributes', []), _sl).values())}"
                 )
                 resolved_variation = matched_variation
                 _fv = format_variation(matched_variation, parent_product_raw)
@@ -1266,6 +1287,13 @@ def handle_quantity_and_variant_check(
             _seeded = _seed_resolved_from_entities(entities, _variations_for_cache, _sl)
             if _seeded:
                 logger.info(f"Step 5.5 (variant prompt): Seeded resolved axes from user input → {_seeded}")
+                # The user named a specific axis (e.g. a colour) — show that
+                # variation's own image rather than the generic parent shot.
+                _variant_images = _variation_images_for_resolved(
+                    _variations_for_cache, _seeded, _sl
+                )
+                if _variant_images:
+                    product["images"] = _variant_images
             elapsed = time.time() - start_time
             return jsonify({
                 "success": True,

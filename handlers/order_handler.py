@@ -28,6 +28,7 @@ from chat_logger import get_logger, sanitize_log_string
 from handlers.chat_utils import (
     default_pagination,
     build_variant_prompt,
+    _get_safe_options,
 )
 from ecommerce import endpoints
 
@@ -739,7 +740,7 @@ def handle_quick_order(
                     logger.info(f"Step 3.6: Attributes matched {len(matched)} variations, asking user")
                     if len(matched) > 1 and len(matched) < len(all_variations):
                         variation_labels = [
-                            " / ".join(a.get("option", "") for a in v.get("attributes", []) if a.get("option"))
+                            " / ".join(_get_safe_options(v.get("attributes", [])).values())
                             for v in matched
                         ]
                         prompt_msg = (

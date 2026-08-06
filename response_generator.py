@@ -852,14 +852,15 @@ def _generate_attribute_info_message(products: List[dict], entities: ExtractedEn
         return None
 
     def _in_stock_for(target: str):
+        from handlers.chat_utils import _get_safe_options
         in_stock_opts = set()
         for v in variations:
             if v.get('in_stock') or v.get('stock_status') == 'instock':
-                for a in v.get('attributes', []):
-                    if target in a.get('name', '').lower():
-                        opt = a.get('option', '')
-                        if opt:
-                            in_stock_opts.add(opt)
+                # _get_safe_options normalises both the custom flat-dict shape
+                # and the standard WC list-of-dicts shape.
+                for axis_name, opt in _get_safe_options(v.get('attributes', [])).items():
+                    if target in str(axis_name).lower() and opt:
+                        in_stock_opts.add(opt)
         return in_stock_opts
 
     claimed = set()
