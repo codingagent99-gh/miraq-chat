@@ -386,7 +386,6 @@ def handle_variant_selection(
         user_context["resolved_attributes"] = prev_resolved
 
         if not _var_quantity:
-            _price_line = f"\n**Unit Price:** {get_currency_symbol()}{_variant_price}" if _variant_price else ""
             elapsed = time.time() - start_time
 
             _pending_action = user_context.get("pending_action", "order")
@@ -398,8 +397,7 @@ def handle_variant_selection(
                 return jsonify({
                     "success": True,
                     "bot_message": (
-                        f"Here's **{_pending_name}**. ✅ In stock"
-                        f"{_price_line}\n\n"
+                        f"Here's **{_pending_name}**. ✅ In stock\n\n"
                         f"Would you like to add it to your cart?"
                     ),
                     "intent": "guided_flow",
@@ -423,8 +421,7 @@ def handle_variant_selection(
                 "bot_message": (
                     f"Great choice! Here's what you selected:\n\n"
                     f"**Product:** {_var_product_name}\n"
-                    f"**Variant:** {_variant_label}"
-                    f"{_price_line}\n\n"
+                    f"**Variant:** {_variant_label}\n\n"
                     f"How many would you like to order? You can tap an option below or type any exact number in the chat. 🛒"
                 ),
                 "intent": "guided_flow",
@@ -1253,7 +1250,6 @@ def handle_quantity_and_variant_check(
                     }), 200
 
                 _var_price = endpoints.parse_variant(_resolved_var)["price"]
-                _price_line = f"\n**Unit Price:** {get_currency_symbol()}{_var_price}" if _var_price else ""
                 _var_label = " / ".join(_get_safe_options(_resolved_var.get("attributes", []), _sl).values())
 
                 elapsed = time.time() - start_time
@@ -1262,8 +1258,7 @@ def handle_quantity_and_variant_check(
                     "bot_message": (
                         f"Great choice! Here's what you selected:\n\n"
                         f"**Product:** {product['name']}\n"
-                        f"**Variant:** {_var_label}"
-                        f"{_price_line}\n\n"
+                        f"**Variant:** {_var_label}\n\n"
                         f"How many would you like to order? You can tap an option below or type any exact number in the chat. 🛒"
                     ),
                     "intent": intent.value,
