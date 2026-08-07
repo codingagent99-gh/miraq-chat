@@ -206,6 +206,16 @@ class EcommerceEndpoints(Protocol):
         """Row 6.3 — Update a customer's profile."""
         ...
         
+    def fetch_saved_addresses(
+        self,
+        requesting_customer_id,
+        target_customer_id=None,
+        description: str = "",
+        requires_resolution: Optional[List[str]] = None,
+    ) -> WooAPICall:
+        """GET /saved-addresses — THWMA multi-address book (custom-api/v1)."""
+        ...
+
     def search_customers_by_company(
         self,
         company_name: str,

@@ -257,11 +257,18 @@ def handle_bulk_order_trigger(conversation, user_context, page, start_time):
     elapsed = round((time.time() - start_time) * 1000)
     return jsonify({
         "success": True,
+        # Mirrors what the parser actually accepts: one company per order,
+        # identified by NAME (never an email), with an optional person per
+        # line. The old copy still showed the email form, which the flow no
+        # longer supports — reps followed it and hit "company required".
         "bot_message": (
             "Tell me everything you need to order today. "
-            "You can include multiple customers and products in one message.\r\n\r\n"
-            "**Example:**\r\n"
-            "*Order 20 Harmony White for abc@buildersco.com, 15 Coral Grey for xyz@interiors.com*"
+            "One company per order, with as many products as you like.\r\n\r\n"
+            "**Examples:**\r\n"
+            "*Order 20 Harmony White, 15 Coral Grey for Company_Name*\r\n"
+            "*Order 20 Harmony White for Ashlynn, 15 Coral Grey for Claire "
+            "at Company_Name*\r\n\r\n"
+            "If you leave out the person, I'll ask who it's for."
         ),
         "intent": "guided_flow",
         "products": [],
@@ -847,10 +854,12 @@ def _build_bulk_confirmation_response(lines_as_dicts, conversation, user_context
         return jsonify({
             "success": True,
             "bot_message": (
-                "I couldn't find any products or customer emails in that message. "
+                "I couldn't find any products in that message. "
                 "Try the format:\r\n\r\n"
-                "**Example:**\r\n"
-                "*Order 20 Harmony White for abc@buildersco.com, 15 Coral Grey for xyz@interiors.com*"
+                "**Examples:**\r\n"
+                "*Order 20 Harmony White, 15 Coral Grey for Beck LTD*\r\n"
+                "*Order 20 Harmony White for Ashlynn, 15 Coral Grey for Claire "
+                "at Beck LTD*"
             ),
             "intent": "guided_flow",
             "products": [],
@@ -1157,6 +1166,60 @@ def handle_bulk_recipient_mode_reply(
     )
 
 
+def _roster_label(entry: dict, disambiguate: bool = False) -> str:
+    """
+    Picker label for one roster entry.
+
+    Plain name normally. When two entries share a name — the same person on
+    file at two of the company's sites — the name alone is useless, so the
+    city (or street, or email) is appended. Without this the rep sees two
+    identical buttons and cannot tell which address they are choosing.
+    """
+    name = (entry.get("display") or "").strip()
+    if not disambiguate:
+        return name
+    detail = (
+        entry.get("city")
+        or entry.get("address_1")
+        or entry.get("email")
+        or ""
+    ).strip()
+    state = (entry.get("state") or "").strip()
+    if detail and state and detail != state:
+        detail = f"{detail}, {state}"
+    return f"{name} \u2014 {detail}" if detail else name
+
+
+def _recipient_candidates(slot, roster):
+    """
+    Roster entries to offer for this slot, plus whether to disambiguate.
+
+    For an ambiguous name only the entries matching THAT name are offered —
+    showing the whole company would bury the actual choice. Labels are
+    disambiguated whenever two offered entries share a display name.
+    """
+    def _norm(v):
+        return re.sub(r'[^a-z0-9]+', ' ', str(v or "").lower()).strip()
+
+    needle = _norm(slot.get("name"))
+    entries = roster
+    if needle:
+        matched = [
+            r for r in roster
+            if _norm(r.get("display")) == needle
+            or needle in _norm(r.get("display")).split()
+        ]
+        if len(matched) > 1:
+            entries = matched
+
+    counts = {}
+    for r in entries:
+        k = _norm(r.get("display"))
+        counts[k] = counts.get(k, 0) + 1
+    ambiguous = any(c > 1 for c in counts.values())
+    return entries, ambiguous
+
+
 def _ask_for_bulk_recipient(
     lines_as_dicts, queue, pos, conversation, user_context, page, start_time,
 ):
@@ -1164,7 +1227,9 @@ def _ask_for_bulk_recipient(
     slot   = queue[pos]
     roster = user_context.get("bulk_company_roster", []) or []
     scope  = user_context.get("bulk_company_scope", "")
-    names  = [r.get("display", "") for r in roster if r.get("display")]
+
+    entries, _ambiguous = _recipient_candidates(slot, roster)
+    names = [_roster_label(r, _ambiguous) for r in entries if r.get("display")]
 
     conversation.flow_state = FlowState.AWAITING_BULK_RECIPIENT.value
     user_context["bulk_recipient_queue"] = queue
@@ -1177,7 +1242,12 @@ def _ask_for_bulk_recipient(
         for i in slot["line_indices"]
     )
 
-    if slot["name"]:
+    if slot["name"] and _ambiguous:
+        _ask = (
+            f"There are {len(entries)} people named **{slot['name']}** at "
+            f"**{scope}**, at different addresses. Which one?"
+        )
+    elif slot["name"]:
         _ask = (
             f"I couldn't find **{slot['name']}** at **{scope}**. "
             "Who should this go to?"
@@ -1240,20 +1310,41 @@ def handle_bulk_recipient_reply(message, store_loader, conversation, user_contex
 
     needle = _norm(choice)
     picked = None
+    # Match against the labels actually offered for THIS slot. For a
+    # duplicate name those read "Raj Chanda — Dallas, TX", so matching on
+    # the bare display name would be ambiguous all over again and would
+    # silently take the first record — the exact bug this step exists to
+    # prevent.
+    slot_for_match = queue[pos] if pos < len(queue) else {"name": ""}
+    entries, _ambiguous = _recipient_candidates(slot_for_match, roster)
+
+    def _only(pred):
+        """The single entry satisfying pred, or None if 0 or 2+ do.
+
+        Correctness here depends on the MATCH being unique, not on the
+        roster being unique: "Elizabeth Rhodes" is an unambiguous answer
+        even when two unrelated Raj Chandas sit in the same list. Gating on
+        a roster-wide ambiguity flag instead would reject perfectly clear
+        replies.
+        """
+        hits = [r for r in entries if pred(r)]
+        return hits[0] if len(hits) == 1 else None
+
     if needle:
-        for r in roster:
-            if _norm(r.get("display")) == needle:
-                picked = r
-                break
+        # 1. exact label as offered ("Raj Chanda — Dallas, TX")
+        picked = _only(lambda r: _norm(_roster_label(r, _ambiguous)) == needle)
+        # 2. exact display name, only if it identifies one person
         if not picked:
-            for r in roster:
+            picked = _only(lambda r: _norm(r.get("display")) == needle)
+        # 3. partial (first/last name), again only if unique
+        if not picked:
+            def _loose(r):
                 hay = _norm(r.get("display"))
-                if hay and (needle in hay or any(needle == w for w in hay.split())):
-                    picked = r
-                    break
+                return bool(hay) and (needle in hay or any(needle == w for w in hay.split()))
+            picked = _only(_loose)
 
     if not picked:
-        names = [r.get("display", "") for r in roster if r.get("display")]
+        names = [_roster_label(r, _ambiguous) for r in entries if r.get("display")]
         elapsed = round((time.time() - start_time) * 1000)
         return jsonify({
             "success": True,

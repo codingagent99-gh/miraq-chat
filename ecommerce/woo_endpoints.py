@@ -578,6 +578,42 @@ class WooEndpoints:
             requires_resolution=requires_resolution or [],
         )
     
+    def fetch_saved_addresses(
+        self,
+        requesting_customer_id,
+        target_customer_id=None,
+        description: str = "",
+        requires_resolution: Optional[List[str]] = None,
+    ) -> WooAPICall:
+        """GET /saved-addresses (custom_plugin surface)
+
+        THWMA lets one customer keep several shipping addresses
+        (`thwma_custom_address` → shipping → address_0, address_1, ...), which
+        vanilla WooCommerce cannot represent — its customer record has exactly
+        one shipping block.
+
+        target_customer_id reads ANOTHER customer's address book — what the
+        bulk flow needs, since the recipient comes from a company roster rather
+        than from whoever holds the session. Omit it to read the requester's
+        own list.
+
+        requesting_customer_id is REQUIRED and carries authorization: these
+        calls have no WP session, so the plugin cannot use get_current_user_id()
+        and gates on this param instead — same convention as
+        search_customers_by_company.
+        """
+        params = {"customer_id": requesting_customer_id}
+        if target_customer_id:
+            params["target_customer_id"] = target_customer_id
+        return WooAPICall(
+            method="GET",
+            endpoint="/saved-addresses",
+            params=params,
+            surface="custom_plugin",
+            description=description or f"Fetch saved addresses for customer {target_customer_id or 'self'}",
+            requires_resolution=requires_resolution or [],
+        )
+
     def search_customers_by_company(
         self,
         company_name: str,

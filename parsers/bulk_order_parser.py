@@ -616,19 +616,30 @@ def parse_bulk_order_utterance(
             f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip()
         )
         display = full_name or customer.get("email") or f"Customer #{customer['id']}"
+        _ship = customer.get("shipping", {}) or {}
+        _bill = customer.get("billing", {}) or {}
+        _addr = _ship if _ship.get("address_1") else _bill
         return {
             "id": str(customer["id"]),
             "display": display,
-            "billing": customer.get("billing", {}) or {},
-            "shipping": customer.get("shipping", {}) or {},
+            # Two people can share a name inside one company — these are what
+            # tell them apart in the picker.
+            "email": customer.get("email", "") or "",
+            "city": _addr.get("city", "") or "",
+            "state": _addr.get("state", "") or "",
+            "address_1": _addr.get("address_1", "") or "",
+            "billing": _bill,
+            "shipping": _ship,
         }
 
     def _match_recipient(name: str):
         """Match a person name against the company roster.
 
-        Returns (resolution | None, match_count). Names are assumed unique
-        within a company for now, so the first match wins; match_count is
-        still reported so an ambiguity prompt can be added later.
+        Returns (resolution | None, match_count).
+
+        Resolves ONLY on a unique match. Zero matches and several matches both
+        return None — the caller tells them apart by match_count, and several
+        becomes an "ambiguous" prompt rather than a silent first-match pick.
         """
         if not name or not company_roster:
             return None, 0
@@ -650,7 +661,17 @@ def parse_bulk_order_utterance(
 
         if not matches:
             return None, 0
-        return _roster_entry_to_resolution(matches[0]), len(matches)
+        if len(matches) > 1:
+            # Same name, two records — e.g. one person on file at two of the
+            # company's sites, each with its own address. Picking the first
+            # would silently ship to the wrong one, so refuse to guess and let
+            # the handler disambiguate.
+            logger.info(
+                f"bulk_parser | recipient '{name}' matches {len(matches)} "
+                f"records at '{company_scope}' — ambiguous, will ask"
+            )
+            return None, len(matches)
+        return _roster_entry_to_resolution(matches[0]), 1
 
     # Stamp company-resolved customers onto pre_lines (email still wins if given)
     for pl in pre_lines:
@@ -724,6 +745,8 @@ def parse_bulk_order_utterance(
             if not resolution and company_roster:
                 if pl.recipient_name:
                     resolution, _recipient_matches = _match_recipient(pl.recipient_name)
+                    # _recipient_matches > 1 means several people share the
+                    # name — handled as "ambiguous", not "not found".
                 elif len(company_roster) == 1:
                     resolution = _roster_entry_to_resolution(company_roster[0])
 
@@ -746,6 +769,10 @@ def parse_bulk_order_utterance(
                     customer_display_name = "⚠️ Company required"
                 elif not company_roster:
                     customer_display_name = f"⚠️ No customers for {company_scope}"
+                elif pl.recipient_name and _recipient_matches > 1:
+                    customer_display_name = (
+                        f"⚠️ {_recipient_matches} people named {pl.recipient_name}"
+                    )
                 elif pl.recipient_name:
                     customer_display_name = f"⚠️ {pl.recipient_name} not found"
                 else:
@@ -766,6 +793,8 @@ def parse_bulk_order_utterance(
                 _customer_reason = "company_not_provided"
             elif not company_roster:
                 _customer_reason = "company_not_found"
+            elif pl.recipient_name and _recipient_matches > 1:
+                _customer_reason = "recipient_ambiguous"
             elif pl.recipient_name:
                 _customer_reason = "recipient_not_found"
             else:
