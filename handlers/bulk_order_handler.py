@@ -265,9 +265,9 @@ def handle_bulk_order_trigger(conversation, user_context, page, start_time):
             "Tell me everything you need to order today. "
             "One company per order, with as many products as you like.\r\n\r\n"
             "**Examples:**\r\n"
-            "*Order 20 Harmony White, 15 Coral Grey for Company_Name*\r\n"
+            "*Order 20 Harmony White, 15 Coral Grey for Beck LTD*\r\n"
             "*Order 20 Harmony White for Ashlynn, 15 Coral Grey for Claire "
-            "at Company_Name*\r\n\r\n"
+            "at Beck LTD*\r\n\r\n"
             "If you leave out the person, I'll ask who it's for."
         ),
         "intent": "guided_flow",
@@ -353,7 +353,7 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
         {
             "raw_fragment": l.raw_fragment,
             "company_name": l.company_name,
-            "recipient_name": l.recipient_name,
+            "recipient_name": getattr(l, "recipient_name", "") or "",
             "email": l.email,
             "product_name": l.product_name,
             "quantity": l.quantity,
@@ -369,8 +369,14 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
             "unresolved": l.unresolved,
             "unresolved_reason": l.unresolved_reason,
             "quantity_explicitly_set":  l.quantity_explicitly_set,
-            "unmatched_variant_hint": l.unmatched_variant_hint,
-            "blank_variant_axes": list(l.blank_variant_axes or []),
+            "unmatched_variant_hint": getattr(l, "unmatched_variant_hint", "") or "",
+            # getattr, not attribute access: these fields were added to
+            # BulkOrderLine alongside this handler, so a half-deploy where
+            # the parser is older would otherwise 500 on every bulk order
+            # rather than simply skipping the newer behaviour.
+            "blank_variant_axes": list(getattr(l, "blank_variant_axes", None) or []),
+            "candidate_variation_ids": list(getattr(l, "candidate_variation_ids", None) or []),
+            "specified_variant_axes": list(getattr(l, "specified_variant_axes", None) or []),
             "variant_meta": {},
             "address_confirmed": False,
             "address_skipped": False,
@@ -539,6 +545,22 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
                 conversation, user_context, page, start_time,
             )
 
+    # Step 4.57: A resolved customer with SEVERAL shipping addresses on file
+    # must be asked which one. This lives here as well as in
+    # _continue_after_slots_filled because the two paths are disjoint: when
+    # every recipient resolves straight from the roster (unresolved=0) this
+    # function goes directly to the quantity prompt and never reaches that
+    # shared exit, so the gate there alone never fired.
+    if role in BULK_ORDER_ROLES:
+        _addr_queue = _build_address_queue(lines_as_dicts, user_context)
+        if _addr_queue:
+            user_context["bulk_address_queue"] = _addr_queue
+            user_context["bulk_address_pos"] = 0
+            return _ask_for_bulk_address(
+                lines_as_dicts, _addr_queue, 0,
+                conversation, user_context, page, start_time,
+            )
+
     # Step 4.6: Rep lines missing an email → ask before proceeding
     if role in BULK_ORDER_ROLES:
         email_missing = [l for l in lines_as_dicts if l.get("unresolved_reason") == "email_not_provided"]
@@ -590,8 +612,10 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
         # still leave Finish / Sample Size as WooCommerce "Any", which the
         # storefront makes the shopper choose. blank_variant_axes carries those.
         if l["product_id"]
-        and (not l["variation_id"] or l.get("blank_variant_axes"))
         and _is_variable_product(l["product_id"], store_loader)
+        and (not l["variation_id"]
+             or l.get("blank_variant_axes")
+             or _ensure_missing_axes(l, user_context))
     ]
 
     if needs_variant_indices:
@@ -672,50 +696,100 @@ def _format_bulk_confirmation_table(lines) -> str:
 # ── Private: _ask_for_bulk_variant ──
 # ══════════════════════════════════════════════════════════════
 
-def _parent_any_axis_options(product_id, axis_names, user_context):
+def _parent_variation_axes(product_id, user_context):
     """
-    Options for axes the matched variation leaves as WooCommerce "Any".
+    Every axis the PARENT product marks as used-for-variations, with options.
 
-    Those options exist only on the PARENT product — every variation has the
-    attribute key with an empty value — so they can't be derived from the
-    variation list the way the normal bulk variant prompt does it. Cached per
-    product because the prompt is re-rendered on every failed reply.
+    This is the only reliable source for WooCommerce "Any" axes. wc/v3's
+    variations endpoint OMITS an attribute a variation leaves as Any rather
+    than returning it blank, so a variation cannot be inspected to discover
+    what it failed to specify — Adams 13544 comes back carrying only Colors,
+    with no trace of Finish or Sample Size. Comparing against the parent is
+    what surfaces them.
     """
-    if not axis_names:
-        return {}
-
     cache = user_context.setdefault("bulk_parent_axis_cache", {})
     key = str(product_id)
-    if key not in cache:
-        axes = {}
-        try:
-            call = endpoints.fetch_product(
-                product_id=product_id,
-                description=f"Fetch parent attributes for product_id={product_id}",
-            )
-            res = woo_client.execute(call)
-            data = res.get("data") if res.get("success") else None
-            if isinstance(data, dict):
-                for a in data.get("attributes", []) or []:
-                    if not isinstance(a, dict) or not a.get("variation"):
-                        continue
-                    name = str(a.get("name") or "").strip()
-                    opts = [str(o) for o in (a.get("options") or []) if str(o).strip()]
-                    if name and opts:
-                        axes[name] = opts
-        except Exception as exc:
-            logger.warning(
-                f"bulk_order | parent attribute fetch failed for {product_id} | error={exc}"
-            )
+    if key in cache:
+        return cache[key]
+
+    axes = {}
+    fetched = False
+    try:
+        call = endpoints.fetch_product(
+            product_id=product_id,
+            description=f"Fetch parent attributes for product_id={product_id}",
+        )
+        res = woo_client.execute(call)
+        data = res.get("data") if res.get("success") else None
+        if isinstance(data, dict):
+            for a in data.get("attributes", []) or []:
+                if not isinstance(a, dict) or not a.get("variation"):
+                    continue
+                name = str(a.get("name") or "").strip()
+                opts = [str(o) for o in (a.get("options") or []) if str(o).strip()]
+                if name and opts:
+                    axes[name] = opts
+            fetched = True
+    except Exception as exc:
+        logger.warning(
+            f"bulk_order | parent attribute fetch failed for {product_id} | error={exc}"
+        )
+
+    # Success only — a cached failure would disable the prompt for the session.
+    if fetched:
         cache[key] = axes
         user_context["bulk_parent_axis_cache"] = cache
+    return axes
 
-    parent = cache.get(key, {}) or {}
+
+def _missing_variant_axes(line, user_context):
+    """
+    Parent variation axes the line's matched variation does NOT pin down.
+
+    Returns [] for a line with no variation yet (the normal prompt covers it)
+    and for a fully specified one.
+    """
+    product_id = line.get("product_id")
+    if not product_id or not line.get("variation_id"):
+        return []
+    parent = _parent_variation_axes(product_id, user_context)
+    if not parent:
+        return []
+    specified = {
+        str(a).strip().lower()
+        for a in (line.get("specified_variant_axes") or [])
+    }
+    return [name for name in parent if name.strip().lower() not in specified]
+
+
+def _parent_any_axis_options(product_id, axis_names, user_context):
+    """Options for a named subset of the parent's variation axes."""
+    if not axis_names:
+        return {}
+    parent = _parent_variation_axes(product_id, user_context)
     wanted = {a.strip().lower() for a in axis_names if a}
     return {
         name: opts for name, opts in parent.items()
         if name.strip().lower() in wanted
     }
+
+
+def _ensure_missing_axes(line, user_context):
+    """
+    True when the line has a variation that leaves parent axes unset, and
+    stamps them onto the line so the prompt knows what to ask.
+    """
+    if line.get("blank_variant_axes"):
+        return True
+    missing = _missing_variant_axes(line, user_context)
+    if missing:
+        line["blank_variant_axes"] = missing
+        logger.info(
+            f"bulk_order | product {line.get('product_id')} variation "
+            f"{line.get('variation_id')} leaves {missing} unset — will ask"
+        )
+        return True
+    return False
 
 
 def _ask_for_bulk_variant(
@@ -743,6 +817,15 @@ def _ask_for_bulk_variant(
         flag_modified(conversation, "context_data")
 
     variations = cache.get(cache_key, [])
+
+    # When the hint narrowed to several variations ("Harmony Moon" in five
+    # sizes), offer only those. Using every variation would re-ask the
+    # colour the rep already gave and list sizes that do not exist in it.
+    _candidates = line.get("candidate_variation_ids") or []
+    if _candidates:
+        _narrowed = [v for v in variations if v.get("id") in _candidates]
+        if _narrowed:
+            variations = _narrowed
 
     attr_axes: dict = {}
     for var in variations:
@@ -1310,6 +1393,7 @@ def handle_bulk_recipient_reply(message, store_loader, conversation, user_contex
 
     needle = _norm(choice)
     picked = None
+
     # Match against the labels actually offered for THIS slot. For a
     # duplicate name those read "Raj Chanda — Dallas, TX", so matching on
     # the bare display name would be ambiguous all over again and would
@@ -1594,8 +1678,10 @@ def handle_bulk_email_reply(message, store_loader, conversation, user_context, p
         # See the note at the first gate: a matched variation can still leave
         # axes as "Any", which the rep must still choose.
         if l.get("product_id")
-        and (not l.get("variation_id") or l.get("blank_variant_axes"))
         and _is_variable_product(l["product_id"], store_loader)
+        and (not l.get("variation_id")
+             or l.get("blank_variant_axes")
+             or _ensure_missing_axes(l, user_context))
     ]
 
     if needs_variant_indices:
@@ -1839,7 +1925,323 @@ def handle_bulk_product_reply(message, store_loader, conversation, user_context,
     )
 
 
+def _company_order_addresses(company, user_context):
+    """
+    Shipping destinations this company has actually had goods sent to.
+
+    Derived from ORDER HISTORY (GET /company-order-addresses) — the same
+    source the storefront's own company address picker uses, and the only one
+    that shows several addresses for a single person: /customers/by-company
+    returns one account address each, and the THWMA address book is empty on
+    this store.
+
+    Cached per company; the whole batch shares one company.
+    """
+    if not company:
+        return []
+    cache = user_context.setdefault("bulk_order_address_cache", {})
+    key = str(company).strip().lower()
+    if key in cache:
+        return cache[key]
+
+    rows = []
+    fetched = False
+    try:
+        call = endpoints.fetch_company_order_addresses(
+            company_name=company,
+            description=f"Order-history addresses for {company!r}",
+        )
+        res = woo_client.execute(call)
+        data = res.get("data") if res.get("success") else None
+        if isinstance(data, dict):
+            data = data.get("data", [])
+        if isinstance(data, list):
+            rows = [r for r in data if isinstance(r, dict)]
+            fetched = True
+    except Exception as exc:
+        logger.warning(
+            f"bulk_order | order-address lookup failed for {company!r} | error={exc}"
+        )
+
+    # Cache SUCCESS only. user_context is persisted on the conversation, so
+    # caching [] after a failed call silently disables the address step for
+    # the rest of the session — the next turn short-circuits and never even
+    # retries the API. A successful empty result IS cached; that is a real
+    # answer.
+    if fetched:
+        cache[key] = rows
+        user_context["bulk_order_address_cache"] = cache
+    logger.info(
+        f"bulk_order | company {company!r} → {len(rows)} historical "
+        f"address(es) | fetched={fetched}"
+    )
+    return rows
+
+
+def _addresses_for_person(rows, first_name, last_name, customer_id=None):
+    """
+    Historical addresses belonging to one person, de-duplicated.
+
+    Matched on customer_id when the row has one (guest orders carry 0), else
+    on name. Only rows with no street at all are dropped — a partial address
+    is still shown.
+
+    These come from past checkouts, so the list includes whatever was typed
+    at the time; an entry like "ASDF" with no city or postcode WILL be
+    offered. That is deliberate: a stricter filter silently hid a real
+    second address for people whose other orders were sloppily entered, and
+    the rep can tell junk from real. The label shows every field present, so
+    a bad entry is visibly bad at the point of choosing.
+    """
+    def _n(v):
+        return re.sub(r"[^a-z0-9]+", " ", str(v or "").lower()).strip()
+
+    want_name = f"{_n(first_name)} {_n(last_name)}".strip()
+    out, seen = [], set()
+    for r in rows:
+        rid = int(r.get("customer_id") or 0)
+        row_name = f'{_n(r.get("shipping_first_name"))} {_n(r.get("shipping_last_name"))}'.strip()
+        if customer_id and rid:
+            if str(rid) != str(customer_id):
+                continue
+        elif want_name and row_name != want_name:
+            continue
+
+        a1 = str(r.get("shipping_address_1") or "").strip()
+        if not a1:
+            continue
+
+        sig = _n("|".join([
+            a1,
+            str(r.get("shipping_address_2") or ""),
+            str(r.get("shipping_city") or ""),
+            str(r.get("shipping_state") or ""),
+            str(r.get("shipping_postcode") or ""),
+        ]))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(r)
+    return out
+
+
+def _address_label(row) -> str:
+    """One-line address label for the picker."""
+    parts = [
+        str(row.get("shipping_address_1") or "").strip(),
+        str(row.get("shipping_address_2") or "").strip(),
+        str(row.get("shipping_city") or "").strip(),
+        str(row.get("shipping_state") or "").strip(),
+        str(row.get("shipping_postcode") or "").strip(),
+    ]
+    return ", ".join(p for p in parts if p)
+
+
+def _build_address_queue(lines_as_dicts, user_context):
+    """
+    One slot per resolved customer that has MORE THAN ONE historical address.
+
+    A customer with a single address needs no question — their line already
+    carries it. Lines for the same customer share a slot, so the rep is asked
+    once per person, not once per product.
+    """
+    company = user_context.get("bulk_company_scope", "")
+    if not company:
+        return []
+    rows = _company_order_addresses(company, user_context)
+    if not rows:
+        return []
+
+    slots = {}
+    for idx, l in enumerate(lines_as_dicts):
+        cid = l.get("customer_id")
+        if not cid or l.get("unresolved"):
+            continue
+        if l.get("address_choice_made"):
+            # Already asked and answered. Without this the queue rebuilds on
+            # every pass through the shared exit — the quantity reply routes
+            # back through it — and the rep is asked the same question twice.
+            continue
+        ship = l.get("shipping_address") or {}
+        options = _addresses_for_person(
+            rows, ship.get("first_name"), ship.get("last_name"), cid
+        )
+        if len(options) < 2:
+            continue
+        slot = slots.setdefault(str(cid), {
+            "customer_id": str(cid),
+            "name": l.get("customer_display_name", ""),
+            "options": options,
+            "line_indices": [],
+        })
+        slot["line_indices"].append(idx)
+    return list(slots.values())
+
+
+def _ask_for_bulk_address(
+    lines_as_dicts, queue, pos, conversation, user_context, page, start_time,
+):
+    """Prompt for which of a person's known addresses to ship to."""
+    slot = queue[pos]
+    conversation.flow_state = FlowState.AWAITING_BULK_ADDRESS_CHOICE.value
+    user_context["bulk_address_queue"] = queue
+    user_context["bulk_address_pos"] = pos
+    conversation.context_data = user_context
+    flag_modified(conversation, "context_data")
+
+    labels = [_address_label(o) for o in slot["options"]]
+    product_lines = "\r\n".join(
+        f"• **{lines_as_dicts[i]['quantity']}× {lines_as_dicts[i]['product_name']}**"
+        for i in slot["line_indices"]
+    )
+    _progress = f" ({pos + 1} of {len(queue)})" if len(queue) > 1 else ""
+
+    elapsed = round((time.time() - start_time) * 1000)
+    return jsonify({
+        "success": True,
+        "bot_message": (
+            f"{product_lines}\r\n\r\n**{slot['name']}** has "
+            f"{len(labels)} addresses on file. Which one should this ship to?{_progress}"
+        ),
+        "intent": "guided_flow",
+        "products": [],
+        "suggestions": labels[:8] + ["Cancel"],
+        "session_id": str(conversation.id),
+        "metadata": {
+            "flow_state": FlowState.AWAITING_BULK_ADDRESS_CHOICE.value,
+            "customer": slot["name"],
+            "candidates": labels,
+            "progress": {"current": pos + 1, "total": len(queue)},
+            "response_time_ms": elapsed,
+        },
+        "flow_state": FlowState.AWAITING_BULK_ADDRESS_CHOICE.value,
+        "pagination": default_pagination(page),
+    }), 200
+
+
+def handle_bulk_address_choice_reply(message, store_loader, conversation, user_context, page, start_time):
+    """
+    Called during AWAITING_BULK_ADDRESS_CHOICE.
+
+    Applies the chosen address to the CURRENT slot only, then advances — same
+    per-slot discipline as the recipient queue, so one person's choice never
+    leaks onto another's lines.
+    """
+    choice = (message or "").strip()
+    lines  = user_context.get("pending_bulk_lines", [])
+    queue  = user_context.get("bulk_address_queue", []) or []
+    pos    = user_context.get("bulk_address_pos", 0)
+
+    if not queue or pos >= len(queue):
+        return _continue_after_addresses_chosen(
+            lines, store_loader, conversation, user_context, page, start_time
+        )
+
+    slot = queue[pos]
+
+    def _n(v):
+        return re.sub(r"[^a-z0-9]+", " ", str(v or "").lower()).strip()
+
+    needle = _n(choice)
+    picked = None
+    if needle:
+        for o in slot["options"]:
+            if _n(_address_label(o)) == needle:
+                picked = o
+                break
+        if not picked:
+            # Partial: enough of the street to identify exactly one option.
+            hits = [o for o in slot["options"] if needle in _n(_address_label(o))]
+            if len(hits) == 1:
+                picked = hits[0]
+
+    if not picked:
+        labels = [_address_label(o) for o in slot["options"]]
+        elapsed = round((time.time() - start_time) * 1000)
+        return jsonify({
+            "success": True,
+            "bot_message": (
+                f"I couldn't match **{choice}** to one of "
+                f"**{slot['name']}**'s addresses. Please pick one."
+                if choice else "Please pick an address."
+            ),
+            "intent": "guided_flow",
+            "products": [],
+            "suggestions": labels[:8] + ["Cancel"],
+            "session_id": str(conversation.id),
+            "metadata": {
+                "flow_state": FlowState.AWAITING_BULK_ADDRESS_CHOICE.value,
+                "candidates": labels,
+                "response_time_ms": elapsed,
+            },
+            "flow_state": FlowState.AWAITING_BULK_ADDRESS_CHOICE.value,
+            "pagination": default_pagination(page),
+        }), 200
+
+    for idx in slot["line_indices"]:
+        if idx >= len(lines):
+            continue
+        ship = dict(lines[idx].get("shipping_address") or {})
+        ship.update({
+            "first_name": picked.get("shipping_first_name", "") or ship.get("first_name", ""),
+            "last_name":  picked.get("shipping_last_name", "")  or ship.get("last_name", ""),
+            "company":    picked.get("company", "") or ship.get("company", ""),
+            "address_1":  picked.get("shipping_address_1", ""),
+            "address_2":  picked.get("shipping_address_2", ""),
+            "city":       picked.get("shipping_city", ""),
+            "state":      picked.get("shipping_state", ""),
+            "postcode":   picked.get("shipping_postcode", ""),
+            "country":    picked.get("shipping_country", ""),
+        })
+        lines[idx]["shipping_address"] = ship
+        lines[idx]["address_choice_made"] = True
+
+    user_context["pending_bulk_lines"] = lines
+    conversation.context_data = user_context
+    flag_modified(conversation, "context_data")
+    logger.info(
+        f"bulk_order | address {_address_label(picked)!r} applied to "
+        f"line(s) {slot['line_indices']} for {slot['name']} "
+        f"(slot {pos + 1}/{len(queue)})"
+    )
+
+    if pos + 1 < len(queue):
+        return _ask_for_bulk_address(
+            lines, queue, pos + 1, conversation, user_context, page, start_time
+        )
+
+    user_context.pop("bulk_address_queue", None)
+    user_context.pop("bulk_address_pos", None)
+    conversation.context_data = user_context
+    flag_modified(conversation, "context_data")
+    return _continue_after_addresses_chosen(
+        lines, store_loader, conversation, user_context, page, start_time
+    )
+
+
 def _continue_after_slots_filled(lines_as_dicts, store_loader, conversation, user_context, page, start_time):
+    """
+    Shared exit point after all blank-product slots are filled.
+
+    Inserts the address-choice step: a resolved customer can have SEVERAL
+    shipping addresses on file (order history), and picking one silently would
+    ship to whichever happened to be on their account record. Customers with a
+    single address skip this entirely.
+    """
+    queue = _build_address_queue(lines_as_dicts, user_context)
+    if queue:
+        user_context["bulk_address_queue"] = queue
+        user_context["bulk_address_pos"] = 0
+        return _ask_for_bulk_address(
+            lines_as_dicts, queue, 0,
+            conversation, user_context, page, start_time,
+        )
+    return _continue_after_addresses_chosen(
+        lines_as_dicts, store_loader, conversation, user_context, page, start_time
+    )
+
+
+def _continue_after_addresses_chosen(lines_as_dicts, store_loader, conversation, user_context, page, start_time):
     """
     Shared exit point after all blank-product slots are filled.
     Cleans up product-tracking keys, then checks for missing emails,
@@ -1897,8 +2299,10 @@ def _continue_after_slots_filled(lines_as_dicts, store_loader, conversation, use
         # See the note at the first gate: a matched variation can still leave
         # axes as "Any", which the rep must still choose.
         if l.get("product_id")
-        and (not l.get("variation_id") or l.get("blank_variant_axes"))
         and _is_variable_product(l["product_id"], store_loader)
+        and (not l.get("variation_id")
+             or l.get("blank_variant_axes")
+             or _ensure_missing_axes(l, user_context))
     ]
     if needs_variant_indices:
         user_context["bulk_variant_line_indices"] = needs_variant_indices
@@ -2045,8 +2449,10 @@ def _continue_after_quantity_filled(lines_as_dicts, store_loader, conversation, 
         # See the note at the first gate: a matched variation can still leave
         # axes as "Any", which the rep must still choose.
         if l.get("product_id")
-        and (not l.get("variation_id") or l.get("blank_variant_axes"))
         and _is_variable_product(l["product_id"], store_loader)
+        and (not l.get("variation_id")
+             or l.get("blank_variant_axes")
+             or _ensure_missing_axes(l, user_context))
     ]
     if needs_variant_indices:
         user_context["bulk_variant_line_indices"] = needs_variant_indices

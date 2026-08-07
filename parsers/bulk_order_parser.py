@@ -49,6 +49,8 @@ class BulkOrderLine:
     unresolved_reason: Optional[str]
     unmatched_variant_hint: str = ""   # hint the user typed that matched no variation
     blank_variant_axes: list = field(default_factory=list)  # axes the matched variation leaves as "Any"
+    candidate_variation_ids: list = field(default_factory=list)  # hint matched several variations
+    specified_variant_axes: list = field(default_factory=list)   # axes the matched variation DOES set
 
 # ══════════════════════════════════════════════════════════════
 # INTERNAL: intermediate pre-line structure
@@ -71,6 +73,8 @@ class _PreLine:
     variation_id: Optional[int] = None
     unmatched_variant_hint: str = ""
     blank_variant_axes: list = field(default_factory=list)
+    candidate_variation_ids: list = field(default_factory=list)
+    specified_variant_axes: list = field(default_factory=list)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -489,15 +493,32 @@ def parse_bulk_order_utterance(
             continue
 
         hint_lower = normalize_spelling_variants(pl.variant_hint)
+        _matches = []
         for var in _variant_cache[pl.product_id]:
-            for attr in var.get("attributes", []):
-                # Normalise BOTH sides — this catalog mixes US and UK spellings
-                # ("ADAMS Gray" vs "Aurora - Misty Grey").
-                if hint_lower in normalize_spelling_variants(attr.get("option", "")):
-                    pl.variation_id = var["id"]
-                    break
-            if pl.variation_id:
-                break
+            _attr_list = var.get("attributes", [])
+            if isinstance(_attr_list, dict):
+                _options = list(_attr_list.values())
+            else:
+                _options = [a.get("option", "") for a in _attr_list if isinstance(a, dict)]
+            # Normalise BOTH sides — this catalog mixes US and UK spellings
+            # ("ADAMS Gray" vs "Aurora - Misty Grey").
+            if any(hint_lower in normalize_spelling_variants(o) for o in _options):
+                _matches.append(var)
+
+        if len(_matches) == 1:
+            pl.variation_id = _matches[0]["id"]
+        elif len(_matches) > 1:
+            # The hint narrows but does not identify: "Harmony Moon" exists
+            # in several sizes/finishes. Taking the first match silently
+            # picked one for the rep. Leave variation_id unset so the
+            # variant prompt fires, and remember which variations are still
+            # in play so the prompt only offers the axes still open.
+            pl.candidate_variation_ids = [v["id"] for v in _matches if v.get("id")]
+            logger.info(
+                f"bulk_parser | hint {pl.variant_hint!r} matches "
+                f"{len(_matches)} variations of product {pl.product_id} — "
+                f"will ask"
+            )
 
         if pl.variation_id:
             # A matched variation can still be only PARTIALLY specified: this
@@ -522,6 +543,15 @@ def parse_bulk_order_utterance(
                 ]
             pl.blank_variant_axes = [
                 _attribute_display_name(k) for k in _blank if k
+            ]
+            pl.specified_variant_axes = [
+                _attribute_display_name(k)
+                for k, v in (
+                    _attrs.items() if isinstance(_attrs, dict)
+                    else [(a.get("name") or a.get("slug") or "", a.get("option"))
+                          for a in _attrs if isinstance(a, dict)]
+                )
+                if k and str(v or "").strip()
             ]
             if pl.blank_variant_axes:
                 logger.info(
@@ -836,6 +866,8 @@ def parse_bulk_order_utterance(
             unresolved_reason=unresolved_reason,
             unmatched_variant_hint=pl.unmatched_variant_hint,
             blank_variant_axes=list(pl.blank_variant_axes or []),
+            candidate_variation_ids=list(pl.candidate_variation_ids or []),
+            specified_variant_axes=list(pl.specified_variant_axes or []),
         ))
 
     logger.info(

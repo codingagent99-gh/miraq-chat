@@ -39,6 +39,7 @@ class FlowState(Enum):
     AWAITING_BULK_COMPANY             = "awaiting_bulk_company"
     AWAITING_BULK_RECIPIENT           = "awaiting_bulk_recipient"
     AWAITING_BULK_RECIPIENT_MODE      = "awaiting_bulk_recipient_mode"
+    AWAITING_BULK_ADDRESS_CHOICE      = "awaiting_bulk_address_choice"
     AWAITING_BULK_PRODUCT             = "awaiting_bulk_product"
     AWAITING_BULK_QUANTITY = "awaiting_bulk_quantity"
 
@@ -56,6 +57,7 @@ _ORDER_FLOW_STATES = {
     FlowState.AWAITING_BULK_COMPANY,
     FlowState.AWAITING_BULK_RECIPIENT,
     FlowState.AWAITING_BULK_RECIPIENT_MODE,
+    FlowState.AWAITING_BULK_ADDRESS_CHOICE,
     FlowState.AWAITING_BULK_PRODUCT,
     FlowState.AWAITING_BULK_QUANTITY,
 }
@@ -110,6 +112,7 @@ def _flow_context_message(state: FlowState) -> dict:
         FlowState.AWAITING_BULK_COMPANY:           "Please provide the company name for this order",
         FlowState.AWAITING_BULK_RECIPIENT:         "Please tell me who this order is for",
         FlowState.AWAITING_BULK_RECIPIENT_MODE:    "Please say whether these are for the same person or different people",
+        FlowState.AWAITING_BULK_ADDRESS_CHOICE:    "Please pick which address to ship to",
         FlowState.AWAITING_BULK_PRODUCT:            "Please enter a product name",
         FlowState.AWAITING_BULK_QUANTITY:           "Please enter a quantity",
         FlowState.AWAITING_BULK_ORDER_INPUT:        "Please enter your order lines",
@@ -489,6 +492,16 @@ def handle_flow_state(
             "pass_through": False,
         }
     
+    # ── State: Awaiting which of a person's addresses to ship to ──
+    if state == FlowState.AWAITING_BULK_ADDRESS_CHOICE:
+        if not message.strip():
+            return _flow_context_message(FlowState.AWAITING_BULK_ADDRESS_CHOICE)
+        return {
+            "action": "process_bulk_address_choice_reply",
+            "flow_state": FlowState.AWAITING_BULK_ADDRESS_CHOICE.value,
+            "pass_through": False,
+        }
+
     # ── State: Awaiting "same person" vs "different people" for unnamed lines ──
     if state == FlowState.AWAITING_BULK_RECIPIENT_MODE:
         if not message.strip():
