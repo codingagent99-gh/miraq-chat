@@ -35,7 +35,11 @@ from app_config import (
 from conversation_flow import FlowState
 from chat_logger import get_logger
 from handlers.chat_utils import default_pagination, _get_safe_options
-from parsers.bulk_order_parser import parse_bulk_order_utterance, BulkOrderLine
+from parsers.bulk_order_parser import (
+    parse_bulk_order_utterance,
+    BulkOrderLine,
+    MultipleCompaniesError,
+)
 from utils.checkout_fields import (
     count_missing,
     format_missing_fields,
@@ -157,11 +161,64 @@ def _merge_address_block(base, override):
     return merged
 
 
-def _effective_address_for_line(line, address_overrides, line_idx, rep_email):
+def _rep_billing_address(conversation, user_context):
     """
-    Return (billing, shipping) for one bulk line: the base address blocks with
-    the per-line panel override merged in, and project_rep defaulted to the
-    logged-in rep.
+    Fetch the LOGGED-IN user's billing block, cached in user_context.
+
+    Requirement: bulk order billing comes from the logged-in user, not from the
+    customer the goods ship to. Shipping still comes from the resolved
+    company/person — see _effective_address_for_line, which combines them.
+
+    Cached because it is identical for every line in the transaction. A FAILED
+    fetch is deliberately not cached: user_context is persisted on the
+    conversation, so caching {} after one dropped connection would starve
+    billing for the rest of the session with no way to recover. A successful
+    fetch that happens to be empty IS cached — that is a real answer.
+    """
+    if user_context.get("rep_billing_fetched"):
+        return user_context.get("rep_billing_address") or {}
+
+    billing = {}
+    fetched = False
+    rep_id = getattr(conversation, "customer_id", None)
+    if rep_id:
+        try:
+            call = endpoints.fetch_customer(
+                customer_id=int(rep_id),
+                description="Fetch logged-in user billing for bulk order",
+            )
+            result = woo_client.execute(call)
+            if result.get("success") and isinstance(result.get("data"), dict):
+                billing = result["data"].get("billing", {}) or {}
+                fetched = True
+            else:
+                logger.warning(
+                    f"bulk_order | rep billing fetch unsuccessful for {rep_id} | "
+                    f"error={result.get('error')}"
+                )
+        except Exception as exc:
+            logger.warning(f"bulk_order | rep billing fetch failed | error={exc}")
+
+    if fetched:
+        user_context["rep_billing_address"] = billing
+        user_context["rep_billing_fetched"] = True
+
+    logger.info(
+        f"bulk_order | rep billing for user {rep_id} | fetched={fetched} | "
+        f"company={billing.get('company')!r} | keys={sorted(billing.keys())}"
+    )
+    return billing
+
+
+def _effective_address_for_line(line, address_overrides, line_idx, rep_email, rep_billing=None):
+    """
+    Return (billing, shipping) for one bulk line.
+
+    Billing is the LOGGED-IN user's billing block (rep_billing) when available,
+    since bulk orders are billed to the rep placing them; the line's own
+    billing_address is the fallback. Shipping always comes from the resolved
+    company/person. The per-line panel override is merged in last, so anything
+    the rep edits by hand still wins.
 
     This is the ONLY place bulk address merging happens. The validation gate,
     the card prefill and _create_all_confirmed_orders all call it, so they
@@ -173,7 +230,9 @@ def _effective_address_for_line(line, address_overrides, line_idx, rep_email):
     would block on a field that would have been populated anyway.
     """
     override = (address_overrides or {}).get(str(line_idx)) or {}
-    billing = _merge_address_block(_get(line, "billing_address"), override.get("billing"))
+
+    _billing_base = rep_billing if (rep_billing and rep_billing.get("address_1")) else _get(line, "billing_address")
+    billing = _merge_address_block(_billing_base, override.get("billing"))
     shipping = _merge_address_block(_get(line, "shipping_address"), override.get("shipping"))
 
     if not str(billing.get("project_rep") or "").strip():
@@ -200,8 +259,8 @@ def handle_bulk_order_trigger(conversation, user_context, page, start_time):
         "success": True,
         "bot_message": (
             "Tell me everything you need to order today. "
-            "You can include multiple customers and products in one message.\n\n"
-            "**Example:**\n"
+            "You can include multiple customers and products in one message.\r\n\r\n"
+            "**Example:**\r\n"
             "*Order 20 Harmony White for abc@buildersco.com, 15 Coral Grey for xyz@interiors.com*"
         ),
         "intent": "guided_flow",
@@ -231,12 +290,36 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
     customer_id = conversation.customer_id
 
     # Step 2: Parse
-    lines = parse_bulk_order_utterance(
-        text=message,
-        store_loader=store_loader,
-        role=role,
-        self_customer_id=str(customer_id) if customer_id else None,
-    )
+    _parse_meta: dict = {}
+    try:
+        lines = parse_bulk_order_utterance(
+            text=message,
+            store_loader=store_loader,
+            role=role,
+            self_customer_id=str(customer_id) if customer_id else None,
+            meta_out=_parse_meta,
+        )
+    except MultipleCompaniesError as e:
+        # One company per transaction — reject rather than guess which one.
+        conversation.flow_state = FlowState.AWAITING_BULK_ORDER_INPUT.value
+        _named = ", ".join(f"**{c}**" for c in e.companies)
+        elapsed = round((time.time() - start_time) * 1000)
+        logger.info(f"bulk_order | rejected multi-company request: {e.companies}")
+        return jsonify({
+            "success": True,
+            "bot_message": (
+                f"A bulk order can only be placed for one company at a time, "
+                f"but this request names {_named}. Please send a separate "
+                f"order for each company."
+            ),
+            "intent": "bulk_order",
+            "flow_state": FlowState.AWAITING_BULK_ORDER_INPUT.value,
+            "products": [],
+            "actions": [],
+            "suggestions": ["Cancel Order"],
+            "metadata": {"response_time_ms": elapsed},
+            "pagination": default_pagination(page),
+        }), 200
 
     # Step 3: Nothing parsed
     if not lines:
@@ -263,6 +346,7 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
         {
             "raw_fragment": l.raw_fragment,
             "company_name": l.company_name,
+            "recipient_name": l.recipient_name,
             "email": l.email,
             "product_name": l.product_name,
             "quantity": l.quantity,
@@ -278,6 +362,9 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
             "unresolved": l.unresolved,
             "unresolved_reason": l.unresolved_reason,
             "quantity_explicitly_set":  l.quantity_explicitly_set,
+            "unmatched_variant_hint": l.unmatched_variant_hint,
+            "blank_variant_axes": list(l.blank_variant_axes or []),
+            "variant_meta": {},
             "address_confirmed": False,
             "address_skipped": False,
         }
@@ -320,6 +407,15 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
                 )
 
     user_context["pending_bulk_lines"] = lines_as_dicts
+    # Keep the raw utterance so AWAITING_BULK_COMPANY can replay it verbatim
+    # once the rep names the company.
+    user_context["pending_bulk_utterance"] = message
+    # Bulk orders bill to the logged-in user — fetch once for the whole batch.
+    _rep_billing_address(conversation, user_context)
+    # Roster for the resolved company, so the recipient picker can list real
+    # people instead of falling back to asking for an email address.
+    user_context["bulk_company_roster"] = _parse_meta.get("company_roster", [])
+    user_context["bulk_company_scope"]  = _parse_meta.get("company_scope", "")
     user_context["bulk_current_line_index"] = 0
     user_context["bulk_confirmed_lines"] = []
     user_context["bulk_address_overrides"] = {}
@@ -347,7 +443,7 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
             if first_line.get("customer_id") else ""
         )
         already_resolved = [l for l in lines_as_dicts if not l.get("unresolved")]
-        resolved_note = f"\n\n{len(already_resolved)} other line(s) already resolved." if already_resolved else ""
+        resolved_note = f"\r\n\r\n{len(already_resolved)} other line(s) already resolved." if already_resolved else ""
 
         elapsed = round((time.time() - start_time) * 1000)
         return jsonify({
@@ -367,6 +463,75 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
             "pagination": default_pagination(page),
         }), 200
 
+    # Step 4.55: Rep lines with no company scope → ask for the company first.
+    # Company is the identity key for bulk orders, so this precedes everything.
+    if role in BULK_ORDER_ROLES:
+        company_missing = [
+            l for l in lines_as_dicts
+            if l.get("unresolved_reason") in ("company_not_provided", "company_not_found")
+        ]
+        if company_missing:
+            conversation.flow_state = FlowState.AWAITING_BULK_COMPANY.value
+            conversation.context_data = user_context
+            flag_modified(conversation, "context_data")
+
+            product_lines = "\r\n".join(
+                f"• **{l['quantity']}× {l['product_name']}**"
+                for l in company_missing
+            )
+            _tried = next(
+                (l.get("company_name") for l in company_missing if l.get("company_name")),
+                "",
+            )
+            _ask = (
+                f"I couldn't find any customers for **{_tried}**. "
+                "Which company is this order for?"
+                if _tried else
+                "Which company is this order for?"
+            )
+
+            elapsed = round((time.time() - start_time) * 1000)
+            return jsonify({
+                "success": True,
+                "bot_message": f"Got it:\r\n{product_lines}\r\n\r\n{_ask}",
+                "intent": "guided_flow",
+                "products": [],
+                "suggestions": ["Cancel"],
+                "session_id": str(conversation.id),
+                "metadata": {
+                    "flow_state": FlowState.AWAITING_BULK_COMPANY.value,
+                    "response_time_ms": elapsed,
+                },
+                "flow_state": FlowState.AWAITING_BULK_COMPANY.value,
+                "pagination": default_pagination(page),
+            }), 200
+
+    # Step 4.56: Company resolved but no person resolved → ask WHICH person.
+    # Bulk orders are keyed on company name, never an email address, so a line
+    # that knows its company must never fall through to the email prompt below.
+    #
+    # Asked PER DISTINCT RECIPIENT, not once for the whole order: example
+    # query 2 ships different products to different people at one company, so
+    # "Harmony for Ashlynn, Adams for Claire" is two separate questions. Lines
+    # that named nobody share a single slot, since one pick genuinely covers
+    # them all.
+    if role in BULK_ORDER_ROLES:
+        queue = _build_recipient_queue(lines_as_dicts)
+        if queue:
+            # Several lines named nobody — one person or several? Ask before
+            # assuming; guessing either way silently misassigns goods.
+            if _unnamed_multi_slot(queue) and not user_context.get("bulk_recipient_mode"):
+                return _ask_recipient_mode(
+                    lines_as_dicts, queue,
+                    conversation, user_context, page, start_time,
+                )
+            user_context["bulk_recipient_queue"] = queue
+            user_context["bulk_recipient_pos"] = 0
+            return _ask_for_bulk_recipient(
+                lines_as_dicts, queue, 0,
+                conversation, user_context, page, start_time,
+            )
+
     # Step 4.6: Rep lines missing an email → ask before proceeding
     if role in BULK_ORDER_ROLES:
         email_missing = [l for l in lines_as_dicts if l.get("unresolved_reason") == "email_not_provided"]
@@ -375,18 +540,18 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
             conversation.context_data = user_context
             flag_modified(conversation, "context_data")
 
-            product_lines = "\n".join(
+            product_lines = "\r\n".join(
                 f"• **{l['quantity']}× {l['product_name']}**"
                 for l in email_missing
             )
             already_resolved = [l for l in lines_as_dicts if not l.get("unresolved")]
-            resolved_note = f"\n\n{len(already_resolved)} other line(s) already resolved." if already_resolved else ""
+            resolved_note = f"\r\n\r\n{len(already_resolved)} other line(s) already resolved." if already_resolved else ""
 
             elapsed = round((time.time() - start_time) * 1000)
             return jsonify({
                 "success": True,
                 "bot_message": (
-                    f"Got it:\n{product_lines}{resolved_note}\n\n"
+                    f"Got it:\r\n{product_lines}{resolved_note}\r\n\r\n"
                     "Please provide the customer's email address."
                 ),
                 "intent": "guided_flow",
@@ -414,7 +579,11 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
     # Step 5: Check for variable products with unresolved variation_id
     needs_variant_indices = [
         i for i, l in enumerate(lines_as_dicts)
-        if l["product_id"] and not l["variation_id"]
+        # "not variation_id" is not enough: a variation can match on colour and
+        # still leave Finish / Sample Size as WooCommerce "Any", which the
+        # storefront makes the shopper choose. blank_variant_axes carries those.
+        if l["product_id"]
+        and (not l["variation_id"] or l.get("blank_variant_axes"))
         and _is_variable_product(l["product_id"], store_loader)
     ]
 
@@ -460,6 +629,14 @@ def _format_bulk_confirmation_table(lines) -> str:
             status = "❌ Email required"
         elif unresolved_reason == "email_not_found":
             status = "❌ Customer not found"
+        elif unresolved_reason == "company_not_provided":
+            status = "❌ Company required"
+        elif unresolved_reason == "company_not_found":
+            status = "❌ Company not found"
+        elif unresolved_reason == "recipient_not_found":
+            status = "❌ Person not found"
+        elif unresolved_reason == "recipient_required":
+            status = "❌ Recipient required"
         elif unresolved_reason == "both_not_found":
             status = "❌ Both not found"
         else:
@@ -471,15 +648,15 @@ def _format_bulk_confirmation_table(lines) -> str:
     skipped_count  = len(lines) - resolved_count
 
     table = (
-        "Here's your bulk order summary:\n\n"
-        "| Customer | Product | Qty | Status |\n"
-        "|---|---|---|---|\n"
-        + "\n".join(rows)
-        + "\n"
+        "Here's your bulk order summary:\r\n\r\n"
+        "| Customer | Product | Qty | Status |\r\n"
+        "|---|---|---|---|\r\n"
+        + "\r\n".join(rows)
+        + "\r\n"
     )
 
     if skipped_count > 0:
-        table += f"\n⚠️ {skipped_count} line(s) could not be resolved and will be skipped.\n"
+        table += f"\r\n⚠️ {skipped_count} line(s) could not be resolved and will be skipped.\r\n"
     table += f"✅ {resolved_count} order(s) ready to place."
 
     return table
@@ -487,6 +664,52 @@ def _format_bulk_confirmation_table(lines) -> str:
 # ══════════════════════════════════════════════════════════════
 # ── Private: _ask_for_bulk_variant ──
 # ══════════════════════════════════════════════════════════════
+
+def _parent_any_axis_options(product_id, axis_names, user_context):
+    """
+    Options for axes the matched variation leaves as WooCommerce "Any".
+
+    Those options exist only on the PARENT product — every variation has the
+    attribute key with an empty value — so they can't be derived from the
+    variation list the way the normal bulk variant prompt does it. Cached per
+    product because the prompt is re-rendered on every failed reply.
+    """
+    if not axis_names:
+        return {}
+
+    cache = user_context.setdefault("bulk_parent_axis_cache", {})
+    key = str(product_id)
+    if key not in cache:
+        axes = {}
+        try:
+            call = endpoints.fetch_product(
+                product_id=product_id,
+                description=f"Fetch parent attributes for product_id={product_id}",
+            )
+            res = woo_client.execute(call)
+            data = res.get("data") if res.get("success") else None
+            if isinstance(data, dict):
+                for a in data.get("attributes", []) or []:
+                    if not isinstance(a, dict) or not a.get("variation"):
+                        continue
+                    name = str(a.get("name") or "").strip()
+                    opts = [str(o) for o in (a.get("options") or []) if str(o).strip()]
+                    if name and opts:
+                        axes[name] = opts
+        except Exception as exc:
+            logger.warning(
+                f"bulk_order | parent attribute fetch failed for {product_id} | error={exc}"
+            )
+        cache[key] = axes
+        user_context["bulk_parent_axis_cache"] = cache
+
+    parent = cache.get(key, {}) or {}
+    wanted = {a.strip().lower() for a in axis_names if a}
+    return {
+        name: opts for name, opts in parent.items()
+        if name.strip().lower() in wanted
+    }
+
 
 def _ask_for_bulk_variant(
     lines_as_dicts, needs_variant_indices, pos,
@@ -522,6 +745,16 @@ def _ask_for_bulk_variant(
             if name and option:
                 attr_axes.setdefault(name, set()).add(option)
 
+    # Axes the matched variation leaves as "Any" carry no value on ANY
+    # variation, so attr_axes above can't see them — their options live on the
+    # parent product. The storefront makes the shopper pick these, so the rep
+    # must be asked too.
+    _any_axes = _parent_any_axis_options(
+        product_id, line.get("blank_variant_axes") or [], user_context
+    )
+    for _name, _opts in _any_axes.items():
+        attr_axes.setdefault(_name, set()).update(_opts)
+
     attributes = [
         {"name": name, "options": sorted(opts)}
         for name, opts in attr_axes.items()
@@ -537,6 +770,16 @@ def _ask_for_bulk_variant(
 
     conversation.flow_state = FlowState.AWAITING_BULK_VARIANT_SELECTION.value
 
+    # If the user named a variant we couldn't match (e.g. "Aurora Taupe" when
+    # Aurora has no Taupe), say so explicitly and show what IS available —
+    # otherwise the generic "select the missing details" prompt looks like we
+    # ignored what they typed.
+    _bad_hint = (line.get("unmatched_variant_hint") or "").strip()
+    _hint_not_in_catalog = bool(_bad_hint) and not any(
+        _bad_hint.lower() in opt.lower()
+        for opts in attr_axes.values() for opt in opts
+    )
+
     # ▼ CHANGED: wrap data inside "payload" key
     action = {
         "type": "SHOW_BULK_VARIANT_PROMPT",
@@ -549,17 +792,29 @@ def _ask_for_bulk_variant(
             "progress": {"current": pos + 1, "total": len(needs_variant_indices)},
             "attributes": attributes,
             "variations": variation_list,
+            "unmatched_variant_hint": _bad_hint if _hint_not_in_catalog else "",
         },
     }
+
+    _line_label = (
+        f"{line.get('customer_display_name', '')} × {line.get('quantity', 0) or '?'}"
+    )
+    if _hint_not_in_catalog:
+        _bot_message = (
+            f"I couldn't find **{_bad_hint}** for **{line['product_name']}** — "
+            f"that option isn't in the catalog. Please pick from the available "
+            f"options instead ({_line_label}):"
+        )
+    else:
+        _bot_message = (
+            f"Please select the missing product details for "
+            f"**{line['product_name']}** ({_line_label}):"
+        )
 
     elapsed = round((time.time() - start_time) * 1000)
     return jsonify({
         "success": True,
-        "bot_message": (
-            f"Please select the missing product details for "
-            f"**{line['product_name']}** "
-            f"({line.get('customer_display_name', '')} × {line.get('quantity', 0) or '?'}):"
-        ),
+        "bot_message": _bot_message,
         "intent": "guided_flow",
         "products": [],
         "suggestions": ["Cancel"],
@@ -593,8 +848,8 @@ def _build_bulk_confirmation_response(lines_as_dicts, conversation, user_context
             "success": True,
             "bot_message": (
                 "I couldn't find any products or customer emails in that message. "
-                "Try the format:\n\n"
-                "**Example:**\n"
+                "Try the format:\r\n\r\n"
+                "**Example:**\r\n"
                 "*Order 20 Harmony White for abc@buildersco.com, 15 Coral Grey for xyz@interiors.com*"
             ),
             "intent": "guided_flow",
@@ -703,9 +958,34 @@ def handle_bulk_variant_selection_reply(
     # Stamp the resolved variation
     import re as _re
 
+    # Record the rep's choice for any axis the variation itself can't encode
+    # ("Any" axes). These ride along as order line-item meta — exactly where
+    # WooCommerce puts an "Any" attribute chosen on the product page.
+    _pending_axes = line.get("blank_variant_axes") or []
+    if _pending_axes:
+        _opts = _parent_any_axis_options(product_id, _pending_axes, user_context)
+        _meta = dict(line.get("variant_meta") or {})
+        for _axis, _choices in _opts.items():
+            for _choice in sorted(_choices, key=len, reverse=True):
+                if _choice.lower() in msg_lower:
+                    _meta[_axis] = _choice
+                    break
+        line["variant_meta"] = _meta
+        line["blank_variant_axes"] = [
+            a for a in _pending_axes
+            if not any(a.strip().lower() == k.strip().lower() for k in _meta)
+        ]
+        logger.info(
+            f"bulk_order | variant meta for line {line_idx} → {_meta} | "
+            f"still pending={line['blank_variant_axes']}"
+        )
+
     line["variation_id"] = best_match["id"]
     line["unresolved"] = False
     line["unresolved_reason"] = None
+    # The user has now chosen a real option — don't keep warning about the
+    # hint that failed, or a re-prompt later would repeat a stale complaint.
+    line["unmatched_variant_hint"] = ""
 
     # If quantity was not specified earlier, extract the last standalone
     # integer from the user's reply. Attribute options like "12x24" don't
@@ -738,6 +1018,347 @@ def handle_bulk_variant_selection_reply(
 # ══════════════════════════════════════════════════════════════
 # ── Public: handle_bulk_email_reply ──
 # ══════════════════════════════════════════════════════════════
+
+def _build_recipient_queue(lines_as_dicts, split_unnamed: bool = False) -> list:
+    """
+    One slot per DISTINCT unresolved recipient.
+
+    Lines naming the same person share a slot (one answer settles them).
+    Lines naming NOBODY are ambiguous — "Order Harmony Moon, Adams Grey at
+    Beck" could be one person taking both or two people taking one each — so
+    the rep is asked which, and split_unnamed carries that answer:
+
+        False -> all unnamed lines share one slot (one question, one person)
+        True  -> each unnamed line gets its own slot (asked separately)
+
+    Returns [] when every line already has a customer, which is the signal to
+    skip the prompt entirely.
+    """
+    slots: dict = {}
+    for idx, l in enumerate(lines_as_dicts):
+        if l.get("unresolved_reason") not in ("recipient_required", "recipient_not_found"):
+            continue
+        raw = (l.get("recipient_name") or "").strip()
+        key = re.sub(r'[^a-z0-9]+', ' ', raw.lower()).strip()
+        if not key and split_unnamed:
+            key = f"__line_{idx}"   # unique per line -> one question each
+        slot = slots.setdefault(key, {"name": raw, "line_indices": []})
+        slot["line_indices"].append(idx)
+    return list(slots.values())
+
+
+# Button labels for the "one person or several?" step. Defined once so the
+# prompt and the reply matcher can never drift — a mismatch here would make a
+# tapped button fall through to the keyword fallback, or worse, re-ask forever.
+RECIPIENT_MODE_SAME = "Same person"
+RECIPIENT_MODE_DIFFERENT = "Different people"
+
+
+def _unnamed_multi_slot(queue) -> bool:
+    """True when the queue has an unnamed slot covering more than one line."""
+    return any(not s["name"] and len(s["line_indices"]) > 1 for s in queue)
+
+
+def _ask_recipient_mode(
+    lines_as_dicts, queue, conversation, user_context, page, start_time,
+):
+    """
+    Ask whether the unnamed lines all go to ONE person or to different people.
+
+    Only reached when more than one line named nobody — with a single line
+    there is nothing to disambiguate. Guessing either way silently misassigns
+    goods, so the rep is asked once and the answer shapes the queue.
+    """
+    slot = next(s for s in queue if not s["name"] and len(s["line_indices"]) > 1)
+    scope = user_context.get("bulk_company_scope", "")
+
+    conversation.flow_state = FlowState.AWAITING_BULK_RECIPIENT_MODE.value
+    user_context["bulk_recipient_queue"] = queue
+    conversation.context_data = user_context
+    flag_modified(conversation, "context_data")
+
+    product_lines = "\n".join(
+        f"\u2022 **{lines_as_dicts[i]['quantity']}\u00d7 {lines_as_dicts[i]['product_name']}**"
+        for i in slot["line_indices"]
+    )
+
+    elapsed = round((time.time() - start_time) * 1000)
+    return jsonify({
+        "success": True,
+        "bot_message": (
+            f"{product_lines}\n\nAre these all for the same person at "
+            f"**{scope}**, or for different people?"
+        ),
+        "intent": "guided_flow",
+        "products": [],
+        "suggestions": [RECIPIENT_MODE_SAME, RECIPIENT_MODE_DIFFERENT, "Cancel"],
+        "session_id": str(conversation.id),
+        "metadata": {
+            "flow_state": FlowState.AWAITING_BULK_RECIPIENT_MODE.value,
+            "company": scope,
+            "line_count": len(slot["line_indices"]),
+            "response_time_ms": elapsed,
+        },
+        "flow_state": FlowState.AWAITING_BULK_RECIPIENT_MODE.value,
+        "pagination": default_pagination(page),
+    }), 200
+
+
+def handle_bulk_recipient_mode_reply(
+    message, store_loader, conversation, user_context, page, start_time
+):
+    """
+    Called during AWAITING_BULK_RECIPIENT_MODE.
+
+    "Same person"     -> unnamed lines stay in one slot, asked once.
+    "Different people" -> each unnamed line becomes its own slot.
+    Anything unrecognised re-asks rather than guessing.
+    """
+    reply = (message or "").strip().lower()
+    lines = user_context.get("pending_bulk_lines", [])
+
+    # Exact button label first — this is the intended path, and it is decided
+    # without interpreting anything. Free text is only a fallback for reps who
+    # type instead of tapping.
+    if reply == RECIPIENT_MODE_SAME.lower():
+        _same, _diff = True, False
+    elif reply == RECIPIENT_MODE_DIFFERENT.lower():
+        _same, _diff = False, True
+    else:
+        _same = any(w in reply for w in ("same", "single", "one person", "1 person"))
+        _diff = any(w in reply for w in ("different", "separate", "multiple", "each", "various"))
+
+    if _same == _diff:   # both or neither matched -> ambiguous, ask again
+        queue = user_context.get("bulk_recipient_queue") or _build_recipient_queue(lines)
+        return _ask_recipient_mode(
+            lines, queue, conversation, user_context, page, start_time
+        )
+
+    mode = "same" if _same else "different"
+    user_context["bulk_recipient_mode"] = mode
+
+    queue = _build_recipient_queue(lines, split_unnamed=(mode == "different"))
+    user_context["bulk_recipient_queue"] = queue
+    user_context["bulk_recipient_pos"] = 0
+    conversation.context_data = user_context
+    flag_modified(conversation, "context_data")
+
+    logger.info(
+        f"bulk_order | recipient mode = {mode!r} -> {len(queue)} question(s)"
+    )
+
+    if not queue:
+        return _continue_after_slots_filled(
+            lines, store_loader, conversation, user_context, page, start_time
+        )
+
+    return _ask_for_bulk_recipient(
+        lines, queue, 0, conversation, user_context, page, start_time
+    )
+
+
+def _ask_for_bulk_recipient(
+    lines_as_dicts, queue, pos, conversation, user_context, page, start_time,
+):
+    """Prompt for the recipient of one slot in the queue."""
+    slot   = queue[pos]
+    roster = user_context.get("bulk_company_roster", []) or []
+    scope  = user_context.get("bulk_company_scope", "")
+    names  = [r.get("display", "") for r in roster if r.get("display")]
+
+    conversation.flow_state = FlowState.AWAITING_BULK_RECIPIENT.value
+    user_context["bulk_recipient_queue"] = queue
+    user_context["bulk_recipient_pos"] = pos
+    conversation.context_data = user_context
+    flag_modified(conversation, "context_data")
+
+    product_lines = "\r\n".join(
+        f"• **{lines_as_dicts[i]['quantity']}× {lines_as_dicts[i]['product_name']}**"
+        for i in slot["line_indices"]
+    )
+
+    if slot["name"]:
+        _ask = (
+            f"I couldn't find **{slot['name']}** at **{scope}**. "
+            "Who should this go to?"
+        )
+    else:
+        _ask = f"**{scope}** has {len(names)} contacts. Who should this go to?"
+
+    _progress = f" ({pos + 1} of {len(queue)})" if len(queue) > 1 else ""
+
+    elapsed = round((time.time() - start_time) * 1000)
+    return jsonify({
+        "success": True,
+        "bot_message": f"{product_lines}\r\n\r\n{_ask}{_progress}",
+        "intent": "guided_flow",
+        "products": [],
+        "suggestions": names[:8] + ["Cancel"],
+        "session_id": str(conversation.id),
+        "metadata": {
+            "flow_state": FlowState.AWAITING_BULK_RECIPIENT.value,
+            "company": scope,
+            "candidates": names,
+            "requested_name": slot["name"],
+            "progress": {"current": pos + 1, "total": len(queue)},
+            "response_time_ms": elapsed,
+        },
+        "flow_state": FlowState.AWAITING_BULK_RECIPIENT.value,
+        "pagination": default_pagination(page),
+    }), 200
+
+
+def handle_bulk_recipient_reply(message, store_loader, conversation, user_context, page, start_time):
+    """
+    Called during AWAITING_BULK_RECIPIENT when the rep names a person.
+
+    Applies the pick to the CURRENT queue slot only, then advances. Stamping
+    every unresolved line at once would silently ship Claire's product to
+    Ashlynn whenever the two names failed together.
+    """
+    choice = (message or "").strip()
+    roster = user_context.get("bulk_company_roster", []) or []
+    scope  = user_context.get("bulk_company_scope", "")
+    lines  = user_context.get("pending_bulk_lines", [])
+    queue  = user_context.get("bulk_recipient_queue", []) or []
+    pos    = user_context.get("bulk_recipient_pos", 0)
+
+    # Queue lost (e.g. resumed session) — rebuild from the lines themselves.
+    if not queue or pos >= len(queue):
+        queue = _build_recipient_queue(
+            lines,
+            split_unnamed=(user_context.get("bulk_recipient_mode") == "different"),
+        )
+        pos = 0
+        if not queue:
+            return _continue_after_slots_filled(
+                lines, store_loader, conversation, user_context, page, start_time
+            )
+
+    def _norm(v):
+        return re.sub(r'[^a-z0-9]+', ' ', str(v or "").lower()).strip()
+
+    needle = _norm(choice)
+    picked = None
+    if needle:
+        for r in roster:
+            if _norm(r.get("display")) == needle:
+                picked = r
+                break
+        if not picked:
+            for r in roster:
+                hay = _norm(r.get("display"))
+                if hay and (needle in hay or any(needle == w for w in hay.split())):
+                    picked = r
+                    break
+
+    if not picked:
+        names = [r.get("display", "") for r in roster if r.get("display")]
+        elapsed = round((time.time() - start_time) * 1000)
+        return jsonify({
+            "success": True,
+            "bot_message": (
+                f"I couldn't match **{choice}** to anyone at **{scope}**."
+                if choice else f"Who should this go to at **{scope}**?"
+            ),
+            "intent": "guided_flow",
+            "products": [],
+            "suggestions": names[:8] + ["Cancel"],
+            "session_id": str(conversation.id),
+            "metadata": {
+                "flow_state": FlowState.AWAITING_BULK_RECIPIENT.value,
+                "candidates": names,
+                "response_time_ms": elapsed,
+            },
+            "flow_state": FlowState.AWAITING_BULK_RECIPIENT.value,
+            "pagination": default_pagination(page),
+        }), 200
+
+    shipping = picked.get("shipping") or {}
+    if not shipping.get("address_1"):
+        shipping = picked.get("billing") or {}
+
+    slot = queue[pos]
+    for idx in slot["line_indices"]:
+        if idx >= len(lines):
+            continue
+        line = lines[idx]
+        line["customer_id"]           = picked["id"]
+        line["customer_display_name"] = picked["display"]
+        line["recipient_name"]        = picked["display"]
+        line["shipping_address"]      = shipping
+        line["billing_address"]       = picked.get("billing") or {}
+        line["is_self_order"]         = False
+        line["unresolved"]            = False
+        line["unresolved_reason"]     = None
+
+    user_context["pending_bulk_lines"] = lines
+    conversation.context_data = user_context
+    flag_modified(conversation, "context_data")
+
+    logger.info(
+        f"bulk_order | recipient '{picked['display']}' (id={picked['id']}) "
+        f"applied to line(s) {slot['line_indices']} "
+        f"(slot {pos + 1}/{len(queue)}, asked for '{slot['name']}') "
+        f"for company '{scope}'"
+    )
+
+    # More people still to identify?
+    if pos + 1 < len(queue):
+        return _ask_for_bulk_recipient(
+            lines, queue, pos + 1,
+            conversation, user_context, page, start_time,
+        )
+
+    user_context.pop("bulk_recipient_queue", None)
+    user_context.pop("bulk_recipient_pos", None)
+    user_context.pop("bulk_recipient_mode", None)
+    conversation.context_data = user_context
+    flag_modified(conversation, "context_data")
+
+    return _continue_after_slots_filled(
+        lines, store_loader, conversation, user_context, page, start_time
+    )
+
+
+def handle_bulk_company_reply(message, store_loader, conversation, user_context, page, start_time):
+    """
+    Called during AWAITING_BULK_COMPANY when the rep names the company.
+
+    The company scopes the entire transaction, so rather than patching
+    individual lines we re-run the original utterance with the company
+    appended — one code path for resolution instead of two.
+    """
+    company = (message or "").strip().strip('.,')
+    if not company:
+        elapsed = round((time.time() - start_time) * 1000)
+        return jsonify({
+            "success": True,
+            "bot_message": "Please provide the company name for this order.",
+            "intent": "guided_flow",
+            "products": [],
+            "suggestions": ["Cancel"],
+            "session_id": str(conversation.id),
+            "metadata": {
+                "flow_state": FlowState.AWAITING_BULK_COMPANY.value,
+                "response_time_ms": elapsed,
+            },
+            "flow_state": FlowState.AWAITING_BULK_COMPANY.value,
+            "pagination": default_pagination(page),
+        }), 200
+
+    lines = user_context.get("pending_bulk_lines", [])
+    original = user_context.get("pending_bulk_utterance", "") or " , ".join(
+        l.get("raw_fragment", "") for l in lines if l.get("raw_fragment")
+    )
+
+    replay = f"{original} for company {company}"
+    logger.info(f"bulk_order | company supplied → replaying with scope '{company}'")
+
+    return handle_bulk_order_input(
+        replay, store_loader, conversation, user_context, page, start_time
+    )
+
 
 def handle_bulk_email_reply(message, store_loader, conversation, user_context, page, start_time):
     """
@@ -879,7 +1500,10 @@ def handle_bulk_email_reply(message, store_loader, conversation, user_context, p
     # Check for variable products still needing variant selection
     needs_variant_indices = [
         i for i, l in enumerate(lines_as_dicts)
-        if l.get("product_id") and not l.get("variation_id")
+        # See the note at the first gate: a matched variation can still leave
+        # axes as "Any", which the rep must still choose.
+        if l.get("product_id")
+        and (not l.get("variation_id") or l.get("blank_variant_axes"))
         and _is_variable_product(l["product_id"], store_loader)
     ]
 
@@ -982,6 +1606,9 @@ def handle_product_reorder(payload, store_loader, conversation, user_context, pa
 
     # ── Store state and go straight to address confirmation ──
     user_context["pending_bulk_lines"]     = lines_as_dicts
+    # Reorder is a separate entry point into the bulk flow, so it needs the
+    # logged-in user's billing cached too.
+    _rep_billing_address(conversation, user_context)
     user_context["bulk_current_line_index"] = 0
     user_context["bulk_confirmed_lines"]   = []
     user_context["bulk_address_overrides"] = {}
@@ -1151,14 +1778,14 @@ def _continue_after_slots_filled(lines_as_dicts, store_loader, conversation, use
             conversation.context_data = user_context
             flag_modified(conversation, "context_data")
 
-            product_lines = "\n".join(
+            product_lines = "\r\n".join(
                 f"• **{l['quantity']}× {l['product_name']}**" for l in email_missing
             )
             elapsed = round((time.time() - start_time) * 1000)
             return jsonify({
                 "success": True,
                 "bot_message": (
-                    f"Got it:\n{product_lines}\n\n"
+                    f"Got it:\r\n{product_lines}\r\n\r\n"
                     "Please provide the customer's email address."
                 ),
                 "intent": "guided_flow",
@@ -1176,7 +1803,10 @@ def _continue_after_slots_filled(lines_as_dicts, store_loader, conversation, use
     # Variable products needing variant selection?
     needs_variant_indices = [
         i for i, l in enumerate(lines_as_dicts)
-        if l.get("product_id") and not l.get("variation_id")
+        # See the note at the first gate: a matched variation can still leave
+        # axes as "Any", which the rep must still choose.
+        if l.get("product_id")
+        and (not l.get("variation_id") or l.get("blank_variant_axes"))
         and _is_variable_product(l["product_id"], store_loader)
     ]
     if needs_variant_indices:
@@ -1321,7 +1951,10 @@ def _continue_after_quantity_filled(lines_as_dicts, store_loader, conversation, 
 
     needs_variant_indices = [
         i for i, l in enumerate(lines_as_dicts)
-        if l.get("product_id") and not l.get("variation_id")
+        # See the note at the first gate: a matched variation can still leave
+        # axes as "Any", which the rep must still choose.
+        if l.get("product_id")
+        and (not l.get("variation_id") or l.get("blank_variant_axes"))
         and _is_variable_product(l["product_id"], store_loader)
     ]
     if needs_variant_indices:
@@ -1421,6 +2054,7 @@ def handle_bulk_address_confirmation_reply(action, message, conversation, user_c
             user_context.get("bulk_address_overrides", {}),
             idx,
             user_context.get("rep_email", ""),
+            user_context.get("rep_billing_address"),
         )
         errors = validate_bulk_address(billing, shipping, get_required_fields())
         if has_errors(errors):
@@ -1468,6 +2102,7 @@ def handle_bulk_address_confirmation_reply(action, message, conversation, user_c
         # ── Validation gate ──
         billing, shipping = _effective_address_for_line(
             current_line, overrides, idx, user_context.get("rep_email", ""),
+            user_context.get("rep_billing_address"),
         )
         errors = validate_bulk_address(billing, shipping, get_required_fields())
         if has_errors(errors):
@@ -1521,6 +2156,7 @@ def handle_bulk_address_confirmation_reply(action, message, conversation, user_c
 
         billing, shipping = _effective_address_for_line(
             current_line, overrides, idx, user_context.get("rep_email", ""),
+            user_context.get("rep_billing_address"),
         )
         errors = validate_bulk_address(billing, shipping, get_required_fields())
         if has_errors(errors):
@@ -1667,6 +2303,7 @@ def _build_address_card_response(
         user_context.get("bulk_address_overrides", {}),
         idx,
         user_context.get("rep_email", ""),
+        user_context.get("rep_billing_address"),
     )
 
     addr_parts = [
@@ -1734,17 +2371,17 @@ def _build_address_card_response(
     header = (
         f"**Order for {current_line['customer_display_name']}** "
         if not current_line.get("is_self_order") else "**Your order** "
-    ) + f"({idx + 1} of {len(resolved_lines)})\n\n"
+    ) + f"({idx + 1} of {len(resolved_lines)})\r\n\r\n"
 
     if has_errors(validation_errors):
         missing_count = count_missing(validation_errors)
         bot_message = (
             header
-            + f"📦 {items_text}\n"
-            + f"📍 Shipping to: {addr_str}\n\n"
+            + f"📦 {items_text}\r\n"
+            + f"📍 Shipping to: {addr_str}\r\n\r\n"
             + f"⚠️ This order is missing {missing_count} required "
             + ("field" if missing_count == 1 else "fields")
-            + f": {format_missing_fields(validation_errors)}.\n\n"
+            + f": {format_missing_fields(validation_errors)}.\r\n\r\n"
             + "Please update the address, or skip this order."
         )
         suggestions = ["Change address", "Skip this order"]
@@ -1756,8 +2393,8 @@ def _build_address_card_response(
     else:
         bot_message = (
             header
-            + f"📦 {items_text}\n"
-            + f"📍 Shipping to: {addr_str}\n\n"
+            + f"📦 {items_text}\r\n"
+            + f"📍 Shipping to: {addr_str}\r\n\r\n"
             + "Confirm this address?"
         )
         suggestions = ["Yes, confirm", "Change address", "Skip this order"]
@@ -1783,6 +2420,31 @@ def _build_address_card_response(
 # ── Function 7: _create_all_confirmed_orders (private) ──
 # ══════════════════════════════════════════════════════════════
 
+def _bulk_line_item(line: dict) -> dict:
+    """
+    One WooCommerce order line item.
+
+    variant_meta carries the rep's choices for axes the variation itself can't
+    encode (WooCommerce "Any" attributes such as Adams' Finish and Sample
+    Size). They ride as line-item meta, which is where WooCommerce records an
+    "Any" attribute chosen on the product page — without this the order would
+    show a colour and nothing else, even though the rep was asked.
+    """
+    item = {
+        "product_id": line["product_id"],
+        "variation_id": line.get("variation_id") or 0,
+        "quantity": line["quantity"],
+    }
+    meta = line.get("variant_meta") or {}
+    if meta:
+        item["meta_data"] = [
+            {"key": str(axis), "value": str(value)}
+            for axis, value in meta.items()
+            if str(value).strip()
+        ]
+    return item
+
+
 def _create_all_confirmed_orders(user_context, conversation, page, start_time):
     """
     Places WooCommerce orders for every confirmed line, then clears all
@@ -1802,18 +2464,55 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
     created_orders = []
     failed_orders  = []
 
+    # ── Group by recipient ────────────────────────────────────────────────────
+    # One order per PERSON, not per line: several products for the same
+    # customer merge into a single order with several line_items, while
+    # different customers still get their own orders.
+    #
+    # The group key is the customer plus the effective address. Two lines for
+    # the same person can carry DIFFERENT addresses when the rep edited one of
+    # them in the per-line panel, and an order has exactly one billing and one
+    # shipping block — merging those would silently ship a line to the wrong
+    # place, so they stay separate.
+    #
+    # Order is preserved (dict keeps insertion order) so the summary still
+    # reads in the sequence the rep typed.
+    rep_email = user_context.get("rep_email", "")
+    _groups: dict = {}
+
     for line_idx, line in enumerate(resolved_lines):
         if not line.get("address_confirmed"):
             continue
 
-        rep_email = user_context.get("rep_email", "")
-
-        # Same merge path the validation gate used — see
-        # _effective_address_for_line. Sharing it is what guarantees the line
-        # that passed validation is the line that gets posted.
-        billing, shipping = _effective_address_for_line(
+        _billing, _shipping = _effective_address_for_line(
             line, address_overrides, line_idx, rep_email,
+            user_context.get("rep_billing_address"),
         )
+        _key = (
+            str(line.get("customer_id")),
+            json.dumps(_billing, sort_keys=True, default=str),
+            json.dumps(_shipping, sort_keys=True, default=str),
+        )
+        if _key not in _groups:
+            _groups[_key] = {
+                "line_idx": line_idx,          # first line — used for overrides/meta
+                "line": line,
+                "billing": _billing,
+                "shipping": _shipping,
+                "lines": [],
+            }
+        _groups[_key]["lines"].append(line)
+
+    logger.info(
+        f"bulk_order | {len(resolved_lines)} confirmed line(s) → "
+        f"{len(_groups)} order(s) after grouping by recipient"
+    )
+
+    for _group in _groups.values():
+        line       = _group["line"]           # representative line (customer/meta)
+        group_lines = _group["lines"]
+        billing    = dict(_group["billing"])
+        shipping   = dict(_group["shipping"])
 
         # ── Defence in depth ──
         # The gate in handle_bulk_address_confirmation_reply should already have
@@ -1824,7 +2523,7 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
         if has_errors(_errors):
             failed_orders.append({
                 "customer": line["customer_display_name"],
-                "product": line["product_name"],
+                "product": ", ".join(gl["product_name"] for gl in group_lines),
                 "error": f"Missing required address fields: {format_missing_fields(_errors)}",
             })
             logger.warning(
@@ -1861,11 +2560,7 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
             "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
             "set_paid": False,
             "line_items": [
-                {
-                    "product_id": line["product_id"],
-                    "variation_id": line.get("variation_id") or 0,
-                    "quantity": line["quantity"],
-                }
+                _bulk_line_item(gl) for gl in group_lines
             ],
         }
         if meta_data:
@@ -1892,17 +2587,19 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
             created_orders.append({
                 "order_number": new_order.get("number") or new_order.get("id"),
                 "customer": line["customer_display_name"],
-                "product": line["product_name"],
-                "quantity": line["quantity"],
+                # A merged order covers several products — name them all, or
+                # the summary silently under-reports what was placed.
+                "product": ", ".join(gl["product_name"] for gl in group_lines),
+                "quantity": sum(int(gl.get("quantity") or 0) for gl in group_lines),
             })
             logger.info(
                 f"bulk_order | created order #{new_order.get('number') or new_order.get('id')} "
-                f"for {line['customer_display_name']}"
+                f"for {line['customer_display_name']} | {len(group_lines)} line item(s)"
             )
         else:
             failed_orders.append({
                 "customer": line["customer_display_name"],
-                "product": line["product_name"],
+                "product": ", ".join(gl["product_name"] for gl in group_lines),
                 "error": str(order_resp.get("error", "Unknown error")),
             })
             logger.warning(
@@ -1928,17 +2625,17 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
     bot_message = ""
 
     if created_orders:
-        bot_message += f"✅ **{len(created_orders)} order(s) placed successfully:**\n\n"
+        bot_message += f"✅ **{len(created_orders)} order(s) placed successfully:**\r\n\r\n"
         for o in created_orders:
-            bot_message += f"• **#{o['order_number']}** — {o['customer']}: {o['product']} ×{o['quantity']}\n"
+            bot_message += f"• **#{o['order_number']}** — {o['customer']}: {o['product']} ×{o['quantity']}\r\n"
 
     if failed_orders:
-        bot_message += f"\n⚠️ **{len(failed_orders)} order(s) failed:**\n\n"
+        bot_message += f"\r\n⚠️ **{len(failed_orders)} order(s) failed:**\r\n\r\n"
         for fail in failed_orders:
-            bot_message += f"• {fail['customer']}: {fail['product']} — {fail['error']}\n"
+            bot_message += f"• {fail['customer']}: {fail['product']} — {fail['error']}\r\n"
 
     if skipped:
-        bot_message += f"\n⏭️ **{len(skipped)} order(s) skipped.**\n"
+        bot_message += f"\r\n⏭️ **{len(skipped)} order(s) skipped.**\r\n"
 
     if not bot_message:
         bot_message = "No orders were placed."

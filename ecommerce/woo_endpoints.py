@@ -581,15 +581,28 @@ class WooEndpoints:
     def search_customers_by_company(
         self,
         company_name: str,
-        per_page: int = 3,
+        per_page: int = 20,
+        requesting_customer_id=None,
         description: str = "",
         requires_resolution: Optional[List[str]] = None,
     ) -> WooAPICall:
-        """GET /customers/by-company?name=<company> (custom_plugin surface)"""
+        """GET /customers/by-company?name=<company> (custom_plugin surface)
+
+        per_page defaults to 20 — the plugin's own ceiling
+        (`min(20, ...)` in get_customers_by_company). The old default of 3
+        silently truncated a company's contact list, so a named recipient
+        could be reported "not found" purely because they sat 4th.
+
+        requesting_customer_id is REQUIRED by the plugin: it role-gates on
+        the caller and returns 403 without it.
+        """
+        params = {"name": company_name, "per_page": per_page}
+        if requesting_customer_id:
+            params["customer_id"] = requesting_customer_id
         return WooAPICall(
             method="GET",
             endpoint="/customers/by-company",
-            params={"name": company_name, "per_page": per_page},
+            params=params,
             surface="custom_plugin",
             description=description or f"Search customers by company '{company_name}'",
             requires_resolution=requires_resolution or [],

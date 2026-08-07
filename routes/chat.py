@@ -89,6 +89,9 @@ from handlers.bulk_order_handler import (
     handle_bulk_address_confirmation_reply,
     handle_bulk_variant_selection_reply,
     handle_bulk_email_reply,
+    handle_bulk_company_reply,
+    handle_bulk_recipient_reply,
+    handle_bulk_recipient_mode_reply,
     handle_bulk_product_reply,
     handle_bulk_quantity_reply,
     handle_cancel_bulk_order,
@@ -122,6 +125,43 @@ chat_bp = Blueprint("chat", __name__)
 # ══════════════════════════════════════════════════════════════
 # ─── MODULE-LEVEL HELPERS ───
 # ══════════════════════════════════════════════════════════════
+
+from parsers.bulk_order_parser import COMPANY_SCOPE_TAIL_RE
+
+
+def _recipient_scope_tokens(message: str, is_bulk: bool = False) -> list:
+    """
+    Tokens sitting in a bulk-order scope tail — after "for" or "at".
+
+    These are proper nouns ("... Adams Grey at Beck", "... for Abel Design
+    Group") and must never be fuzzy-matched against catalog vocabulary. Left
+    unprotected, "beck" is corrected to the attribute term "back" and the
+    company lookup silently runs against the wrong company; "abel" ties against
+    ['abeto','azul','area','panel'] and hijacks the turn into a typo
+    clarification chip before the parser ever sees it.
+
+    ONLY applied to bulk orders. The marker words are far too common in
+    ordinary questions — "look at the blue tiles", "show me bella at 12x12" —
+    to blanket-protect; doing so would switch typo correction off across much
+    of the catalog vocabulary.
+
+    The marker list comes from COMPANY_SCOPE_TAIL_RE in the bulk parser, so a
+    marker added to the format is protected here automatically rather than
+    needing the same edit in two files.
+
+    Returned lowercase for correct_message(suppressed_tokens=...), which passes
+    them through verbatim and does not raise them as ambiguities.
+    """
+    if not message or not is_bulk:
+        return []
+
+    tokens = []
+    for tail in COMPANY_SCOPE_TAIL_RE.findall(message):
+        for tok in re.split(r'[^A-Za-z]+', tail):
+            if len(tok) > 1:
+                tokens.append(tok.lower())
+    return tokens
+
 
 def _is_inline_bulk_order(message: str, store_loader=None) -> bool:
     # Check 1: comma-separated fragments with quantities (original)
@@ -298,6 +338,18 @@ def _dispatch_bulk_action(action, message, role, store_loader, conversation, use
         )
     elif action == "process_bulk_variant_selection":
         return handle_bulk_variant_selection_reply(
+            message, store_loader, conversation, user_context, page, start_time
+        )
+    elif action == "process_bulk_recipient_mode_reply":
+        return handle_bulk_recipient_mode_reply(
+            message, store_loader, conversation, user_context, page, start_time
+        )
+    elif action == "process_bulk_recipient_reply":
+        return handle_bulk_recipient_reply(
+            message, store_loader, conversation, user_context, page, start_time
+        )
+    elif action == "process_bulk_company_reply":
+        return handle_bulk_company_reply(
             message, store_loader, conversation, user_context, page, start_time
         )
     elif action == "process_bulk_email_reply":
@@ -1583,9 +1635,15 @@ def chat():
             and not re.match(r"(?i)^no\s*-\s*search\s*for\s*['\"]", message)
         ):
             from utils.typo_correction import correct_message, find_mos_confusions
+            _suppressed = list(user_context.get("typo_suppressed_tokens", []))
+            _suppressed.extend(
+                _recipient_scope_tokens(
+                    message, is_bulk=_is_inline_bulk_order(message, store_loader)
+                )
+            )
             _corrected, _typo_corrections, _typo_ambiguities = correct_message(
                 message, store_loader,
-                suppressed_tokens=user_context.get("typo_suppressed_tokens", []),
+                suppressed_tokens=_suppressed,
             )
             if _typo_corrections:
                 message = _corrected

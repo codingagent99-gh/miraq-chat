@@ -209,7 +209,8 @@ class EcommerceEndpoints(Protocol):
     def search_customers_by_company(
         self,
         company_name: str,
-        per_page: int = 3,
+        per_page: int = 20,
+        requesting_customer_id=None,
         description: str = "",
         requires_resolution: Optional[List[str]] = None,
     ) -> WooAPICall:

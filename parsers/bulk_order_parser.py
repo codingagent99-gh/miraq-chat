@@ -18,7 +18,7 @@ from woo_client import woo_client
 from ecommerce import endpoints
 from chat_logger import get_logger
 from app_config import BULK_ORDER_ROLES
-from handlers.chat_utils import normalize_spelling_variants
+from handlers.chat_utils import normalize_spelling_variants, _attribute_display_name
 
 logger = get_logger("miraq_chat")
 
@@ -30,7 +30,8 @@ EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', re.I)
 @dataclass
 class BulkOrderLine:
     raw_fragment: str
-    company_name: str                     # as typed (display only; not used for resolution)
+    company_name: str                     # transaction-wide company scope
+    recipient_name: str                   # person this line ships to (within the company)
     email: str                            # customer identifier; empty string if not provided
     product_name: str
     quantity: int
@@ -46,6 +47,8 @@ class BulkOrderLine:
     reorder_source_order_id: Optional[int]
     unresolved: bool
     unresolved_reason: Optional[str]
+    unmatched_variant_hint: str = ""   # hint the user typed that matched no variation
+    blank_variant_axes: list = field(default_factory=list)  # axes the matched variation leaves as "Any"
 
 # ══════════════════════════════════════════════════════════════
 # INTERNAL: intermediate pre-line structure
@@ -55,6 +58,7 @@ class BulkOrderLine:
 class _PreLine:
     raw_fragment: str
     company_name: str
+    recipient_name: str
     email: str
     product_name: str
     quantity: int
@@ -65,17 +69,92 @@ class _PreLine:
     reorder_source_order_id: Optional[int] = None
     variant_hint: str = ""
     variation_id: Optional[int] = None
+    unmatched_variant_hint: str = ""
+    blank_variant_axes: list = field(default_factory=list)
 
 
 # ══════════════════════════════════════════════════════════════
 # PUBLIC FUNCTION
 # ══════════════════════════════════════════════════════════════
 
+class MultipleCompaniesError(ValueError):
+    """Raised when one utterance names more than one company.
+
+    The requirement restricts a bulk order to a single company per
+    transaction, so this is rejected outright rather than partially applied.
+    """
+
+    def __init__(self, companies):
+        self.companies = companies
+        super().__init__(f"multiple companies in one request: {companies}")
+
+
+# "for company Beck LTD" — the explicit, unambiguous form.
+_FOR_COMPANY_RE = re.compile(r'\bfor\s+company\s+([^,]+)', re.I)
+
+# Any "for <something>" tail on a fragment.
+_FOR_TAIL_RE = re.compile(r'\bfor\s+(.+)$', re.I)
+
+# ── Company-scope markers ────────────────────────────────────────────────────
+# The bulk-order format scopes a company with one of these words:
+#     "... for Claire at Abel Design Group"
+#     "... Aurora Taupe for Beck LTD"
+#
+# "on" is deliberately NOT a marker: "Order Harmony Moon, Adams Grey on sale"
+# would read "sale" as the company.
+#
+# SINGLE SOURCE OF TRUTH. routes/chat.py imports COMPANY_SCOPE_TAIL_RE from
+# here to decide which tokens the typo corrector must leave alone. Keeping two
+# copies is what let "at Beck" get silently corrected to "at back" after "at"
+# was added here but not there — every marker added below is protected from
+# typo correction automatically.
+COMPANY_SCOPE_MARKERS = ("for", "at")
+
+# "at" tails, anchored to the fragment end — this marks a company only in
+# trailing position ("Adams Grey at Beck"), never mid-fragment.
+_AT_COMPANY_RE = re.compile(r'\bat\s+([^,]+)$', re.I)
+
+# Any scope tail, used ONLY for typo-guard token extraction (not for parsing).
+# Unanchored so it catches "for ram" mid-fragment as well as trailing tails.
+COMPANY_SCOPE_TAIL_RE = re.compile(
+    r'\b(?:for(?:\s+company)?|at)\s+([^,]+)', re.I
+)
+
+
+def _extract_company_scope(text: str):
+    """
+    Pull the transaction-wide company out of the raw utterance.
+
+    Handles the explicit form only ("... for company Beck LTD"); the implicit
+    trailing form ("Order A, B, C for Beck LTD") is resolved later, once the
+    text has been split into fragments and we can tell a lone trailing "for"
+    from per-line recipients.
+
+    Returns (company_name, cleaned_text).
+    Raises MultipleCompaniesError if two different companies are named.
+    """
+    names = []
+    for raw in _FOR_COMPANY_RE.findall(text):
+        name = raw.strip().strip(' ,.')
+        if name and not any(name.lower() == seen.lower() for seen in names):
+            names.append(name)
+
+    if len(names) > 1:
+        raise MultipleCompaniesError(names)
+
+    if names:
+        cleaned = _FOR_COMPANY_RE.sub('', text).strip().strip(' ,.')
+        return names[0], cleaned
+
+    return "", text
+
+
 def parse_bulk_order_utterance(
     text: str,
     store_loader,
     role: str = "",
     self_customer_id: Optional[str] = None,
+    meta_out: Optional[dict] = None,
 ) -> List[BulkOrderLine]:
     """
     Parse a free-text bulk order utterance into a list of resolved BulkOrderLine objects.
@@ -89,6 +168,12 @@ def parse_bulk_order_utterance(
       6. Assemble final BulkOrderLine objects
     """
     _is_rep = role in BULK_ORDER_ROLES
+
+    # ── Step 0: Transaction-wide company scope ("... for company Beck LTD") ──
+    # Bulk orders are scoped to ONE company; naming two raises immediately.
+    company_scope = ""
+    if _is_rep:
+        company_scope, text = _extract_company_scope(text)
 
     # ── Step 1: Split into fragments ─────────────────────────────────────────
     _catalog_names = {
@@ -127,6 +212,78 @@ def parse_bulk_order_utterance(
                     continue
             expanded.append(sub)
         final_fragments.extend(expanded)
+
+    # ── Step 1.5: Implicit trailing company ──────────────────────────────────
+    # Three shapes reach here, all without the explicit "for company" keyword:
+    #
+    #   (a) "Order A, B, C for Beck LTD."
+    #       Only the LAST fragment has a "for" tail, so it scopes the whole
+    #       order rather than naming a recipient for C alone.
+    #
+    #   (b) "Order A for ram, B for sovan for Abel Design Group"
+    #       The last fragment has TWO "for" tails — the first names the
+    #       recipient, the LAST names the company.
+    #
+    #   (c) "Order A for Ashlynn, B for Claire at Abel Design Group"
+    #       "at" separates person from company. This reads most naturally to
+    #       a rep and was previously swallowed whole into the recipient
+    #       ("Claire at Abel Design Group"), so no company was ever detected.
+    if _is_rep and not company_scope:
+        # (c) first — an explicit "at" marker is less ambiguous than counting
+        # "for" tails, so it wins when present.
+        _at_hits = []
+        for i, frag in enumerate(final_fragments):
+            _m = _AT_COMPANY_RE.search(frag)
+            if not _m:
+                continue
+            _name = _m.group(1).strip().strip(' ,.')
+            if _name:
+                _at_hits.append((i, _m.start(), _name))
+
+        _distinct_at = []
+        for _, _, _name in _at_hits:
+            if not any(_name.lower() == seen.lower() for seen in _distinct_at):
+                _distinct_at.append(_name)
+        if len(_distinct_at) > 1:
+            raise MultipleCompaniesError(_distinct_at)
+
+        if _at_hits:
+            company_scope = _distinct_at[0]
+            # Strip the "at <company>" tail from every fragment carrying it.
+            for i, start, _ in _at_hits:
+                final_fragments[i] = final_fragments[i][:start].strip().strip(' ,.')
+            logger.debug(
+                f"bulk_parser | scope-marker company → '{company_scope}'"
+            )
+
+    if _is_rep and not company_scope:
+        _last = final_fragments[-1] if final_fragments else ""
+        _for_positions = [m.start() for m in re.finditer(r'\bfor\b', _last, re.I)]
+        _for_idx = [
+            i for i, f in enumerate(final_fragments)
+            if _FOR_TAIL_RE.search(f)
+        ]
+
+        _split_at = None
+        if len(_for_positions) >= 2:
+            # (b) last "for" in the final fragment starts the company scope
+            _split_at = _for_positions[-1]
+        elif len(_for_idx) == 1 and _for_idx[0] == len(final_fragments) - 1:
+            # (a) the lone "for" tail across the whole utterance
+            _split_at = _for_positions[0] if _for_positions else None
+
+        if _split_at is not None:
+            _tail = _last[_split_at:]
+            _m = _FOR_TAIL_RE.search(_tail)
+            if _m:
+                _cand = EMAIL_RE.sub('', _m.group(1)).strip().strip(' ,.')
+                # An email tail identifies a person, not a company.
+                if _cand and not EMAIL_RE.search(_m.group(1)):
+                    company_scope = _cand
+                    final_fragments[-1] = _last[:_split_at].strip()
+                    logger.debug(
+                        f"bulk_parser | trailing company scope → '{company_scope}'"
+                    )
 
     # ── Step 2: Per-fragment extraction ──────────────────────────────────────
     pre_lines: List[_PreLine] = []
@@ -167,14 +324,16 @@ def parse_bulk_order_utterance(
             if email_match:
                 email = email_match.group(0).strip()
 
-        # ── Company name: text after "for" minus any email (display only) ──
-        company_name = ""
+        # ── Recipient: the "for <person>" tail, minus any email ──────────────
+        # The company is transaction-wide (Step 0/1.5), so anything left after
+        # "for" on an individual fragment names the PERSON the line ships to.
+        recipient_name = ""
         if _is_rep:
-            for_match = re.search(r'\bfor\s+(.+)$', fragment, re.I)
+            for_match = _FOR_TAIL_RE.search(fragment)
             if for_match:
                 candidate = EMAIL_RE.sub('', for_match.group(1)).strip().strip(', ')
                 if candidate:
-                    company_name = candidate
+                    recipient_name = candidate
 
         # ── Product: strip quantity, email addresses, and "for …" tail ──
         # If a catalog product name was pre-claimed above, leave the fragment
@@ -201,7 +360,8 @@ def parse_bulk_order_utterance(
 
         pre_lines.append(_PreLine(
             raw_fragment=fragment,
-            company_name=company_name,
+            company_name=company_scope,
+            recipient_name=recipient_name,
             email=email,
             product_name=product_name,
             quantity=quantity,
@@ -272,12 +432,12 @@ def parse_bulk_order_utterance(
                 if remainder:
                     _for_match = re.match(r'^for\s+(.+)$', remainder, re.I)
                     if _for_match:
-                        # "for <Name>" in remainder → display-only company hint
-                        # Email (the actual resolution key) was already extracted in Step 2.
-                        if not pl.company_name:
+                        # "for <Name>" in remainder names the RECIPIENT; the
+                        # company is transaction-wide and set in Step 0/1.5.
+                        if not pl.recipient_name:
                             candidate = EMAIL_RE.sub('', _for_match.group(1)).strip().strip(', ')
                             if candidate:
-                                pl.company_name = candidate
+                                pl.recipient_name = candidate
                     else:
                         pl.variant_hint = remainder
             pl.product_name = matched_catalog_name
@@ -294,12 +454,13 @@ def parse_bulk_order_utterance(
             
     # ── Step 3.5: Variation resolution (API call per unique product with a hint) ─
     _variant_cache: dict = {}   # product_id → list[variation dicts]; avoids duplicate calls
+    _variant_fetch_failed: set = set()   # product_ids whose lookup errored out
 
     for pl in pre_lines:
         if not pl.product_id or not pl.variant_hint:
             continue
 
-        if pl.product_id not in _variant_cache:
+        if pl.product_id not in _variant_cache and pl.product_id not in _variant_fetch_failed:
             var_call = endpoints.list_variants(
                 product_id=pl.product_id,
                 per_page=100,
@@ -307,7 +468,25 @@ def parse_bulk_order_utterance(
             )
             var_result = woo_client.execute(var_call)
             data = var_result.get("data", [])
-            _variant_cache[pl.product_id] = data if isinstance(data, list) else []
+            if var_result.get("success") and isinstance(data, list):
+                _variant_cache[pl.product_id] = data
+            else:
+                # A transport failure returns {"success": False, "data": []},
+                # which is indistinguishable from "this product has no
+                # variations" once cached. Track it separately so a dropped
+                # connection is never reported to the rep as "that option
+                # isn't in the catalog".
+                _variant_fetch_failed.add(pl.product_id)
+                logger.warning(
+                    f"bulk_parser | variation lookup FAILED for product_id="
+                    f"{pl.product_id} | hint='{pl.variant_hint}' | "
+                    f"error={var_result.get('error')}"
+                )
+
+        if pl.product_id in _variant_fetch_failed:
+            # Leave variation_id unset so the variant prompt still fires, but
+            # do NOT claim the hint was not found — we never got to check.
+            continue
 
         hint_lower = normalize_spelling_variants(pl.variant_hint)
         for var in _variant_cache[pl.product_id]:
@@ -321,11 +500,43 @@ def parse_bulk_order_utterance(
                 break
 
         if pl.variation_id:
+            # A matched variation can still be only PARTIALLY specified: this
+            # catalog has products (Adams) where every variation carries a
+            # colour but leaves Finish and Sample Size blank — WooCommerce
+            # "Any". The storefront still makes the shopper choose those, so
+            # record them and let the handler ask rather than silently
+            # ordering an under-specified line.
+            _matched = next(
+                (v for v in _variant_cache[pl.product_id] if v.get("id") == pl.variation_id),
+                None,
+            )
+            _attrs = (_matched or {}).get("attributes", [])
+            _blank = []
+            if isinstance(_attrs, dict):
+                _blank = [k for k, v in _attrs.items() if not str(v or "").strip()]
+            elif isinstance(_attrs, list):
+                _blank = [
+                    a.get("name") or a.get("slug") or ""
+                    for a in _attrs
+                    if isinstance(a, dict) and not str(a.get("option") or "").strip()
+                ]
+            pl.blank_variant_axes = [
+                _attribute_display_name(k) for k in _blank if k
+            ]
+            if pl.blank_variant_axes:
+                logger.info(
+                    f"bulk_parser | variation {pl.variation_id} leaves "
+                    f"{pl.blank_variant_axes} unset — will prompt"
+                )
+
             logger.debug(
                 f"bulk_parser | resolved variation hint='{pl.variant_hint}' "
                 f"→ variation_id={pl.variation_id}"
             )
         else:
+            # Remember WHAT the user asked for so the variant prompt can say
+            # "I couldn't find Taupe" instead of silently asking them to pick.
+            pl.unmatched_variant_hint = pl.variant_hint
             logger.debug(
                 f"bulk_parser | unresolved variation hint='{pl.variant_hint}' "
                 f"for product_id={pl.product_id}"
@@ -373,6 +584,95 @@ def parse_bulk_order_utterance(
         if resolution:
             pl.customer_id = resolution["id"]
 
+    # ── Step 4b: Company roster resolution (rep only, one API call) ───────────
+    # The company scopes the whole transaction, so one lookup serves every
+    # line. Each line's recipient is then matched WITHIN that roster.
+    company_roster: List[dict] = []
+    company_lookup_done = False
+
+    if _is_rep and company_scope:
+        call = endpoints.search_customers_by_company(
+            company_name=company_scope,
+            per_page=20,
+            requesting_customer_id=self_customer_id,
+            description=f"Bulk order company lookup: '{company_scope}'",
+        )
+        result = woo_client.execute(call)
+        company_lookup_done = True
+
+        customers = result.get("data", [])
+        if isinstance(customers, dict):
+            customers = customers.get("results", []) or customers.get("customers", [])
+        if result.get("success") and isinstance(customers, list):
+            company_roster = [c for c in customers if isinstance(c, dict) and c.get("id")]
+
+        logger.info(
+            f"bulk_parser | company '{company_scope}' → "
+            f"{len(company_roster)} customer(s)"
+        )
+
+    def _roster_entry_to_resolution(customer: dict) -> dict:
+        full_name = (
+            f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip()
+        )
+        display = full_name or customer.get("email") or f"Customer #{customer['id']}"
+        return {
+            "id": str(customer["id"]),
+            "display": display,
+            "billing": customer.get("billing", {}) or {},
+            "shipping": customer.get("shipping", {}) or {},
+        }
+
+    def _match_recipient(name: str):
+        """Match a person name against the company roster.
+
+        Returns (resolution | None, match_count). Names are assumed unique
+        within a company for now, so the first match wins; match_count is
+        still reported so an ambiguity prompt can be added later.
+        """
+        if not name or not company_roster:
+            return None, 0
+        needle = re.sub(r'[^a-z0-9]+', ' ', name.lower()).strip()
+        if not needle:
+            return None, 0
+
+        matches = []
+        for c in company_roster:
+            first = str(c.get("first_name", "") or "").lower()
+            last = str(c.get("last_name", "") or "").lower()
+            full = f"{first} {last}".strip()
+            email_local = str(c.get("email", "") or "").split("@")[0].lower()
+            haystacks = {h for h in (first, last, full, email_local) if h}
+            if any(needle == h for h in haystacks) or any(
+                needle in h.split() for h in haystacks
+            ):
+                matches.append(c)
+
+        if not matches:
+            return None, 0
+        return _roster_entry_to_resolution(matches[0]), len(matches)
+
+    # Stamp company-resolved customers onto pre_lines (email still wins if given)
+    for pl in pre_lines:
+        if not _is_rep or pl.customer_id:
+            continue
+        if pl.recipient_name:
+            resolution, _count = _match_recipient(pl.recipient_name)
+            if resolution:
+                pl.customer_id = resolution["id"]
+        elif len(company_roster) == 1:
+            # No person named and the company has exactly one contact —
+            # unambiguous, so use them (example query 1).
+            pl.customer_id = _roster_entry_to_resolution(company_roster[0])["id"]
+
+    if meta_out is not None:
+        # The caller needs the roster to build a recipient picker; re-querying
+        # it in the handler would cost a second identical API round trip.
+        meta_out["company_scope"] = company_scope
+        meta_out["company_roster"] = [
+            _roster_entry_to_resolution(c) for c in company_roster
+        ]
+
     # ── Step 5: Reorder resolution ────────────────────────────────────────────
     for pl in pre_lines:
         if not pl.is_reorder or not pl.customer_id:
@@ -416,8 +716,17 @@ def parse_bulk_order_utterance(
     result_lines: List[BulkOrderLine] = []
 
     for pl in pre_lines:
+        _recipient_matches = 0
         if _is_rep:
             resolution = email_resolution_cache.get(pl.email) if pl.email else None
+
+            # Fall back to the company roster when no email was given.
+            if not resolution and company_roster:
+                if pl.recipient_name:
+                    resolution, _recipient_matches = _match_recipient(pl.recipient_name)
+                elif len(company_roster) == 1:
+                    resolution = _roster_entry_to_resolution(company_roster[0])
+
             if resolution:
                 customer_id = resolution["id"]
                 customer_display_name = resolution["display"]
@@ -428,10 +737,19 @@ def parse_bulk_order_utterance(
                     shipping_address = billing_address
             else:
                 customer_id = None
-                customer_display_name = "⚠️ Not found" if pl.email else "⚠️ Email required"
                 is_self_order = False
                 shipping_address = None
                 billing_address = None
+                if pl.email:
+                    customer_display_name = "⚠️ Not found"
+                elif not company_scope:
+                    customer_display_name = "⚠️ Company required"
+                elif not company_roster:
+                    customer_display_name = f"⚠️ No customers for {company_scope}"
+                elif pl.recipient_name:
+                    customer_display_name = f"⚠️ {pl.recipient_name} not found"
+                else:
+                    customer_display_name = "⚠️ Recipient required"
         else:
             customer_id = self_customer_id
             customer_display_name = "Order"
@@ -443,6 +761,18 @@ def parse_bulk_order_utterance(
         _customer_unresolved = customer_id is None
         _product_unresolved = pl.product_id is None
 
+        if _is_rep and _customer_unresolved and not pl.email:
+            if not company_scope:
+                _customer_reason = "company_not_provided"
+            elif not company_roster:
+                _customer_reason = "company_not_found"
+            elif pl.recipient_name:
+                _customer_reason = "recipient_not_found"
+            else:
+                _customer_reason = "recipient_required"
+        else:
+            _customer_reason = "email_not_provided" if (_is_rep and not pl.email) else "email_not_found"
+
         if _product_unresolved and _customer_unresolved:
             unresolved = True
             unresolved_reason = "both_not_found"
@@ -451,7 +781,7 @@ def parse_bulk_order_utterance(
             unresolved_reason = "product_not_found"
         elif _customer_unresolved:
             unresolved = True
-            unresolved_reason = "email_not_provided" if (_is_rep and not pl.email) else "email_not_found"
+            unresolved_reason = _customer_reason
         else:
             unresolved = False
             unresolved_reason = None
@@ -459,6 +789,7 @@ def parse_bulk_order_utterance(
         result_lines.append(BulkOrderLine(
             raw_fragment=pl.raw_fragment,
             company_name=pl.company_name,
+            recipient_name=pl.recipient_name,
             email=pl.email,
             product_name=pl.product_name,
             quantity=pl.quantity,
@@ -474,6 +805,8 @@ def parse_bulk_order_utterance(
             reorder_source_order_id=pl.reorder_source_order_id,
             unresolved=unresolved,
             unresolved_reason=unresolved_reason,
+            unmatched_variant_hint=pl.unmatched_variant_hint,
+            blank_variant_axes=list(pl.blank_variant_axes or []),
         ))
 
     logger.info(

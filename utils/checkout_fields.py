@@ -58,9 +58,19 @@ _CACHE_TTL_SECONDS = 900  # 15 minutes
 # consumer, which looks for these exact keys.
 _BILLING_KEEP_PREFIX = frozenset({"billing_field_type", "billing_project"})
 
-# THWCFE sometimes registers "shipping_company_name" instead of the standard
-# "shipping_company".
-_SHIPPING_KEY_REMAP = {"shipping_company_name": "company"}
+# THWCFE registers "<group>_company_name" instead of the standard
+# "<group>_company". BOTH groups must be normalised to the same short key.
+#
+# Billing was missing here, so /checkout-fields' "billing_company_name" became
+# the short key "company_name" on this side while the widget mapped it to
+# "company". The rep would fill in Company Name, the payload would carry
+# "company", and validation would look for "company_name", find it blank, and
+# block the order with "Company Name cannot be edited here" — a field the card
+# was in fact rendering, just under the other key.
+_COMPANY_KEY_REMAP = {
+    "billing_company_name": "company",
+    "shipping_company_name": "company",
+}
 
 # Short keys that belong to the "meta" group rather than the address block they
 # were registered under.
@@ -101,11 +111,13 @@ def _form_key(wc_key: str, group: str) -> str:
     """WooCommerce field key → short form key. Mirrors formKey() in the widget."""
     if group == "billing" and wc_key in _BILLING_KEEP_PREFIX:
         return wc_key
-    remapped = _SHIPPING_KEY_REMAP.get(wc_key)
+    remapped = _COMPANY_KEY_REMAP.get(wc_key)
     if remapped:
         return remapped
     prefix = f"{group}_"
-    return wc_key[len(prefix):] if wc_key.startswith(prefix) else wc_key
+    stripped = wc_key[len(prefix):] if wc_key.startswith(prefix) else wc_key
+    # Catch any other "<group>_company_name" spelling the theme may register.
+    return "company" if stripped == "company_name" else stripped
 
 
 def label_for(key: str) -> str:

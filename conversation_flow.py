@@ -36,6 +36,9 @@ class FlowState(Enum):
     AWAITING_BULK_ADDRESS_CONFIRMATION = "awaiting_bulk_address_confirmation"
     AWAITING_BULK_VARIANT_SELECTION   = "awaiting_bulk_variant_selection"
     AWAITING_BULK_EMAIL               = "awaiting_bulk_email"
+    AWAITING_BULK_COMPANY             = "awaiting_bulk_company"
+    AWAITING_BULK_RECIPIENT           = "awaiting_bulk_recipient"
+    AWAITING_BULK_RECIPIENT_MODE      = "awaiting_bulk_recipient_mode"
     AWAITING_BULK_PRODUCT             = "awaiting_bulk_product"
     AWAITING_BULK_QUANTITY = "awaiting_bulk_quantity"
 
@@ -50,6 +53,9 @@ _ORDER_FLOW_STATES = {
     FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION,
     FlowState.AWAITING_BULK_VARIANT_SELECTION,
     FlowState.AWAITING_BULK_EMAIL,
+    FlowState.AWAITING_BULK_COMPANY,
+    FlowState.AWAITING_BULK_RECIPIENT,
+    FlowState.AWAITING_BULK_RECIPIENT_MODE,
     FlowState.AWAITING_BULK_PRODUCT,
     FlowState.AWAITING_BULK_QUANTITY,
 }
@@ -101,6 +107,9 @@ def _flow_context_message(state: FlowState) -> dict:
         FlowState.AWAITING_VARIANT_SELECTION:       "Please select a variant from the options above",
         FlowState.AWAITING_CART_CONFIRMATION:       "Please reply **Yes** to add to cart or **No** to skip",
         FlowState.AWAITING_BULK_EMAIL:              "Please provide a valid customer email address",
+        FlowState.AWAITING_BULK_COMPANY:           "Please provide the company name for this order",
+        FlowState.AWAITING_BULK_RECIPIENT:         "Please tell me who this order is for",
+        FlowState.AWAITING_BULK_RECIPIENT_MODE:    "Please say whether these are for the same person or different people",
         FlowState.AWAITING_BULK_PRODUCT:            "Please enter a product name",
         FlowState.AWAITING_BULK_QUANTITY:           "Please enter a quantity",
         FlowState.AWAITING_BULK_ORDER_INPUT:        "Please enter your order lines",
@@ -480,6 +489,36 @@ def handle_flow_state(
             "pass_through": False,
         }
     
+    # ── State: Awaiting "same person" vs "different people" for unnamed lines ──
+    if state == FlowState.AWAITING_BULK_RECIPIENT_MODE:
+        if not message.strip():
+            return _flow_context_message(FlowState.AWAITING_BULK_RECIPIENT_MODE)
+        return {
+            "action": "process_bulk_recipient_mode_reply",
+            "flow_state": FlowState.AWAITING_BULK_RECIPIENT_MODE.value,
+            "pass_through": False,
+        }
+
+    # ── State: Awaiting the person this bulk order ships to ──
+    if state == FlowState.AWAITING_BULK_RECIPIENT:
+        if not message.strip():
+            return _flow_context_message(FlowState.AWAITING_BULK_RECIPIENT)
+        return {
+            "action": "process_bulk_recipient_reply",
+            "flow_state": FlowState.AWAITING_BULK_RECIPIENT.value,
+            "pass_through": False,
+        }
+
+    # ── State: Awaiting company name for bulk order scope resolution ──
+    if state == FlowState.AWAITING_BULK_COMPANY:
+        if not message.strip():
+            return _flow_context_message(FlowState.AWAITING_BULK_COMPANY)
+        return {
+            "action": "process_bulk_company_reply",
+            "flow_state": FlowState.AWAITING_BULK_COMPANY.value,
+            "pass_through": False,
+        }
+
     # ── State: Awaiting email address for bulk order customer resolution ──
     if state == FlowState.AWAITING_BULK_EMAIL:
         import re as _re
