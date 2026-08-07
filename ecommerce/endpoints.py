@@ -216,6 +216,16 @@ class EcommerceEndpoints(Protocol):
         """GET /saved-addresses — THWMA multi-address book (custom-api/v1)."""
         ...
 
+    def fetch_company_order_addresses(
+        self,
+        company_name: str,
+        limit: int = 100,
+        description: str = "",
+        requires_resolution: Optional[List[str]] = None,
+    ) -> WooAPICall:
+        """GET /company-order-addresses — shipping destinations from order history."""
+        ...
+
     def search_customers_by_company(
         self,
         company_name: str,

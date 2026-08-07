@@ -614,6 +614,37 @@ class WooEndpoints:
             requires_resolution=requires_resolution or [],
         )
 
+    def fetch_company_order_addresses(
+        self,
+        company_name: str,
+        limit: int = 100,
+        description: str = "",
+        requires_resolution: Optional[List[str]] = None,
+    ) -> WooAPICall:
+        """GET /company-order-addresses (custom_plugin surface)
+
+        Shipping destinations a company has actually had goods sent to, taken
+        from order history — the same source the storefront's company address
+        picker uses.
+
+        This is the ONLY source that shows several addresses for one person:
+        `/customers/by-company` returns a customer's single account address,
+        and the THWMA address book is empty on this store. Rows carry
+        customer_id (0 on guest orders), so a chosen address can still be tied
+        to an account.
+
+        Addresses come from past checkouts, so they include whatever was typed
+        at the time. Offer them as suggestions, not as validated data.
+        """
+        return WooAPICall(
+            method="GET",
+            endpoint="/company-order-addresses",
+            params={"company": company_name, "limit": limit},
+            surface="custom_plugin",
+            description=description or f"Order-history addresses for '{company_name}'",
+            requires_resolution=requires_resolution or [],
+        )
+
     def search_customers_by_company(
         self,
         company_name: str,
