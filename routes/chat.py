@@ -156,7 +156,11 @@ def _recipient_scope_tokens(message: str, is_bulk: bool = False) -> list:
     if not message or not is_bulk:
         return []
 
-    tokens = []
+    # The marker words themselves must be protected too. "company" is not a
+    # catalog term, so the corrector ties it against distant tile names
+    # ('bombay', 'romano' at edit distance 3) and hijacks the whole turn
+    # into a typo-clarification chip before the parser ever runs.
+    tokens = ["for", "at", "company"]
     for tail in COMPANY_SCOPE_TAIL_RE.findall(message):
         for tok in re.split(r'[^A-Za-z]+', tail):
             if len(tok) > 1:

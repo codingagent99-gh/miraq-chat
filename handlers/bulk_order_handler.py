@@ -2917,6 +2917,27 @@ def _build_address_card_response(
 # ── Function 7: _create_all_confirmed_orders (private) ──
 # ══════════════════════════════════════════════════════════════
 
+def _address_group_key(addr) -> str:
+    """
+    Canonical key for "is this the same destination?".
+    
+    Only the fields that define a destination, normalised. Hashing the whole
+    dict split lines that ship to the identical address purely because the two
+    code paths that build them differ in shape — the parser's roster entry
+    carries an empty "phone" key and the recipient-reply path does not, so one
+    person's two products became two orders.
+    """
+    a = addr or {}
+    fields = (
+        "first_name", "last_name", "company",
+        "address_1", "address_2", "city", "state", "postcode", "country",
+    )
+    return "|".join(
+        re.sub(r"\s+", " ", str(a.get(f) or "")).strip().lower()
+        for f in fields
+    )
+
+
 def _bulk_line_item(line: dict) -> dict:
     """
     One WooCommerce order line item.
@@ -2987,8 +3008,8 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
         )
         _key = (
             str(line.get("customer_id")),
-            json.dumps(_billing, sort_keys=True, default=str),
-            json.dumps(_shipping, sort_keys=True, default=str),
+            _address_group_key(_billing),
+            _address_group_key(_shipping),
         )
         if _key not in _groups:
             _groups[_key] = {
