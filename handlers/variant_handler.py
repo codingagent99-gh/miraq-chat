@@ -4,6 +4,7 @@ handlers/variant_handler.py — Steps 3.55, 3.7, 5.5: Variant and variation hand
 
 import time
 import re
+from types import SimpleNamespace
 from flask import jsonify
 
 from app_config import DEFAULT_PER_PAGE, CLASSIFIER_PROVIDER_TAG, get_currency_symbol, ORDER_CREATE_INTENTS
@@ -691,12 +692,39 @@ def _no_variation_combination_response(
 
     product_name = parent_raw.get("name") or "This product"
 
+    # Still show what DID match. The request is only partly unmeetable, so
+    # returning nothing throws away results the shopper can use — the point
+    # is to be honest that one dimension was dropped, not to withhold the
+    # rest. Matched against the SATISFIED dimensions only.
+    _satisfied_attrs = {
+        k: v for k, v in (entities.attributes or {}).items()
+        if k not in unsatisfied
+    }
+    _partial = []
+    if _satisfied_attrs:
+        _shim = SimpleNamespace(attributes=_satisfied_attrs)
+        _partial, _ = match_variations_all_attributes(variations_raw, _shim)
+
     lines = [f"**{product_name}** doesn't come in that combination."]
     if have_bits:
         lines.append("")
         lines.append(f"Available: {' · '.join(have_bits)}")
     if missing_bits:
         lines.append(f"Not available: {' · '.join(missing_bits)}")
+
+    if _partial:
+        _have_desc = " · ".join(have_bits) or "your other filters"
+        lines.append("")
+        lines.append(
+            f"Here {'is' if len(_partial) == 1 else 'are'} the "
+            f"**{len(_partial)}** matching {_have_desc}:"
+        )
+        for _v in _partial[:12]:
+            _lbl = " / ".join(
+                o for o in _get_safe_options(_v.get("attributes", []), _sl).values() if o
+            )
+            _stock = "✅ In stock" if (_v.get("in_stock") or _v.get("stock_status") == "instock") else "❌ Out of stock"
+            lines.append(f"• **{_lbl}** — {_stock}")
 
     # What the product DOES offer on the failed dimensions, so the shopper has
     # somewhere to go rather than just a dead end.
@@ -716,17 +744,26 @@ def _no_variation_combination_response(
         lines.append(f"Available **{name}**: {', '.join(shown)}")
         _suggestions.extend(shown[:4])
 
+    _products = [parent_formatted]
+    for _v in _partial[:12]:
+        _fv = format_variation(_v, parent_raw)
+        if _v.get("url"):
+            _fv["permalink"] = _v["url"]
+        _products.append(_fv)
+
     elapsed = round((time.time() - start_time) * 1000)
     return jsonify({
         "success": True,
         "bot_message": "\r\n".join(lines),
         "intent": "product_variations",
-        "products": [parent_formatted],
+        "products": _products,
         "actions": [],
         "suggestions": _suggestions[:6],
         "session_id": str(conversation.id),
         "metadata": {
             "unsatisfied_attributes": unsatisfied,
+            "partial_matches": len(_partial),
+            "variations_matched": len(_partial),
             "response_time_ms": elapsed,
         },
         "flow_state": conversation.flow_state,
