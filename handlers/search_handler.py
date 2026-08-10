@@ -26,6 +26,7 @@ from chat_logger import get_logger
 from formatters import _entities_to_dict
 from handlers.chat_utils import default_pagination
 from handlers.suggestion_builder import build_suggestions
+from handlers.search_refinement import describe_active_filters_labeled
 
 logger = get_logger("miraq_chat")
 
@@ -202,12 +203,23 @@ def handle_empty_results(
         _cat = entities.category_name or "products"
 
         if not suggestion_msg:
-            # LLM retry yielded nothing useful — build a sensible fallback message
-            if entities.attributes or getattr(entities, "tag_slugs", None):
+            # LLM retry yielded nothing useful — build a fallback that NAMES the
+            # combination. "those filters" told the shopper nothing: with several
+            # dimensions in play (category + colour + tag + size) they cannot tell
+            # which one is too narrow, or even what MiraQ thought they asked for.
+            _labeled = describe_active_filters_labeled(entities)
+            _dimensions = _labeled.count("**") // 2 if _labeled else 0
+
+            if _labeled and _dimensions > 1:
                 suggestion_msg = (
-                    f"I couldn't find any products matching those filters in our catalog. "
-                    f"Try broadening your search — for example, removing one of the filters, "
-                    f"or browse all **{_cat}** instead."
+                    f"No products match all of these together:\n\n{_labeled}\n\n"
+                    f"Each filter on its own may have results — it's the combination "
+                    f"that's empty. Try removing one, or tap a filter below to drop it."
+                )
+            elif _labeled:
+                suggestion_msg = (
+                    f"No products match {_labeled} in our catalog.\n\n"
+                    f"Try a different value, or browse all **{_cat}** instead."
                 )
             else:
                 suggestion_msg = (

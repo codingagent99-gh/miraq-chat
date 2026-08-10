@@ -28,7 +28,7 @@ from handlers.chat_utils import (
     _STRIP_QUOTES_RE,
     _TOKENIZE_RE,
 )
-from api_builder import match_variation_to_entities
+from api_builder import match_variation_to_entities, match_variations_all_attributes
 from datetime import datetime, timezone
 from sqlalchemy.orm.attributes import flag_modified
 from store_registry import get_store_loader
@@ -386,6 +386,7 @@ def handle_variant_selection(
         user_context["resolved_attributes"] = prev_resolved
 
         if not _var_quantity:
+            # _price_line = f"\n**Unit Price:** {get_currency_symbol()}{_variant_price}" if _variant_price else ""
             elapsed = time.time() - start_time
 
             _pending_action = user_context.get("pending_action", "order")
@@ -398,6 +399,7 @@ def handle_variant_selection(
                     "success": True,
                     "bot_message": (
                         f"Here's **{_pending_name}**. ✅ In stock\n\n"
+                        # f"{_price_line}\n\n"
                         f"Would you like to add it to your cart?"
                     ),
                     "intent": "guided_flow",
@@ -422,6 +424,7 @@ def handle_variant_selection(
                     f"Great choice! Here's what you selected:\n\n"
                     f"**Product:** {_var_product_name}\n"
                     f"**Variant:** {_variant_label}\n\n"
+                    # f"{_price_line}\n\n"
                     f"How many would you like to order? You can tap an option below or type any exact number in the chat. 🛒"
                 ),
                 "intent": "guided_flow",
@@ -650,6 +653,87 @@ def _variation_images_for_resolved(variations: list, resolved: dict, store_loade
     return []
 
 
+def _no_variation_combination_response(
+    parent_raw, parent_formatted, entities, unsatisfied,
+    variations_raw, conversation, page, start_time,
+):
+    """
+    Reply for "this product exists, but not in that combination".
+
+    Names BOTH halves: which parts of the request the product does offer, and
+    which it does not. Returning the closest-scoring variations instead — the
+    old behaviour — showed six Ribbed tiles to someone who asked for White
+    Ribbed, with a header claiming both. Silently dropping half a request is
+    worse than saying it cannot be met.
+    """
+    _sl = None
+    try:
+        _sl = get_store_loader()
+    except Exception:
+        pass
+
+    def _label(key):
+        try:
+            return _attribute_display_name(key, _sl)
+        except Exception:
+            return str(key).replace("-", " ").title()
+
+    def _values(val):
+        return ", ".join(
+            v.strip().replace("-", " ")
+            for v in str(val).split(",") if v.strip()
+        )
+
+    missing_bits, have_bits = [], []
+    for key, val in (entities.attributes or {}).items():
+        bit = f"**{_label(key)}:** {_values(val)}"
+        (missing_bits if key in unsatisfied else have_bits).append(bit)
+
+    product_name = parent_raw.get("name") or "This product"
+
+    lines = [f"**{product_name}** doesn't come in that combination."]
+    if have_bits:
+        lines.append("")
+        lines.append(f"Available: {' · '.join(have_bits)}")
+    if missing_bits:
+        lines.append(f"Not available: {' · '.join(missing_bits)}")
+
+    # What the product DOES offer on the failed dimensions, so the shopper has
+    # somewhere to go rather than just a dead end.
+    _options: dict = {}
+    for var in variations_raw or []:
+        for name, opt in _get_safe_options(var.get("attributes", []), _sl).items():
+            if not opt:
+                continue
+            for key in unsatisfied:
+                if _label(key).strip().lower() == name.strip().lower():
+                    _options.setdefault(name, set()).add(opt)
+
+    _suggestions = []
+    for name, opts in _options.items():
+        shown = sorted(opts)[:6]
+        lines.append("")
+        lines.append(f"Available **{name}**: {', '.join(shown)}")
+        _suggestions.extend(shown[:4])
+
+    elapsed = round((time.time() - start_time) * 1000)
+    return jsonify({
+        "success": True,
+        "bot_message": "\r\n".join(lines),
+        "intent": "product_variations",
+        "products": [parent_formatted],
+        "actions": [],
+        "suggestions": _suggestions[:6],
+        "session_id": str(conversation.id),
+        "metadata": {
+            "unsatisfied_attributes": unsatisfied,
+            "response_time_ms": elapsed,
+        },
+        "flow_state": conversation.flow_state,
+        "pagination": default_pagination(page),
+    }), 200
+
+
 def handle_variation_product(
     intent,
     entities,
@@ -769,7 +853,25 @@ def handle_variation_product(
                     variation_products.append(fv)
 
         else:
-            matched_variations = match_variation_to_entities(variations_raw, entities)
+            # Strict AND first. The best-score matcher below keeps whatever
+            # scores highest, so "harmony white ribbed" came back with six
+            # RIBBED variations and no White anywhere — the unmatched half of
+            # the request silently dropped, while the header still claimed
+            # "Ribbed / White". Better to say the combination does not exist.
+            _strict, _unsatisfied = match_variations_all_attributes(
+                variations_raw, entities
+            )
+            if _unsatisfied:
+                logger.info(
+                    f"Step 3.7: no variation satisfies {_unsatisfied} for "
+                    f"product {parent_product_raw.get('id')} — reporting the gap"
+                )
+                return _no_variation_combination_response(
+                    parent_product_raw, parent_formatted, entities, _unsatisfied,
+                    variations_raw, conversation, page, start_time,
+                )
+
+            matched_variations = _strict or match_variation_to_entities(variations_raw, entities)
             matched_variation = matched_variations[0] if len(matched_variations) == 1 else None
             if len(matched_variations) == 1:
                 logger.info(
@@ -1250,6 +1352,7 @@ def handle_quantity_and_variant_check(
                     }), 200
 
                 _var_price = endpoints.parse_variant(_resolved_var)["price"]
+                _price_line = f"\n**Unit Price:** {get_currency_symbol()}{_var_price}" if _var_price else ""
                 _var_label = " / ".join(_get_safe_options(_resolved_var.get("attributes", []), _sl).values())
 
                 elapsed = time.time() - start_time
@@ -1259,6 +1362,7 @@ def handle_quantity_and_variant_check(
                         f"Great choice! Here's what you selected:\n\n"
                         f"**Product:** {product['name']}\n"
                         f"**Variant:** {_var_label}\n\n"
+                        # f"{_price_line}\n\n"
                         f"How many would you like to order? You can tap an option below or type any exact number in the chat. 🛒"
                     ),
                     "intent": intent.value,

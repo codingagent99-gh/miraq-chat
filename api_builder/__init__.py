@@ -71,6 +71,69 @@ def match_variation_to_entities(variations: list, entities) -> list:
 
     return best_variations
 
+def match_variations_all_attributes(variations: list, entities):
+    """
+    Variations satisfying EVERY requested attribute, plus the ones that failed.
+
+    Returns (matches, unsatisfied_labels).
+
+    match_variation_to_entities() is a BEST-SCORE matcher: it keeps whatever
+    scores highest, so asking for "harmony white ribbed" returns the six Ribbed
+    variations even though none of them is White — the unmatched dimension is
+    silently dropped and the shopper is shown results that contradict what they
+    typed. This is the strict AND version: a variation must satisfy every
+    dimension, and any dimension nothing satisfies is reported back so the
+    caller can say WHICH part of the combination failed.
+    """
+    if not variations or not getattr(entities, "attributes", None):
+        return [], []
+
+    def _values_for(ent_value):
+        if isinstance(ent_value, (list, tuple, set)):
+            return [str(v).strip().lower().replace("-", " ") for v in ent_value]
+        raw = re.sub(r'\s+(?:and|&)\s+', ',', str(ent_value), flags=re.IGNORECASE)
+        return [
+            re.sub(r'[\"\'`]', '', t).strip().lower().replace("-", " ")
+            for t in raw.split(",") if t.strip()
+        ]
+
+    def _dimension_hit(var_attrs, ent_k, ent_values):
+        for v_k, v_v in var_attrs.items():
+            if not v_v:
+                continue
+            if ent_k in v_k or v_k in ent_k:
+                for ent_v in ent_values:
+                    if ent_v == v_v or ent_v in v_v or v_v in ent_v:
+                        return True
+        return False
+
+    dims = []
+    for ent_label, ent_value in entities.attributes.items():
+        ent_k = ent_label.replace("-", " ").strip().lower()
+        vals = _values_for(ent_value)
+        if vals:
+            dims.append((ent_label, ent_k, vals))
+
+    if not dims:
+        return [], []
+
+    matches = []
+    satisfied_anywhere = {label: False for label, _, _ in dims}
+
+    for variation in variations:
+        var_attrs = _normalize_variation_attrs(variation)
+        hits = 0
+        for label, ent_k, vals in dims:
+            if _dimension_hit(var_attrs, ent_k, vals):
+                hits += 1
+                satisfied_anywhere[label] = True
+        if hits == len(dims):
+            matches.append(variation)
+
+    unsatisfied = [label for label, ok in satisfied_anywhere.items() if not ok]
+    return matches, unsatisfied
+
+
 def _normalize_variation_attrs(variation: dict) -> dict:
     """Normalize variation attributes into a flat {clean_key: clean_value} dict."""
     result = {}
