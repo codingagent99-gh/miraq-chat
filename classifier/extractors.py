@@ -12,6 +12,7 @@ from typing import Optional
 import calendar
 from models import ExtractedEntities
 from store_registry import get_store_loader
+from app_config import FISCAL_YEAR_START_MONTH
 from config.store_config import (
     PRODUCT_TYPE_TERMS,
     ORIGIN_KEYWORDS,
@@ -763,10 +764,121 @@ def _normalize_fused_dates(text: str) -> str:
     text = re.sub(r'\b(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(20\d{2})\b', r'\1-\2-\3', text)
     return text
 
+def _fiscal_quarter_start(dt: datetime, fy_start_month: int) -> datetime:
+    """First day of the fiscal quarter containing dt.
+
+    With fy_start_month=1 these are plain calendar quarters (Jan/Apr/Jul/Oct).
+
+    Works by stepping BACK from dt to the quarter's first month rather than
+    reconstructing an absolute month number: the reconstruction approach has
+    to special-case the fiscal year wrapping the calendar year, and got it
+    wrong (January under an April FY landed in the following calendar year).
+    Counting months-into-the-quarter has no such wrap case.
+    """
+    offset = (dt.month - fy_start_month) % 12   # months into the fiscal year
+    months_back = offset % 3                    # months into the current quarter
+    start = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return _add_months(start, -months_back)
+
+
+def _add_months(dt: datetime, months: int) -> datetime:
+    """Shift dt by whole months, clamping the day to the target month's length."""
+    total = (dt.year * 12 + (dt.month - 1)) + months
+    year, month = divmod(total, 12)
+    month += 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
 def extract_time_range(text: str, entities: ExtractedEntities):
     """Extract date/time ranges for order history queries."""
     text_lower = text.lower()
     now = datetime.now()
+
+    def _set(start: datetime, end: datetime):
+        entities.date_after  = start.replace(hour=0,  minute=0,  second=0,  microsecond=0).isoformat()
+        entities.date_before = end.replace(  hour=23, minute=59, second=59, microsecond=999999).isoformat()
+
+    # ── Period-to-date: "month to date"/"MTD", "quarter to date", "year to date"
+    # Checked FIRST: the bare "month"/"year" patterns below would otherwise
+    # swallow "month to date" and silently return a rolling 30-day window,
+    # which is a different number than the calendar month the user asked for.
+    m_ptd = re.search(
+        r'\b(?:(month|quarter|year)[\s-]+to[\s-]+date|(mtd|qtd|ytd))\b', text_lower
+    )
+    if m_ptd:
+        unit = m_ptd.group(1) or {"mtd": "month", "qtd": "quarter", "ytd": "year"}[m_ptd.group(2)]
+        if unit == "month":
+            start = now.replace(day=1)
+        elif unit == "quarter":
+            start = _fiscal_quarter_start(now, FISCAL_YEAR_START_MONTH)
+        else:
+            start = _fiscal_quarter_start(now, FISCAL_YEAR_START_MONTH)
+            # Walk back to the first quarter of this fiscal year.
+            while ((start.month - FISCAL_YEAR_START_MONTH) % 12) != 0:
+                start = _add_months(start, -3)
+        _set(start, now)
+        return
+
+    # ── "in a/the/one month|quarter|year" ────────────────────────────────────
+    # Bare period phrasing ("how many samples were ordered by Ram in a
+    # quarter") matched none of the patterns below, so date_after/date_before
+    # stayed None and the query silently ran ALL-TIME — a plausible-looking
+    # number for the wrong window. Read as the current period to date; the
+    # caller states the window it used so the interpretation is visible.
+    m_bare = re.search(r'\bin\s+(?:a|an|the|one|1)\s+(month|quarter|year)\b', text_lower)
+    if m_bare:
+        unit = m_bare.group(1)
+        if unit == "month":
+            start = now.replace(day=1)
+        elif unit == "quarter":
+            start = _fiscal_quarter_start(now, FISCAL_YEAR_START_MONTH)
+        else:
+            start = _fiscal_quarter_start(now, FISCAL_YEAR_START_MONTH)
+            while ((start.month - FISCAL_YEAR_START_MONTH) % 12) != 0:
+                start = _add_months(start, -3)
+        _set(start, now)
+        return
+
+    # ── "this/current month|quarter|year" ────────────────────────────────────
+    m_this = re.search(r'\b(?:this|current)\s+(month|quarter|year)\b', text_lower)
+    if m_this:
+        unit = m_this.group(1)
+        if unit == "month":
+            start = now.replace(day=1)
+            end = now.replace(day=calendar.monthrange(now.year, now.month)[1])
+        elif unit == "quarter":
+            start = _fiscal_quarter_start(now, FISCAL_YEAR_START_MONTH)
+            end = _add_months(start, 3) - timedelta(days=1)
+        else:
+            start = _fiscal_quarter_start(now, FISCAL_YEAR_START_MONTH)
+            while ((start.month - FISCAL_YEAR_START_MONTH) % 12) != 0:
+                start = _add_months(start, -3)
+            end = _add_months(start, 12) - timedelta(days=1)
+        _set(start, end)
+        return
+
+    # ── "last/previous quarter" ──────────────────────────────────────────────
+    # Handled here rather than with the bare last-week/month/year rule below,
+    # which subtracts a fixed number of days; a quarter needs real calendar
+    # boundaries or the totals straddle two quarters.
+    if re.search(r'\b(?:last|previous|past)\s+quarter\b', text_lower):
+        this_q = _fiscal_quarter_start(now, FISCAL_YEAR_START_MONTH)
+        start = _add_months(this_q, -3)
+        _set(start, this_q - timedelta(days=1))
+        return
+
+    # ── Explicit quarter: "Q3", "Q2 2025", "quarter 1" ───────────────────────
+    m_q = re.search(r'\b(?:q\s*([1-4])|quarter\s+([1-4]))\b(?:\s*(?:of\s+)?(\d{4}))?', text_lower)
+    if m_q:
+        q_num = int(m_q.group(1) or m_q.group(2))
+        fy = int(m_q.group(3)) if m_q.group(3) else now.year
+        start_month_abs = FISCAL_YEAR_START_MONTH + (q_num - 1) * 3
+        year = fy + (0 if start_month_abs <= 12 else 1)
+        month = start_month_abs if start_month_abs <= 12 else start_month_abs - 12
+        start = datetime(year, month, 1, 0, 0, 0)
+        _set(start, _add_months(start, 3) - timedelta(days=1))
+        return
 
     # ── Relative: "last/past week/month/year" (bare — no number) ─────────────
     m_bare = re.search(r'\b(?:last|past)\s+(week|month|year)\b', text_lower)

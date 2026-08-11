@@ -51,6 +51,7 @@ class Intent(Enum):
     # Attribute Filtering
     FILTER_BY_ATTRIBUTE    = "filter_by_attribute"
     MOST_POPULAR           = "most_popular"
+    ORDER_STATS_BY_REP     = "order_stats_by_rep"
 
     # Discounts & Promotions
     DISCOUNT_INQUIRY       = "discount_inquiry"
@@ -185,11 +186,16 @@ class ExtractedEntities:
     product_type: Optional[str] = None
     search_term: Optional[str] = None
 
-    # ──── Sorting ────
-    # Set by PopularityEvaluator when the shopper asks for "most popular" /
+    # ──── Sorting ────    # Set by PopularityEvaluator when the shopper asks for "most popular" /
     # "best sellers" / etc. Only "popularity" is supported today (ranks by
     # WooCommerce's all-time `total_sales` meta) — no time-boxed window.
     sort_by: Optional[str] = None
+
+    # ──── Order reporting ────
+    # Rep named in an order-stats query ("how many samples did <name> order").
+    # Free text as the user typed it — the plugin resolves name → email and
+    # refuses ambiguous matches rather than guessing.
+    target_rep_name: Optional[str] = None
 
     # ──── Ordering ────
     order_id: Optional[int] = None

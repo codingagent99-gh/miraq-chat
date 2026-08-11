@@ -260,6 +260,58 @@ def _load_custom_order_roles() -> frozenset:
 CUSTOM_ORDER_ROLES: frozenset = _load_custom_order_roles()
 BULK_ORDER_ROLES: frozenset = CUSTOM_ORDER_ROLES | frozenset({"sales_rep"})
 
+# ── Order reporting (rep sample counts, order lists by date range) ───────────
+# Roles allowed to see reporting ACROSS reps/customers. The rep roles above are
+# scoped to their own book; this tier is not. Override with ORDER_REPORT_ADMIN_ROLES_JSON.
+def _load_admin_roles() -> frozenset:
+    raw = os.getenv("ORDER_REPORT_ADMIN_ROLES_JSON", "")
+    if raw:
+        try:
+            parsed = _json.loads(raw)
+            if isinstance(parsed, list):
+                return frozenset(parsed)
+        except Exception:
+            pass
+    return frozenset({"administrator"})
+
+ORDER_REPORT_ADMIN_ROLES: frozenset = _load_admin_roles()
+
+
+# Which order statuses count toward reported totals. Cancelled/refunded/failed
+# are excluded so they can't inflate a rep's sample count; on-hold IS counted
+# it counted, so a number is never unexplained.
+def _load_counted_statuses() -> tuple:
+    raw = os.getenv("ORDER_REPORT_STATUSES_JSON", "")
+    if raw:
+        try:
+            parsed = _json.loads(raw)
+            if isinstance(parsed, list) and parsed:
+                return tuple(parsed)
+        except Exception:
+            pass
+    return ("completed", "pending", "processing")
+
+ORDER_REPORT_STATUSES: tuple = _load_counted_statuses()
+
+# First month of the fiscal year (1 = January = calendar quarters). Drives what
+# "Q1" and "this quarter" mean. Set FISCAL_YEAR_START_MONTH to e.g. 4 for an
+# April-start fiscal year.
+# NOTE: pending Diya's confirmation — defaults to CALENDAR quarters.
+FISCAL_YEAR_START_MONTH: int = max(1, min(12, int(os.getenv("FISCAL_YEAR_START_MONTH", "1"))))
+
+
+def is_order_report_admin(role) -> bool:
+    """True when this role may run reporting ACROSS reps and customers.
+
+    Mirrors WC_Chat_Security::is_admin() in the plugin. The plugin is the
+    real enforcement point (it holds the WP session/capabilities); this is
+    the client-side check that decides what to OFFER, so the two must agree
+    or a user gets shown a report the API then refuses.
+    """
+    return bool(role) and role in ORDER_REPORT_ADMIN_ROLES
+
+
+
 LLM_API_BASE_URL: str = _resolve_llm_api_base_url()
 
 # LLM behavior settings

@@ -138,12 +138,26 @@ class WooClient:
             data = resp.json()
 
             # ── Response logging ──────────────────────────────────────────────
+            # `count` is the number of ITEMS in a list-shaped response. Aggregate
+            # endpoints return a dict of totals with no item list, which used to
+            # log a bare count=0 — indistinguishable from "no results" while the
+            # body actually held real numbers. Summarise those instead.
+            _summary_extra = ""
             if isinstance(data, dict) and "products" in data:
                 items = data.get("products", [])
             elif isinstance(data, list):
                 items = data
             else:
                 items = []
+                if isinstance(data, dict):
+                    _keys = ("total_orders", "total_items", "unattributed_orders", "truncated")
+                    _present = {k: data.get(k) for k in _keys if k in data}
+                    if _present:
+                        _summary_extra = " | " + " ".join(f"{k}={v}" for k, v in _present.items())
+                        if data.get("reps") is not None:
+                            _summary_extra += f" reps={len(data.get('reps') or [])}"
+                    else:
+                        _summary_extra = f" | keys={sorted(data.keys())[:8]}"
 
             if items:
                 product_summary = ", ".join(
@@ -158,12 +172,12 @@ class WooClient:
                 api_logger.info(
                     f"RESPONSE {api_call.method} {endpoint_short} | "
                     f"status={resp.status_code} | count={len(items)} | "
-                    f"time_ms={_elapsed_ms}"
+                    f"time_ms={_elapsed_ms}{_summary_extra}"
                 )
 
             logger.info(
                 f"API response: {endpoint_short} | status={resp.status_code} | "
-                f"count={len(items)} | time_ms={_elapsed_ms}"
+                f"count={len(items)} | time_ms={_elapsed_ms}{_summary_extra}"
             )
 
             if isinstance(data, dict) and "products" in data:
@@ -201,7 +215,22 @@ class WooClient:
                 f"API error: {endpoint_short} | error={str(e)}{body_preview}",
                 exc_info=True,
             )
-            return {"success": False, "data": [], "error": str(e)}
+            # Preserve the API's own error code/message. WordPress returns
+            # {"code": "...", "message": "...", "data": {"status": 4xx}} — a
+            # precise reason ("no rep by that name") that callers can act on.
+            # Collapsing it to a bare string forced every caller into a
+            # generic "something went wrong", hiding the real cause.
+            _err = {"success": False, "data": [], "error": str(e)}
+            if hasattr(e, "response") and e.response is not None:
+                try:
+                    _body = e.response.json()
+                    if isinstance(_body, dict) and _body.get("code"):
+                        _err["error_code"] = _body.get("code")
+                        _err["error_message"] = _body.get("message")
+                    _err["status_code"] = e.response.status_code
+                except Exception:
+                    pass
+            return _err
 
     def execute_all(self, api_calls: List[WooAPICall]) -> List[dict]:
         results = []

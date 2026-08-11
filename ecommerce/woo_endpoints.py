@@ -439,6 +439,47 @@ class WooEndpoints:
             requires_resolution=requires_resolution or [],
         )
 
+    def order_stats_by_rep(
+        self,
+        requesting_customer_id,
+        date_after: Optional[str] = None,
+        date_before: Optional[str] = None,
+        rep: Optional[str] = None,
+        statuses: Optional[List[str]] = None,
+        description: str = "",
+        requires_resolution: Optional[List[str]] = None,
+    ) -> WooAPICall:
+        """GET /order-stats-by-rep — sample/order counts grouped by credited rep.
+
+        Aggregates on `_billing_project_rep`, the meta both the storefront's
+        rep selector and MiraQ write, so counts cover orders from either path.
+
+        `rep` accepts an email OR a display name; the plugin resolves it and
+        returns 404/409 rather than guessing between two similarly-named reps.
+
+        Admin-gated for cross-rep figures; a rep gets their own only.
+        Response carries `truncated` and `counted_statuses` — surface both
+        rather than presenting the totals bare.
+        """
+        params = {"customer_id": requesting_customer_id}
+        if date_after:
+            params["after"] = date_after
+        if date_before:
+            params["before"] = date_before
+        if rep:
+            params["rep"] = rep
+        if statuses:
+            params["status"] = ",".join(statuses)
+
+        return WooAPICall(
+            method="GET",
+            endpoint="/order-stats-by-rep",
+            params=params,
+            surface="custom_plugin",
+            description=description or "Order/sample counts by rep",
+            requires_resolution=requires_resolution or [],
+        )
+
     def list_rep_orders(
         self,
         body: dict,

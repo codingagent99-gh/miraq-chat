@@ -43,6 +43,9 @@ class FlowState(Enum):
     AWAITING_BULK_PRODUCT             = "awaiting_bulk_product"
     AWAITING_BULK_QUANTITY = "awaiting_bulk_quantity"
 
+    # Admin picking between several reps who match a name in an order report
+    AWAITING_REP_CHOICE = "awaiting_rep_choice"
+
 _ORDER_FLOW_STATES = {
     FlowState.AWAITING_QUANTITY,
     FlowState.AWAITING_CART_CONFIRMATION,
@@ -111,6 +114,7 @@ def _flow_context_message(state: FlowState) -> dict:
         FlowState.AWAITING_BULK_EMAIL:              "Please provide a valid customer email address",
         FlowState.AWAITING_BULK_COMPANY:           "Please provide the company name for this order",
         FlowState.AWAITING_BULK_RECIPIENT:         "Please tell me who this order is for",
+        FlowState.AWAITING_REP_CHOICE:             "Please pick which rep you meant",
         FlowState.AWAITING_BULK_RECIPIENT_MODE:    "Please say whether these are for the same person or different people",
         FlowState.AWAITING_BULK_ADDRESS_CHOICE:    "Please pick which address to ship to",
         FlowState.AWAITING_BULK_PRODUCT:            "Please enter a product name",
@@ -519,6 +523,16 @@ def handle_flow_state(
         return {
             "action": "process_bulk_recipient_reply",
             "flow_state": FlowState.AWAITING_BULK_RECIPIENT.value,
+            "pass_through": False,
+        }
+
+    # ── State: Admin choosing which of several matching reps to report on ──
+    if state == FlowState.AWAITING_REP_CHOICE:
+        if not message.strip():
+            return _flow_context_message(FlowState.AWAITING_REP_CHOICE)
+        return {
+            "action": "process_rep_choice_reply",
+            "flow_state": FlowState.AWAITING_REP_CHOICE.value,
             "pass_through": False,
         }
 

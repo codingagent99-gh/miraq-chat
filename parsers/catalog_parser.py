@@ -278,11 +278,20 @@ def phase2_nlp_merge(
                 entities.target_attributes.append(t_attr)
 
     # Merge action fields from original NLP (full text)
+    #
+    # This is a WHITELIST: any field an evaluator sets as a side effect during
+    # classify() is silently dropped unless it is listed here, because phase 1
+    # builds a fresh accumulator and only these names are copied across. That
+    # is how target_rep_name went missing — the evaluator set it correctly, the
+    # intent survived, and the rep filter vanished before reaching the handler,
+    # turning "how many did Ram order" into an unfiltered all-reps total.
+    # Add any new evaluator-set entity field here.
     _action_fields = [
         'product_id', 'product_name', 'product_slug',
         'quantity', 'order_id', 'reorder', 'explicit_last_order', 'order_item_name',
         'quick_ship', 'customer_updates', 'billing_updates', 'shipping_updates',
-        'customer_fields_requested'
+        'customer_fields_requested',
+        'target_rep_name', 'sort_by',
     ]
     for _f in _action_fields:
         _val = getattr(original_nlp_result.entities, _f, None)

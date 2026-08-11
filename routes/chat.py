@@ -76,6 +76,7 @@ from parsers.catalog_parser import parse_csv_message
 from parsers.address_parser import extract_address, address_summary
 from utils.language_utils import detect_and_translate
 from handlers.cart_handler import handle_cart_intent
+from handlers.order_stats_handler import handle_order_stats, handle_rep_choice_reply
 from core.actions import build_propose_checkout_address
 from utils.rep_utils import (
     fetch_product_order_history  as _fetch_product_order_history,
@@ -332,7 +333,7 @@ def _merge_phase_entities(result):
     return intent, entities, confidence
 
 
-def _dispatch_bulk_action(action, message, role, store_loader, conversation, user_context, page, start_time):
+def _dispatch_bulk_action(action, message, role, store_loader, conversation, user_context, page, start_time, customer_id=None):
     """
     Route a bulk-order or sales-rep flow action to its handler.
     Returns a Flask response tuple, or None if the action is not recognised.
@@ -352,6 +353,11 @@ def _dispatch_bulk_action(action, message, role, store_loader, conversation, use
     elif action == "process_bulk_recipient_mode_reply":
         return handle_bulk_recipient_mode_reply(
             message, store_loader, conversation, user_context, page, start_time
+        )
+    elif action == "process_rep_choice_reply":
+        # Admin disambiguating which rep an order report refers to.
+        return handle_rep_choice_reply(
+            message, conversation, user_context, page, start_time, customer_id
         )
     elif action == "process_bulk_recipient_reply":
         return handle_bulk_recipient_reply(
@@ -1869,6 +1875,7 @@ def chat():
             resp = _dispatch_bulk_action(
                 _flow_action, message, role, store_loader,
                 conversation, user_context, page, start_time,
+                customer_id=customer_id,
             )
             if resp is not None:
                 return _ft(resp)
@@ -2100,6 +2107,19 @@ def chat():
         empty_resp = _check_empty_order(intent, entities, conversation, page, start_time)
         if empty_resp:
             return empty_resp
+
+        # ── Step 6.4: Order reporting fork ──
+        # Answered from an aggregate endpoint, not the product/API-call path,
+        # so it forks before Step 7 builds product calls.
+        if intent == Intent.ORDER_STATS_BY_REP:
+            _role = user_context.get("role") or user_context.get("user_role")
+            stats_resp = handle_order_stats(
+                entities, _role, customer_id, conversation, page, start_time
+            )
+            if stats_resp is not None:
+                conversation.context_data = user_context
+                flag_modified(conversation, "context_data")
+                return _ft(stats_resp)
 
         # ── Step 6.5: Cart intent fork ──
         if intent in CART_INTENTS or intent == Intent.CHECKOUT:

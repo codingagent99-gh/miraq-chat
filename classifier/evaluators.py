@@ -269,6 +269,89 @@ class ProductDetailEvaluator(IntentEvaluator):
         return False
 
 
+class OrderStatsEvaluator(IntentEvaluator):
+    """
+    Detects order/sample reporting: "how many samples did <rep> order this
+    quarter", "who ordered how many last month", "month to date order list".
+
+    Runs BEFORE the product evaluators. "How many samples were ordered by
+    sale_rep_1" is full of catalog-shaped words ("samples", "ordered") that
+    CatalogSearchEvaluator/ProductDetailEvaluator would otherwise claim,
+    turning a reporting question into a product search.
+
+    Only sets the intent — it does NOT check permissions. Gating happens in
+    the handler (and again in the plugin), so an unauthorized user gets an
+    explicit refusal instead of a silently empty product list.
+    """
+    KEYWORDS = frozenset({
+        "bought", "did", "how", "items", "list", "many", "mtd", "much",
+        "of", "order", "ordered", "orders", "ordering", "pieces", "placed",
+        "qtd", "quarter", "rep", "reps", "report", "samples", "sold",
+        "summary", "who", "ytd",
+    })
+
+    # "how many samples/orders …", "how many did X order"
+    _COUNT_RE = re.compile(
+        r'\bhow\s+many\b.{0,40}?\b(samples?|orders?|items?|pieces?)\b'
+        r'|\bhow\s+many\b.{0,40}?\border(?:ed|s)?\b'
+    )
+    # "who ordered how many", "who placed the most orders"
+    _WHO_RE = re.compile(
+        r'\bwho\b.{0,30}?\b(order(?:ed|s)?|placed|bought)\b'
+    )
+    # "order list", "list of orders" — the MTD-list variant
+    _LIST_RE = re.compile(
+        r'\border\s+list\b|\blist\s+of\s+orders\b|\borders?\s+(?:report|summary)\b'
+    )
+    # "by <rep>" / "for <rep>" / "did <rep> order". The char class includes @
+    # so an email identifier is captured whole — the plugin accepts either an
+    # email or a display name.
+    _REP_RE = re.compile(
+        r'\b(?:ordered|placed)\s+by\s+([a-z0-9._@\-]+(?:\s+[a-z0-9._@\-]+){0,2})'
+        r'|\bdid\s+([a-z0-9._@\-]+(?:\s+[a-z0-9._@\-]+){0,2})\s+order\b'
+        r'|\bby\s+(?:rep\s+)([a-z0-9._@\-]+(?:\s+[a-z0-9._@\-]+){0,2})',
+        re.I,
+    )
+
+    _STOP = {"i", "we", "you", "they", "anyone", "someone", "each", "every", "the", "a", "an"}
+
+    # Trailing words that belong to the DATE phrase, not the rep's name. The
+    # capture allows up to 3 words (real names have surnames), which otherwise
+    # swallows "…by sale_rep_1 this year" into the name and fails the lookup.
+    _TAIL_STOP = {
+        "a", "an", "at", "between", "day", "days", "during", "far", "for",
+        "from", "in", "last", "month", "months", "mtd", "on", "over", "past",
+        "qtd", "quarter", "quarters", "since", "so", "the", "this", "to",
+        "today", "week", "weeks", "within", "year", "years", "yesterday", "ytd",
+    }
+
+    def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
+        if not (
+            self._COUNT_RE.search(text)
+            or self._WHO_RE.search(text)
+            or self._LIST_RE.search(text)
+        ):
+            return None, 0.0
+
+        m_rep = self._REP_RE.search(text)
+        if m_rep:
+            raw = next((g for g in m_rep.groups() if g), "").strip(" .,?")
+            tokens = raw.split()
+            while tokens and tokens[-1].lower() in self._TAIL_STOP:
+                tokens.pop()
+            # Strip punctuation AFTER the tail trim, not before: trimming
+            # "this" off "ram r. this" exposes a new final token whose
+            # trailing period would otherwise survive, and "Ram R." then
+            # fails a lookup that "Ram R" passes.
+            raw = " ".join(tokens).strip(" .,?!;:")
+            # "how many did I order" is self-scoped, not a named rep — leave
+            # target_rep_name unset so the handler scopes to the caller.
+            if raw and raw.lower() not in self._STOP:
+                entities.target_rep_name = raw
+
+        return Intent.ORDER_STATS_BY_REP, 0.9
+
+
 class PopularityEvaluator(IntentEvaluator):
     """
     Detects "most popular" / "best sellers" / "top selling" style requests.
@@ -516,6 +599,11 @@ class ClassifierPipeline:
 DEFAULT_EVALUATORS = [
     CartCheckoutEvaluator(),
     BulkOrderEvaluator(),
+    # Before OrderActionEvaluator: "how many samples did <rep> order" is a
+    # reporting question, not a request to show someone's order history, and
+    # before the product evaluators because it is full of catalog-shaped
+    # words ("samples", "ordered") they would otherwise claim.
+    OrderStatsEvaluator(),
     OrderActionEvaluator(),
     DiscountEvaluator(),
     ProductDetailEvaluator(),
