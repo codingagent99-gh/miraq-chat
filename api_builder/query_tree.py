@@ -45,6 +45,12 @@ def make_search_condition(search_term: str) -> dict:
     return {"field_type": "search", "value": search_term}
 
 
+def make_sort_condition(sort_by: str) -> dict:
+    """A result-ordering leaf node. Only "popularity" (all-time total_sales,
+    descending) is supported today — see ExtractedEntities.sort_by."""
+    return {"field_type": "sort", "value": sort_by}
+
+
 # ─── Serialization ───
 
 def serialize_condition(condition: dict) -> dict:
@@ -72,6 +78,7 @@ def serialize_query(
       - {"field_type": "price", "min": ..., "max": ...}  → body["price"]
       - {"field_type": "stock_status", "value": ...}     → body["stock_status"]
       - {"field_type": "search", "value": ...}           → body["search"]
+      - {"field_type": "sort", "value": ...}             → body["orderby"]
     All other conditions are routed into body["filters"].
     """
     body = {"page": page, "per_page": per_page}
@@ -91,6 +98,8 @@ def serialize_query(
             body["stock_status"] = cond["value"]
         elif ft == "search":
             body["search"] = cond["value"]
+        elif ft == "sort":
+            body["orderby"] = cond["value"]
         else:
             taxonomy_conditions.append(cond)
 

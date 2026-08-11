@@ -192,6 +192,7 @@ def build_api_calls(
         Intent.PRODUCT_CATALOG:       _build_product_catalog,
         Intent.PRODUCT_TYPES:         _build_product_types,
         Intent.FILTER_BY_ATTRIBUTE:   _build_filter_by_attribute,
+        Intent.MOST_POPULAR:          _build_most_popular,
         Intent.PRODUCT_VARIATIONS:    _build_product_variations,
         Intent.DISCOUNT_INQUIRY:      _build_discount_inquiry,
         Intent.BULK_DISCOUNT:         _build_bulk_discount,
@@ -768,6 +769,47 @@ def _build_filter_by_attribute(e, page, user_message: str = "") -> list:
         description=f"Filter by {attr_label}: {attr_value}",
         search_term=actual_search,
         product_id=e.product_id,
+        **_common_exclusion_kwargs(e),
+    )]
+
+
+def _build_most_popular(e, page) -> list:
+    """
+    "Most popular" / "best sellers" — same tag/category/attribute filter
+    parsing as _build_filter_by_attribute (deduped against attribute-value
+    tokens the same way), sorted by all-time total_sales instead of the
+    default order.
+
+    Out-of-stock products are excluded by default (a best-seller shoppers
+    can't buy isn't a useful answer) unless the shopper's message already
+    resolved an explicit in_stock signal — including asking for out-of-stock
+    ones specifically.
+    """
+    attr_filters = resolve_attr_filters(e.attributes)
+
+    attr_value_tokens = set()
+    for v in e.attributes.values():
+        attr_value_tokens |= {t for t in re.split(r'[\s\-_"/]+', v.lower()) if len(t) >= 2}
+    deduped_tag_slugs = [
+        slug for slug in (e.tag_slugs or [])
+        if not {t for t in slug.split("-") if len(t) >= 2} <= attr_value_tokens
+    ]
+
+    in_stock = e.in_stock if e.in_stock is not None else True
+
+    return [build_advanced_filter_call(
+        tags=deduped_tag_slugs or None,
+        attributes=attr_filters or None,
+        or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
+        categories=e.target_category_slugs,
+        category_groups=list(e.category_groups) if e.category_groups else None,
+        page=page,
+        in_stock=in_stock,
+        sort_by="popularity",
+        description="Most popular products (sorted by total_sales)",
+        # No product_id: a "most popular" request always ranks a listing —
+        # passing a coincidentally-resolved product_id through would collapse
+        # the query to body["ids"] = [that one product], defeating the point.
         **_common_exclusion_kwargs(e),
     )]
 

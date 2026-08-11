@@ -50,6 +50,7 @@ class Intent(Enum):
 
     # Attribute Filtering
     FILTER_BY_ATTRIBUTE    = "filter_by_attribute"
+    MOST_POPULAR           = "most_popular"
 
     # Discounts & Promotions
     DISCOUNT_INQUIRY       = "discount_inquiry"
@@ -183,6 +184,12 @@ class ExtractedEntities:
     in_stock: Optional[bool] = None
     product_type: Optional[str] = None
     search_term: Optional[str] = None
+
+    # ──── Sorting ────
+    # Set by PopularityEvaluator when the shopper asks for "most popular" /
+    # "best sellers" / etc. Only "popularity" is supported today (ranks by
+    # WooCommerce's all-time `total_sales` meta) — no time-boxed window.
+    sort_by: Optional[str] = None
 
     # ──── Ordering ────
     order_id: Optional[int] = None

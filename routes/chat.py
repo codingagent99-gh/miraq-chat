@@ -1126,6 +1126,7 @@ def _build_final_response(
     _PRODUCT_RESULT_INTENTS = {
         Intent.PRODUCT_SEARCH, Intent.FILTER_BY_ATTRIBUTE,
         Intent.CATEGORY_BROWSE, Intent.PRODUCT_LIST, Intent.PRODUCT_BY_TAG,
+        Intent.MOST_POPULAR,
     }
     if refinement_summary:
         bot_message = f"*Showing {refinement_summary}*\n\n{bot_message}"
@@ -1143,6 +1144,7 @@ def _build_final_response(
         Intent.PRODUCT_BY_COLLECTION,
         Intent.FILTER_BY_ATTRIBUTE,
         Intent.CATEGORY_BROWSE,
+        Intent.MOST_POPULAR,
     }
 
     _single_product_found = (
@@ -2119,6 +2121,7 @@ def chat():
         _PRODUCT_SEARCH_INTENTS = (
             Intent.PRODUCT_SEARCH, Intent.FILTER_BY_ATTRIBUTE,
             Intent.CATEGORY_BROWSE, Intent.PRODUCT_LIST, Intent.PRODUCT_BY_TAG, Intent.PRODUCT_QUICK_SHIP,
+            Intent.MOST_POPULAR,
         )
         _did_refine = False
         _turn_new_snapshot = None

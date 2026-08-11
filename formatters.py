@@ -149,6 +149,7 @@ def format_product(raw: dict) -> dict:
         "attributes":    _format_attributes(raw.get("attributes", [])),
         "raw_attributes": _format_attributes(raw.get("attributes", []), include_hidden=True),
         "variations":    raw.get("variations", []),
+        "total_sales":   raw.get("total_sales", 0),
     }
 
 def _format_attributes(attrs: list, include_hidden: bool = False) -> list:
@@ -216,6 +217,7 @@ def format_custom_product(raw: dict) -> dict:
         "images":        image_urls,
         "attributes":    attributes,
         "variations":    raw.get("variations", []),
+        "total_sales":   raw.get("total_sales", 0),
     }
 
 def variation_image_urls(raw: dict) -> list:

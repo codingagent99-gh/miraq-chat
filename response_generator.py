@@ -654,6 +654,12 @@ def generate_bot_message(
         else:
             msg += f"Found **{count}** products! 🛍️\n\n"
 
+    elif intent == Intent.MOST_POPULAR:
+        if search_context:
+            msg += f"Here are our **{count}** most popular products for {search_context}, ranked by sales! 🔥\n\n"
+        else:
+            msg += f"Here are our **{count}** most popular products, ranked by sales! 🔥\n\n"
+
     elif intent == Intent.RELATED_PRODUCTS:
         p_name = entities.product_name or "this item"
         msg += f"Here are some products similar to **{p_name}** that you might like! ✨\n\n"
@@ -735,7 +741,7 @@ def generate_suggestions(
                 suggestions.append(f"Show all {p_name} products")
         suggestions.append("Browse Products")
     
-    elif intent == Intent.FILTER_BY_ATTRIBUTE:
+    elif intent in (Intent.FILTER_BY_ATTRIBUTE, Intent.MOST_POPULAR):
         suggestions.append("Browse Products")
         suggestions.append("View my orders")
         

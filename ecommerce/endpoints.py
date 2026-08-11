@@ -230,11 +230,16 @@ class EcommerceEndpoints(Protocol):
         self,
         company_name: str,
         per_page: int = 20,
+        page: int = 1,
         requesting_customer_id=None,
         description: str = "",
         requires_resolution: Optional[List[str]] = None,
     ) -> WooAPICall:
-        """Search customers by billing company name (custom-api/v1 endpoint)."""
+        """Search customers by billing company name (custom-api/v1 endpoint).
+
+        `page` is required to read past the plugin's per-page ceiling; see
+        the implementation in woo_endpoints.py.
+        """
         ...
         
     def search_customers_by_email(

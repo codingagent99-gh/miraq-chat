@@ -649,21 +649,28 @@ class WooEndpoints:
         self,
         company_name: str,
         per_page: int = 20,
+        page: int = 1,
         requesting_customer_id=None,
         description: str = "",
         requires_resolution: Optional[List[str]] = None,
     ) -> WooAPICall:
-        """GET /customers/by-company?name=<company> (custom_plugin surface)
+        """GET /customers/by-company?name=<company>&page=<n> (custom_plugin surface)
 
         per_page defaults to 20 — the plugin's own ceiling
         (`min(20, ...)` in get_customers_by_company). The old default of 3
         silently truncated a company's contact list, so a named recipient
         could be reported "not found" purely because they sat 4th.
 
+        That ceiling is per PAGE, not per company: 20 was still a hard stop
+        because the endpoint had no offset. Callers that need the full
+        membership must page through with `page` until a short page comes
+        back — see the roster loop in parsers/bulk_order_parser.py, which
+        also caps how far it will walk.
+
         requesting_customer_id is REQUIRED by the plugin: it role-gates on
         the caller and returns 403 without it.
         """
-        params = {"name": company_name, "per_page": per_page}
+        params = {"name": company_name, "per_page": per_page, "page": page}
         if requesting_customer_id:
             params["customer_id"] = requesting_customer_id
         return WooAPICall(

@@ -386,10 +386,24 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
     
      # ── Patch: apply classifier-resolved product when parser misidentified digits in name ──
     if pre_resolved and pre_resolved.product_id:
+        _pre_name = pre_resolved.product_name or ""
         for ld in lines_as_dicts:
             if ld.get("unresolved") and ld.get("unresolved_reason") in (
                 "product_not_found", "both_not_found"
             ):
+                # pre_resolved is ONE whole-message classifier resolution,
+                # but a bulk request can have several unresolved lines — only
+                # patch a line whose OWN text actually names this product.
+                # Without this check, a line the parser genuinely couldn't
+                # match to anything (e.g. an attribute-only description like
+                # "Grey Marble") silently gets relabeled with an unrelated
+                # product resolved from a DIFFERENT line, and the fabricated
+                # line goes to the confirmation table looking legitimate.
+                if not _pre_name or not re.search(
+                    r'\b' + re.escape(_pre_name) + r'\b', ld["raw_fragment"], re.I
+                ):
+                    continue
+
                 # Strip the known product name from raw_fragment,
                 # then re-scan what's left for an explicit quantity
                 stripped = re.sub(
@@ -429,6 +443,11 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
     # people instead of falling back to asking for an email address.
     user_context["bulk_company_roster"] = _parse_meta.get("company_roster", [])
     user_context["bulk_company_scope"]  = _parse_meta.get("company_scope", "")
+    # Whether the roster above is the company's FULL membership or just the
+    # part we managed to read — governs whether "not found" can be asserted.
+    user_context["bulk_company_roster_truncated"] = _parse_meta.get(
+        "company_roster_truncated", False
+    )
     user_context["bulk_current_line_index"] = 0
     user_context["bulk_confirmed_lines"] = []
     user_context["bulk_address_overrides"] = {}
@@ -1275,44 +1294,144 @@ def _roster_label(entry: dict, disambiguate: bool = False) -> str:
 
 def _recipient_candidates(slot, roster):
     """
-    Roster entries to offer for this slot, plus whether to disambiguate.
+    Roster entries to offer for this slot, plus label/wording flags.
 
-    For an ambiguous name only the entries matching THAT name are offered —
-    showing the whole company would bury the actual choice. Labels are
-    disambiguated whenever two offered entries share a display name.
+    Returns (entries, disambiguate_labels, name_matched).
+
+    For a name that matches roster entries, only THOSE entries are offered —
+    showing the whole company would bury the actual choice. When the name
+    matches nobody, the full roster is offered as a fallback so the rep can
+    still pick, but `name_matched` comes back False so the caller words the
+    prompt as "I couldn't find X" instead of claiming those people share the
+    requested name.
+
+    `disambiguate_labels` is purely about LABELS (append city when two offered
+    entries share a display name) and says nothing about whether the requested
+    name matched — conflating the two is what produced "There are 20 people
+    named Kelly Fitchett" for a roster of 20 unrelated customers that merely
+    happened to contain two Carissa Diazes.
     """
     def _norm(v):
         return re.sub(r'[^a-z0-9]+', ' ', str(v or "").lower()).strip()
 
-    needle = _norm(slot.get("name"))
+    # Tolerate a malformed roster (bad JSONB, partial write, older schema)
+    # rather than raising or offering unusable buttons.
+    roster = [r for r in (roster or []) if isinstance(r, dict) and r.get("display")]
+
+    needle = _norm(slot.get("name") if isinstance(slot, dict) else "")
     entries = roster
-    if needle:
-        matched = [
-            r for r in roster
-            if _norm(r.get("display")) == needle
-            or needle in _norm(r.get("display")).split()
-        ]
-        if len(matched) > 1:
+    name_matched = False
+
+    if needle and roster:
+        # Every word of the requested name must appear in the display name.
+        # The previous test was `needle in _norm(display).split()`, which
+        # asked whether the whole "kelly fitchett" string equalled one
+        # single-word token — impossible for any first+last name, so this
+        # branch was dead and only exact equality could ever match.
+        needle_tokens = [t for t in needle.split() if t]
+        matched = []
+        for r in roster:
+            hay = _norm(r.get("display"))
+            if not hay:
+                continue
+            hay_tokens = hay.split()
+            if (
+                hay == needle
+                or (needle_tokens and all(t in hay_tokens for t in needle_tokens))
+                or needle in hay
+            ):
+                matched.append(r)
+
+        # Narrow on ANY match, including exactly one. The old guard was
+        # `len(matched) > 1`, so a single match — and, critically, ZERO
+        # matches — silently left `entries` as the entire company roster.
+        if matched:
             entries = matched
+            name_matched = True
 
     counts = {}
     for r in entries:
         k = _norm(r.get("display"))
         counts[k] = counts.get(k, 0) + 1
-    ambiguous = any(c > 1 for c in counts.values())
-    return entries, ambiguous
+    disambiguate = any(c > 1 for c in counts.values())
+    return entries, disambiguate, name_matched
 
 
 def _ask_for_bulk_recipient(
     lines_as_dicts, queue, pos, conversation, user_context, page, start_time,
 ):
     """Prompt for the recipient of one slot in the queue."""
-    slot   = queue[pos]
     roster = user_context.get("bulk_company_roster", []) or []
     scope  = user_context.get("bulk_company_scope", "")
+    _truncated = bool(user_context.get("bulk_company_roster_truncated", False))
 
-    entries, _ambiguous = _recipient_candidates(slot, roster)
-    names = [_roster_label(r, _ambiguous) for r in entries if r.get("display")]
+    # ── Fail-safe: no usable slot to ask about ──────────────────────────────
+    # A lost/corrupt queue (resumed session, partial context write) would
+    # otherwise IndexError here. Bail to the company step rather than
+    # guessing which line we were asking about.
+    if not queue or not (0 <= pos < len(queue)) or not isinstance(queue[pos], dict):
+        logger.warning(
+            f"bulk_order | recipient prompt aborted — bad queue state "
+            f"(pos={pos}, queue_len={len(queue) if queue else 0}) for company '{scope}'"
+        )
+        conversation.flow_state = FlowState.AWAITING_BULK_COMPANY.value
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+        elapsed = round((time.time() - start_time) * 1000)
+        return jsonify({
+            "success": True,
+            "bot_message": (
+                "I lost track of who this order is for. "
+                "Which company is this order for?"
+            ),
+            "intent": "guided_flow",
+            "products": [],
+            "suggestions": ["Cancel"],
+            "session_id": str(conversation.id),
+            "metadata": {
+                "flow_state": FlowState.AWAITING_BULK_COMPANY.value,
+                "response_time_ms": elapsed,
+            },
+            "flow_state": FlowState.AWAITING_BULK_COMPANY.value,
+            "pagination": default_pagination(page),
+        }), 200
+
+    slot = queue[pos]
+    entries, _disambiguate, _name_matched = _recipient_candidates(slot, roster)
+    names = [_roster_label(r, _disambiguate) for r in entries if r.get("display")]
+
+    # ── Fail-safe: nothing to offer ─────────────────────────────────────────
+    # An empty/unusable roster previously produced "**X** has 0 contacts."
+    # with a Cancel-only button — a dead end. Send the rep back to the
+    # company step, which is the thing that actually needs correcting.
+    if not names:
+        logger.warning(
+            f"bulk_order | recipient prompt aborted — no usable roster entries "
+            f"for company '{scope}' (roster_size={len(roster)})"
+        )
+        conversation.flow_state = FlowState.AWAITING_BULK_COMPANY.value
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+        elapsed = round((time.time() - start_time) * 1000)
+        return jsonify({
+            "success": True,
+            "bot_message": (
+                f"I don't have any contacts on file for **{scope}**, so I can't "
+                f"tell who this should ship to. Which company is this order for?"
+                if scope else "Which company is this order for?"
+            ),
+            "intent": "guided_flow",
+            "products": [],
+            "suggestions": ["Cancel"],
+            "session_id": str(conversation.id),
+            "metadata": {
+                "flow_state": FlowState.AWAITING_BULK_COMPANY.value,
+                "company": scope,
+                "response_time_ms": elapsed,
+            },
+            "flow_state": FlowState.AWAITING_BULK_COMPANY.value,
+            "pagination": default_pagination(page),
+        }), 200
 
     conversation.flow_state = FlowState.AWAITING_BULK_RECIPIENT.value
     user_context["bulk_recipient_queue"] = queue
@@ -1320,17 +1439,37 @@ def _ask_for_bulk_recipient(
     conversation.context_data = user_context
     flag_modified(conversation, "context_data")
 
+    # Skip line indices that no longer exist rather than IndexError-ing on a
+    # queue built against a different (older) set of lines.
     product_lines = "\r\n".join(
         f"• **{lines_as_dicts[i]['quantity']}× {lines_as_dicts[i]['product_name']}**"
-        for i in slot["line_indices"]
+        for i in slot.get("line_indices", [])
+        if isinstance(i, int) and 0 <= i < len(lines_as_dicts)
     )
 
-    if slot["name"] and _ambiguous:
+    # Wording keys off whether the requested name actually matched — never off
+    # the label-disambiguation flag, which can be True purely because two
+    # UNRELATED people on the roster share a name.
+    if slot.get("name") and _name_matched and len(entries) > 1:
         _ask = (
             f"There are {len(entries)} people named **{slot['name']}** at "
             f"**{scope}**, at different addresses. Which one?"
         )
-    elif slot["name"]:
+    elif slot.get("name") and _name_matched:
+        _ask = (
+            f"Is this **{slot['name']}** at **{scope}**? "
+            "Confirm or pick someone else."
+        )
+    elif slot.get("name") and _truncated:
+        # The roster is incomplete, so absence was never established — don't
+        # tell the rep this person isn't at the company when we only read
+        # part of it.
+        _ask = (
+            f"I couldn't find **{slot['name']}** in the first {len(roster)} "
+            f"contacts at **{scope}**, and there may be more I haven't checked. "
+            "Who should this go to?"
+        )
+    elif slot.get("name"):
         _ask = (
             f"I couldn't find **{slot['name']}** at **{scope}**. "
             "Who should this go to?"
@@ -1352,7 +1491,14 @@ def _ask_for_bulk_recipient(
             "flow_state": FlowState.AWAITING_BULK_RECIPIENT.value,
             "company": scope,
             "candidates": names,
-            "requested_name": slot["name"],
+            "requested_name": slot.get("name", ""),
+            # False means these candidates are a fallback list of everyone at
+            # the company, NOT people matching requested_name — the frontend
+            # must not label them as such.
+            "name_matched": _name_matched,
+            # True means these candidates are only part of the company's
+            # contacts — absence from this list proves nothing.
+            "roster_truncated": _truncated,
             "progress": {"current": pos + 1, "total": len(queue)},
             "response_time_ms": elapsed,
         },
@@ -1400,7 +1546,7 @@ def handle_bulk_recipient_reply(message, store_loader, conversation, user_contex
     # silently take the first record — the exact bug this step exists to
     # prevent.
     slot_for_match = queue[pos] if pos < len(queue) else {"name": ""}
-    entries, _ambiguous = _recipient_candidates(slot_for_match, roster)
+    entries, _disambiguate, _name_matched = _recipient_candidates(slot_for_match, roster)
 
     def _only(pred):
         """The single entry satisfying pred, or None if 0 or 2+ do.
@@ -1416,7 +1562,7 @@ def handle_bulk_recipient_reply(message, store_loader, conversation, user_contex
 
     if needle:
         # 1. exact label as offered ("Raj Chanda — Dallas, TX")
-        picked = _only(lambda r: _norm(_roster_label(r, _ambiguous)) == needle)
+        picked = _only(lambda r: _norm(_roster_label(r, _disambiguate)) == needle)
         # 2. exact display name, only if it identifies one person
         if not picked:
             picked = _only(lambda r: _norm(r.get("display")) == needle)
@@ -1427,8 +1573,18 @@ def handle_bulk_recipient_reply(message, store_loader, conversation, user_contex
                 return bool(hay) and (needle in hay or any(needle == w for w in hay.split()))
             picked = _only(_loose)
 
+    # A roster entry with no id cannot be stamped onto a line — treating it as
+    # a match would produce an order with no customer attached. Fall through
+    # to the re-ask instead.
+    if picked and not picked.get("id"):
+        logger.warning(
+            f"bulk_order | discarded match '{picked.get('display')}' for "
+            f"'{choice}' at '{scope}' — roster entry has no id"
+        )
+        picked = None
+
     if not picked:
-        names = [_roster_label(r, _ambiguous) for r in entries if r.get("display")]
+        names = [_roster_label(r, _disambiguate) for r in entries if r.get("display")]
         elapsed = round((time.time() - start_time) * 1000)
         return jsonify({
             "success": True,

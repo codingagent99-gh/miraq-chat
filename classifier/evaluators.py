@@ -269,6 +269,40 @@ class ProductDetailEvaluator(IntentEvaluator):
         return False
 
 
+class PopularityEvaluator(IntentEvaluator):
+    """
+    Detects "most popular" / "best sellers" / "top selling" style requests.
+
+    Runs before CatalogSearchEvaluator so a category/attribute/tag already
+    resolved by the extractors (e.g. "most popular tiles in the Aurora
+    collection") doesn't get claimed by CATEGORY_BROWSE / FILTER_BY_ATTRIBUTE
+    first — those filters are picked up as-is by _build_most_popular via the
+    same entities, just ranked by total_sales instead of the default order.
+    """
+    KEYWORDS = frozenset({
+        "best", "highest", "most", "popular", "sell", "sellers", "selling",
+        "sells", "sold", "top",
+    })
+
+    _POPULARITY_RE = re.compile(
+        r"\b(most\s+popular|best[\s-]?sellers?|top[\s-]?sellers?|"
+        r"top[\s-]?selling|best[\s-]?selling|most\s+sold|highest[\s-]?selling|"
+        r"sells?\s+(?:the\s+)?(?:most|best))\b"
+    )
+
+    def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
+        # A named product ("is Aurora Marble a best seller?") is a
+        # per-product question, not a ranked listing — let it fall through
+        # to CatalogSearchEvaluator's product_name-aware PRODUCT_DETAIL /
+        # PRODUCT_SEARCH branches instead of claiming it here.
+        if entities.product_name:
+            return None, 0.0
+        if self._POPULARITY_RE.search(text):
+            entities.sort_by = "popularity"
+            return Intent.MOST_POPULAR, 0.92
+        return None, 0.0
+
+
 class CatalogSearchEvaluator(IntentEvaluator):
     KEYWORDS = frozenset({
         "about", "all", "categor", "category", "categories", "cost", "detail",
@@ -486,6 +520,7 @@ DEFAULT_EVALUATORS = [
     DiscountEvaluator(),
     ProductDetailEvaluator(),
     AccountActionsEvaluator(),
+    PopularityEvaluator(),
     CatalogSearchEvaluator(),
     GeneralFallbackEvaluator(),
 ]

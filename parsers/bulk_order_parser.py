@@ -19,8 +19,21 @@ from ecommerce import endpoints
 from chat_logger import get_logger
 from app_config import BULK_ORDER_ROLES
 from handlers.chat_utils import normalize_spelling_variants, _attribute_display_name
+from models import ExtractedEntities
+from classifier.extractors import extract_attributes
+from api_builder.store_helpers import resolve_attr_filters
+from api_builder.filter_builder import build_advanced_filter_call
 
 logger = get_logger("miraq_chat")
+
+# ── Company roster pagination ────────────────────────────────────────────────
+# The plugin hard-caps per_page at 20 (min(20, ...) in
+# get_customers_by_company), so a company's full membership can only be read
+# by paging. MAX_ROSTER_PAGES bounds that walk: 5 pages × 20 = up to 100
+# contacts per company. Past that we stop and mark the roster truncated
+# rather than silently treating a partial list as complete.
+ROSTER_PAGE_SIZE = 20
+MAX_ROSTER_PAGES = 5
 
 EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', re.I)
 # ══════════════════════════════════════════════════════════════
@@ -425,14 +438,67 @@ def parse_bulk_order_utterance(
                     None,
                 )
 
+        # 3c.5. Attribute-based fallback: the line may describe a product by
+        # its ATTRIBUTES rather than its name (e.g. "Grey Marble" = colour
+        # grey + visual marble) — 3a-3c only ever compare against catalog
+        # product NAMES, so a pure attribute description can never match
+        # there and always fell through to unresolved. Reuse the exact same
+        # attribute vocabulary and filter-resolution the main product search
+        # flow uses, and query the advanced filter endpoint for it. Only
+        # auto-resolve on a SINGLE match — several matches means the
+        # description is genuinely ambiguous, and guessing one would be
+        # worse than asking (same reasoning as the unmatched_variant_hint
+        # safeguard above).
+        if pl.product_id is None:
+            _attr_entities = ExtractedEntities()
+            extract_attributes(pl.product_name, _attr_entities)
+            _attr_filters = resolve_attr_filters(_attr_entities.attributes) if _attr_entities.attributes else {}
+            if _attr_filters:
+                _attr_call = build_advanced_filter_call(
+                    attributes=_attr_filters,
+                    page=1, per_page=5,
+                    in_stock=True,
+                    description=f"Bulk order attribute resolve: '{pl.product_name}'",
+                )
+                _attr_result = woo_client.execute(_attr_call)
+                _attr_data = _attr_result.get("data") or {}
+                _attr_products = _attr_data.get("products", []) if isinstance(_attr_data, dict) else []
+
+                if _attr_result.get("success") and len(_attr_products) == 1:
+                    matched_catalog_name = _attr_products[0].get("name")
+                    pl.product_id = _attr_products[0].get("id")
+                    logger.debug(
+                        f"bulk_parser | attribute-resolved '{pl.product_name}' → "
+                        f"'{matched_catalog_name}' (id={pl.product_id}) "
+                        f"via {_attr_entities.attributes}"
+                    )
+                elif _attr_result.get("success") and len(_attr_products) > 1:
+                    logger.info(
+                        f"bulk_parser | attribute match for '{pl.product_name}' "
+                        f"({_attr_entities.attributes}) is ambiguous — "
+                        f"{len(_attr_products)} products match, leaving unresolved"
+                    )
+
         # 3d. Extract variant hint OR display company from remainder, and
         # normalize product_name to the canonical catalog name. Normalization
         # now fires whenever a match was found — not just when product_name
         # starts with it — because the Step 2 pre-claim can leave a leading
         # qty token in product_name (e.g. "20 harmony white").
         if matched_catalog_name:
-            if pl.product_name.lower().startswith(matched_catalog_name.lower()):
-                remainder = pl.product_name[len(matched_catalog_name):].strip(" ,.-")
+            # Search for the matched name rather than requiring product_name
+            # to START with it: Step 2 deliberately skips the qty-slice when
+            # a name was pre-claimed (to protect the pre-claim span), so a
+            # stray leading token can survive here (e.g. "1 london white" for
+            # "London White" after "1" failed to get stripped). A prefix
+            # check against that would silently drop everything after the
+            # match as an unrecognised variant hint — searching for the
+            # match's position instead finds "White" regardless of what
+            # precedes "London".
+            _name_match = re.search(
+                r'\b' + re.escape(matched_catalog_name) + r'\b', pl.product_name, re.I
+            )
+            if _name_match:
+                remainder = pl.product_name[_name_match.end():].strip(" ,.-")
                 if remainder:
                     _for_match = re.match(r'^for\s+(.+)$', remainder, re.I)
                     if _for_match:
@@ -619,26 +685,63 @@ def parse_bulk_order_utterance(
     # line. Each line's recipient is then matched WITHIN that roster.
     company_roster: List[dict] = []
     company_lookup_done = False
+    # True when we stopped paging with more records still possibly unread, so
+    # downstream code must NOT assert that a missing name is absent from the
+    # company — it is only absent from what we actually looked at.
+    roster_truncated = False
 
     if _is_rep and company_scope:
-        call = endpoints.search_customers_by_company(
-            company_name=company_scope,
-            per_page=20,
-            requesting_customer_id=self_customer_id,
-            description=f"Bulk order company lookup: '{company_scope}'",
-        )
-        result = woo_client.execute(call)
-        company_lookup_done = True
+        _seen_ids = set()
+        for _page in range(1, MAX_ROSTER_PAGES + 1):
+            call = endpoints.search_customers_by_company(
+                company_name=company_scope,
+                per_page=ROSTER_PAGE_SIZE,
+                page=_page,
+                requesting_customer_id=self_customer_id,
+                description=f"Bulk order company lookup: '{company_scope}' (page {_page})",
+            )
+            result = woo_client.execute(call)
+            company_lookup_done = True
 
-        customers = result.get("data", [])
-        if isinstance(customers, dict):
-            customers = customers.get("results", []) or customers.get("customers", [])
-        if result.get("success") and isinstance(customers, list):
-            company_roster = [c for c in customers if isinstance(c, dict) and c.get("id")]
+            customers = result.get("data", [])
+            if isinstance(customers, dict):
+                customers = customers.get("results", []) or customers.get("customers", [])
+            if not (result.get("success") and isinstance(customers, list)):
+                # A failed page mid-walk means the roster is incomplete —
+                # flag it rather than treating what we have as the whole list.
+                if _page > 1:
+                    roster_truncated = True
+                else:
+                    logger.warning(
+                        f"bulk_parser | company lookup failed for '{company_scope}' "
+                        f"on page {_page}"
+                    )
+                break
+
+            _page_rows = [c for c in customers if isinstance(c, dict) and c.get("id")]
+            for c in _page_rows:
+                # Defensive dedupe: an unstable server-side sort could repeat a
+                # row across pages, which would read as a false "two people
+                # with this name" and trigger a bogus disambiguation prompt.
+                if c["id"] not in _seen_ids:
+                    _seen_ids.add(c["id"])
+                    company_roster.append(c)
+
+            # A short page means we reached the end of the result set.
+            if len(customers) < ROSTER_PAGE_SIZE:
+                break
+            # Walked the full allowance and the last page was still full —
+            # there are probably more customers we never fetched.
+            if _page == MAX_ROSTER_PAGES:
+                roster_truncated = True
 
         logger.info(
             f"bulk_parser | company '{company_scope}' → "
             f"{len(company_roster)} customer(s)"
+            + (
+                f" (TRUNCATED at {MAX_ROSTER_PAGES} pages — more may exist)"
+                if roster_truncated else ""
+            )
         )
 
     def _roster_entry_to_resolution(customer: dict) -> dict:
@@ -711,9 +814,12 @@ def parse_bulk_order_utterance(
             resolution, _count = _match_recipient(pl.recipient_name)
             if resolution:
                 pl.customer_id = resolution["id"]
-        elif len(company_roster) == 1:
+        elif len(company_roster) == 1 and not roster_truncated:
             # No person named and the company has exactly one contact —
-            # unambiguous, so use them (example query 1).
+            # unambiguous, so use them (example query 1). Gated on a COMPLETE
+            # roster: "exactly one" read off a partial list is not a fact
+            # about the company, and silently shipping to that person would
+            # be the worst possible failure here.
             pl.customer_id = _roster_entry_to_resolution(company_roster[0])["id"]
 
     if meta_out is not None:
@@ -723,6 +829,9 @@ def parse_bulk_order_utterance(
         meta_out["company_roster"] = [
             _roster_entry_to_resolution(c) for c in company_roster
         ]
+        # Lets the handler soften "I couldn't find X" into "not in the first N"
+        # instead of asserting an absence it cannot actually vouch for.
+        meta_out["company_roster_truncated"] = roster_truncated
 
     # ── Step 5: Reorder resolution ────────────────────────────────────────────
     for pl in pre_lines:
@@ -802,6 +911,12 @@ def parse_bulk_order_utterance(
                 elif pl.recipient_name and _recipient_matches > 1:
                     customer_display_name = (
                         f"⚠️ {_recipient_matches} people named {pl.recipient_name}"
+                    )
+                elif pl.recipient_name and roster_truncated:
+                    # We only read part of the company — say so rather than
+                    # claiming this person isn't there.
+                    customer_display_name = (
+                        f"⚠️ {pl.recipient_name} not in first {len(company_roster)}"
                     )
                 elif pl.recipient_name:
                     customer_display_name = f"⚠️ {pl.recipient_name} not found"

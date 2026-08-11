@@ -37,6 +37,7 @@ _SEARCH_FILTER_INTENTS = {
     Intent.FILTER_BY_ATTRIBUTE,
     Intent.PRODUCT_BY_TAG,
     Intent.PRODUCT_QUICK_SHIP,
+    Intent.MOST_POPULAR,
 }
 
 
