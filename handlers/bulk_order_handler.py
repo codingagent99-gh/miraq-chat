@@ -323,7 +323,7 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
             "flow_state": FlowState.AWAITING_BULK_ORDER_INPUT.value,
             "products": [],
             "actions": [],
-            "suggestions": ["Cancel Order"],
+            "suggestions": ["Cancel"],
             "metadata": {"response_time_ms": elapsed},
             "pagination": default_pagination(page),
         }), 200
@@ -2868,7 +2868,7 @@ def _prompt_for_quantity(qty_unset, lines_as_dicts, conversation, user_context, 
         "bot_message": _build_quantity_prompt(line),
         "intent":      "guided_flow",
         "products":    [],
-        "suggestions": ["1", "5", "10", "15", "20", "Cancel"],
+        "suggestions": ["Cancel"],
         "session_id":  str(conversation.id),
         "metadata": {
             "flow_state":       FlowState.AWAITING_BULK_QUANTITY.value,
@@ -2919,7 +2919,7 @@ def handle_bulk_quantity_reply(message, store_loader, conversation, user_context
             ),
             "intent":      "guided_flow",
             "products":    [],
-            "suggestions": ["1", "5", "10", "15", "20", "Cancel"],
+            "suggestions": ["Cancel"],
             "session_id":  str(conversation.id),
             "metadata": {
                 "flow_state":       FlowState.AWAITING_BULK_QUANTITY.value,
@@ -2948,7 +2948,7 @@ def handle_bulk_quantity_reply(message, store_loader, conversation, user_context
             "bot_message": _build_quantity_prompt(next_line),
             "intent":      "guided_flow",
             "products":    [],
-            "suggestions": ["1", "5", "10", "15", "20", "Cancel"],
+            "suggestions": ["Cancel"],
             "session_id":  str(conversation.id),
             "metadata": {
                 "flow_state":       FlowState.AWAITING_BULK_QUANTITY.value,

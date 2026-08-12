@@ -18,7 +18,14 @@ def fetch_product_order_history(product_id: int, role: str) -> list:
     Only runs for rep roles — customers don't see other customers' orders.
     Returns a list of raw WooCommerce order dicts (empty on failure).
     """
-    if not product_id or role not in BULK_ORDER_ROLES:
+    # Any rep or admin can view product order history — it's a read
+    # operation, not an order placement. BULK_ORDER_ROLES is the wrong gate
+    # here; that set exists to control who can PLACE bulk orders, not who can
+    # VIEW order history. A plain CUSTOM_ORDER_ROLES check (the rep-facing
+    # surface) is what we want, plus admins.
+    from app_config import CUSTOM_ORDER_ROLES, ORDER_REPORT_ADMIN_ROLES
+    _can_view = CUSTOM_ORDER_ROLES | ORDER_REPORT_ADMIN_ROLES
+    if not product_id or role not in _can_view:
         return []
     try:
         call   = endpoints.search_orders_by_product(

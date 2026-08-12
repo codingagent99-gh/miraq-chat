@@ -367,7 +367,7 @@ def handle_variant_selection(
                 "bot_message": f"I'm sorry, but that specific variant is currently out of stock! 😔\n\nWould you like to choose a different finish or size?",
                 "intent": "guided_flow",
                 "products": [],
-                "suggestions": ["Show me other options", "Cancel Order"],
+                "suggestions": ["Show me other options", "Cancel"],
                 "session_id": session_id,
                 "metadata": {
                     "flow_state": FlowState.AWAITING_VARIANT_SELECTION.value,
@@ -399,7 +399,7 @@ def handle_variant_selection(
                 return jsonify({
                     "success": True,
                     "bot_message": (
-                        f"Here's **{_pending_name}**. ✅ In stock\n\n"
+                        f"Here's **{_pending_name}**.\n\n"
                         # f"{_price_line}\n\n"
                         f"Would you like to add it to your cart?"
                     ),
@@ -426,11 +426,11 @@ def handle_variant_selection(
                     f"**Product:** {_var_product_name}\n"
                     f"**Variant:** {_variant_label}\n\n"
                     # f"{_price_line}\n\n"
-                    f"How many would you like to order? You can tap an option below or type any exact number in the chat. 🛒"
+                    f"How many would you like to order? Type any number of quantities you need in the chat. 🛒"
                 ),
                 "intent": "guided_flow",
                 "products": [],
-                "suggestions": ["1", "5", "10", "25", "Cancel Order"],
+                "suggestions": ["Cancel"],
                 "session_id": session_id,
                 "metadata": {
                     "flow_state": FlowState.AWAITING_QUANTITY.value,
@@ -535,7 +535,7 @@ def handle_variant_selection(
         "bot_message": prompt_msg,
         "intent": "guided_flow",
         "products": [],
-        "suggestions": ["Cancel Order"],
+        "suggestions": ["Cancel"],
         "variant_options": _variant_options,
         "session_id": session_id,
         "metadata": {
@@ -723,8 +723,7 @@ def _no_variation_combination_response(
             _lbl = " / ".join(
                 o for o in _get_safe_options(_v.get("attributes", []), _sl).values() if o
             )
-            _stock = "✅ In stock" if (_v.get("in_stock") or _v.get("stock_status") == "instock") else "❌ Out of stock"
-            lines.append(f"• **{_lbl}** — {_stock}")
+            lines.append(f"• **{_lbl}**")
 
     # What the product DOES offer on the failed dimensions, so the shopper has
     # somewhere to go rather than just a dead end.
@@ -1142,7 +1141,7 @@ def handle_variation_product(
             flag_modified(conversation, "context_data")
 
             bot_message = (
-                f"Here's **{pending_name}**. ✅ In stock\n\n"
+                f"Here's **{pending_name}**.\n\n"
                 f"Would you like to add it to your cart?"
             )
             suggestions = ["Yes, add it", "No thanks"]
@@ -1189,22 +1188,6 @@ def handle_variation_product(
         ),
     }
     
-    # ── Rep: product order history ──────────────────────────────────────────
-    # Injected here so variable products (which never reach _build_final_response)
-    # still get the SHOW_PRODUCT_RECENT_ORDERS action.
-    _rep_actions = []
-    if role and entities.product_id:
-        from utils.rep_utils import (
-            fetch_product_order_history,
-            format_product_orders_for_action,
-        )
-        _recent = fetch_product_order_history(entities.product_id, role)
-        if _recent:
-            _rep_actions.append({
-                "type": "SHOW_PRODUCT_RECENT_ORDERS",
-                "payload": {"orders": format_product_orders_for_action(_recent)},
-            })
-
     return jsonify({
         "success":     True,
         "bot_message": bot_message,
@@ -1215,7 +1198,6 @@ def handle_variation_product(
         "metadata":    metadata,
         "pagination":  pagination,
         "flow_state":  next_flow_state,
-        **({"actions": _rep_actions} if _rep_actions else {}),
     }), 200
 
 def handle_quantity_and_variant_check(
@@ -1400,11 +1382,11 @@ def handle_quantity_and_variant_check(
                         f"**Product:** {product['name']}\n"
                         f"**Variant:** {_var_label}\n\n"
                         # f"{_price_line}\n\n"
-                        f"How many would you like to order? You can tap an option below or type any exact number in the chat. 🛒"
+                        f"How many would you like to order? How many do you need? Type any number of quantities you need in the chat. 🛒"
                     ),
                     "intent": intent.value,
                     "products": products_formatted[:1],
-                    "suggestions": ["1", "5", "10", "25", "Cancel Order"],
+                    "suggestions": ["Cancel"],
                     "session_id": session_id,
                     "metadata": {
                         "flow_state": FlowState.AWAITING_QUANTITY.value,
@@ -1436,7 +1418,7 @@ def handle_quantity_and_variant_check(
                 "bot_message": prompt_msg,
                 "intent": intent.value,
                 "products": products_formatted[:1],
-                "suggestions": ["Cancel Order"],
+                "suggestions": ["Cancel"],
                 "variant_options": _variant_options,
                 "session_id": session_id,
                 "metadata": {
@@ -1453,10 +1435,10 @@ def handle_quantity_and_variant_check(
         elapsed = time.time() - start_time
         return jsonify({
             "success": True,
-            "bot_message": f"Sure, I can order **{product['name']}** for you! How many do you need? You can tap an option below or type any exact number in the chat. 🛒",
+            "bot_message": f"Sure, I can order **{product['name']}** for you! How many do you need? Type any number of quantities you need in the chat. 🛒",
             "intent": intent.value,
             "products": products_formatted[:1],
-            "suggestions": ["1", "5", "10", "25", "Cancel Order"],
+            "suggestions": ["Cancel"],
             "session_id": session_id,
             "metadata": {
                 "flow_state": FlowState.AWAITING_QUANTITY.value,
@@ -1528,7 +1510,7 @@ def handle_quantity_and_variant_check(
             "bot_message": prompt_msg,
             "intent": intent.value,
             "products": products_formatted[:1],
-            "suggestions": ["Cancel Order"],
+            "suggestions": ["Cancel"],
             "variant_options": _variant_options,
             "session_id": session_id,
             "metadata": {

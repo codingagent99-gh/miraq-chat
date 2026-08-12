@@ -247,7 +247,7 @@ def handle_flow_state(
             
     if state not in (FlowState.IDLE, FlowState.AWAITING_ANYTHING_ELSE):
         # Exact matches or starts-with to prevent accidental triggers 
-        # (e.g., we want to catch "cancel order" but not "I want to order cancela tiles")
+        # (e.g., we want to catch "cancel" but not "I want to order cancela tiles")
         exit_phrases = sorted(EXIT_PHRASES)
         if text in exit_phrases or any(text.startswith(p + " ") for p in exit_phrases):
             return {

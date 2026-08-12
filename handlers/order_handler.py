@@ -102,7 +102,8 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
             "flow_state": FlowState.IDLE.value,
         }), 200
 
-    from api_builder import _build_advanced_filter_call, _attr_slug_for_label
+    from api_builder import build_advanced_filter_call as _build_advanced_filter_call
+    from api_builder.store_helpers import attr_slug_for_label as _attr_slug_for_label
     
     # 1. Fetch ONLY the exact past purchases matching the criteria
     attr_filters = {
@@ -236,6 +237,33 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
         "has_more": page < total_pages_calc
     }
 
+    # ── Product order history card ──────────────────────────────────────────
+    # handle_historical_search returns its own response and bypasses
+    # _build_final_response, which is where the rep-features block lives.
+    # The SHOW_PRODUCT_RECENT_ORDERS action must therefore be built HERE.
+    from app_config import CUSTOM_ORDER_ROLES, ORDER_REPORT_ADMIN_ROLES
+    _actions = []
+    _product_id = getattr(entities, "product_id", None)
+    _role = ""
+    try:
+        from flask import request as _req
+        _role = (_req.get_json(silent=True) or {}).get("user_context", {}).get("role", "")
+    except Exception:
+        pass
+    _can_view = CUSTOM_ORDER_ROLES | ORDER_REPORT_ADMIN_ROLES
+    if _product_id and _role in _can_view:
+        try:
+            from utils.rep_utils import fetch_product_order_history, format_product_orders_for_action
+            _hist = fetch_product_order_history(_product_id, _role)
+            if _hist:
+                _actions.append({
+                    "type": "SHOW_PRODUCT_RECENT_ORDERS",
+                    "payload": {"orders": format_product_orders_for_action(_hist)},
+                })
+                logger.info(f"HISTORICAL_SEARCH | SHOW_PRODUCT_RECENT_ORDERS emitted with {len(_hist)} order(s)")
+        except Exception as _e:
+            logger.warning(f"HISTORICAL_SEARCH | order history card failed: {_e}")
+
     elapsed = time.time() - start_time
     logger.info(f"Step 10: Response sent | intent={intent.value} | products_count={len(formatted_products)} | response_time_ms={round(elapsed * 1000)} | flow_state=idle")
 
@@ -243,7 +271,12 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
         "success": True,
         "bot_message": bot_message,
         "intent": intent.value,
-        "products": formatted_products,
+        # Product cards are suppressed when showing order history — the user
+        # asked for their past orders, not to browse the product. The order
+        # items in the SHOW_PRODUCT_RECENT_ORDERS action already name the
+        # product, so the card adds nothing and clutters the response.
+        "products": [] if _actions else formatted_products,
+        "actions": _actions,
         "suggestions": suggestions,
         "session_id": session_id,
         "metadata": {

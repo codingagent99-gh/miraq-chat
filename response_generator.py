@@ -545,18 +545,16 @@ def generate_bot_message(
         # If we have specific attributes or stock filters, show the FILTERED specific view!
         if has_attributes or has_stock_filter:
             attr_desc = _build_attribute_value_summary(entities.attributes)
-            if has_stock_filter:
-                stock_desc = "In Stock" if entities.in_stock else "Out of Stock"
-                attr_desc = f"{attr_desc} ({stock_desc})" if attr_desc else stock_desc
             
             if not variations:
                 return (
-                    f"I found **{parent['name']}** but couldn't find variations matching "
-                    f"**{attr_desc}**. 😕\n\n"
+                    f"I found **{parent['name']}** but couldn't find matching variations"
+                    + (f" for **{attr_desc}**" if attr_desc else "")
+                    + ". 😕\n\n"
                     f"Try asking: *'What variations does {parent['name']} come in?'*"
                 )
                 
-            msg = f"🎯 **{parent['name']}** — {attr_desc}\n\n"
+            msg = f"🎯 **{parent['name']}**" + (f" — {attr_desc}" if attr_desc else "") + "\n\n"    
             msg += f"Found **{len(variations)}** matching variation(s):\n\n"
             
             for v in variations[:10]:
@@ -564,12 +562,9 @@ def generate_bot_message(
                 price_val = float(v.get("price") or 0)
                 price_str = f"{CS}{price_val:.2f}" if price_val > 0 else ""
                 
-                stock = "✅ In stock" if v.get("in_stock", v.get("stock_status") == "instock") else "❌ Out of stock"
-                
                 line = f"• **{label}**"
                 if price_str:
                     line += f" — {price_str}"
-                line += f" — {stock}"
                 msg += line + "\n"
                 
             if len(variations) > 10:
@@ -585,14 +580,13 @@ def generate_bot_message(
                 msg += f"\n{parent['short_description']}\n"
                
             if variations:
-                msg += f"\n**Available variations ({len(variations)}):** *(✅ In Stock | ❌ Out of Stock)*\n"
+                msg += f"\n**Available variations ({len(variations)}):**\n"
                 for v in variations[:10]:
                     label = _get_var_label(v)
                     price_val = float(v.get("price") or 0)
                     price_str = f"{CS}{price_val:.2f}" if price_val > 0 else ""
-                    stock = "✅" if v.get("in_stock", True) else "❌"
                     
-                    line = f"  {stock} {label}"
+                    line = f"  {label}"
                     if price_str:
                         line += f" — {price_str}"
                     msg += line + "\n"
@@ -857,18 +851,6 @@ def _generate_attribute_info_message(products: List[dict], entities: ExtractedEn
                     return attr
         return None
 
-    def _in_stock_for(target: str):
-        from handlers.chat_utils import _get_safe_options
-        in_stock_opts = set()
-        for v in variations:
-            if v.get('in_stock') or v.get('stock_status') == 'instock':
-                # _get_safe_options normalises both the custom flat-dict shape
-                # and the standard WC list-of-dicts shape.
-                for axis_name, opt in _get_safe_options(v.get('attributes', [])).items():
-                    if target in str(axis_name).lower() and opt:
-                        in_stock_opts.add(opt)
-        return in_stock_opts
-
     claimed = set()
     msg_parts = []
 
@@ -889,11 +871,6 @@ def _generate_attribute_info_message(products: List[dict], entities: ExtractedEn
 
         opts_str = ", ".join(f"**{o}**" for o in options)
         line = f"• **{display_name}**: {opts_str}"
-
-        in_stock = _in_stock_for(target)
-        if in_stock and 0 < len(in_stock) < len(options):
-            line += f" ✅ (In stock: {', '.join(sorted(in_stock))})"
-
         msg_parts.append(line)
 
     if msg_parts:

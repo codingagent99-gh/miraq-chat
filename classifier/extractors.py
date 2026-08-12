@@ -799,16 +799,19 @@ def extract_time_range(text: str, entities: ExtractedEntities):
         entities.date_after  = start.replace(hour=0,  minute=0,  second=0,  microsecond=0).isoformat()
         entities.date_before = end.replace(  hour=23, minute=59, second=59, microsecond=999999).isoformat()
 
-    # ── Period-to-date: "month to date"/"MTD", "quarter to date", "year to date"
+    # ── Period-to-date: "week to date"/"WTD", "month to date"/"MTD",
+    # "quarter to date", "year to date"
     # Checked FIRST: the bare "month"/"year" patterns below would otherwise
     # swallow "month to date" and silently return a rolling 30-day window,
     # which is a different number than the calendar month the user asked for.
     m_ptd = re.search(
-        r'\b(?:(month|quarter|year)[\s-]+to[\s-]+date|(mtd|qtd|ytd))\b', text_lower
+        r'\b(?:(week|month|quarter|year)[\s-]+to[\s-]+date|(wtd|mtd|qtd|ytd))\b', text_lower
     )
     if m_ptd:
-        unit = m_ptd.group(1) or {"mtd": "month", "qtd": "quarter", "ytd": "year"}[m_ptd.group(2)]
-        if unit == "month":
+        unit = m_ptd.group(1) or {"wtd": "week", "mtd": "month", "qtd": "quarter", "ytd": "year"}[m_ptd.group(2)]
+        if unit == "week":
+            start = now - timedelta(days=now.weekday())
+        elif unit == "month":
             start = now.replace(day=1)
         elif unit == "quarter":
             start = _fiscal_quarter_start(now, FISCAL_YEAR_START_MONTH)
@@ -826,10 +829,12 @@ def extract_time_range(text: str, entities: ExtractedEntities):
     # stayed None and the query silently ran ALL-TIME — a plausible-looking
     # number for the wrong window. Read as the current period to date; the
     # caller states the window it used so the interpretation is visible.
-    m_bare = re.search(r'\bin\s+(?:a|an|the|one|1)\s+(month|quarter|year)\b', text_lower)
+    m_bare = re.search(r'\bin\s+(?:a|an|the|one|1)\s+(week|month|quarter|year)\b', text_lower)
     if m_bare:
         unit = m_bare.group(1)
-        if unit == "month":
+        if unit == "week":
+            start = now - timedelta(days=now.weekday())
+        elif unit == "month":
             start = now.replace(day=1)
         elif unit == "quarter":
             start = _fiscal_quarter_start(now, FISCAL_YEAR_START_MONTH)
@@ -840,11 +845,17 @@ def extract_time_range(text: str, entities: ExtractedEntities):
         _set(start, now)
         return
 
-    # ── "this/current month|quarter|year" ────────────────────────────────────
-    m_this = re.search(r'\b(?:this|current)\s+(month|quarter|year)\b', text_lower)
+    # ── "this/current week|month|quarter|year" ──────────────────
+    # Week uses a to-date end (today) rather than the full calendar week —
+    # unlike month/quarter/year, the rest of the current week hasn't
+    # happened yet, so extending to Sunday would include future dates.
+    m_this = re.search(r'\b(?:this|current)\s+(week|month|quarter|year)\b', text_lower)
     if m_this:
         unit = m_this.group(1)
-        if unit == "month":
+        if unit == "week":
+            start = now - timedelta(days=now.weekday())
+            end = now
+        elif unit == "month":
             start = now.replace(day=1)
             end = now.replace(day=calendar.monthrange(now.year, now.month)[1])
         elif unit == "quarter":
@@ -907,20 +918,6 @@ def extract_time_range(text: str, entities: ExtractedEntities):
             start = now - timedelta(days=amount * 30)
         else:
             start = now - timedelta(days=amount * 365)
-        entities.date_after  = start.replace(hour=0,  minute=0,  second=0,  microsecond=0).isoformat()
-        entities.date_before = now.replace(  hour=23, minute=59, second=59, microsecond=999999).isoformat()
-        return
-
-    # ── "this week/month/year" ────────────────────────────────────────────────
-    m_this = re.search(r'\b(?:this)\s+(week|month|year)\b', text_lower)
-    if m_this:
-        unit = m_this.group(1)
-        if unit == 'week':
-            start = now - timedelta(days=now.weekday())
-        elif unit == 'month':
-            start = now.replace(day=1)
-        else:
-            start = now.replace(month=1, day=1)
         entities.date_after  = start.replace(hour=0,  minute=0,  second=0,  microsecond=0).isoformat()
         entities.date_before = now.replace(  hour=23, minute=59, second=59, microsecond=999999).isoformat()
         return

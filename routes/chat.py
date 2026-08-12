@@ -1217,15 +1217,21 @@ def _build_final_response(
     # that dead-end (SHOW_PRODUCT_RECENT_ORDERS also triggers a Woo call).
     _sr_rep_features = ECOMMERCE_BACKEND != "shopify"
 
+    from app_config import CUSTOM_ORDER_ROLES, ORDER_REPORT_ADMIN_ROLES
+    _can_view_orders = CUSTOM_ORDER_ROLES | ORDER_REPORT_ADMIN_ROLES
+
+    # Bulk-order button: rep roles only (they place orders).
     if _sr_rep_features and _sr_role in BULK_ORDER_ROLES and customer_id and products:
         _sr_actions.append({"type": "SHOW_RECENTLY_ORDERED_BUTTON", "payload": {}})
 
-        # Product order history — only when a specific product resolved
+    # Product order history: any rep or admin can VIEW it.
+    # Gated separately so an administrator logged in for reporting doesn't miss
+    # it just because they're not in the bulk-order role set.
+    if _sr_rep_features and _sr_role in _can_view_orders and customer_id and products:
         _searched_product_id = getattr(entities, "product_id", None)
-        # if not _searched_product_id and len(products) == 1:
-        #     _searched_product_id = products[0].get("id")
 
-        if _searched_product_id:
+        # Show only when the user explicitly asks — not on every product search.
+        if _searched_product_id and intent in (Intent.ORDER_HISTORY, Intent.LAST_ORDER, Intent.HISTORICAL_SEARCH):
             _recent_orders = _fetch_product_order_history(_searched_product_id, _sr_role)
             if _recent_orders:
                 _sr_actions.append({
@@ -1667,6 +1673,14 @@ def chat():
                 message, store_loader,
                 suppressed_tokens=_suppressed,
             )
+            # Keep the ORIGINAL wording. Rep-name resolution matches against
+            # this rather than the corrected text, because correction rewrites
+            # tokens toward catalog vocabulary — "Bullock" became "Block" (a
+            # mosaic-type attribute), so the rep lookup searched for someone
+            # who does not exist. Matching the raw message sidesteps that
+            # entirely instead of trying to protect names positionally.
+            user_context["raw_message_for_names"] = message
+
             if _typo_corrections:
                 message = _corrected
                 user_msg.metadata_json = {
@@ -2119,7 +2133,8 @@ def chat():
         if intent == Intent.ORDER_STATS_BY_REP:
             _role = user_context.get("role") or user_context.get("user_role")
             stats_resp = handle_order_stats(
-                entities, _role, customer_id, conversation, page, start_time
+                entities, _role, customer_id, conversation, page, start_time,
+                user_context=user_context,
             )
             if stats_resp is not None:
                 conversation.context_data = user_context
