@@ -228,6 +228,16 @@ def find_mos_confusions(message: str, suppressed_tokens=None) -> list:
     return confusions
 
 
+# Words that can trail a person's name in a reporting query — part of the
+# date phrase, not the name, so they stay correctable.
+_DATE_TAIL_WORDS = frozenset({
+    "a", "an", "the", "this", "last", "past", "in", "for", "at", "on",
+    "since", "between", "month", "months", "quarter", "quarters", "year",
+    "years", "week", "weeks", "day", "days", "today", "yesterday",
+    "mtd", "qtd", "ytd", "to", "date", "so", "far",
+})
+
+
 def correct_message(message: str, loader, suppressed_tokens=None) -> tuple[str, list, list]:
     """
     Correct misspelled catalog/glue words in `message`.
@@ -256,6 +266,29 @@ def correct_message(message: str, loader, suppressed_tokens=None) -> tuple[str, 
         return message, [], []
 
     _suppressed = {t.lower() for t in (suppressed_tokens or ())}
+
+    # ── Protect PERSON NAMES from catalog-vocabulary correction ──────────────
+    # A surname resembling a catalog term gets "corrected" into it: "ordered
+    # by Jennifer Bullock" became "Jennifer Block" ("block" is a mosaic-type
+    # attribute), so the rep lookup searched for someone who does not exist.
+    # Catalog vocabulary must not rewrite a name the user typed.
+    #
+    # Names sit in known positions — after "ordered/placed by", or between
+    # "did" and "order" — so protect those spans rather than trying to detect
+    # names in general.
+    for _m in re.finditer(
+        r'\b(?:ordered|placed)\s+by\s+((?:[A-Za-z][\w.\-]*\s*){1,3})'
+        r'|\bdid\s+((?:[A-Za-z][\w.\-]*\s*){1,3}?)\s+order\b',
+        message, re.I,
+    ):
+        _span = next((g for g in _m.groups() if g), "") or ""
+        for _w in _span.split():
+            _w = _w.strip(".,?!;:").lower()
+            # Date words trailing the name are not part of it — leave those
+            # correctable.
+            if _w and _w.isalpha() and _w not in _DATE_TAIL_WORDS:
+                _suppressed.add(_w)
+
 
     corrections: list = []
     ambiguities: list = []

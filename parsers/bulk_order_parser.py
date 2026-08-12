@@ -703,7 +703,8 @@ def parse_bulk_order_utterance(
             result = woo_client.execute(call)
             company_lookup_done = True
 
-            customers = result.get("data", [])
+            _raw_data = result.get("data", [])
+            customers = _raw_data
             if isinstance(customers, dict):
                 customers = customers.get("results", []) or customers.get("customers", [])
             if not (result.get("success") and isinstance(customers, list)):
@@ -718,7 +719,23 @@ def parse_bulk_order_utterance(
                     )
                 break
 
+            # The plugin returns a {_diagnostic: {...}} envelope rather than a
+            # bare [] when nothing matched, so "no such company" can be told
+            # apart from an out-of-date plugin build without server access.
+            if isinstance(_raw_data, dict) and _raw_data.get("_diagnostic"):
+                logger.warning(
+                    f"bulk_parser | company lookup NO MATCHES | "
+                    f"diagnostic={_raw_data['_diagnostic']}"
+                )
+                break
+
             _page_rows = [c for c in customers if isinstance(c, dict) and c.get("id")]
+            if _page_rows and _page == 1:
+                logger.info(
+                    f"bulk_parser | roster page 1 | lookup_version="
+                    f"{_page_rows[0].get('lookup_version', 'MISSING -> OLD PLUGIN BUILD')}"
+                    f" | companies={[r.get('company') for r in _page_rows[:5]]}"
+                )
             for c in _page_rows:
                 # Defensive dedupe: an unstable server-side sort could repeat a
                 # row across pages, which would read as a false "two people

@@ -46,6 +46,11 @@ class FlowState(Enum):
     # Admin picking between several reps who match a name in an order report
     AWAITING_REP_CHOICE = "awaiting_rep_choice"
 
+    # Rep picking which COMPANY a bulk order is for, when a fuzzy company
+    # lookup matched more than one business. Always resolved BEFORE the
+    # recipient question, so the person list never mixes two companies.
+    AWAITING_BULK_COMPANY_CHOICE = "awaiting_bulk_company_choice"
+
 _ORDER_FLOW_STATES = {
     FlowState.AWAITING_QUANTITY,
     FlowState.AWAITING_CART_CONFIRMATION,
@@ -63,6 +68,8 @@ _ORDER_FLOW_STATES = {
     FlowState.AWAITING_BULK_ADDRESS_CHOICE,
     FlowState.AWAITING_BULK_PRODUCT,
     FlowState.AWAITING_BULK_QUANTITY,
+    FlowState.AWAITING_BULK_COMPANY_CHOICE,
+    FlowState.AWAITING_REP_CHOICE,
 }
 
 # Bare exit vocabulary. Shared by the in-flow escape hatch below and by the
@@ -115,6 +122,7 @@ def _flow_context_message(state: FlowState) -> dict:
         FlowState.AWAITING_BULK_COMPANY:           "Please provide the company name for this order",
         FlowState.AWAITING_BULK_RECIPIENT:         "Please tell me who this order is for",
         FlowState.AWAITING_REP_CHOICE:             "Please pick which rep you meant",
+        FlowState.AWAITING_BULK_COMPANY_CHOICE:    "Please pick which company this order is for",
         FlowState.AWAITING_BULK_RECIPIENT_MODE:    "Please say whether these are for the same person or different people",
         FlowState.AWAITING_BULK_ADDRESS_CHOICE:    "Please pick which address to ship to",
         FlowState.AWAITING_BULK_PRODUCT:            "Please enter a product name",
@@ -523,6 +531,16 @@ def handle_flow_state(
         return {
             "action": "process_bulk_recipient_reply",
             "flow_state": FlowState.AWAITING_BULK_RECIPIENT.value,
+            "pass_through": False,
+        }
+
+    # ── State: Rep choosing which matching company the bulk order is for ──
+    if state == FlowState.AWAITING_BULK_COMPANY_CHOICE:
+        if not message.strip():
+            return _flow_context_message(FlowState.AWAITING_BULK_COMPANY_CHOICE)
+        return {
+            "action": "process_bulk_company_choice_reply",
+            "flow_state": FlowState.AWAITING_BULK_COMPANY_CHOICE.value,
             "pass_through": False,
         }
 

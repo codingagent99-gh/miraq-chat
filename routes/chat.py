@@ -91,6 +91,7 @@ from handlers.bulk_order_handler import (
     handle_bulk_variant_selection_reply,
     handle_bulk_email_reply,
     handle_bulk_company_reply,
+    handle_bulk_company_choice_reply,
     handle_bulk_recipient_reply,
     handle_bulk_recipient_mode_reply,
     handle_bulk_address_choice_reply,
@@ -352,6 +353,10 @@ def _dispatch_bulk_action(action, message, role, store_loader, conversation, use
         )
     elif action == "process_bulk_recipient_mode_reply":
         return handle_bulk_recipient_mode_reply(
+            message, store_loader, conversation, user_context, page, start_time
+        )
+    elif action == "process_bulk_company_choice_reply":
+        return handle_bulk_company_choice_reply(
             message, store_loader, conversation, user_context, page, start_time
         )
     elif action == "process_rep_choice_reply":

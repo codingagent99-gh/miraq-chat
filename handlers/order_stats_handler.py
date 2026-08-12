@@ -94,13 +94,25 @@ def handle_order_stats(
         # retry a query that will never succeed.
         code = result.get("error_code")
         if code == "rep_not_found":
+            # The plugin distinguishes "no user by that name" from "the user
+            # exists but has no cs_rep role" — the latter is a role-assignment
+            # problem, and reporting it as a spelling issue sends the admin
+            # hunting for a typo that isn't there.
+            _msg = result.get("error_message") or ""
+            if "cs_rep role" in _msg:
+                return _respond(
+                    f"**{requested_rep}** has a user account, but it isn't "
+                    "assigned the sales rep role, so no orders are credited to "
+                    "them. An administrator can add that role in WordPress.",
+                    metadata={"error_code": code, "reason": "not_a_rep",
+                              "requested_name": requested_rep},
+                )
             return _respond(
                 f"I couldn't find a rep called **{requested_rep}**. "
-                "That name isn't registered as a sales rep, so there are no "
-                "orders recorded against it — check the spelling, or try their "
-                "full name as it appears in WordPress.",
-                suggestions=["Show all reps", "Browse Products"],
-                metadata={"error_code": code, "requested_name": requested_rep},
+                "Check the spelling, or try their full name as it appears in "
+                "WordPress.",
+                metadata={"error_code": code, "reason": "no_such_name",
+                          "requested_name": requested_rep},
             )
         if code == "forbidden":
             return _respond(

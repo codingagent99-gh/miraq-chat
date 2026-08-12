@@ -471,7 +471,7 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
         first_line = lines_as_dicts[product_blank_indices[0]]
         customer_hint = (
             "" if first_line.get("is_self_order")
-            else f" for **{first_line['customer_display_name']}**"
+            else f" for **{_line_recipient_display(first_line)}**"
             if first_line.get("customer_id") else ""
         )
         already_resolved = [l for l in lines_as_dicts if not l.get("unresolved")]
@@ -503,6 +503,78 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
             if l.get("unresolved_reason") in ("company_not_provided", "company_not_found")
         ]
         if company_missing:
+            # ── Fallback: order-history addresses ───────────────────────────
+            # No USER ACCOUNT carries this company name, but the company can
+            # still be real — /company-order-addresses derives it from ORDER
+            # HISTORY, the only source that sees a company shipped to whose
+            # customers never had the company field set on their account.
+            #
+            # This has to live HERE, not only in _ask_for_bulk_recipient:
+            # Step 4.55 returns before that function is ever reached, so a
+            # fallback placed only there never runs.
+            _tried_co = next(
+                (l.get("company_name") for l in company_missing if l.get("company_name")),
+                "",
+            )
+            _addr_rows = _company_order_addresses(_tried_co, user_context) if _tried_co else []
+            _addr_opts = []
+            for _r in _addr_rows:
+                _lbl = _address_label(_r)
+                if _lbl and _lbl not in _addr_opts:
+                    _addr_opts.append(_lbl)
+
+            if _addr_opts:
+                logger.info(
+                    f"bulk_order | no customer accounts for '{_tried_co}' — "
+                    f"offering {len(_addr_opts)} order-history address(es)"
+                )
+                conversation.flow_state = FlowState.AWAITING_BULK_ADDRESS_CHOICE.value
+                user_context["bulk_address_only_mode"] = True
+                # handle_bulk_address_choice_reply reads its slot from
+                # bulk_address_queue[bulk_address_pos] — NOT from any
+                # pending_* key. Writing elsewhere left the queue empty, so
+                # the handler took its early "nothing to choose" branch and
+                # skipped applying the address altogether.
+                #
+                # `options` must be ROW DICTS (the handler calls
+                # _address_label on each), and `line_indices` drives the loop
+                # that copies the address onto the lines.
+                user_context["bulk_address_queue"] = [{
+                    "name": _tried_co,
+                    "company": _tried_co,
+                    "options": _addr_rows,
+                    "line_indices": list(range(len(lines_as_dicts))),
+                }]
+                user_context["bulk_address_pos"] = 0
+                conversation.context_data = user_context
+                flag_modified(conversation, "context_data")
+                _pl = "\r\n".join(
+                    f"• **{l['quantity']}× {l['product_name']}**" for l in company_missing
+                )
+                _el = round((time.time() - start_time) * 1000)
+                return jsonify({
+                    "success": True,
+                    "bot_message": (
+                        f"Got it:\r\n{_pl}\r\n\r\n"
+                        f"I don't have contact records for **{_tried_co}**, but it has "
+                        f"been shipped to before. Pick a delivery address and I'll use "
+                        f"it — you can add the recipient's name at confirmation."
+                    ),
+                    "intent": "guided_flow",
+                    "products": [],
+                    "suggestions": _addr_opts[:8] + ["Cancel"],
+                    "session_id": str(conversation.id),
+                    "metadata": {
+                        "flow_state": FlowState.AWAITING_BULK_ADDRESS_CHOICE.value,
+                        "company": _tried_co,
+                        "candidates": _addr_opts,
+                        "address_only_mode": True,
+                        "response_time_ms": _el,
+                    },
+                    "flow_state": FlowState.AWAITING_BULK_ADDRESS_CHOICE.value,
+                    "pagination": default_pagination(page),
+                }), 200
+
             conversation.flow_state = FlowState.AWAITING_BULK_COMPANY.value
             conversation.context_data = user_context
             flag_modified(conversation, "context_data")
@@ -515,11 +587,22 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
                 (l.get("company_name") for l in company_missing if l.get("company_name")),
                 "",
             )
+            # Nothing at all: no customer accounts AND no delivery history.
+            # Say so plainly and give a way FORWARD as well as a retry — a
+            # Cancel-only prompt strands the rep on a company they may know
+            # is real (a brand-new client places a first order with no
+            # history and no account yet, which is entirely normal).
             _ask = (
-                f"I couldn't find any customers for **{_tried}**. "
-                "Which company is this order for?"
+                f"I couldn't find **{_tried}** — no customer records and no "
+                "past deliveries under that name.\r\n\r\n"
+                "You can enter a different company, or continue anyway and "
+                "I'll take the delivery address from you directly."
                 if _tried else
                 "Which company is this order for?"
+            )
+            _sugg = (
+                ["Continue anyway", "Enter a different company", "Cancel"]
+                if _tried else ["Cancel"]
             )
 
             elapsed = round((time.time() - start_time) * 1000)
@@ -528,10 +611,12 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
                 "bot_message": f"Got it:\r\n{product_lines}\r\n\r\n{_ask}",
                 "intent": "guided_flow",
                 "products": [],
-                "suggestions": ["Cancel"],
+                "suggestions": _sugg,
                 "session_id": str(conversation.id),
                 "metadata": {
                     "flow_state": FlowState.AWAITING_BULK_COMPANY.value,
+                    "requested_company": _tried,
+                    "no_records_found": bool(_tried),
                     "response_time_ms": elapsed,
                 },
                 "flow_state": FlowState.AWAITING_BULK_COMPANY.value,
@@ -665,7 +750,7 @@ def _format_bulk_confirmation_table(lines) -> str:
     """
     rows = []
     for line in lines:
-        customer = _get(line, "customer_display_name", "")
+        customer = _line_recipient_display(line) if isinstance(line, dict) else _get(line, "customer_display_name", "")
         product  = _get(line, "product_name", "")
         qty      = _get(line, "quantity", 0)
         unresolved      = _get(line, "unresolved", False)
@@ -864,10 +949,27 @@ def _ask_for_bulk_variant(
     for _name, _opts in _any_axes.items():
         attr_axes.setdefault(_name, set()).update(_opts)
 
+    # EVERY axis stays on the prompt, including ones the matched variation
+    # already pins — the rep may still want to change the colour. What their
+    # message settled rides along in `preselected` so the UI can pre-tick it
+    # rather than making them find and re-pick a value they already gave.
     attributes = [
         {"name": name, "options": sorted(opts)}
         for name, opts in attr_axes.items()
     ]
+
+    _resolved_axes = {}
+    if line.get("variation_id"):
+        _matched_var = next(
+            (v for v in variations if v.get("id") == line.get("variation_id")), None
+        )
+        if _matched_var:
+            _resolved_axes = {
+                n: o
+                for n, o in _get_safe_options(_matched_var.get("attributes", [])).items()
+                if n and o
+            }
+    _open_axes = {a.strip().lower() for a in (line.get("blank_variant_axes") or []) if a}
 
     variation_list = [
         {
@@ -894,19 +996,22 @@ def _ask_for_bulk_variant(
         "type": "SHOW_BULK_VARIANT_PROMPT",
         "payload": {
             "line_index": line_idx,
-            "company": line.get("customer_display_name", ""),
+            "company": _line_recipient_display(line),
             "is_self_order": line.get("is_self_order", False),
             "product_name": line.get("product_name", ""),
             "quantity": line.get("quantity", 0),
             "progress": {"current": pos + 1, "total": len(needs_variant_indices)},
             "attributes": attributes,
+            # Axes already settled from the rep's message. The UI should show
+            # these as chosen (read-only), not ask for them again.
+            "preselected": _resolved_axes,
             "variations": variation_list,
             "unmatched_variant_hint": _bad_hint if _hint_not_in_catalog else "",
         },
     }
 
     _line_label = (
-        f"{line.get('customer_display_name', '')} × {line.get('quantity', 0) or '?'}"
+        f"{_line_recipient_display(line)} × {line.get('quantity', 0) or '?'}"
     )
     if _hint_not_in_catalog:
         _bot_message = (
@@ -915,10 +1020,18 @@ def _ask_for_bulk_variant(
             f"options instead ({_line_label}):"
         )
     else:
-        _bot_message = (
-            f"Please select the missing product details for "
-            f"**{line['product_name']}** ({_line_label}):"
-        )
+        if _resolved_axes and _open_axes:
+            _settled = ", ".join(f"{v}" for v in _resolved_axes.values())
+            _bot_message = (
+                f"**{line['product_name']}** — {_settled} is set. "
+                f"Just need the {', '.join(line.get('blank_variant_axes') or [])} "
+                f"({_line_label}):"
+            )
+        else:
+            _bot_message = (
+                f"Please select the missing product details for "
+                f"**{line['product_name']}** ({_line_label}):"
+            )
 
     elapsed = round((time.time() - start_time) * 1000)
     return jsonify({
@@ -975,17 +1088,37 @@ def _build_bulk_confirmation_response(lines_as_dicts, conversation, user_context
             "pagination": default_pagination(page),
         }), 200
 
+    # Render rows with the RESOLVED recipient. The card reads
+    # customer_display_name straight off each line, which still carries the
+    # "⚠️ No customers for X" status label from the lookup — so a fully
+    # prepared order with a confirmed address and a named recipient displayed
+    # as if nothing had been found. Shallow copies only: the underlying lines
+    # keep the original label, which the unresolved-line paths still rely on.
+    _display_lines = []
+    for _l in lines_as_dicts:
+        if isinstance(_l, dict):
+            _c = dict(_l)
+            _c["customer_display_name"] = _line_recipient_display(_l)
+            _display_lines.append(_c)
+        else:
+            _display_lines.append(_l)
+
     # wrap data inside "payload" key
     action = {
         "type": "SHOW_BULK_ORDER_CONFIRMATION",
         "payload": {
-            "lines": lines_as_dicts,
+            "lines": _display_lines,
             "resolved_count": resolved_count,
             "unresolved_count": unresolved_count,
         },
     }
 
-    bot_message = f"Here's your bulk order — {resolved_count} order(s) ready to place."
+    # Addresses are confirmed before this card is built, so "ready to place"
+    # is now literally true and confirming is the final action.
+    bot_message = (
+        f"Here's your bulk order — {resolved_count} order(s) ready to place. "
+        "Confirming will place them."
+    )
     if unresolved_count:
         bot_message += f" {unresolved_count} unresolved line(s) will be skipped."
     bot_message += " Would you like to proceed?"
@@ -1121,7 +1254,21 @@ def handle_bulk_variant_selection_reply(
             conversation, user_context, page, start_time,
         )
 
-    # All variants resolved — show structured confirmation table
+    # All variants resolved — collect ADDRESSES next, then show the summary.
+    #
+    # This site returns directly rather than going through
+    # _continue_after_addresses_chosen, so reordering that function alone left
+    # this path unchanged: the rep still saw a "ready to place" table before
+    # any address existed.
+    _resolved = [l for l in lines_as_dicts if not l.get("unresolved")]
+    if _resolved:
+        user_context["bulk_current_line_index"] = 0
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+        return _advance_to_next_address_confirmation(
+            _resolved, 0, conversation, user_context, page, start_time,
+        )
+
     return _build_bulk_confirmation_response(
         lines_as_dicts, conversation, user_context, page, start_time
     )
@@ -1365,6 +1512,58 @@ def _ask_for_bulk_recipient(
     scope  = user_context.get("bulk_company_scope", "")
     _truncated = bool(user_context.get("bulk_company_roster_truncated", False))
 
+    # ── Stage 1: which COMPANY? ─────────────────────────────────────────────
+    # Company lookup is fuzzy (substring OR similar_text >= 70), so one name
+    # can legitimately return people from SEVERAL companies — "Turner Ceramic
+    # Tile" and "Turner Ceramics" are different businesses. Asking for the
+    # person first would mix staff from both into one list, and the rep could
+    # pick someone from the wrong company without ever seeing that two
+    # existed. Company first, then person.
+    def _norm_company(v):
+        # Same normalisation the plugin uses: punctuation is noise, so
+        # "Turner Ceramic & Tile" and "Turner Ceramic Tile" are ONE company.
+        # Deduping on the raw string instead would offer a picker between two
+        # spellings of the same business.
+        return re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9 ]+', ' ', str(v or "").lower())).strip()
+
+    _companies = []
+    _seen_c = set()
+    for r in roster:
+        c = (r.get("company") or "").strip()
+        key = _norm_company(c)
+        if c and key and key not in _seen_c:
+            _seen_c.add(key)
+            _companies.append(c)
+
+    if len(_companies) > 1 and not user_context.get("bulk_company_choice_made"):
+        conversation.flow_state = FlowState.AWAITING_BULK_COMPANY_CHOICE.value
+        user_context["bulk_recipient_queue"] = queue
+        user_context["bulk_recipient_pos"] = pos
+        user_context["pending_company_choice"] = {"companies": _companies}
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+        _el = round((time.time() - start_time) * 1000)
+        return jsonify({
+            "success": True,
+            "bot_message": (
+                f"**{len(_companies)}** companies match **{scope}**. "
+                "Which one is this order for?"
+            ),
+            "intent": "guided_flow",
+            "products": [],
+            "suggestions": _companies[:8] + ["Cancel"],
+            "session_id": str(conversation.id),
+            "metadata": {
+                "flow_state": FlowState.AWAITING_BULK_COMPANY_CHOICE.value,
+                "candidates": _companies,
+                "requested_company": scope,
+                "response_time_ms": _el,
+            },
+            "flow_state": FlowState.AWAITING_BULK_COMPANY_CHOICE.value,
+            "pagination": default_pagination(page),
+        }), 200
+
+
     # ── Fail-safe: no usable slot to ask about ──────────────────────────────
     # A lost/corrupt queue (resumed session, partial context write) would
     # otherwise IndexError here. Bail to the company step rather than
@@ -1405,6 +1604,64 @@ def _ask_for_bulk_recipient(
     # with a Cancel-only button — a dead end. Send the rep back to the
     # company step, which is the thing that actually needs correcting.
     if not names:
+        # ── Fallback: order-history addresses ───────────────────────────────
+        # An empty roster means no USER ACCOUNT carries this company name. The
+        # company can still be real: /company-order-addresses derives it from
+        # ORDER HISTORY, which is the only source that sees a company that has
+        # been shipped to but whose customers never had the company field set
+        # on their account. Offer those destinations rather than dead-ending
+        # the rep on a company that demonstrably exists.
+        _addr_rows = _company_order_addresses(scope, user_context)
+        if _addr_rows:
+            _opts = []
+            for _r in _addr_rows:
+                _lbl = _address_label(_r)
+                if _lbl and _lbl not in _opts:
+                    _opts.append(_lbl)
+            logger.info(
+                f"bulk_order | roster empty for '{scope}' — offering "
+                f"{len(_opts)} order-history address(es)"
+            )
+            if _opts:
+                conversation.flow_state = FlowState.AWAITING_BULK_ADDRESS_CHOICE.value
+                user_context["bulk_recipient_queue"] = queue
+                user_context["bulk_recipient_pos"] = pos
+                # Signals the address step is standing in for the recipient
+                # step: there is no customer account to attach, so the name is
+                # collected at confirmation instead.
+                user_context["bulk_address_only_mode"] = True
+                user_context["bulk_address_queue"] = [{
+                    "name": scope,
+                    "company": scope,
+                    "options": _addr_rows,
+                    "line_indices": list(range(len(lines_as_dicts))),
+                }]
+                user_context["bulk_address_pos"] = 0
+                conversation.context_data = user_context
+                flag_modified(conversation, "context_data")
+                _el = round((time.time() - start_time) * 1000)
+                return jsonify({
+                    "success": True,
+                    "bot_message": (
+                        f"I don't have contact records for **{scope}**, but it has "
+                        f"been shipped to before. Pick a delivery address and I'll "
+                        f"use it — you can add the recipient's name at confirmation."
+                    ),
+                    "intent": "guided_flow",
+                    "products": [],
+                    "suggestions": _opts[:8] + ["Cancel"],
+                    "session_id": str(conversation.id),
+                    "metadata": {
+                        "flow_state": FlowState.AWAITING_BULK_ADDRESS_CHOICE.value,
+                        "company": scope,
+                        "candidates": _opts,
+                        "address_only_mode": True,
+                        "response_time_ms": _el,
+                    },
+                    "flow_state": FlowState.AWAITING_BULK_ADDRESS_CHOICE.value,
+                    "pagination": default_pagination(page),
+                }), 200
+
         logger.warning(
             f"bulk_order | recipient prompt aborted — no usable roster entries "
             f"for company '{scope}' (roster_size={len(roster)})"
@@ -1416,8 +1673,11 @@ def _ask_for_bulk_recipient(
         return jsonify({
             "success": True,
             "bot_message": (
-                f"I don't have any contacts on file for **{scope}**, so I can't "
-                f"tell who this should ship to. Which company is this order for?"
+                # Reached only when the company has NO customer accounts AND has
+                # never been shipped to — genuinely unknown to this store.
+                f"I can't find **{scope}** — there are no customer records and "
+                f"no past deliveries under that name. Check the spelling, or tell "
+                f"me which company this order is for."
                 if scope else "Which company is this order for?"
             ),
             "intent": "guided_flow",
@@ -1661,6 +1921,54 @@ def handle_bulk_company_reply(message, store_loader, conversation, user_context,
     appended — one code path for resolution instead of two.
     """
     company = (message or "").strip().strip('.,')
+
+    # "Continue anyway" after a company with no records at all — the rep knows
+    # the company is real (a brand-new client has neither an account nor
+    # delivery history). Route to manual address entry instead of re-running a
+    # lookup that has already been shown to return nothing.
+    if company.lower() in ("continue anyway", "continue", "proceed anyway", "proceed"):
+        user_context["bulk_manual_address_mode"] = True
+        conversation.flow_state = FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+        logger.info("bulk_order | rep chose to continue with no company records")
+        elapsed = round((time.time() - start_time) * 1000)
+        return jsonify({
+            "success": True,
+            "bot_message": (
+                "OK — I'll take the delivery details from you.\r\n\r\n"
+                "Please give me the recipient's name and full shipping address."
+            ),
+            "intent": "guided_flow",
+            "products": [],
+            "suggestions": ["Cancel"],
+            "session_id": str(conversation.id),
+            "metadata": {
+                "flow_state": FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value,
+                "manual_address_mode": True,
+                "response_time_ms": elapsed,
+            },
+            "flow_state": FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value,
+            "pagination": default_pagination(page),
+        }), 200
+
+    if company.lower() in ("enter a different company", "different company"):
+        elapsed = round((time.time() - start_time) * 1000)
+        return jsonify({
+            "success": True,
+            "bot_message": "Which company is this order for?",
+            "intent": "guided_flow",
+            "products": [],
+            "suggestions": ["Cancel"],
+            "session_id": str(conversation.id),
+            "metadata": {
+                "flow_state": FlowState.AWAITING_BULK_COMPANY.value,
+                "response_time_ms": elapsed,
+            },
+            "flow_state": FlowState.AWAITING_BULK_COMPANY.value,
+            "pagination": default_pagination(page),
+        }), 200
+
     if not company:
         elapsed = round((time.time() - start_time) * 1000)
         return jsonify({
@@ -1800,7 +2108,7 @@ def handle_bulk_email_reply(message, store_loader, conversation, user_context, p
         first_line = lines_as_dicts[blank_after_email[0]]
         customer_hint = (
             "" if first_line.get("is_self_order")
-            else f" for **{first_line['customer_display_name']}**"
+            else f" for **{_line_recipient_display(first_line)}**"
             if first_line.get("customer_id") else ""
         )
         elapsed = round((time.time() - start_time) * 1000)
@@ -2056,7 +2364,7 @@ def handle_bulk_product_reply(message, store_loader, conversation, user_context,
         next_line = lines_as_dicts[next_idx]
         customer_hint = (
             "" if first_line.get("is_self_order")
-            else f" for **{first_line['customer_display_name']}**"
+            else f" for **{_line_recipient_display(first_line)}**"
             if first_line.get("customer_id") else ""
         )
         elapsed = round((time.time() - start_time) * 1000)
@@ -2179,6 +2487,35 @@ def _addresses_for_person(rows, first_name, last_name, customer_id=None):
         seen.add(sig)
         out.append(r)
     return out
+
+
+def _line_recipient_display(line) -> str:
+    """Name to SHOW for a line.
+
+    customer_display_name doubles as a status label when no customer account
+    resolved ("⚠️ No customers for X", "⚠️ Not found"). That is useful on the
+    unresolved-lines table, but once the rep has supplied a shipping address
+    the recipient IS known, and continuing to show the warning makes a
+    complete order look broken.
+
+    Order of preference: the shipping name the rep entered, then the company
+    on the address, then the stored display name (which may still be a ⚠️
+    label — correct when nothing has been supplied yet).
+    """
+    if not isinstance(line, dict):
+        return ""
+    ship = line.get("shipping_address") or {}
+    name = " ".join(
+        v for v in (ship.get("first_name"), ship.get("last_name")) if v
+    ).strip()
+    if name:
+        return name
+    if ship.get("company"):
+        return ship["company"]
+    bill = line.get("billing_address") or {}
+    if bill.get("company"):
+        return bill["company"]
+    return line.get("customer_display_name", "") or ""
 
 
 def _address_label(row) -> str:
@@ -2338,9 +2675,25 @@ def handle_bulk_address_choice_reply(message, store_loader, conversation, user_c
         if idx >= len(lines):
             continue
         ship = dict(lines[idx].get("shipping_address") or {})
+
+        # The rep's OWN stated recipient wins over the name attached to a
+        # historical address. Order-history rows carry whoever that delivery
+        # went to, so copying their name across overwrote the people the rep
+        # actually named — "1x London for Tamra Smith" silently became Kevin
+        # Shuker's order because his name rode along with the address.
+        # The address supplies the DESTINATION; the recipient comes from the
+        # request.
+        _stated = (lines[idx].get("recipient_name") or "").strip()
+        if _stated:
+            _parts = _stated.split()
+            _first, _last = _parts[0], " ".join(_parts[1:])
+        else:
+            _first = picked.get("shipping_first_name", "") or ship.get("first_name", "")
+            _last  = picked.get("shipping_last_name", "")  or ship.get("last_name", "")
+
         ship.update({
-            "first_name": picked.get("shipping_first_name", "") or ship.get("first_name", ""),
-            "last_name":  picked.get("shipping_last_name", "")  or ship.get("last_name", ""),
+            "first_name": _first,
+            "last_name":  _last,
             "company":    picked.get("company", "") or ship.get("company", ""),
             "address_1":  picked.get("shipping_address_1", ""),
             "address_2":  picked.get("shipping_address_2", ""),
@@ -2469,6 +2822,24 @@ def _continue_after_addresses_chosen(lines_as_dicts, store_loader, conversation,
         return _ask_for_bulk_variant(
             lines_as_dicts, needs_variant_indices, 0,
             conversation, user_context, page, start_time,
+        )
+
+    # Everything the rep can supply is now supplied EXCEPT the address, so
+    # collect that next — the summary comes after, not before.
+    #
+    # This used to render the summary here and start the address loop only
+    # once the rep pressed "Yes, confirm". That asked them to approve a table
+    # marked "Ready / N orders ready to place" while no address existed, and
+    # made "Yes, confirm" mean "begin collecting addresses" rather than
+    # "place the order". Address first, then a summary showing the real
+    # destination, then a confirm that actually places.
+    _resolved = [l for l in lines_as_dicts if not l.get("unresolved")]
+    if _resolved:
+        user_context["bulk_current_line_index"] = 0
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+        return _advance_to_next_address_confirmation(
+            _resolved, 0, conversation, user_context, page, start_time,
         )
 
     return _build_bulk_confirmation_response(
@@ -2632,7 +3003,7 @@ def _continue_after_quantity_filled(lines_as_dicts, store_loader, conversation, 
 def handle_bulk_order_confirmation(user_context, conversation, page, start_time):
     """
     Called when the rep confirms the bulk order table (action == "confirm_bulk_order").
-    Begins the per-customer address confirmation loop.
+    Addresses are already confirmed by this point, so this PLACES the orders.
     Returns a Flask response.
     """
     lines = user_context.get("pending_bulk_lines", [])
@@ -2661,14 +3032,33 @@ def handle_bulk_order_confirmation(user_context, conversation, page, start_time)
             "pagination": default_pagination(page),
         }), 200
 
-    return _advance_to_next_address_confirmation(
-        resolved_lines=resolved_lines,
-        idx=0,
-        conversation=conversation,
-        user_context=user_context,
-        page=page,
-        start_time=start_time,
-    )
+    # Addresses are confirmed BEFORE this summary is shown, so "Yes, confirm"
+    # is the final step: place the orders. It previously kicked off the
+    # address loop, which is why the rep was asked to approve a table and was
+    # then immediately asked for more information.
+    #
+    # Safety gate: several other paths also render this summary (re-entry
+    # after an edit, resumed sessions). If any line reaches here without a
+    # confirmed address, collect it rather than placing an order whose
+    # destination the rep never saw — the reordering must not turn a missed
+    # step into an unverified order.
+    _unconfirmed = [
+        l for l in resolved_lines
+        if not l.get("address_confirmed") and not l.get("address_skipped")
+    ]
+    if _unconfirmed:
+        logger.info(
+            f"bulk_order | confirm pressed with {len(_unconfirmed)} line(s) "
+            f"lacking a confirmed address — collecting before placing"
+        )
+        user_context["bulk_current_line_index"] = 0
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+        return _advance_to_next_address_confirmation(
+            resolved_lines, 0, conversation, user_context, page, start_time,
+        )
+
+    return _create_all_confirmed_orders(user_context, conversation, page, start_time)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2870,7 +3260,13 @@ def _advance_to_next_address_confirmation(resolved_lines, idx, conversation, use
         idx += 1
 
     if idx >= len(resolved_lines):
-        return _create_all_confirmed_orders(user_context, conversation, page, start_time)
+        # Every address settled — NOW show the summary. It can finally state a
+        # real recipient and destination, and its confirm button places the
+        # orders rather than starting another data-collection step.
+        lines = user_context.get("pending_bulk_lines", [])
+        return _build_bulk_confirmation_response(
+            lines, conversation, user_context, page, start_time,
+        )
 
     return _build_address_card_response(
         resolved_lines, idx, conversation, user_context, page, start_time,
@@ -2921,10 +3317,14 @@ def _build_address_card_response(
     shipping_block = current_line.get("shipping_address") or {}
     billing_block = current_line.get("billing_address") or {}
 
-    if not shipping_block.get("address_1"):
+    # Address-only mode (company has delivery history but no customer
+    # account) leaves customer_id None. int(None) raised here and killed
+    # the whole card — which is how a chosen address showed up blank.
+    _cid = current_line.get("customer_id")
+    if not shipping_block.get("address_1") and _cid:
         try:
             cust_call = endpoints.fetch_customer(
-                customer_id=int(current_line["customer_id"]),
+                customer_id=int(_cid),
                 description=f"Fetch address for {current_line['customer_display_name']}",
             )
             cust_result = woo_client.execute(cust_call)
@@ -2997,7 +3397,7 @@ def _build_address_card_response(
 
     # ▼ emit a structured action so React can render the address card + panel
     payload = {
-        "customer_name": current_line["customer_display_name"],
+        "customer_name": _line_recipient_display(current_line),
         "items_text": items_text,
         # Legacy read-only summary fields (kept for back-compat).
         "address": {
@@ -3022,7 +3422,7 @@ def _build_address_card_response(
     }
 
     header = (
-        f"**Order for {current_line['customer_display_name']}** "
+        f"**Order for {_line_recipient_display(current_line)}** "
         if not current_line.get("is_self_order") else "**Your order** "
     ) + f"({idx + 1} of {len(resolved_lines)})\r\n\r\n"
 
@@ -3162,8 +3562,20 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
             line, address_overrides, line_idx, rep_email,
             user_context.get("rep_billing_address"),
         )
+        # The RECIPIENT NAME is part of the key, not just customer_id.
+        # With no customer account (address-only mode) every line carries
+        # customer_id=None, so two different people ordering to the same
+        # company address collapsed into ONE order labelled with whichever
+        # line came first — "1× London for Kevin Shuker" when London was
+        # Tamra Smith's. Different named recipients stay separate orders.
+        _recipient_key = (
+            line.get("recipient_name")
+            or line.get("customer_display_name")
+            or ""
+        ).strip().lower()
         _key = (
             str(line.get("customer_id")),
+            _recipient_key,
             _address_group_key(_billing),
             _address_group_key(_shipping),
         )
@@ -3250,9 +3662,25 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
         payload["billing"] = billing
         payload["shipping"] = shipping
 
+        # customer_display_name carries a ⚠️ STATUS LABEL when no customer
+        # account resolved ("⚠️ No customers for Turner Ceramic Tile"). That
+        # is fine on the confirmation table, but it read as the recipient's
+        # name in the order log and in the response, so a legitimate
+        # address-only order looked like a failed one. Prefer the actual
+        # shipping name, then the company, and only fall back to the label.
+        _ship_name = " ".join(
+            v for v in (shipping.get("first_name"), shipping.get("last_name")) if v
+        ).strip()
+        _order_for = (
+            _ship_name
+            or shipping.get("company")
+            or billing.get("company")
+            or line.get("customer_display_name", "")
+        )
+
         order_call = endpoints.create_order(
             payload=payload,
-            description=f"Bulk order for {line['customer_display_name']}",
+            description=f"Bulk order for {_order_for}",
         )
         order_resp = woo_client.execute(order_call)
 
@@ -3260,7 +3688,7 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
             new_order = order_resp["data"]
             created_orders.append({
                 "order_number": new_order.get("number") or new_order.get("id"),
-                "customer": line["customer_display_name"],
+                "customer": _order_for,
                 # A merged order covers several products — name them all, or
                 # the summary silently under-reports what was placed.
                 "product": ", ".join(gl["product_name"] for gl in group_lines),
@@ -3268,11 +3696,11 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
             })
             logger.info(
                 f"bulk_order | created order #{new_order.get('number') or new_order.get('id')} "
-                f"for {line['customer_display_name']} | {len(group_lines)} line item(s)"
+                f"for {_line_recipient_display(line)} | {len(group_lines)} line item(s)"
             )
         else:
             failed_orders.append({
-                "customer": line["customer_display_name"],
+                "customer": _order_for,
                 "product": ", ".join(gl["product_name"] for gl in group_lines),
                 "error": str(order_resp.get("error", "Unknown error")),
             })
@@ -3334,3 +3762,75 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
         "flow_state": FlowState.IDLE.value,
         "pagination": default_pagination(page),
     }), 200
+
+def handle_bulk_company_choice_reply(
+    message, store_loader, conversation, user_context, page, start_time,
+):
+    """Rep picked which company the bulk order is for (stage 1 of 2).
+
+    Narrows the roster to that company, then falls through to the recipient
+    question. Matching is exact-then-unique-partial: an ambiguous reply
+    re-asks rather than guessing, since picking the wrong company here would
+    silently ship to a different business.
+    """
+    pending   = (user_context or {}).get("pending_company_choice") or {}
+    companies = pending.get("companies") or []
+    roster    = user_context.get("bulk_company_roster", []) or []
+    queue     = user_context.get("bulk_recipient_queue") or []
+    pos       = user_context.get("bulk_recipient_pos", 0)
+
+    def _norm(v):
+        return re.sub(r'[^a-z0-9]+', ' ', str(v or "").lower()).strip()
+
+    reply = _norm(message)
+
+
+    picked = None
+    if reply:
+        exact = [c for c in companies if _norm(c) == reply]
+        if len(exact) == 1:
+            picked = exact[0]
+        else:
+            partial = [c for c in companies if reply in _norm(c)]
+            if len(partial) == 1:
+                picked = partial[0]
+
+    if not picked:
+        elapsed = round((time.time() - start_time) * 1000)
+        return jsonify({
+            "success": True,
+            "bot_message": "I couldn't tell which company you meant. Please pick one:",
+            "intent": "guided_flow",
+            "products": [],
+            "suggestions": companies[:8] + ["Cancel"],
+            "session_id": str(conversation.id),
+            "metadata": {
+                "flow_state": FlowState.AWAITING_BULK_COMPANY_CHOICE.value,
+                "candidates": companies,
+                "response_time_ms": elapsed,
+            },
+            "flow_state": FlowState.AWAITING_BULK_COMPANY_CHOICE.value,
+            "pagination": default_pagination(page),
+        }), 200
+
+    # Narrow the roster to the chosen company. The flag stops the question
+    # being asked again for later recipients in the same order.
+    _p = _norm(picked)
+    filtered = [r for r in roster if _norm(r.get("company")) == _p]
+
+    logger.info(
+        f"bulk_order | company choice '{picked}' → "
+        f"{len(filtered)} of {len(roster)} roster entries"
+    )
+
+    user_context["bulk_company_roster"] = filtered or roster
+    user_context["bulk_company_scope"]  = picked
+    user_context["bulk_company_choice_made"] = True
+    user_context.pop("pending_company_choice", None)
+    conversation.context_data = user_context
+    flag_modified(conversation, "context_data")
+
+    lines_as_dicts = user_context.get("pending_bulk_lines", []) or []
+    return _ask_for_bulk_recipient(
+        lines_as_dicts, queue, pos, conversation, user_context, page, start_time,
+    )
