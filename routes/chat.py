@@ -76,7 +76,11 @@ from parsers.catalog_parser import parse_csv_message
 from parsers.address_parser import extract_address, address_summary
 from utils.language_utils import detect_and_translate
 from handlers.cart_handler import handle_cart_intent
-from handlers.order_stats_handler import handle_order_stats, handle_rep_choice_reply
+from handlers.order_stats_handler import (
+    handle_order_stats,
+    handle_rep_choice_reply,
+    handle_date_range_reply,
+)
 from core.actions import build_propose_checkout_address
 from utils.rep_utils import (
     fetch_product_order_history  as _fetch_product_order_history,
@@ -364,6 +368,11 @@ def _dispatch_bulk_action(action, message, role, store_loader, conversation, use
         return handle_rep_choice_reply(
             message, conversation, user_context, page, start_time, customer_id
         )
+    elif action == "process_date_range_reply":
+        # Admin answering "which period should I cover?" for an order report.
+        return handle_date_range_reply(
+            message, conversation, user_context, page, start_time, customer_id
+        )
     elif action == "process_bulk_recipient_reply":
         return handle_bulk_recipient_reply(
             message, store_loader, conversation, user_context, page, start_time
@@ -609,6 +618,37 @@ def _maybe_attach_address_proposal(
 # ─── TYPO CORRECTION NOTE ───
 # ══════════════════════════════════════════════════════════════
 
+def _display_message(content: str) -> str:
+    """Friendly text for a stored user message that carries a structured payload.
+
+    Cards submit "__SENTINEL__<json>" so the flow handlers get exact data, and
+    that raw string is what lands in the messages table. Replaying it into the
+    transcript shows the user a wall of JSON they never typed, so it is
+    rewritten on the way out. Anything unrecognised is returned untouched.
+    """
+    if not isinstance(content, str):
+        return content
+    text = content.strip()
+
+    if text.startswith("__DATE_RANGE__"):
+        try:
+            payload = json.loads(text[len("__DATE_RANGE__"):] or "{}")
+        except (ValueError, TypeError):
+            payload = {}
+        if isinstance(payload, dict):
+            if payload.get("all_time"):
+                return "📅 All time"
+            after, before = payload.get("after"), payload.get("before")
+            if after and before:
+                return f"📅 {after} to {before}"
+        return "📅 Selected a date range"
+
+    if text.startswith("__BULK_ADDR__"):
+        return "✏️ Updated billing & shipping address"
+
+    return content
+
+
 def _build_typo_correction_note(corrections: list, found_results: bool = True) -> str:
     """
     Render a short, honest note when we silently corrected misspelled terms
@@ -781,7 +821,11 @@ def get_chat_history():
         for msg in messages_query:
             item = {
                 "role":      msg.role,
-                "message":   msg.content,
+                # Structured picks are stored verbatim so the flow handlers can
+                # re-read them, but the raw "__SENTINEL__{json}" is not what the
+                # user typed and must never surface in a replayed transcript.
+                # The live path masks these in the widget; this covers reload.
+                "message":   _display_message(msg.content) if msg.role == "user" else msg.content,
                 "intent":    msg.intent,
                 "timestamp": msg.created_at.isoformat(),
             }

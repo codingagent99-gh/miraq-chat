@@ -220,6 +220,12 @@ class ExtractedEntities:
     # ──── Time range (ORDER_HISTORY) ────
     date_after: Optional[str] = None
     date_before: Optional[str] = None
+    # True once a date window has been DECIDED, which is not the same as
+    # date_after/date_before being populated: "all time" is a deliberate choice
+    # that leaves both bounds None. Order reporting blocks on an undecided
+    # window, so without this flag an explicit all-time answer would be
+    # indistinguishable from "the user never said" and re-prompt forever.
+    date_range_resolved: bool = False
 
     # ──── Tag+attribute OR pairs ────
     # Populated when a term matches BOTH a tag slug AND a pa_* attribute term.

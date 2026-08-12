@@ -46,6 +46,12 @@ class FlowState(Enum):
     # Admin picking between several reps who match a name in an order report
     AWAITING_REP_CHOICE = "awaiting_rep_choice"
 
+    # Admin choosing the date window for an order report, when the question
+    # named no period at all. Reporting blocks here rather than defaulting to
+    # all-time: a total silently covering a different window than the asker had
+    # in mind is a wrong answer that looks like a right one.
+    AWAITING_DATE_RANGE = "awaiting_date_range"
+
     # Rep picking which COMPANY a bulk order is for, when a fuzzy company
     # lookup matched more than one business. Always resolved BEFORE the
     # recipient question, so the person list never mixes two companies.
@@ -70,6 +76,7 @@ _ORDER_FLOW_STATES = {
     FlowState.AWAITING_BULK_QUANTITY,
     FlowState.AWAITING_BULK_COMPANY_CHOICE,
     FlowState.AWAITING_REP_CHOICE,
+    FlowState.AWAITING_DATE_RANGE,
 }
 
 # Bare exit vocabulary. Shared by the in-flow escape hatch below and by the
@@ -122,6 +129,7 @@ def _flow_context_message(state: FlowState) -> dict:
         FlowState.AWAITING_BULK_COMPANY:           "Please provide the company name for this order",
         FlowState.AWAITING_BULK_RECIPIENT:         "Please tell me who this order is for",
         FlowState.AWAITING_REP_CHOICE:             "Please pick which rep you meant",
+        FlowState.AWAITING_DATE_RANGE:             "Please pick a date range, or choose **All time**",
         FlowState.AWAITING_BULK_COMPANY_CHOICE:    "Please pick which company this order is for",
         FlowState.AWAITING_BULK_RECIPIENT_MODE:    "Please say whether these are for the same person or different people",
         FlowState.AWAITING_BULK_ADDRESS_CHOICE:    "Please pick which address to ship to",
@@ -541,6 +549,30 @@ def handle_flow_state(
         return {
             "action": "process_bulk_company_choice_reply",
             "flow_state": FlowState.AWAITING_BULK_COMPANY_CHOICE.value,
+            "pass_through": False,
+        }
+
+    # ── State: Admin choosing the date window for an order report ──
+    if state == FlowState.AWAITING_DATE_RANGE:
+        # Structured pick from the date-range card: "__DATE_RANGE__<json>".
+        # Checked against the RAW message, not the lowercased `text`, so the
+        # prefix and the JSON payload survive intact — same reason the bulk
+        # address branch does it.
+        if message.strip().startswith("__DATE_RANGE__"):
+            return {
+                "action": "process_date_range_reply",
+                "flow_state": FlowState.AWAITING_DATE_RANGE.value,
+                "pass_through": False,
+            }
+        if not message.strip():
+            return _flow_context_message(FlowState.AWAITING_DATE_RANGE)
+        # Anything else is treated as a typed window ("last quarter",
+        # "01/02/2026 to 03/15/2026"). It still routes to the same handler,
+        # which re-runs the extractor over it — typing a range must work
+        # exactly as well as clicking one.
+        return {
+            "action": "process_date_range_reply",
+            "flow_state": FlowState.AWAITING_DATE_RANGE.value,
             "pass_through": False,
         }
 

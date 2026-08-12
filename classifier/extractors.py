@@ -790,6 +790,36 @@ def _add_months(dt: datetime, months: int) -> datetime:
     return dt.replace(year=year, month=month, day=day)
 
 
+# Explicit numeric date tokens. ISO is listed first and tried first: it is
+# unambiguous, so it must never be reinterpreted under the US day/month order.
+# The remaining formats are read MM/DD/YYYY, matching the assumption already
+# baked into _normalize_fused_dates() above — the two must agree or the same
+# string parses differently depending on whether it arrived fused.
+_EXPLICIT_DATE_FORMATS = ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y")
+
+# One explicit date. Kept deliberately narrow (4-digit years, or 2-digit only
+# with slashes) so it cannot swallow dimensions like "12/24" or a bare year.
+_EXPLICIT_DATE_PAT = r'\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{4}|\d{1,2}/\d{1,2}/\d{2}'
+
+# "<date> to <date>", "<date> - <date>", "from <date> until <date>",
+# "between <date> and <date>".
+_EXPLICIT_RANGE_RE = re.compile(
+    rf'(?:\bbetween\s+)?({_EXPLICIT_DATE_PAT})\s*(?:to|and|until|through|thru|[-–—])\s*({_EXPLICIT_DATE_PAT})',
+    re.I,
+)
+
+
+def _parse_explicit_date(token: str) -> Optional[datetime]:
+    """Parse one explicit numeric date token, or None if no format fits."""
+    token = token.strip()
+    for fmt in _EXPLICIT_DATE_FORMATS:
+        try:
+            return datetime.strptime(token, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def extract_time_range(text: str, entities: ExtractedEntities):
     """Extract date/time ranges for order history queries."""
     text_lower = text.lower()
@@ -798,6 +828,26 @@ def extract_time_range(text: str, entities: ExtractedEntities):
     def _set(start: datetime, end: datetime):
         entities.date_after  = start.replace(hour=0,  minute=0,  second=0,  microsecond=0).isoformat()
         entities.date_before = end.replace(  hour=23, minute=59, second=59, microsecond=999999).isoformat()
+
+    # ── Explicit numeric range: "01/02/2026 to 03/15/2026", "2026-01-02 - 2026-03-15"
+    # Checked FIRST. An explicit range is the most specific signal a user can
+    # give; every pattern below is a fuzzier reading of the same text, and
+    # several would happily match a fragment of it ("between ... and ..." and
+    # the bare 4-digit year in the dateparser guard both would).
+    m_explicit = _EXPLICIT_RANGE_RE.search(text_lower)
+    if m_explicit:
+        start = _parse_explicit_date(m_explicit.group(1))
+        end   = _parse_explicit_date(m_explicit.group(2))
+        # An inverted range is NOT repaired here. The named-month branch below
+        # rolls end forward a year when it precedes start, which is right for
+        # "between dec 5 and jan 10" — and wrong for an explicit year the user
+        # typed on purpose. Falling through leaves the later branches (and
+        # ultimately the picker) to handle it rather than silently reporting on
+        # a window nobody asked for.
+        if start and end and start <= end:
+            _set(start, end)
+            entities.date_range_resolved = True
+            return
 
     # ── Period-to-date: "week to date"/"WTD", "month to date"/"MTD",
     # "quarter to date", "year to date"
@@ -1008,7 +1058,18 @@ def extract_time_range(text: str, entities: ExtractedEntities):
     normalized = re.sub(r'\b\d+\s*["\'](?!\s*(?:[xX×]|\d))', ' ', normalized)
     normalized = re.sub(r'\s+', ' ', normalized).strip()
 
-    parsed = search_dates(normalized, settings={'PREFER_DATES_FROM': 'past', 'RETURN_AS_TIMEZONE_AWARE': False})
+    # DATE_ORDER is pinned rather than left to dateparser's default so this
+    # fallback reads "01/02/2026" the same way the explicit branch above and
+    # _normalize_fused_dates() do. Unpinned, the same string could resolve to
+    # two different months depending on which path claimed it.
+    parsed = search_dates(
+        normalized,
+        settings={
+            'PREFER_DATES_FROM': 'past',
+            'RETURN_AS_TIMEZONE_AWARE': False,
+            'DATE_ORDER': 'MDY',
+        },
+    )
     if parsed:
         dates = sorted(
             p[1].replace(tzinfo=None) if p[1].tzinfo else p[1]
