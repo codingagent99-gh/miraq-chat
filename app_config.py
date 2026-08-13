@@ -258,8 +258,8 @@ def _load_custom_order_roles() -> frozenset:
     return frozenset({"cs_rep", "project_manager", "cs_project_manager"})
 
 CUSTOM_ORDER_ROLES: frozenset = _load_custom_order_roles()
-BULK_ORDER_ROLES: frozenset = CUSTOM_ORDER_ROLES | frozenset({"sales_rep"})
-
+# BULK_ORDER_ROLES: frozenset = CUSTOM_ORDER_ROLES | frozenset({"sales_rep"})
+BULK_ORDER_ROLES: frozenset = CUSTOM_ORDER_ROLES | frozenset({"sales_rep", "administrator"})
 # ── Order reporting (rep sample counts, order lists by date range) ───────────
 # Roles allowed to see reporting ACROSS reps/customers. The rep roles above are
 # scoped to their own book; this tier is not. Override with ORDER_REPORT_ADMIN_ROLES_JSON.

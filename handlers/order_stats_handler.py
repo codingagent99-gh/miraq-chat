@@ -50,23 +50,15 @@ DATE_RANGE_SENTINEL = "__DATE_RANGE__"
 # unable to do anything else in the widget.
 _MAX_DATE_RANGE_ATTEMPTS = 2
 
-def _fmt_date_mdy(iso_date: str) -> str:
-    """'2026-01-02' -> '01/02/2026'. Falls back to the raw ISO slice if the
-    string isn't a parseable calendar date (defensive — callers only ever
-    pass the first 10 chars of an already-validated ISO timestamp)."""
-    try:
-        return datetime.strptime(iso_date[:10], "%Y-%m-%d").strftime("%m/%d/%Y")
-    except ValueError:
-        return iso_date[:10]
 
 def _describe_range(date_after, date_before) -> str:
     """Human phrase for the window, or '' when unbounded."""
     if date_after and date_before:
-        return f"{_fmt_date_mdy(date_after)} to {_fmt_date_mdy(date_before)}"
+        return f"{date_after[:10]} to {date_before[:10]}"
     if date_after:
-        return f"since {_fmt_date_mdy(date_after)}"
+        return f"since {date_after[:10]}"
     if date_before:
-        return f"up to {_fmt_date_mdy(date_before)}"
+        return f"up to {date_before[:10]}"
     return ""
 
 
@@ -82,8 +74,15 @@ def _clear_stats_pending(user_context):
     user_context.pop("pending_order_stats", None)
 
 
-def _park_date_range_prompt(conversation, user_context, rep, role, attempts=0):
+def _park_date_range_prompt(conversation, user_context, rep, role, attempts=0,
+                            kind="stats"):
     """Park the report and ask for a window. Returns the action payload.
+
+    `kind` records WHICH report is waiting on the window — "stats" for the
+    aggregate rep count, "order_list" for the admin's all-orders list. Both
+    park in the same flow state and reuse the same picker, so without the
+    discriminator the resume path would run the stats report for a user who
+    asked to see the order list.
 
     The token is the defence against a replayed card: /history re-renders
     stored actions verbatim, so a picker from a finished conversation comes
@@ -97,6 +96,7 @@ def _park_date_range_prompt(conversation, user_context, rep, role, attempts=0):
         "role": role,
         "token": token,
         "attempts": attempts,
+        "kind": kind,
     }
     conversation.flow_state = FlowState.AWAITING_DATE_RANGE.value
     conversation.context_data = user_context
@@ -383,6 +383,35 @@ def handle_rep_choice_reply(
     )
 
 
+def prompt_for_order_list_range(conversation, user_context, role, start_time, page=1):
+    """Ask which period the admin's all-orders list should cover.
+
+    Separate entry point from handle_order_stats' own prompt so the order-list
+    flow can park without pretending to be a stats query, but the card, the
+    flow state, and the reply handler are shared.
+    """
+    action = _park_date_range_prompt(
+        conversation, user_context, None, role, kind="order_list",
+    )
+    elapsed = round((time.time() - start_time) * 1000)
+    return jsonify({
+        "success": True,
+        "bot_message": "Which period should the order list cover?",
+        "intent": "order_history",
+        "products": [],
+        "orders": [],
+        "suggestions": ["This week", "This month", "This quarter", "This year", "All time", "Cancel"],
+        "session_id": str(conversation.id),
+        "metadata": {
+            "flow_state": FlowState.AWAITING_DATE_RANGE.value,
+            "response_time_ms": elapsed,
+        },
+        "pagination": default_pagination(page),
+        "actions": [action],
+        "flow_state": FlowState.AWAITING_DATE_RANGE.value,
+    }), 200
+
+
 def handle_date_range_reply(
     message, conversation, user_context, page, start_time, customer_id=None,
 ):
@@ -502,7 +531,21 @@ def handle_date_range_reply(
     # Resolved — clear the prompt and run the report.
     rep  = pending.get("rep")
     role = pending.get("role") or (user_context or {}).get("role") or (user_context or {}).get("user_role")
+    kind = pending.get("kind", "stats")
     _reset_idle()
+
+    if kind == "order_list":
+        # Hand the resolved window back to the caller rather than running the
+        # report here: the order list is answered through the normal API-call
+        # pipeline (build -> execute -> handle_order_status), which lives in
+        # routes/chat.py. Re-running it from inside this module would mean
+        # duplicating that pipeline.
+        return {
+            "resume": "order_list",
+            "date_after": date_after,
+            "date_before": date_before,
+            "role": role,
+        }
 
     class _E:
         pass
@@ -552,6 +595,7 @@ def _retry_date_range(conversation, user_context, pending, _respond, reason):
     action = _park_date_range_prompt(
         conversation, user_context,
         pending.get("rep"), pending.get("role"), attempts=attempts,
+        kind=pending.get("kind", "stats"),
     )
     return _respond(
         f"{reason} Pick a period below, or type one like *\"last quarter\"* "

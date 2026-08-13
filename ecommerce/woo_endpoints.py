@@ -344,6 +344,36 @@ class WooEndpoints:
             requires_resolution=requires_resolution or [],
         )
 
+    def list_all_orders(
+        self,
+        page: int,
+        per_page: int = 20,
+        description: str = "",
+        requires_resolution: Optional[List[str]] = None,
+        **filters,
+    ) -> WooAPICall:
+        """Row 5.1b — GET /orders with NO customer filter (admin only).
+
+        Identical to list_customer_orders minus the `customer` param. The
+        caller is responsible for the admin check; the plugin re-checks
+        capabilities server-side, which is the real enforcement point.
+        """
+        params = {
+            "per_page": per_page,
+            "page": page,
+            "orderby": "date",
+            "order": "desc",
+            **filters,
+        }
+        return WooAPICall(
+            method="GET",
+            endpoint="/orders",
+            params=params,
+            surface="admin",
+            description=description or "List all store orders",
+            requires_resolution=requires_resolution or [],
+        )
+
     def fetch_order(
         self,
         order_id: int,

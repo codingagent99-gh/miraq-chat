@@ -21,6 +21,7 @@ from models import ExtractedEntities, ClassifiedResult, WooAPICall
 from app_config import (
     ORDER_INTENTS,
     CART_INTENTS,
+    is_order_report_admin,
     ORDER_CREATE_INTENTS,
     CLASSIFIER_PROVIDER_TAG,
     BULK_ORDER_ROLES,
@@ -80,6 +81,7 @@ from handlers.order_stats_handler import (
     handle_order_stats,
     handle_rep_choice_reply,
     handle_date_range_reply,
+    prompt_for_order_list_range,
 )
 from core.actions import build_propose_checkout_address
 from utils.rep_utils import (
@@ -370,6 +372,10 @@ def _dispatch_bulk_action(action, message, role, store_loader, conversation, use
         )
     elif action == "process_date_range_reply":
         # Admin answering "which period should I cover?" for an order report.
+        # Returns a Flask response for the stats report, or a plain dict when
+        # the window belongs to the ALL-ORDERS list — that one is answered by
+        # the normal API-call pipeline further down, so it can't be completed
+        # from inside the handler. The dict is passed back to the caller.
         return handle_date_range_reply(
             message, conversation, user_context, page, start_time, customer_id
         )
@@ -1129,6 +1135,8 @@ def _build_final_response(
     products        = []
     categories      = []
     suggestions_list = []
+    _sr_ctx     = payload_context or {}
+    _sr_role    = _sr_ctx.get("role", "")
 
     if intent in (Intent.CATEGORY_LIST, Intent.PRODUCT_CATALOG):
         seen_names = set()
@@ -1248,11 +1256,12 @@ def _build_final_response(
     }
 
     if intent in (Intent.ORDER_HISTORY, Intent.LAST_ORDER) and order_data:
-        response["orders"]            = [format_order_for_frontend(o) for o in order_data]
-        response["order_pagination"]  = build_pagination(page, api_responses, api_calls_to_execute)
+        response["orders"]           = [format_order_for_frontend(o) for o in order_data]
+        response["order_pagination"] = build_pagination(page, api_responses, api_calls_to_execute)
+        # Mirrors the admin gate in handle_order_status (order_handler.py) —
+        # without this the frontend never offers the CSV download control.
+        response["metadata"]["allow_order_download"] = is_order_report_admin(_sr_role)
 
-    _sr_ctx     = payload_context or {}
-    _sr_role    = _sr_ctx.get("role", "")
     _sr_actions = response.get("actions", [])
 
     # Rep-only affordances are WooCommerce-only: the bulk-order and CS-rep
@@ -1930,17 +1939,31 @@ def chat():
             if resp:
                 return _ft(resp)
 
+        _resume_order_list = None
+
         # ── Early action dispatch ──────────────────────────────────────────
         # Bulk/rep flow actions short-circuit here before classification so
         # replies like "Yes, confirm" or "Change address" are never misrouted
         # to the product-search or update_customer classifier paths.
         if _flow_action:
+            # A resume dict (not a response) means the flow resolved a date
+            # window for the all-orders list; fall through to classification
+            # with the window applied instead of returning here.
             resp = _dispatch_bulk_action(
                 _flow_action, message, role, store_loader,
                 conversation, user_context, page, start_time,
                 customer_id=customer_id,
             )
-            if resp is not None:
+            if isinstance(resp, dict) and resp.get("resume") == "order_list":
+                # Not a response — the admin picked a window for the
+                # all-orders list. Rewrite the turn as an order-history
+                # request carrying that window and let the normal pipeline
+                # answer it, so there is one code path building order lists
+                # rather than two that can drift apart.
+                _resume_order_list = resp
+                message = "view all orders"
+                _skip_classification = False
+            elif resp is not None:
                 return _ft(resp)
 
         # ── Step 3: Classify ──
@@ -2184,6 +2207,28 @@ def chat():
                 conversation.context_data = user_context
                 flag_modified(conversation, "context_data")
                 return _ft(stats_resp)
+
+        # ── Step 6.4b: Admin all-orders list needs a window ──
+        # An administrator asking for orders gets the WHOLE store, which on a
+        # real catalog is thousands of rows. Same reasoning as the stats
+        # report: ask which period rather than silently picking one. Reuses
+        # the same picker, flow state, and reply handler.
+        if intent == Intent.ORDER_HISTORY:
+            _role = user_context.get("role") or user_context.get("user_role")
+            if is_order_report_admin(_role):
+                if _resume_order_list:
+                    # Window already chosen this turn — apply it and continue.
+                    entities.date_after  = _resume_order_list.get("date_after")
+                    entities.date_before = _resume_order_list.get("date_before")
+                elif not getattr(entities, "date_after", None) \
+                        and not getattr(entities, "date_before", None) \
+                        and not getattr(entities, "date_range_resolved", False):
+                    list_resp = prompt_for_order_list_range(
+                        conversation, user_context, _role, start_time, page,
+                    )
+                    conversation.context_data = user_context
+                    flag_modified(conversation, "context_data")
+                    return _ft(list_resp)
 
         # ── Step 6.5: Cart intent fork ──
         if intent in CART_INTENTS or intent == Intent.CHECKOUT:
@@ -2558,7 +2603,10 @@ def chat():
                 o for o in order_data
                 if (o.get("billing", {}).get("email") or "").lower() == _want
             ]
-        resp = handle_order_status(intent, entities, order_data, customer_id, str(conversation.id), page, start_time)
+        resp = handle_order_status(
+            intent, entities, order_data, customer_id, str(conversation.id), page, start_time,
+            role=user_context.get("role") or user_context.get("user_role"),
+        )
         if resp:
             return _ft(resp)
 

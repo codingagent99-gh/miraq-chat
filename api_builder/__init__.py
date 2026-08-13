@@ -10,7 +10,12 @@ import re
 from typing import List, Optional
 
 from models import Intent, ClassifiedResult, WooAPICall, ExtractedEntities
-from app_config import CUSTOM_ORDER_ROLES, DEFAULT_PER_PAGE, DEFAULT_ORDER_PER_PAGE
+from app_config import (
+    CUSTOM_ORDER_ROLES,
+    DEFAULT_PER_PAGE,
+    DEFAULT_ORDER_PER_PAGE,
+    is_order_report_admin,
+)
 from config.store_config import TAG_SLUG_QUICK_SHIP
 from chat_logger import get_logger
 
@@ -268,7 +273,31 @@ def _build_last_order(e, page, customer_id=None, role=None) -> list:
     )]
 
 
+# How many orders an admin's store-wide list pulls per page. Higher than the
+# shopper default because the admin view is a report, not a "your recent
+# orders" glance — but still capped, since the whole page is serialised into
+# the chat payload and then into a CSV in the browser.
+ADMIN_ORDER_PER_PAGE = 50
+
+
 def _build_order_history(e, page, customer_id=None, role=None) -> list:
+    # ── Admin: every order in the store, not just the admin's own ──────────
+    # Checked BEFORE the customer-scoped branches below, which would otherwise
+    # pin an administrator to customer_id=CURRENT_USER_ID and show them their
+    # personal purchase history instead of the store's orders.
+    if is_order_report_admin(role):
+        extra = {}
+        if getattr(e, "date_after", None):
+            extra["after"] = e.date_after
+        if getattr(e, "date_before", None):
+            extra["before"] = e.date_before
+        return [endpoints.list_all_orders(
+            page=page,
+            per_page=e.order_count or ADMIN_ORDER_PER_PAGE,
+            description="Admin: all store orders",
+            **extra,
+        )]
+
     if role in CUSTOM_ORDER_ROLES:
         body = {"customer_id": "CURRENT_USER_ID", "page": page, "per_page": e.order_count or DEFAULT_ORDER_PER_PAGE}
         if getattr(e, "date_after", None): body["after"] = e.date_after

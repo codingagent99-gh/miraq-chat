@@ -109,7 +109,14 @@ class WooClient:
                 body_str = str(api_call.body)
             api_logger.info(f"REQUEST {api_call.method} {sanitized_endpoint} | body={body_str}{context}")
 
-        logger.info(f"API call: {api_call.method} {endpoint_short} | params={safe_params}")
+        # The body matters as much as the params on POST endpoints — a
+        # resolved-but-wrong customer_id is invisible when only params are
+        # logged, which is exactly the blind spot that made an empty CS-rep
+        # order list impossible to diagnose from logs alone.
+        _safe_body = ""
+        if getattr(api_call, "body", None):
+            _safe_body = f" | body={api_call.body}"
+        logger.info(f"API call: {api_call.method} {endpoint_short} | params={safe_params}{_safe_body}")
 
         _req_start = _time.time()
 

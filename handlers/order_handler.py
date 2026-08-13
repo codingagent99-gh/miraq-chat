@@ -504,7 +504,8 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
         "pagination": default_pagination(page),
     }), 200
 
-def handle_order_status(intent, entities, order_data, customer_id, session_id, page, start_time):
+def handle_order_status(intent, entities, order_data, customer_id, session_id, page, start_time,
+                        role=None):
     """Step 3.5d: Handle ORDER_STATUS/ORDER_TRACKING when no specific order ID was given.
 
     When the user asks about an order without providing a number, api_builder
@@ -580,6 +581,7 @@ def handle_order_status(intent, entities, order_data, customer_id, session_id, p
         bot_msg = f"I found {len(order_data)} recent orders. Tap one to see its status."
 
     from handlers.chat_utils import format_order_for_frontend
+    from app_config import is_order_report_admin
     return jsonify({
         "success": True,
         "bot_message": bot_msg,
@@ -591,6 +593,11 @@ def handle_order_status(intent, entities, order_data, customer_id, session_id, p
         "metadata": {
             "flow_state": FlowState.AWAITING_ORDER_DETAIL.value,
             "response_time_ms": round(elapsed * 1000),
+            # Decided here, not in the widget: the export carries customer
+            # names, emails and addresses, and the browser has no basis to
+            # authorise that. The plugin re-checks capabilities on the fetch
+            # itself, so this only governs whether the control is OFFERED.
+            "allow_order_download": is_order_report_admin(role),
         },
         "pagination": default_pagination(page),
         "flow_state": FlowState.AWAITING_ORDER_DETAIL.value,

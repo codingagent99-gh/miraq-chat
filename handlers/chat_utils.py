@@ -435,21 +435,41 @@ def format_order_for_frontend(order: dict) -> dict:
     except (ValueError, TypeError):
         total = 0.0
 
+    billing = order.get("billing", {}) or {}
+
+    # Customer identity is absent on guest checkouts, where WooCommerce reports
+    # customer_id 0 (not null) and leaves the customer_* fields empty — the
+    # billing block is the only place the name and email exist. An admin
+    # looking at a store-wide list needs to see WHOSE order each row is, so
+    # fall back rather than render a blank.
+    _first = (billing.get("first_name") or "").strip()
+    _last  = (billing.get("last_name") or "").strip()
+    customer_name = " ".join(p for p in (_first, _last) if p)
+
     return {
         "id": order.get("id"),
         "order_number": str(order.get("number") or order.get("id", "")),
         "status": order.get("status", "unknown"),
         "currency": order.get("currency_symbol") or get_currency_symbol(),
+        # ISO code as well as the symbol: a spreadsheet wants "INR", which
+        # sorts and filters, not "₹", which does neither.
+        "currency_code": order.get("currency", ""),
         "total": total,
         "subtotal": order.get("subtotal", "0"),
         "shipping_total": order.get("shipping_total", "0"),
+        "tax_total": order.get("total_tax", "0"),
+        "discount_total": order.get("discount_total", "0"),
         "date_created": order.get("date_created", ""),
         "date_paid": order.get("date_paid"),
+        "date_completed": order.get("date_completed"),
+        "customer_id": order.get("customer_id", 0),
+        "customer_name": customer_name,
+        "customer_email": billing.get("email", ""),
         "payment_method": order.get("payment_method_title", ""),
         "items": items,
         "item_count": len(items),
         "shipping": order.get("shipping", {}),
-        "billing": order.get("billing", {}),
+        "billing": billing,
     }
 
 def build_out_of_stock_response(product_name: str, product_raw: dict, intent, session_id: str, page: int, start_time: float):
