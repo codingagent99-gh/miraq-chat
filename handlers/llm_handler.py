@@ -161,9 +161,29 @@ def run_llm_fallback(
         llm_metadata = llm_result.get("metadata", {})
         llm_metadata["response_time_ms"] = round(elapsed * 1000)
 
+        _msg = (llm_result.get("bot_message") or "").strip()
+        if not _msg:
+            disambig = get_disambiguation_message()
+            llm_metadata["flow_state"] = disambig["flow_state"]
+            logger.info(
+                f"Step 1.5: conversational with no message — returning disambiguation | "
+                f"skipped={llm_metadata.get('llm_skipped', 'none')}"
+            )
+            return jsonify({
+                "success": True,
+                "bot_message": disambig["bot_message"],
+                "intent": "disambiguation",
+                "products": [],
+                "suggestions": disambig["suggestions"],
+                "session_id": session_id,
+                "metadata": llm_metadata,
+                "flow_state": disambig["flow_state"],
+                "pagination": default_pagination(page),
+            }), 200
+
         return jsonify({
             "success": True,
-            "bot_message": llm_result["bot_message"],
+            "bot_message": _msg,
             "intent": "conversational",
             "products": [],
             "suggestions": list(_FALLBACK_SUGGESTIONS),

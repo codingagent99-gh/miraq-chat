@@ -38,6 +38,30 @@ logger = get_logger("miraq_chat")
 # Used in the LLM system prompt so it can only pick from this fixed list.
 _VALID_INTENTS = ", ".join(i.value for i in Intent if i != Intent.UNKNOWN) + ", unknown"
 
+# Tokens that only ever MODIFY a subject — periods, quantifiers, determiners,
+# ordinals. A message consisting solely of these narrows something without
+# saying what, so it carries no intent of its own. Used by
+# _is_subjectless_fragment; keep it closed and boring — every word added here
+# is a word that can no longer stand alone as a question.
+_MODIFIER_ONLY_TOKENS = frozenset({
+    # determiners / demonstratives
+    "a", "an", "the", "this", "that", "these", "those", "it", "them",
+    # period words
+    "day", "days", "week", "weeks", "month", "months", "quarter", "quarters",
+    "year", "years", "today", "yesterday", "tomorrow", "morning", "evening",
+    "mtd", "qtd", "ytd", "time", "date", "period", "range",
+    # relative position
+    "last", "next", "past", "previous", "prior", "current", "recent",
+    "coming", "upcoming", "ago", "since", "until", "till", "from", "to",
+    "between", "before", "after", "during", "within", "over",
+    # quantifiers
+    "all", "any", "some", "none", "every", "each", "both", "few", "many",
+    "more", "most", "less", "least", "only", "just", "of", "and", "or",
+    # bare ordinals/numerals that modify a period ("last 3 months")
+    "first", "second", "third", "fourth", "one", "two", "three", "four",
+    "five", "six", "seven", "eight", "nine", "ten", "twelve",
+})
+
 
 # ══════════════════════════════════════════════════════════════
 # PRIVACY & SANITIZATION
@@ -246,7 +270,15 @@ relevant intent for this message — it may be off-topic, small talk, or otherwi
 shopping or order support. If you can confidently identify a relevant intent anyway, return
 "intent_resolved". Otherwise return "conversational" with a brief, friendly bot_message
 acknowledging you're not sure how to help with that specific message, in the context of a store
-chatbot."""
+chatbot.
+
+"Unknown" is a legitimate answer and is often the correct one — you are not required to find an
+intent. In particular, a message that only MODIFIES something without naming what it modifies
+carries no intent to find: a bare time period ("this quarter", "last week"), a bare quantifier
+("all of them"), a bare attribute ("the blue one") with nothing in the history it could attach to.
+Do not guess a subject for these. Return "conversational" and ask what they'd like for that
+period / which item they mean. Resolving such a fragment to a browsing or order intent produces a
+confident answer to a question the user never asked, which is worse than admitting uncertainty."""
 
     prompt = f"""You are an intent classifier for a WooCommerce store chatbot.
 
@@ -505,6 +537,34 @@ class LLMClient:
 # STEP 1.5: PRE-API FALLBACK
 # ══════════════════════════════════════════════════════════════
 
+def _is_subjectless_fragment(text: str) -> bool:
+    """True when every token is a modifier and none names a subject.
+
+    Guards the LLM fallback against messages like "this quarter" — a phrase
+    that narrows something without ever saying what. The local date extractor
+    resolves such a phrase to a real range regardless of context, which makes
+    it look meaningful downstream; it is not, on its own, a question.
+
+    The word list is intentionally small and closed. Anything outside it —
+    "orders", "tiles", a product name, a verb — counts as a subject and this
+    returns False, leaving the LLM path untouched. Erring toward False is the
+    safe direction: the cost is one unnecessary LLM call, whereas erring
+    toward True would suppress the fallback on real questions.
+    """
+    if not text:
+        return False
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    if not tokens:
+        return False
+    # A bare number is NOT a modifier on its own — "1066502" is most likely an
+    # order number, i.e. a real subject. Digits only count as modifiers when
+    # something else in the message is already modifier-shaped, which is what
+    # makes "the last 3 months" a fragment and "129" not one.
+    if all(t.isdigit() for t in tokens):
+        return False
+    return all(t.isdigit() or t in _MODIFIER_ONLY_TOKENS for t in tokens)
+
+
 def llm_fallback(
     user_message: str,
     original_intent: str,
@@ -548,6 +608,41 @@ def llm_fallback(
         f"confidence={original_confidence:.2f} | message=\"{sanitize_log_string(user_message)}\""
     )
 
+
+    # ── Subjectless fragments never reach the LLM ───────────────────────────
+    # A message made up ENTIRELY of modifiers — a bare period ("this
+    # quarter"), a bare quantifier ("all of them") — names no subject, so
+    # there is no intent in it to find. Asking the LLM anyway does not
+    # produce "I don't know": it is handed a list of intents and told to pick
+    # one, which is how "this quarter" came back as HISTORICAL_SEARCH at 0.95
+    # confidence and was then announced to the user as a purchase they had
+    # made. The local classifier's UNKNOWN was correct here; this guard lets
+    # it stand and routes to the same clarification menu an unparseable
+    # message already gets.
+    #
+    # Deliberately narrow: EVERY token must be a modifier. "orders this
+    # quarter" keeps "orders" and is not a fragment, so it still goes to the
+    # LLM exactly as before. Only fires on unknown_intent — a low-confidence
+    # guess or a missing entity means the classifier DID find a subject, and
+    # the conversation history may well supply the rest.
+    if trigger_reason == "unknown_intent" and _is_subjectless_fragment(user_message):
+        logger.info(
+            f"Step 1.5: LLM fallback skipped \u2014 subjectless fragment | "
+            f"session={session_id} | message=\"{sanitize_log_string(user_message)}\""
+        )
+        return {
+            "success": True,
+            "fallback_type": "conversational",
+            "intent": "unknown",
+            "bot_message": "",   # caller falls back to the clarification menu
+            "confidence": 0.0,
+            "metadata": {
+                "llm_trigger_reason": trigger_reason,
+                "original_intent": original_intent,
+                "original_confidence": original_confidence,
+                "llm_skipped": "subjectless_fragment",
+            },
+        }
     try:
         # Sanitize user message
         sanitized_message = _sanitize_for_llm(user_message)

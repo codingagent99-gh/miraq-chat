@@ -158,7 +158,6 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
     if not seed_products:
         filter_parts = []
         if entities.product_name: filter_parts.append(entities.product_name)
-        elif entities.search_term: filter_parts.append(entities.search_term)
         filter_parts.extend(entities.tag_slugs)
         filter_parts.extend(list(entities.attributes.values()))
         filter_str = " ".join(filter_parts).replace("-", " ") or "that description"
@@ -211,15 +210,22 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
         
     formatted_products = [p for p in formatted_products if p.get("name")]
 
-    # 🚀 FIX: Dynamic Yes/No conversational response
+    _filtered_on_product = bool(entities.product_id or entities.product_name)
+    _filtered_on_attrs = bool(
+        entities.tag_slugs or entities.attributes or entities.attr_tag_or_pairs
+    )
+
+    # Dynamic Yes/No conversational response
     if specific_order_id:
         bot_message = f"Here are the products from order **#{specific_order_id}**! 📦\n\n"
-    elif entities.product_id or entities.product_name or entities.search_term:
-        p_name = entities.product_name or entities.search_term or "that product"
+    elif _filtered_on_product:
+        p_name = entities.product_name or "that product"
         bot_message = f"Yes, you have ordered **{p_name}** before! Here are the details of your past purchase(s): 🎯\n\n"
-    else:
+    elif _filtered_on_attrs:
         filter_str = " ".join(entities.tag_slugs + list(entities.attributes.values())).replace("-", " ") or "that description"
         bot_message = f"Here are your previous purchases matching **{filter_str}**! 🎯\n\n"
+    else:
+        bot_message = "Here are your recent purchases: 🎯\n\n"
         
     if purchased_items_text:
         bot_message += "You specifically ordered:\n" + "\n".join(purchased_items_text) + "\n\n"
