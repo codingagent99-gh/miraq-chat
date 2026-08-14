@@ -291,7 +291,7 @@ def phase2_nlp_merge(
         'quantity', 'order_id', 'reorder', 'explicit_last_order', 'order_item_name',
         'quick_ship', 'customer_updates', 'billing_updates', 'shipping_updates',
         'customer_fields_requested',
-        'target_rep_name', 'sort_by',
+        'target_rep_name', 'sort_by', 'mode', 'scope',
     ]
     for _f in _action_fields:
         _val = getattr(original_nlp_result.entities, _f, None)

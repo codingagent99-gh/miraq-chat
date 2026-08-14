@@ -273,32 +273,50 @@ def _build_last_order(e, page, customer_id=None, role=None) -> list:
     )]
 
 
-# How many orders an admin's store-wide list pulls per page. Higher than the
-# shopper default because the admin view is a report, not a "your recent
-# orders" glance — but still capped, since the whole page is serialised into
-# the chat payload and then into a CSV in the browser.
+# How many orders an admin's order list pulls per page — both the store-wide
+# list and the admin's own ("my orders") list, which is the same kind of
+# report and so uses the same page size. Higher than the shopper default
+# because the admin view is a report, not a "your recent orders" glance — but
+# still capped, since the whole page is serialised into the chat payload and
+# then into a CSV in the browser. Pagination beyond page 1 is handled by
+# build_pagination() off WooCommerce's total_pages header.
 ADMIN_ORDER_PER_PAGE = 50
 
 
 def _build_order_history(e, page, customer_id=None, role=None) -> list:
-    # ── Admin: every order in the store, not just the admin's own ──────────
+    # ── Admin: three-way scope — self / person / all ────────────────────────
     # Checked BEFORE the customer-scoped branches below, which would otherwise
-    # pin an administrator to customer_id=CURRENT_USER_ID and show them their
-    # personal purchase history instead of the store's orders.
+    # unconditionally pin an administrator to customer_id=CURRENT_USER_ID.
+    #
+    # `scope` comes from OrderActionEvaluator ("my orders" -> self, "all
+    # orders" -> all) or is None when neither wording was present. A named
+    # person ("orders by Jennifer") is intercepted earlier by
+    # OrderStatsEvaluator -> Intent.ORDER_STATS_BY_REP and never reaches this
+    # function; scope == "person" here would mean that routing broke, so it
+    # is treated the same as the no-wording default (all) rather than being
+    # silently mis-scoped to a single customer.
     if is_order_report_admin(role):
-        extra = {}
-        if getattr(e, "date_after", None):
-            extra["after"] = e.date_after
-        if getattr(e, "date_before", None):
-            extra["before"] = e.date_before
-        return [endpoints.list_all_orders(
-            page=page,
-            per_page=e.order_count or ADMIN_ORDER_PER_PAGE,
-            description="Admin: all store orders",
-            **extra,
-        )]
+        scope = getattr(e, "scope", None)
 
-    if role in CUSTOM_ORDER_ROLES:
+        # scope == "self": exactly the call every non-admin already uses
+        # below. Do NOT special-case it here — fall through to the shared
+        # customer-scoped branch at the bottom of this function so there is
+        # one call site for "my orders", not two that can drift apart.
+        if scope != "self":
+            extra = {}
+            if getattr(e, "date_after", None):
+                extra["after"] = e.date_after
+            if getattr(e, "date_before", None):
+                extra["before"] = e.date_before
+            return [endpoints.list_all_orders(
+                page=page,
+                per_page=e.order_count or ADMIN_ORDER_PER_PAGE,
+                description="Admin: all store orders",
+                **extra,
+            )]
+        # scope == "self" falls through to the customer-scoped branch below.
+
+    elif role in CUSTOM_ORDER_ROLES:
         body = {"customer_id": "CURRENT_USER_ID", "page": page, "per_page": e.order_count or DEFAULT_ORDER_PER_PAGE}
         if getattr(e, "date_after", None): body["after"] = e.date_after
         if getattr(e, "date_before", None): body["before"] = e.date_before
@@ -308,7 +326,20 @@ def _build_order_history(e, page, customer_id=None, role=None) -> list:
             requires_resolution=["customer_id"],
         )]
 
-    count = e.order_count or DEFAULT_ORDER_PER_PAGE
+    # Page size follows the ROLE, not the branch. This is the shared tail
+    # used by customers, and now also by an admin whose scope resolved to
+    # "self" — but those are different jobs: a shopper glancing at recent
+    # orders wants a handful, an admin pulling their own orders for a named
+    # period is running the same kind of report as "view all orders" and was
+    # getting 5 rows where the store-wide list gives 50.
+    #
+    # per_page feeds build_pagination(), which reads it back off the call and
+    # pairs it with WooCommerce's total/total_pages headers — so raising it
+    # here also fixes has_more/total_pages for this branch rather than just
+    # returning a longer first page.
+    count = e.order_count or (
+        ADMIN_ORDER_PER_PAGE if is_order_report_admin(role) else DEFAULT_ORDER_PER_PAGE
+    )
 
     if ECOMMERCE_BACKEND == "shopify":
         from api_builder.shopify_order_calls import build_order_history_call

@@ -197,6 +197,22 @@ class ExtractedEntities:
     # refuses ambiguous matches rather than guessing.
     target_rep_name: Optional[str] = None
 
+    # "count" (a number/summary answer) or "list" (actual order cards). Set by
+    # OrderStatsEvaluator. "order list for Jennifer" is list; "how many did
+    # Jennifer order" is count even when list-shaped words are also present —
+    # see OrderStatsEvaluator's precedence rule.
+    mode: Optional[str] = None
+
+    # "self" / "person" / "all" — who an ADMIN's order-history question is
+    # about. Only meaningful for the admin role; every other role is always
+    # self-scoped regardless of this value. Set by OrderActionEvaluator for
+    # plain ORDER_HISTORY phrasing ("my orders" vs "all orders") and by
+    # OrderStatsEvaluator (scope="person", alongside target_rep_name) when a
+    # named rep is present — the two evaluators set the same field even
+    # though "person" currently routes through a different handler than
+    # "self"/"all" (see api_builder._build_order_history vs order_stats_handler).
+    scope: Optional[str] = None
+
     # ──── Ordering ────
     order_id: Optional[int] = None
     quantity: Optional[int] = None

@@ -35,7 +35,7 @@ from ecommerce import endpoints
 from chat_logger import get_logger
 from conversation_flow import FlowState
 from app_config import ORDER_REPORT_STATUSES, is_order_report_admin
-from handlers.chat_utils import default_pagination
+from handlers.chat_utils import default_pagination, format_order_for_frontend
 
 logger = get_logger("miraq_chat")
 
@@ -75,7 +75,7 @@ def _clear_stats_pending(user_context):
 
 
 def _park_date_range_prompt(conversation, user_context, rep, role, attempts=0,
-                            kind="stats"):
+                            kind="stats", mode=None, scope=None):
     """Park the report and ask for a window. Returns the action payload.
 
     `kind` records WHICH report is waiting on the window — "stats" for the
@@ -83,6 +83,12 @@ def _park_date_range_prompt(conversation, user_context, rep, role, attempts=0,
     park in the same flow state and reuse the same picker, so without the
     discriminator the resume path would run the stats report for a user who
     asked to see the order list.
+
+    `mode` ("count"/"list") and `scope` ("self"/"person"/"all") ride along
+    the same way `kind` does, for the same reason: the date picker is a
+    detour through a different flow state, and anything not parked here is
+    lost by the time the admin answers it — see handle_date_range_reply and
+    handle_rep_choice_reply, which restore both on resume.
 
     The token is the defence against a replayed card: /history re-renders
     stored actions verbatim, so a picker from a finished conversation comes
@@ -97,6 +103,8 @@ def _park_date_range_prompt(conversation, user_context, rep, role, attempts=0,
         "token": token,
         "attempts": attempts,
         "kind": kind,
+        "mode": mode,
+        "scope": scope,
     }
     conversation.flow_state = FlowState.AWAITING_DATE_RANGE.value
     conversation.context_data = user_context
@@ -124,11 +132,12 @@ def handle_order_stats(
     if user_context is None:
         user_context = conversation.context_data or {}
 
-    def _respond(message, suggestions=None, metadata=None, actions=None):
+    def _respond(message, suggestions=None, metadata=None, actions=None,
+                 orders=None, order_pagination=None, flow_state=None):
         elapsed = round((time.time() - start_time) * 1000)
         meta = {"response_time_ms": elapsed}
         meta.update(metadata or {})
-        return jsonify({
+        payload = {
             "success": True,
             "bot_message": message,
             "intent": "order_stats_by_rep",
@@ -138,7 +147,16 @@ def handle_order_stats(
             "metadata": meta,
             "pagination": default_pagination(page),
             "actions": actions or [],
-        }), 200
+        }
+        # List mode only: same fields _build_final_response attaches for the
+        # self/all order-history path (§8 — identical serialization, so the
+        # frontend needs no changes to render either).
+        if orders is not None:
+            payload["orders"] = orders
+            payload["order_pagination"] = order_pagination or default_pagination(page)
+        if flow_state is not None:
+            payload["flow_state"] = flow_state
+        return jsonify(payload), 200
 
     # ── Access: administrators only ─────────────────────────────────────────
     # Refuse explicitly. An unauthorized user must not get a zeroed report
@@ -151,6 +169,15 @@ def handle_order_stats(
 
     requested_rep = getattr(entities, "target_rep_name", None)
 
+    # "list" only means anything when a rep is named — the no-rep branch is
+    # a SQL GROUP BY with no order objects behind it (see get_order_stats_by_rep
+    # in the plugin), so there is nothing to list. Falling back to "count"
+    # here is a safety net, not the expected path: OrderStatsEvaluator only
+    # sets mode="list" together with target_rep_name in the first place.
+    mode = getattr(entities, "mode", None) or "count"
+    if mode == "list" and not requested_rep:
+        mode = "count"
+
     date_after  = getattr(entities, "date_after", None)
     date_before = getattr(entities, "date_before", None)
 
@@ -159,9 +186,11 @@ def handle_order_stats(
     # "the user said nothing" — both leave the bounds None, and only the second
     # is a question. Without the flag an all-time pick re-prompts forever.
     if not date_after and not date_before and not getattr(entities, "date_range_resolved", False):
-        action = _park_date_range_prompt(conversation, user_context, requested_rep, role)
+        action = _park_date_range_prompt(
+            conversation, user_context, requested_rep, role, mode=mode,
+        )
         who = f" for **{requested_rep}**" if requested_rep else ""
-        logger.info(f"order_stats | no date range given — prompting | rep={requested_rep!r}")
+        logger.info(f"order_stats | no date range given — prompting | rep={requested_rep!r} mode={mode!r}")
         return _respond(
             f"Which period should I cover{who}?",
             suggestions=["This week", "This month", "This quarter", "This year", "All time", "Cancel"],
@@ -175,6 +204,12 @@ def handle_order_stats(
         date_before=date_before,
         rep=requested_rep or None,
         statuses=list(ORDER_REPORT_STATUSES),
+        # Only meaningful with a rep named — see the mode fallback above.
+        # The plugin returns order rows alongside the totals when set, using
+        # the SAME merged (credited + self-placed) query as the count, so
+        # "how many did Jennifer order" and "show me orders by Jennifer"
+        # never disagree about which orders are hers.
+        include_orders=(mode == "list"),
         description="Order/sample counts by rep",
     )
     result = woo_client.execute(call)
@@ -240,6 +275,10 @@ def handle_order_stats(
             # None) is mistaken for an unanswered question.
             "date_resolved": True,
             "requested":   asked,
+            # Same reasoning as date_resolved: without parking mode too, a
+            # list-mode request that hits the rep-disambiguation step loses
+            # "list" and comes back as a count once a rep is picked.
+            "mode": mode,
         }
         conversation.flow_state = FlowState.AWAITING_REP_CHOICE.value
         conversation.context_data = user_context
@@ -255,17 +294,62 @@ def handle_order_stats(
     truncated   = bool(data.get("truncated"))
     name        = data.get("rep_filter_label") or requested_rep or "That rep"
     window      = _describe_range(data.get("date_after"), data.get("date_before"))
-    scope       = f" ({window})" if window else " (all time)"
+    window_str  = f" ({window})" if window else " (all time)"
 
     if total_orders == 0:
         return _respond(
-            f"**{name}** has no orders{scope}.",
+            f"**{name}** has no orders{window_str}.",
             metadata={"total_orders": 0},
+        )
+
+    # ── List mode: order cards, not a count ─────────────────────────────────
+    if mode == "list":
+        raw_orders = data.get("orders") or []
+        orders_list = [format_order_for_frontend(o) for o in raw_orders]
+        msg = (
+            f"**{name}** — **{total_orders} order{'s' if total_orders != 1 else ''}**"
+            f"{window_str}."
+        )
+        # Say WHICH question this answers. These are orders credited to the
+        # rep plus orders they placed themselves — so the billing name on a
+        # card is often someone else entirely (bulk orders bill the rep's
+        # customer and ship to a third party). Without this line an admin
+        # sees "Jennifer — 1 order" over a card that names a different
+        # person and reasonably concludes the filter is broken.
+        msg += (
+            "\n\n_Includes orders credited to them as sales rep and orders "
+            "they placed themselves — so the billing name on an order may "
+            "differ._"
+        )
+        if truncated:
+            msg += (
+                f"\n\n⚠️ _Only the most recent {data.get('max_orders_scanned')} orders "
+                f"were scanned — this list is a minimum. Narrow the date range to see all of them._"
+            )
+        return _respond(
+            msg,
+            metadata={
+                "total_orders": total_orders,
+                "total_items": total_items,
+                "truncated": truncated,
+                "allow_order_download": is_order_report_admin(role),
+            },
+            orders=orders_list,
+            order_pagination={
+                **default_pagination(page),
+                "per_page": len(orders_list),
+                "total_items": total_orders,
+            },
+            # Matches requirement 2's order-history response: tapping a card
+            # re-enters as "show me order #N" through the normal pipeline,
+            # not AWAITING_ORDER_DETAIL (that flow_state belongs to
+            # handle_order_status's own multi-match picker, a different flow).
+            flow_state=FlowState.IDLE.value,
         )
 
     msg = (
         f"**{name}** — **{total_orders} order{'s' if total_orders != 1 else ''}**, "
-        f"**{total_items} sample{'s' if total_items != 1 else ''}**{scope}."
+        f"**{total_items} sample{'s' if total_items != 1 else ''}**{window_str}."
     )
     # Only surfaced when it actually fires: without it a rep with more orders
     # than we scan would silently report the cap as their total.
@@ -368,6 +452,10 @@ def handle_rep_choice_reply(
     # Default True: anything parked by an older build predates this key, and
     # for those the window HAD been settled before the rep prompt appeared.
     entities.date_range_resolved = pending.get("date_resolved", True)
+    # Same failure the date_resolved key was added to prevent: without this,
+    # "show orders by Jennifer" -> "2 reps match?" -> pick -> counts come
+    # back instead of the order cards that were actually asked for.
+    entities.mode = pending.get("mode") or "count"
 
     logger.info(
         f"rep_choice | resolved to {picked.get('email')} "
@@ -383,15 +471,20 @@ def handle_rep_choice_reply(
     )
 
 
-def prompt_for_order_list_range(conversation, user_context, role, start_time, page=1):
+def prompt_for_order_list_range(conversation, user_context, role, start_time, page=1, scope=None):
     """Ask which period the admin's all-orders list should cover.
 
     Separate entry point from handle_order_stats' own prompt so the order-list
     flow can park without pretending to be a stats query, but the card, the
     flow state, and the reply handler are shared.
+
+    `scope` ("self"/"all"/None) is the admin's original wording ("my orders"
+    vs "all orders") — parked here so the resume path in routes/chat.py can
+    restore it after the date picker's message-rewrite would otherwise
+    silently collapse it to "all" (see the comment at that rewrite site).
     """
     action = _park_date_range_prompt(
-        conversation, user_context, None, role, kind="order_list",
+        conversation, user_context, None, role, kind="order_list", scope=scope,
     )
     elapsed = round((time.time() - start_time) * 1000)
     return jsonify({
@@ -545,6 +638,7 @@ def handle_date_range_reply(
             "date_after": date_after,
             "date_before": date_before,
             "role": role,
+            "scope": pending.get("scope"),
         }
 
     class _E:
@@ -554,6 +648,10 @@ def handle_date_range_reply(
     entities.date_after         = date_after
     entities.date_before        = date_before
     entities.date_range_resolved = True
+    # Same reason kind/date_resolved are parked: this resume rebuilds
+    # entities from scratch, so anything not read from `pending` here is
+    # silently lost — see handle_rep_choice_reply for the matching fix.
+    entities.mode = pending.get("mode") or "count"
 
     logger.info(
         f"date_range | resolved rep={rep!r} "
@@ -596,6 +694,7 @@ def _retry_date_range(conversation, user_context, pending, _respond, reason):
         conversation, user_context,
         pending.get("rep"), pending.get("role"), attempts=attempts,
         kind=pending.get("kind", "stats"),
+        mode=pending.get("mode"), scope=pending.get("scope"),
     )
     return _respond(
         f"{reason} Pick a period below, or type one like *\"last quarter\"* "

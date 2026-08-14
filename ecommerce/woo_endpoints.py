@@ -354,9 +354,16 @@ class WooEndpoints:
     ) -> WooAPICall:
         """Row 5.1b — GET /orders with NO customer filter (admin only).
 
-        Identical to list_customer_orders minus the `customer` param. The
-        caller is responsible for the admin check; the plugin re-checks
-        capabilities server-side, which is the real enforcement point.
+        Identical to list_customer_orders minus the `customer` param.
+
+        Enforcement is Python-only: this call goes straight to `wc/v3` with
+        the store's own consumer key/secret (see woo_client.py), which is
+        NOT the requesting user's credential and has no per-user capability
+        of its own to check. The plugin is never in this call's path, so it
+        cannot re-check anything here. `is_order_report_admin(role)` on the
+        caller — reading a role out of the request payload — is the only
+        gate. Accepted as-is for now; if that role field ever becomes
+        spoofable from the client, this is the call it protects.
         """
         params = {
             "per_page": per_page,
@@ -476,16 +483,25 @@ class WooEndpoints:
         date_before: Optional[str] = None,
         rep: Optional[str] = None,
         statuses: Optional[List[str]] = None,
+        include_orders: bool = False,
         description: str = "",
         requires_resolution: Optional[List[str]] = None,
     ) -> WooAPICall:
         """GET /order-stats-by-rep — sample/order counts grouped by credited rep.
 
-        Aggregates on `_billing_project_rep`, the meta both the storefront's
-        rep selector and MiraQ write, so counts cover orders from either path.
+        Aggregates on `_billing_project_rep` (credited orders) UNION orders
+        the rep placed for herself, the same merge `get_user_orders` uses —
+        so counts and, when `include_orders` is set, the order rows returned
+        alongside them never disagree about which orders belong to a rep.
 
         `rep` accepts an email OR a display name; the plugin resolves it and
         returns 404/409 rather than guessing between two similarly-named reps.
+
+        `include_orders` only does anything when `rep` is also set — the
+        no-rep breakdown is a SQL GROUP BY with no order objects behind it.
+        When set, the response carries an `orders` array (raw WC REST order
+        shape) in addition to the totals, capped at the same 2,000-order
+        scan the totals already use.
 
         Admin-gated for cross-rep figures; a rep gets their own only.
         Response carries `truncated` and `counted_statuses` — surface both
@@ -500,6 +516,8 @@ class WooEndpoints:
             params["rep"] = rep
         if statuses:
             params["status"] = ",".join(statuses)
+        if include_orders:
+            params["list"] = "1"
 
         return WooAPICall(
             method="GET",

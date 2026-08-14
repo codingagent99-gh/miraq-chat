@@ -25,6 +25,7 @@ from classifier.extractors import (
     extract_order_id,
     extract_email,
     extract_time_range,
+    extract_order_scope,
     extract_order_item,
     extract_unresolved_descriptors,
     extract_price_range,
@@ -130,6 +131,10 @@ def classify(utterance: str) -> ClassifiedResult:
     extract_email(text, entities)
     logger.debug("ClassifierPipeline: Calling extract_time_range")
     extract_time_range(text, entities)
+    # Scope must be read from the RAW message here, not inside an evaluator:
+    # a message the local evaluators pass on still reaches ORDER_HISTORY via
+    # the LLM fallback, which returns an intent but no entities.
+    extract_order_scope(text, entities)
     logger.debug(f"ClassifierPipeline: After extract_time_range | entities={entities}")
     extract_unresolved_descriptors(text, entities)
     extract_price_range(text, entities)

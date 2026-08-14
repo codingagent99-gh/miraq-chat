@@ -163,6 +163,17 @@ class WooClient:
                         _summary_extra = " | " + " ".join(f"{k}={v}" for k, v in _present.items())
                         if data.get("reps") is not None:
                             _summary_extra += f" reps={len(data.get('reps') or [])}"
+                        # Row count for list mode. Without this, a response
+                        # carrying order rows and one carrying only totals log
+                        # identically — which is exactly the difference between
+                        # a deployed and an undeployed plugin when the caller
+                        # asked for list=1. Logged as absent vs 0 on purpose:
+                        # "key missing" means the plugin never built rows,
+                        # "0 rows" means it did and found none.
+                        _summary_extra += (
+                            f" orders={len(data.get('orders') or [])}"
+                            if "orders" in data else " orders=<absent>"
+                        )
                     else:
                         _summary_extra = f" | keys={sorted(data.keys())[:8]}"
 

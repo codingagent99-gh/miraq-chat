@@ -318,7 +318,12 @@ def generate_bot_message(
         if intent in (Intent.ORDER_STATUS, Intent.ORDER_TRACKING) and order_data:
             return format_order_detail(order_data[0])
         elif intent == Intent.ORDER_HISTORY and order_data:
-            return _format_order_history_message(order_data, date_after=getattr(entities, "date_after", None))
+            return _format_order_history_message(
+                order_data,
+                date_after=getattr(entities, "date_after", None),
+                date_before=getattr(entities, "date_before", None),
+                scope=getattr(entities, "scope", None),
+            )
         elif intent == Intent.LAST_ORDER and order_data:
             order = order_data[0]
             order_id = order.get("id", "")
@@ -368,7 +373,9 @@ def generate_bot_message(
         if page_count == 0 and not order_data:
             # date_after present → logged-in user with genuinely no orders in that period
             if getattr(entities, 'date_after', None):
-                period = _describe_date_period(entities.date_after)
+                period = _describe_date_period(
+                    entities.date_after, getattr(entities, 'date_before', None)
+                )
                 if intent == Intent.ORDER_HISTORY:
                     return (
                         f"📭 You don't have any orders from {period}.\n\n"
@@ -777,10 +784,35 @@ def _format_order_date(date_created: str) -> str:
         return date_created
 
 
-def _describe_date_period(date_after: str) -> str:
-    """Convert a date_after ISO string into a human-readable period description."""
+def _describe_date_period(date_after: str, date_before: str = None) -> str:
+    """Convert a date window into a human-readable period description.
+
+    With BOTH bounds, describe the actual window. The rolling "last N days"
+    phrasing below measures from now to date_after and ignores date_before
+    entirely, which is fine for an open-ended "orders since X" but wrong for
+    an explicit range: picking "This week" on a Friday resolved to
+    2026-08-10..2026-08-14 and was described as "the last 3 days", because
+    the delta from now to the START of the week happened to be 3 days. The
+    window the user chose is known exactly here — say it rather than
+    re-deriving an approximation of it.
+    """
     try:
         from datetime import timezone, timedelta
+
+        if date_after and date_before:
+            try:
+                a = datetime.fromisoformat(date_after.replace("Z", "+00:00"))
+                b = datetime.fromisoformat(date_before.replace("Z", "+00:00"))
+                if a.year == b.year:
+                    if a.month == b.month and a.day == b.day:
+                        return a.strftime("%B %d, %Y")
+                    return f"{a.strftime('%B %d')} – {b.strftime('%B %d, %Y')}"
+                return f"{a.strftime('%B %d, %Y')} – {b.strftime('%B %d, %Y')}"
+            except (ValueError, TypeError):
+                # Fall through to the rolling description rather than losing
+                # the message entirely on an unparseable bound.
+                pass
+
         dt = datetime.fromisoformat(date_after.replace("Z", "+00:00"))
         now = datetime.now(timezone.utc)
         if dt.tzinfo is None:
@@ -804,16 +836,29 @@ def _describe_date_period(date_after: str) -> str:
         return "that period"
 
 
-def _format_order_history_message(orders: List[dict], date_after: str = None) -> str:
-    """Return a short header — the frontend renders order cards from the structured orders array."""
+def _format_order_history_message(orders: List[dict], date_after: str = None,
+                                  date_before: str = None, scope: str = None) -> str:
+    """Return a short header — the frontend renders order cards from the structured orders array.
+
+    `scope` names WHOSE orders these are, and the wording has to follow it. An
+    admin asking "view all orders" gets the whole store, and calling that
+    "your orders" states the opposite of the truth — the one thing this header
+    exists to make unambiguous. Only "all" changes the phrasing; "self", None,
+    and every non-admin role are genuinely the caller's own orders, because
+    _build_order_history scopes those to CURRENT_USER_ID.
+    """
     if not orders:
         return "No orders found."
     count = len(orders)
     verb = "is" if count == 1 else "are"
     order_word = "order" if count == 1 else "orders"
     if date_after:
-        period = _describe_date_period(date_after)
+        period = _describe_date_period(date_after, date_before)
+        if scope == "all":
+            return f"📦 Here {verb} {count} {order_word} store-wide from {period}. Tap any to see full details."
         return f"📦 Here {verb} your {count} {order_word} from {period}. Tap any to see full details."
+    if scope == "all":
+        return f"📦 Here {verb} the {count} most recent {order_word} store-wide. Tap any to see full details."
     return f"📦 Here {verb} your {count} most recent {order_word}. Tap any to see full details."
 
 

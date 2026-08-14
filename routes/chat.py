@@ -1960,6 +1960,14 @@ def chat():
                 # request carrying that window and let the normal pipeline
                 # answer it, so there is one code path building order lists
                 # rather than two that can drift apart.
+                #
+                # This rewrite destroys whatever scope wording ("my"/"all")
+                # the ORIGINAL turn had — re-classifying the literal string
+                # "view all orders" always derives scope="all". The real
+                # scope traveled through resp["scope"] (parked in
+                # pending_order_stats by prompt_for_order_list_range) and is
+                # reapplied to entities AFTER classification below, the same
+                # way date_after/date_before already are.
                 _resume_order_list = resp
                 message = "view all orders"
                 _skip_classification = False
@@ -2218,13 +2226,20 @@ def chat():
             if is_order_report_admin(_role):
                 if _resume_order_list:
                     # Window already chosen this turn — apply it and continue.
+                    # scope must be restored here too: the message rewrite
+                    # above always re-derives scope="all" from the literal
+                    # string "view all orders", which silently drops "my"
+                    # from the ORIGINAL turn (see the comment at the rewrite
+                    # site). The real scope rode through the resume dict.
                     entities.date_after  = _resume_order_list.get("date_after")
                     entities.date_before = _resume_order_list.get("date_before")
+                    entities.scope       = _resume_order_list.get("scope")
                 elif not getattr(entities, "date_after", None) \
                         and not getattr(entities, "date_before", None) \
                         and not getattr(entities, "date_range_resolved", False):
                     list_resp = prompt_for_order_list_range(
                         conversation, user_context, _role, start_time, page,
+                        scope=getattr(entities, "scope", None),
                     )
                     conversation.context_data = user_context
                     flag_modified(conversation, "context_data")

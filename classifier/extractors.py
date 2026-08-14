@@ -820,6 +820,34 @@ def _parse_explicit_date(token: str) -> Optional[datetime]:
     return None
 
 
+def extract_order_scope(text: str, entities: ExtractedEntities):
+    """Who an order-history question is about: "self", "all", or unset.
+
+    Runs as an EXTRACTOR, not inside an evaluator, and that placement is the
+    whole point. An earlier version set this from OrderActionEvaluator, which
+    only runs when that evaluator claims the message. "my orders this month"
+    is claimed by no evaluator — it reaches Intent.ORDER_HISTORY through the
+    LLM fallback, which returns an intent label and never entities. Scope was
+    therefore None on exactly the phrasing that states it most plainly, and an
+    admin asking for "my orders" was shown the entire store.
+
+    Extractors run before evaluation on every message, so scope now survives
+    any route to ORDER_HISTORY — local evaluator, LLM fallback, or a resume.
+
+    Only consulted for the admin role; every other role is self-scoped by
+    _build_order_history regardless of what this sets. A named person is a
+    separate case set later by OrderStatsEvaluator (scope="person"), which
+    runs after extraction and deliberately overrides whatever is set here.
+    """
+    t = text.lower()
+    # "my" wins over "all" — "show me all my orders" is still self-scoped, and
+    # reading the "all" there as store-wide is the bug this ordering prevents.
+    if re.search(r'\bmy\b', t):
+        entities.scope = "self"
+    elif re.search(r'\ball\b', t):
+        entities.scope = "all"
+
+
 def extract_time_range(text: str, entities: ExtractedEntities):
     """Extract date/time ranges for order history queries."""
     text_lower = text.lower()
@@ -899,9 +927,7 @@ def extract_time_range(text: str, entities: ExtractedEntities):
     # Week uses a to-date end (today) rather than the full calendar week —
     # unlike month/quarter/year, the rest of the current week hasn't
     # happened yet, so extending to Sunday would include future dates.
-    m_this = re.search(r'\b(?:this|current)\s+(week|month|quarter|year)\b', text_lower)
-    if m_this:
-        unit = m_this.group(1)
+    def _current_period_bounds(unit):
         if unit == "week":
             start = now - timedelta(days=now.weekday())
             end = now
@@ -916,6 +942,33 @@ def extract_time_range(text: str, entities: ExtractedEntities):
             while ((start.month - FISCAL_YEAR_START_MONTH) % 12) != 0:
                 start = _add_months(start, -3)
             end = _add_months(start, 12) - timedelta(days=1)
+        return start, end
+
+    m_this = re.search(r'\b(?:this|current)\s+(week|month|quarter|year)\b', text_lower)
+    if m_this:
+        start, end = _current_period_bounds(m_this.group(1))
+        _set(start, end)
+        return
+
+    # ── "the week|month|quarter|year" ────────────────────────────────────────
+    # Read the same as "this <period>". Checked AFTER the branch above so
+    # "this/current" behaviour is untouched, and after "last/previous <period>"
+    # cannot be reached by it — "the last week" keeps "last" between the
+    # determiner and the unit, so this pattern does not match it.
+    #
+    # Without this, "show me all my orders for the week" resolved no range at
+    # all and the caller fell through to the date picker — asking which period
+    # the user meant immediately after they named one.
+    #
+    # The lookahead keeps a determiner that introduces a SPECIFIC period out of
+    # this branch: "the month of March", "the year 2024", "the quarter 1" all
+    # name a period that later branches resolve properly, and reading them as
+    # the current one would quietly answer about the wrong window.
+    m_the = re.search(
+        r'\bthe\s+(week|month|quarter|year)\b(?!\s+(?:of\b|\d))', text_lower
+    )
+    if m_the:
+        start, end = _current_period_bounds(m_the.group(1))
         _set(start, end)
         return
 

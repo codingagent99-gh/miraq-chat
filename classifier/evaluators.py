@@ -41,18 +41,25 @@ class OrderActionEvaluator(IntentEvaluator):
     # Vocabulary this evaluator's regexes key off. Must never be typo-corrected
     # — see classifier/keywords.py. Kept in sync by audit_keyword_drift().
     KEYWORDS = frozenset({
-        "about", "add", "after", "again", "apr", "aug", "before", "between",
+        "about", "add", "after", "again", "all", "apr", "aug", "before", "between",
         "bought", "browse", "buy", "cart", "check", "checkout", "complement",
         "day", "dec", "detail", "details", "did", "display", "during", "feb",
         "fetch", "find", "get", "goes", "had", "have", "history", "info",
         "item", "items", "jan", "jul", "jun", "last", "latest", "list", "look",
-        "mar", "match", "may", "month", "most", "nov", "oct", "open", "order",
+        "mar", "match", "may", "month", "most", "my", "nov", "oct", "open", "order",
         "ordered", "orders", "pair", "past", "previous", "previously",
         "product", "products", "provide", "purchase", "purchases", "recent",
         "related", "reorder", "repeat", "search", "see", "sep", "should",
         "show", "similar", "something", "status", "tell", "track", "tracking",
         "view", "want", "week", "what", "where", "which", "year",
     })
+
+    # NOTE: scope ("my orders" vs "all orders") is NOT set here. It is
+    # extracted in classifier/extractors.py::extract_order_scope, which runs
+    # on every message before evaluation — this evaluator does not claim
+    # every phrasing that reaches ORDER_HISTORY (the LLM fallback resolves
+    # some), and scope set here would be missing on exactly those.
+
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
         if re.search(r"\b(repeat|reorder|re-order|order\s*again)\b", text):
             entities.reorder = True
@@ -272,12 +279,17 @@ class ProductDetailEvaluator(IntentEvaluator):
 class OrderStatsEvaluator(IntentEvaluator):
     """
     Detects order/sample reporting: "how many samples did <rep> order this
-    quarter", "who ordered how many last month", "month to date order list".
+    quarter", "who ordered how many last month", "month to date order list",
+    and now "show me orders by <rep>" / "order list for <rep>" (list mode —
+    actual order cards for one named rep, not a count).
 
     Runs BEFORE the product evaluators. "How many samples were ordered by
     sale_rep_1" is full of catalog-shaped words ("samples", "ordered") that
     CatalogSearchEvaluator/ProductDetailEvaluator would otherwise claim,
-    turning a reporting question into a product search.
+    turning a reporting question into a product search. Also runs BEFORE
+    OrderActionEvaluator so a named-rep "orders by/for <rep>" phrasing is
+    claimed here rather than falling through to plain ORDER_HISTORY, which
+    has no concept of a named person.
 
     Only sets the intent — it does NOT check permissions. Gating happens in
     the handler (and again in the plugin), so an unauthorized user gets an
@@ -299,9 +311,27 @@ class OrderStatsEvaluator(IntentEvaluator):
     _WHO_RE = re.compile(
         r'\bwho\b.{0,30}?\b(order(?:ed|s)?|placed|bought)\b'
     )
-    # "order list", "list of orders" — the MTD-list variant
+    # "order list", "list of orders" — genuinely wants order ROWS. Split out
+    # of the old combined _LIST_RE: this half changed to mode="list" (§6.3),
+    # the report/summary half below stayed mode="count".
     _LIST_RE = re.compile(
-        r'\border\s+list\b|\blist\s+of\s+orders\b|\borders?\s+(?:report|summary)\b'
+        r'\border\s+list\b|\blist\s+of\s+orders\b'
+    )
+    # "orders report", "orders summary" — list-shaped words, but this has
+    # always meant an aggregate report, not order cards. Stays mode="count".
+    _REPORT_RE = re.compile(
+        r'\borders?\s+(?:report|summary)\b'
+    )
+    # "orders by <rep>", "orders for <rep>", "order list for <rep>", "list of
+    # orders for <rep>" — the new named-rep list-mode phrasings (§6.2).
+    # Anchored on order(s)/ordered immediately before by/for (small gap for
+    # "list of"/"list for" in between), never a bare \bby\b or \bfor\b —
+    # both are overloaded elsewhere ("sort by", "orders for the week") and
+    # the bulk parser had to drop a bare \bon\b as a company marker for the
+    # same reason.
+    _NAMED_LIST_RE = re.compile(
+        r'\border(?:s|ed)?\b.{0,20}?\b(?:by|for)\s+(?:rep\s+)?[a-z0-9._@\-]+',
+        re.I,
     )
     # "by <rep>" / "for <rep>" / "did <rep> order". The char class includes @
     # so an email identifier is captured whole — the plugin accepts either an
@@ -309,7 +339,11 @@ class OrderStatsEvaluator(IntentEvaluator):
     _REP_RE = re.compile(
         r'\b(?:ordered|placed)\s+by\s+([a-z0-9._@\-]+(?:\s+[a-z0-9._@\-]+){0,2})'
         r'|\bdid\s+([a-z0-9._@\-]+(?:\s+[a-z0-9._@\-]+){0,2})\s+order\b'
-        r'|\bby\s+(?:rep\s+)([a-z0-9._@\-]+(?:\s+[a-z0-9._@\-]+){0,2})',
+        r'|\bby\s+(?:rep\s+)([a-z0-9._@\-]+(?:\s+[a-z0-9._@\-]+){0,2})'
+        # "orders by/for <rep>", "order list for <rep>" — the same shape
+        # _NAMED_LIST_RE triggers on, captured here so the name extraction
+        # and the mode trigger stay in sync.
+        r'|\border(?:s|ed)?\b.{0,20}?\b(?:by|for)\s+(?:rep\s+)?([a-z0-9._@\-]+(?:\s+[a-z0-9._@\-]+){0,2})',
         re.I,
     )
 
@@ -325,29 +359,70 @@ class OrderStatsEvaluator(IntentEvaluator):
         "today", "week", "weeks", "within", "year", "years", "yesterday", "ytd",
     }
 
+    def _extract_rep(self, text: str) -> Optional[str]:
+        """Pull a rep name out of the query, or None if there isn't one.
+
+        Returns None (not "") when the captured span turns out to be a date
+        phrase or a pronoun — "orders for this week" captures "this week",
+        which _TAIL_STOP then trims away to nothing.
+        """
+        m_rep = self._REP_RE.search(text)
+        if not m_rep:
+            return None
+        raw = next((g for g in m_rep.groups() if g), "").strip(" .,?")
+        tokens = raw.split()
+        while tokens and tokens[-1].lower() in self._TAIL_STOP:
+            tokens.pop()
+        # Strip punctuation AFTER the tail trim, not before: trimming
+        # "this" off "ram r. this" exposes a new final token whose
+        # trailing period would otherwise survive, and "Ram R." then
+        # fails a lookup that "Ram R" passes.
+        raw = " ".join(tokens).strip(" .,?!;:")
+        # "how many did I order" is self-scoped, not a named rep — leave
+        # target_rep_name unset so the handler scopes to the caller.
+        if raw and raw.lower() not in self._STOP:
+            return raw
+        return None
+
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
-        if not (
-            self._COUNT_RE.search(text)
-            or self._WHO_RE.search(text)
-            or self._LIST_RE.search(text)
+        is_count_trigger  = bool(self._COUNT_RE.search(text) or self._WHO_RE.search(text))
+        is_list_trigger   = bool(self._LIST_RE.search(text))
+        is_report_trigger = bool(self._REPORT_RE.search(text))
+        has_named_shape   = bool(self._NAMED_LIST_RE.search(text))
+
+        if not (is_count_trigger or is_list_trigger or is_report_trigger or has_named_shape):
+            return None, 0.0
+
+        rep = self._extract_rep(text)
+
+        # The "orders by/for X" SHAPE alone does not make a query ours —
+        # "show me all orders for the week" has exactly that shape with a
+        # date phrase where the name would be, and claiming it here would
+        # steal plain order-history queries (which is what an earlier
+        # version of this rule did). Only a resolved rep name counts. With
+        # no rep and no other trigger, fall through to OrderActionEvaluator
+        # and let it answer as ORDER_HISTORY.
+        if has_named_shape and not rep and not (
+            is_count_trigger or is_list_trigger or is_report_trigger
         ):
             return None, 0.0
 
-        m_rep = self._REP_RE.search(text)
-        if m_rep:
-            raw = next((g for g in m_rep.groups() if g), "").strip(" .,?")
-            tokens = raw.split()
-            while tokens and tokens[-1].lower() in self._TAIL_STOP:
-                tokens.pop()
-            # Strip punctuation AFTER the tail trim, not before: trimming
-            # "this" off "ram r. this" exposes a new final token whose
-            # trailing period would otherwise survive, and "Ram R." then
-            # fails a lookup that "Ram R" passes.
-            raw = " ".join(tokens).strip(" .,?!;:")
-            # "how many did I order" is self-scoped, not a named rep — leave
-            # target_rep_name unset so the handler scopes to the caller.
-            if raw and raw.lower() not in self._STOP:
-                entities.target_rep_name = raw
+        if rep:
+            entities.target_rep_name = rep
+            entities.scope = "person"
+
+        # Precedence: an explicit count/ranking phrase always wins, even
+        # when show/list wording is also present — "show me how many orders
+        # Jennifer placed" is a count, not a card list (§6.4). List mode also
+        # requires an actual rep: the no-rep branch in the plugin is a SQL
+        # GROUP BY with no order objects behind it, so "order list" on its
+        # own stays a count exactly as it always has.
+        if is_count_trigger:
+            entities.mode = "count"
+        elif rep and (is_list_trigger or has_named_shape):
+            entities.mode = "list"
+        else:
+            entities.mode = "count"
 
         return Intent.ORDER_STATS_BY_REP, 0.9
 
