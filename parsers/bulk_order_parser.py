@@ -112,6 +112,17 @@ _FOR_COMPANY_RE = re.compile(r'\bfor\s+company\s+([^,]+)', re.I)
 # Any "for <something>" tail on a fragment.
 _FOR_TAIL_RE = re.compile(r'\bfor\s+(.+)$', re.I)
 
+# Spelled-out counts accepted before "each" ("order one each of A and B").
+# Ordered longest-first where prefixes overlap so the alternation cannot match
+# a shorter word inside a longer one. Stops at twelve deliberately: past that,
+# people type digits, and every extra word is another chance to swallow a
+# product name.
+_WORD_NUMERALS = {
+    "twelve": 12, "eleven": 11, "seven": 7, "eight": 8, "three": 3,
+    "nine": 9, "four": 4, "five": 5, "six": 6, "ten": 10, "two": 2,
+    "one": 1,
+}
+
 # ── Company-scope markers ────────────────────────────────────────────────────
 # The bulk-order format scopes a company with one of these words:
 #     "... for Claire at Abel Design Group"
@@ -302,6 +313,57 @@ def parse_bulk_order_utterance(
                         f"bulk_parser | trailing company scope → '{company_scope}'"
                     )
 
+    # ── Step 1.6: Transaction-wide RECIPIENT and "each" quantity ─────────────
+    # "Order 1 chip card each of Harmony, Adams, Marigold, Lager for Kiki at
+    # Gensler" means all four go to Kiki, one each. But the "for" tail and the
+    # quantity both sit on single fragments — the tail on the last, the number
+    # on the first — so per-fragment extraction gave Kiki only the Lager and
+    # left three lines with no recipient and no quantity. A live order split
+    # 3/1 between the wrong person and the right one because of this.
+    #
+    # Company scope already works transaction-wide (Step 0/1.5); these are the
+    # same idea for the other two shared values.
+    recipient_scope = ""
+    each_quantity = None
+    if _is_rep and len(final_fragments) > 1:
+        _tails = [
+            i for i, f in enumerate(final_fragments)
+            if _FOR_TAIL_RE.search(f or "")
+        ]
+        # ONLY when the last fragment is the sole one carrying a "for" tail.
+        # If several fragments name their own people ("Harmony for ram, Adams
+        # for sovan"), each tail is that line's own recipient and nothing is
+        # shared — that is the documented multi-recipient shape and must not
+        # be collapsed onto one person.
+        if len(_tails) == 1 and _tails[0] == len(final_fragments) - 1:
+            _m = _FOR_TAIL_RE.search(final_fragments[-1])
+            _cand = EMAIL_RE.sub('', _m.group(1)).strip().strip(' ,.')
+            if _cand:
+                recipient_scope = _cand
+                logger.debug(
+                    f"bulk_parser | shared recipient scope → '{recipient_scope}' "
+                    f"(applied to {len(final_fragments)} lines)"
+                )
+
+    # "N <unit> each of A, B, C" — the count distributes over every line rather
+    # than belonging to the fragment that happens to carry the digits. Scanned
+    # on the ORIGINAL text, since by now the number sits in fragment 0 only.
+    #
+    # Word numerals count too: "order one each of …" and "two each of …" are
+    # at least as common as digits here, and matching only \d+ would leave
+    # "two each" silently distributing 1 (the per-fragment default) — wrong in
+    # a way nothing downstream would flag, since a quantity of 1 looks
+    # deliberate rather than missing.
+    if re.search(r'\beach\b', text, re.I):
+        _each_m = re.search(
+            r'\b(\d+|' + '|'.join(_WORD_NUMERALS) + r')\b(?=[^,]*\beach\b)',
+            text, re.I,
+        )
+        if _each_m:
+            _tok = _each_m.group(1).lower()
+            each_quantity = int(_tok) if _tok.isdigit() else _WORD_NUMERALS[_tok]
+            logger.debug(f"bulk_parser | 'each' quantity → {each_quantity} per line")
+
     # ── Step 2: Per-fragment extraction ──────────────────────────────────────
     pre_lines: List[_PreLine] = []
 
@@ -330,6 +392,13 @@ def parse_bulk_order_utterance(
         quantity = int(qty_match.group(1)) if qty_match else 1
         quantity_explicitly_set = qty_match is not None
 
+        # "1 … each of A, B, C" — a fragment that named no count of its own
+        # inherits the shared one rather than silently defaulting to 1 and
+        # then prompting for a quantity the user already gave.
+        if each_quantity is not None and not quantity_explicitly_set:
+            quantity = each_quantity
+            quantity_explicitly_set = True
+
         is_reorder = bool(
             re.search(r'\b(reorder|re-order|last\s+week[\'s]*|previous)\b', fragment, re.I)
         )
@@ -351,6 +420,10 @@ def parse_bulk_order_utterance(
                 candidate = EMAIL_RE.sub('', for_match.group(1)).strip().strip(', ')
                 if candidate:
                     recipient_name = candidate
+            # A trailing "for <person>" on the LAST fragment covers the whole
+            # order (Step 1.6) — apply it to fragments that named nobody.
+            if not recipient_name and recipient_scope:
+                recipient_name = recipient_scope
 
         # ── Product: strip quantity, email addresses, and "for …" tail ──
         # If a catalog product name was pre-claimed above, leave the fragment

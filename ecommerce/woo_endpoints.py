@@ -484,6 +484,8 @@ class WooEndpoints:
         rep: Optional[str] = None,
         statuses: Optional[List[str]] = None,
         include_orders: bool = False,
+        page: int = 1,
+        per_page: Optional[int] = None,
         description: str = "",
         requires_resolution: Optional[List[str]] = None,
     ) -> WooAPICall:
@@ -500,8 +502,9 @@ class WooEndpoints:
         `include_orders` only does anything when `rep` is also set — the
         no-rep breakdown is a SQL GROUP BY with no order objects behind it.
         When set, the response carries an `orders` array (raw WC REST order
-        shape) in addition to the totals, capped at the same 2,000-order
-        scan the totals already use.
+        shape) for the requested `page` ONLY, plus `page`/`per_page`/
+        `total_pages`. Paging does not affect the totals: those always cover
+        the whole window, scanned up to the same 2,000-order cap.
 
         Admin-gated for cross-rep figures; a rep gets their own only.
         Response carries `truncated` and `counted_statuses` — surface both
@@ -518,6 +521,12 @@ class WooEndpoints:
             params["status"] = ",".join(statuses)
         if include_orders:
             params["list"] = "1"
+            # Paging applies to the ROWS only. The totals in the response are
+            # always computed over the whole window, so page 3 of a 4-page
+            # list still reports the same total_orders as page 1.
+            params["page"] = page
+            if per_page:
+                params["per_page"] = per_page
 
         return WooAPICall(
             method="GET",

@@ -83,6 +83,12 @@ CONTROL_PHRASE_WORDS = frozenset({
     # account / support
     "email", "address", "shipping", "billing", "payment", "account",
     "help", "support", "agent", "human", "quantity", "price", "total",
+    # quantity / distribution glue — "each" sits 2 edits from 'patch', 'echo'
+    # and 'back', so "1 chip card each of Harmony, Adams…" opened with a
+    # "did you mean patch / echo / back?" clarification before the order was
+    # read at all. These words carry meaning for the bulk parser ("N each of")
+    # and must never be rewritten to a catalog term.
+    "each", "every", "per", "both", "all", "some", "any", "of",
 })
 
 # A single unambiguous winner — applied immediately, no user involved.

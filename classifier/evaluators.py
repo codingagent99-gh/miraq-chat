@@ -329,8 +329,15 @@ class OrderStatsEvaluator(IntentEvaluator):
     # both are overloaded elsewhere ("sort by", "orders for the week") and
     # the bulk parser had to drop a bare \bon\b as a company marker for the
     # same reason.
+    #
+    # PLURAL/past-tense only — a bare singular "order" is the imperative VERB
+    # that starts a bulk order: "Order Harmony for Kiki" is placing an order
+    # for a person, not asking to see her order history. Allowing singular
+    # here classified exactly that message as order_stats_by_rep whenever
+    # only one product was named (two or more products are claimed earlier by
+    # BulkOrderEvaluator, which is what hid this).
     _NAMED_LIST_RE = re.compile(
-        r'\border(?:s|ed)?\b.{0,20}?\b(?:by|for)\s+(?:rep\s+)?[a-z0-9._@\-]+',
+        r'\border(?:s|ed)\b.{0,20}?\b(?:by|for)\s+(?:rep\s+)?[a-z0-9._@\-]+',
         re.I,
     )
     # "by <rep>" / "for <rep>" / "did <rep> order". The char class includes @
@@ -342,8 +349,14 @@ class OrderStatsEvaluator(IntentEvaluator):
         r'|\bby\s+(?:rep\s+)([a-z0-9._@\-]+(?:\s+[a-z0-9._@\-]+){0,2})'
         # "orders by/for <rep>", "order list for <rep>" — the same shape
         # _NAMED_LIST_RE triggers on, captured here so the name extraction
-        # and the mode trigger stay in sync.
-        r'|\border(?:s|ed)?\b.{0,20}?\b(?:by|for)\s+(?:rep\s+)?([a-z0-9._@\-]+(?:\s+[a-z0-9._@\-]+){0,2})',
+        # and the mode trigger stay in sync. Plural/past-tense only, for the
+        # reason given on _NAMED_LIST_RE.
+        r'|\border(?:s|ed)\b.{0,20}?\b(?:by|for)\s+(?:rep\s+)?([a-z0-9._@\-]+(?:\s+[a-z0-9._@\-]+){0,2})'
+        # "order list for <rep>" — singular "order", but the following "list"
+        # makes it unambiguously a request to SEE orders, not the imperative
+        # verb that opens a bulk order. Spelled out separately so the plural
+        # rule above can stay strict.
+        r'|\border\s+list\s+(?:for|by)\s+(?:rep\s+)?([a-z0-9._@\-]+(?:\s+[a-z0-9._@\-]+){0,2})',
         re.I,
     )
 
@@ -590,6 +603,10 @@ class BulkOrderEvaluator(IntentEvaluator):
     KEYWORDS = frozenset({
         "bulk", "buy", "buying", "order", "ordering", "place", "purchase",
         "reorder",
+        # Shared-quantity phrasing — "2 each of Harmony, Adams for Kiki" is a
+        # bulk order with no order verb anywhere in it.
+        "each", "one", "two", "three", "four", "five", "six", "seven",
+        "eight", "nine", "ten", "eleven", "twelve",
     })
     _ORDER_VERBS = re.compile(r'\b(order|buy|purchase|reorder|re-order)\b', re.I)
     _BULK_TRIGGER = re.compile(
@@ -597,6 +614,43 @@ class BulkOrderEvaluator(IntentEvaluator):
         r'|\bplace\s+(?:a\s+)?bulk\b',
         re.I
     )
+    # "N each of A, B" / "one each of A and B" — a single count governing
+    # several products. Digits and spelled-out numbers both, matching what
+    # bulk_order_parser distributes across the lines.
+    _EACH_QTY = re.compile(
+        r'\b(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten'
+        r'|eleven|twelve)\b[^,]*\beach\b',
+        re.I,
+    )
+
+    def _count_catalog_products(self, text: str) -> int:
+        """How many DISTINCT catalog product names the text mentions.
+
+        Longest names first: if "aurora mosaic" matches, a shorter name that
+        is purely a substring of that same span (e.g. "aurora") shouldn't
+        count as a second, separate product mention — it's the same word,
+        just a shorter catalog entry.
+        """
+        loader = get_store_loader()
+        if not loader or not loader.products:
+            return 0
+        _name_set = {
+            p["name"].lower() for p in loader.products if p.get("name")
+        }
+        sorted_names = sorted(_name_set, key=len, reverse=True)
+        claimed_spans: list[tuple[int, int]] = []
+        resolved_count = 0
+        for name in sorted_names:
+            match = re.search(r'\b' + re.escape(name) + r'\b', text, re.I)
+            if not match:
+                continue
+            start, end = match.span()
+            if any(start < c_end and end > c_start for c_start, c_end in claimed_spans):
+                continue
+            claimed_spans.append((start, end))
+            resolved_count += 1
+        return resolved_count
+
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
 
         # ── Check 0: Explicit bulk intent phrase ──
@@ -615,33 +669,25 @@ class BulkOrderEvaluator(IntentEvaluator):
             if qualified >= 2:
                 return Intent.BULK_ORDER, 0.92
 
+        # ── Check 1.5: shared "N each" quantity + 2+ catalog products ──
+        # "2 each of Harmony, Adams for Kiki" reaches neither check above: the
+        # digit sits on the first fragment and the "for" on the second, so
+        # Check 1 qualifies nothing, and there is no order verb for Check 2.
+        # It went to CatalogSearchEvaluator instead and came back as a product
+        # search — with the leading "2" read as a 2cm thickness filter.
+        #
+        # A count governing several named products is an order, verb or not.
+        # Still requires 2+ resolvable products, so "2 each of these please"
+        # does not qualify.
+        if self._EACH_QTY.search(text) and self._count_catalog_products(text) >= 2:
+            return Intent.BULK_ORDER, 0.92
+
         # ── Check 2: order trigger + 2+ resolvable catalog products ──
         # Handles all separators: comma-only, "and"-only, "A, B and C",
         # comma+email, any mix — no digit requirement.
         if self._ORDER_VERBS.search(text):
-            loader = get_store_loader()
-            if loader and loader.products:
-                _name_set = {
-                    p["name"].lower() for p in loader.products if p.get("name")
-                }
-                # Longest names first: if "aurora mosaic" matches, a shorter
-                # name that's purely a substring of that same span (e.g.
-                # "aurora") shouldn't count as a second, separate product
-                # mention — it's the same word, just a shorter catalog entry.
-                sorted_names = sorted(_name_set, key=len, reverse=True)
-                claimed_spans: list[tuple[int, int]] = []
-                resolved_count = 0
-                for name in sorted_names:
-                    match = re.search(r'\b' + re.escape(name) + r'\b', text, re.I)
-                    if not match:
-                        continue
-                    start, end = match.span()
-                    if any(start < c_end and end > c_start for c_start, c_end in claimed_spans):
-                        continue
-                    claimed_spans.append((start, end))
-                    resolved_count += 1
-                if resolved_count >= 2:
-                    return Intent.BULK_ORDER, 0.92
+            if self._count_catalog_products(text) >= 2:
+                return Intent.BULK_ORDER, 0.92
 
         return None, 0.0
 

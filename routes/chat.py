@@ -2192,10 +2192,26 @@ def chat():
                 "actions":     [],
             }), 200))
 
+        # Bulk order is available to EVERY role, but it means different things.
+        # For rep roles it is the full multi-recipient flow: company scope,
+        # recipient resolution, address picking. For everyone else it is
+        # multi-LINE ordering only — several products and quantities in one
+        # message, always shipped to the person placing it.
+        #
+        # Nothing extra is needed to make that safe here. The parser gates
+        # company scope, recipient names and email extraction on the same role
+        # set (`_is_rep` in bulk_order_parser) and routes non-rep lines through
+        # its self-order branch, and every on-behalf-of step in
+        # bulk_order_handler is likewise gated. A non-rep therefore cannot
+        # reach another person's roster or address book through this path even
+        # when the message names someone — the "for <person>" tail is stripped
+        # as part of product-name cleanup and never resolved.
         if intent == Intent.BULK_ORDER and role not in BULK_ORDER_ROLES:
-            intent = Intent.QUICK_ORDER
-            if result is not None:
-                result.intent = intent
+            logger.info(
+                "BULK_ORDER: non-rep role %r — proceeding as SELF-scoped "
+                "multi-line order (no company/recipient/address resolution)",
+                role,
+            )
                 
         # ── Step 6: Empty order guard ──
         empty_resp = _check_empty_order(intent, entities, conversation, page, start_time)
@@ -2586,7 +2602,14 @@ def chat():
         # Handles the case where the classifier or LLM resolved intent=bulk_order
         # from a natural language message (e.g. "place bulk order") rather than
         # the __BULK_CANCEL__ / __PRODUCT_REORDER__ magic string paths.
-        if intent == Intent.BULK_ORDER and role in BULK_ORDER_ROLES:
+        #
+        # Open to every role: reps get the full multi-recipient flow, everyone
+        # else gets self-scoped multi-line ordering (see the note at the
+        # non-rep branch above). This previously required a rep role, which
+        # left customers seeing a bulk-order button — SHOW_BULK_ORDER_BUTTON
+        # has never been role-gated — that did nothing when they typed their
+        # order as a sentence.
+        if intent == Intent.BULK_ORDER:
             # If the triggering message ALREADY carries the order lines
             # (e.g. "Order Harmony Moon, Adams Grey, Aurora Taupe"), parse it now.
             # Prompting would throw that message away and ask the rep to retype

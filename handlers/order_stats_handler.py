@@ -37,6 +37,13 @@ from conversation_flow import FlowState
 from app_config import ORDER_REPORT_STATUSES, is_order_report_admin
 from handlers.chat_utils import default_pagination, format_order_for_frontend
 
+# Order rows per page in list mode ("show me orders by <rep>"). Matches
+# ADMIN_ORDER_PER_PAGE in api_builder — the same kind of admin report, so the
+# same page size — but kept as its own constant to avoid importing api_builder
+# into a handler. A year-long window for a busy rep is hundreds of orders;
+# without this the whole set was serialised into one chat payload.
+ORDER_LIST_PER_PAGE = 50
+
 logger = get_logger("miraq_chat")
 
 
@@ -210,6 +217,8 @@ def handle_order_stats(
         # "how many did Jennifer order" and "show me orders by Jennifer"
         # never disagree about which orders are hers.
         include_orders=(mode == "list"),
+        page=page,
+        per_page=ORDER_LIST_PER_PAGE if mode == "list" else None,
         description="Order/sample counts by rep",
     )
     result = woo_client.execute(call)
@@ -306,10 +315,19 @@ def handle_order_stats(
     if mode == "list":
         raw_orders = data.get("orders") or []
         orders_list = [format_order_for_frontend(o) for o in raw_orders]
+        # Paging metadata comes from the plugin, which knows the full match
+        # count; falling back to a single page keeps an older plugin (one that
+        # returns rows but no page keys) rendering correctly instead of
+        # claiming a page 2 that does not exist.
+        _page       = int(data.get("page") or page or 1)
+        _per_page   = int(data.get("per_page") or ORDER_LIST_PER_PAGE)
+        _total_pages = int(data.get("total_pages") or 1)
         msg = (
             f"**{name}** — **{total_orders} order{'s' if total_orders != 1 else ''}**"
             f"{window_str}."
         )
+        if _total_pages > 1:
+            msg += f" Showing page {_page} of {_total_pages}."
         # Say WHICH question this answers. These are orders credited to the
         # rep plus orders they placed themselves — so the billing name on a
         # card is often someone else entirely (bulk orders bill the rep's
@@ -336,9 +354,11 @@ def handle_order_stats(
             },
             orders=orders_list,
             order_pagination={
-                **default_pagination(page),
-                "per_page": len(orders_list),
+                "page": _page,
+                "per_page": _per_page,
                 "total_items": total_orders,
+                "total_pages": _total_pages,
+                "has_more": _page < _total_pages,
             },
             # Matches requirement 2's order-history response: tapping a card
             # re-enters as "show me order #N" through the normal pipeline,

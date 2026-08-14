@@ -57,6 +57,11 @@ _BULK_STATE_KEYS = (
     "bulk_awaiting_address_text",
     "bulk_product_missing_indices", "bulk_product_current_pos",
     "bulk_quantity_pending_indices", "bulk_quantity_current_pos",
+    # Set when the rep answers "Continue anyway" to a company with no records.
+    # It suppresses the company prompt for the REST OF THAT ORDER only — left
+    # behind, it would silently skip company resolution on the next bulk order
+    # in the same session.
+    "bulk_company_skipped",
 )
 
 def handle_cancel_bulk_order(user_context, conversation, page, start_time):
@@ -497,7 +502,10 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
 
     # Step 4.55: Rep lines with no company scope → ask for the company first.
     # Company is the identity key for bulk orders, so this precedes everything.
-    if role in BULK_ORDER_ROLES:
+    # Skipped once the rep has chosen "Continue anyway" — they have already
+    # been shown that no records exist and said to proceed, so asking again on
+    # any re-entry into this function would be a loop they cannot leave.
+    if role in BULK_ORDER_ROLES and not user_context.get("bulk_company_skipped"):
         company_missing = [
             l for l in lines_as_dicts
             if l.get("unresolved_reason") in ("company_not_provided", "company_not_found")
@@ -1924,33 +1932,34 @@ def handle_bulk_company_reply(message, store_loader, conversation, user_context,
 
     # "Continue anyway" after a company with no records at all — the rep knows
     # the company is real (a brand-new client has neither an account nor
-    # delivery history). Route to manual address entry instead of re-running a
-    # lookup that has already been shown to return nothing.
+    # delivery history).
+    #
+    # Rejoin the NORMAL flow rather than diverting to free-text address entry.
+    # The address-confirmation step later on already renders an editable panel,
+    # validates every required field, and blocks until they are filled — so
+    # asking the rep to type a name and address here duplicates that step,
+    # loses the structured field-by-field validation, and does it BEFORE the
+    # quantity and variant questions instead of at the point the rest of the
+    # flow puts it.
+    #
+    # The lines keep their unresolved customer: with no company records there
+    # is nobody to resolve them to, so the confirmation panel opens with blank
+    # shipping fields for the rep to complete.
     if company.lower() in ("continue anyway", "continue", "proceed anyway", "proceed"):
-        user_context["bulk_manual_address_mode"] = True
-        conversation.flow_state = FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value
+        user_context.pop("bulk_manual_address_mode", None)
+        # Remember that the company lookup was deliberately bypassed, so no
+        # later step re-prompts for a company the rep has already skipped.
+        user_context["bulk_company_skipped"] = True
         conversation.context_data = user_context
         flag_modified(conversation, "context_data")
-        logger.info("bulk_order | rep chose to continue with no company records")
-        elapsed = round((time.time() - start_time) * 1000)
-        return jsonify({
-            "success": True,
-            "bot_message": (
-                "OK — I'll take the delivery details from you.\r\n\r\n"
-                "Please give me the recipient's name and full shipping address."
-            ),
-            "intent": "guided_flow",
-            "products": [],
-            "suggestions": ["Cancel"],
-            "session_id": str(conversation.id),
-            "metadata": {
-                "flow_state": FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value,
-                "manual_address_mode": True,
-                "response_time_ms": elapsed,
-            },
-            "flow_state": FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value,
-            "pagination": default_pagination(page),
-        }), 200
+        logger.info(
+            "bulk_order | rep chose to continue with no company records — "
+            "resuming normal flow; address collected at the confirmation step"
+        )
+        _lines = user_context.get("pending_bulk_lines", [])
+        return _continue_after_slots_filled(
+            _lines, store_loader, conversation, user_context, page, start_time
+        )
 
     if company.lower() in ("enter a different company", "different company"):
         elapsed = round((time.time() - start_time) * 1000)
@@ -3719,6 +3728,10 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
     user_context.pop("bulk_product_current_pos", None)
     user_context.pop("bulk_quantity_pending_indices", None)
     user_context.pop("bulk_quantity_current_pos", None)
+    # Must not survive this order: it suppresses the company prompt, and a
+    # leftover flag would silently skip company resolution on the NEXT bulk
+    # order in the same session.
+    user_context.pop("bulk_company_skipped", None)
     conversation.context_data = user_context
     flag_modified(conversation, "context_data")
     conversation.flow_state = FlowState.IDLE.value
