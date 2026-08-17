@@ -51,12 +51,27 @@ import re
 import difflib
 logger = get_logger("miraq_chat")
 
+# How many contact names are offered as tappable chips at the recipient step.
+# The full roster goes out in metadata.candidates regardless — this only caps
+# the chip row, which becomes unusable past roughly this many. Any message
+# quoting a contact COUNT must say how many are actually shown, or the rep
+# reads "20 contacts" above 8 chips and assumes the rest are unreachable.
+_RECIPIENT_CHIP_LIMIT = 8
+
+# Chip labels for paging the contact list. Matched before any name lookup in
+# handle_bulk_recipient_reply — if a real contact were ever called this, the
+# rep could not select them, so keep them clearly non-name-like.
+_MORE_CONTACTS_CHIP = "▸ More contacts"
+_PREV_CONTACTS_CHIP = "◂ Previous contacts"
+
 _BULK_STATE_KEYS = (
     "pending_bulk_lines", "bulk_current_line_index",
     "bulk_confirmed_lines", "bulk_address_overrides",
     "bulk_awaiting_address_text",
     "bulk_product_missing_indices", "bulk_product_current_pos",
     "bulk_quantity_pending_indices", "bulk_quantity_current_pos",
+    # Which page of contact chips the recipient prompt is showing.
+    "bulk_recipient_chip_page",
     # Set when the rep answers "Continue anyway" to a company with no records.
     # It suppresses the company prompt for the REST OF THAT ORDER only — left
     # behind, it would silently skip company resolution on the next bulk order
@@ -951,9 +966,26 @@ def _ask_for_bulk_variant(
     # variation, so attr_axes above can't see them — their options live on the
     # parent product. The storefront makes the shopper pick these, so the rep
     # must be asked too.
-    _any_axes = _parent_any_axis_options(
-        product_id, line.get("blank_variant_axes") or [], user_context
-    )
+    #
+    # blank_variant_axes is only populated once a variation has been resolved
+    # and inspected. On the FIRST prompt for a line that has no variation yet
+    # it is empty, so this used to add nothing and the rep was asked for
+    # Colors alone — then asked again for Finish and Sample Size the moment a
+    # colour pinned a variation. Two prompts for one product, the first one
+    # visibly incomplete.
+    #
+    # Derive them here instead: any parent variation axis that NO variation
+    # sets is an "Any" axis by definition, which is exactly what
+    # _missing_variant_axes would conclude later. Products whose variations
+    # encode every axis produce an empty list and are unaffected.
+    _blank_axes = list(line.get("blank_variant_axes") or [])
+    if not _blank_axes:
+        _seen = {k.strip().lower() for k in attr_axes}
+        _blank_axes = [
+            n for n in _parent_variation_axes(product_id, user_context)
+            if n.strip().lower() not in _seen
+        ]
+    _any_axes = _parent_any_axis_options(product_id, _blank_axes, user_context)
     for _name, _opts in _any_axes.items():
         attr_axes.setdefault(_name, set()).update(_opts)
 
@@ -977,7 +1009,10 @@ def _ask_for_bulk_variant(
                 for n, o in _get_safe_options(_matched_var.get("attributes", [])).items()
                 if n and o
             }
-    _open_axes = {a.strip().lower() for a in (line.get("blank_variant_axes") or []) if a}
+    # Use the same derived list the attribute options came from, so the
+    # wording ("just need the Finish, Sample Size") matches what's rendered
+    # even on the first prompt, where the line carries no blank_variant_axes.
+    _open_axes = {a.strip().lower() for a in _blank_axes if a}
 
     variation_list = [
         {
@@ -1063,8 +1098,16 @@ def _ask_for_bulk_variant(
 # ══════════════════════════════════════════════════════════════
 
 def _build_bulk_confirmation_response(lines_as_dicts, conversation, user_context, page, start_time):
-    resolved_count = sum(1 for l in lines_as_dicts if not l.get("unresolved"))
-    unresolved_count = len(lines_as_dicts) - resolved_count
+    # "Ready to place" must exclude lines the rep skipped at the address step.
+    # Counting every resolvable line told them N orders were ready when only
+    # N-minus-skipped would actually be created — and the skipped rows also
+    # rendered as "Ready" in the table, so nothing on the card disagreed.
+    skipped_count = sum(1 for l in lines_as_dicts if l.get("address_skipped"))
+    resolved_count = sum(
+        1 for l in lines_as_dicts
+        if not l.get("unresolved") and not l.get("address_skipped")
+    )
+    unresolved_count = len(lines_as_dicts) - resolved_count - skipped_count
     
     # Nothing resolvable at all — re-prompt instead of showing a confusing
     # confirmation card with 0 orders ready and the user's own raw text
@@ -1118,6 +1161,7 @@ def _build_bulk_confirmation_response(lines_as_dicts, conversation, user_context
             "lines": _display_lines,
             "resolved_count": resolved_count,
             "unresolved_count": unresolved_count,
+            "skipped_count": skipped_count,
         },
     }
 
@@ -1210,9 +1254,24 @@ def handle_bulk_variant_selection_reply(
     # Stamp the resolved variation
     import re as _re
 
-    # Record the rep's choice for any axis the variation itself can't encode
-    # ("Any" axes). These ride along as order line-item meta — exactly where
-    # WooCommerce puts an "Any" attribute chosen on the product page.
+    line["variation_id"] = best_match["id"]
+    line["unresolved"] = False
+    line["unresolved_reason"] = None
+
+    # The variation just chosen may ITSELF leave parent axes unset — "Any"
+    # axes that no single variation encodes. Detect that HERE, after stamping.
+    # A line whose variation came from this prompt (rather than from a hint in
+    # the original message) had no variation to inspect until now, so nothing
+    # had ever computed its blank axes and Sample Size / Finish were dropped
+    # from the order silently. Lines with a hint were checked earlier, which
+    # is why only those ever asked.
+    _ensure_missing_axes(line, user_context)
+
+    # Record the rep's choice for any axis the variation itself can't encode.
+    # These ride along as order line-item meta — exactly where WooCommerce
+    # puts an "Any" attribute chosen on the product page. The reply often
+    # already names them ("TOKYO Aegean Blue, Chip Card"), so harvest from
+    # this same message before deciding anything is still missing.
     _pending_axes = line.get("blank_variant_axes") or []
     if _pending_axes:
         _opts = _parent_any_axis_options(product_id, _pending_axes, user_context)
@@ -1232,9 +1291,6 @@ def handle_bulk_variant_selection_reply(
             f"still pending={line['blank_variant_axes']}"
         )
 
-    line["variation_id"] = best_match["id"]
-    line["unresolved"] = False
-    line["unresolved_reason"] = None
     # The user has now chosen a real option — don't keep warning about the
     # hint that failed, or a re-prompt later would repeat a stale complaint.
     line["unmatched_variant_hint"] = ""
@@ -1250,6 +1306,33 @@ def handle_bulk_variant_selection_reply(
     
     lines_as_dicts[line_idx] = line
     user_context["pending_bulk_lines"] = lines_as_dicts
+
+    # An axis the reply didn't answer → ask THIS line again instead of moving
+    # on, which is what silently produced order items with no Sample Size or
+    # Finish. Capped: after two further tries the order proceeds without them
+    # rather than trapping the rep in a prompt they cannot satisfy (a parent
+    # axis with no usable options would otherwise loop forever).
+    _still_pending = line.get("blank_variant_axes") or []
+    _axis_tries = int(line.get("variant_axis_attempts") or 0)
+    if _still_pending and _axis_tries < 2:
+        line["variant_axis_attempts"] = _axis_tries + 1
+        lines_as_dicts[line_idx] = line
+        user_context["pending_bulk_lines"] = lines_as_dicts
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+        logger.info(
+            f"bulk_order | line {line_idx} still missing {_still_pending} "
+            f"after variant pick — re-asking (attempt {_axis_tries + 1}/2)"
+        )
+        return _ask_for_bulk_variant(
+            lines_as_dicts, needs_variant_indices, pos,
+            conversation, user_context, page, start_time,
+        )
+    if _still_pending:
+        logger.warning(
+            f"bulk_order | line {line_idx} proceeding with {_still_pending} "
+            f"unset after {_axis_tries} attempt(s)"
+        )
 
     next_pos = pos + 1
     user_context["bulk_variant_current_pos"] = next_pos
@@ -1715,6 +1798,29 @@ def _ask_for_bulk_recipient(
         if isinstance(i, int) and 0 <= i < len(lines_as_dicts)
     )
 
+    # ── Chip paging ─────────────────────────────────────────────────────────
+    # Paged, not truncated: with 20 contacts the rep saw the first 8 and had
+    # no way to reach the other 12 short of typing a name exactly right.
+    # Clamped rather than wrapped — a stale page index (roster re-fetched
+    # smaller, or the rep backing out of a company choice) would otherwise
+    # render an empty chip row with no way forward.
+    _chip_page = int(user_context.get("bulk_recipient_chip_page", 0) or 0)
+    _max_chip_page = max(0, (len(names) - 1) // _RECIPIENT_CHIP_LIMIT)
+    _chip_page = max(0, min(_chip_page, _max_chip_page))
+    user_context["bulk_recipient_chip_page"] = _chip_page
+    conversation.context_data = user_context
+    flag_modified(conversation, "context_data")
+
+    _chip_lo = _chip_page * _RECIPIENT_CHIP_LIMIT
+    _chip_hi = min(_chip_lo + _RECIPIENT_CHIP_LIMIT, len(names))
+    _chips = names[_chip_lo:_chip_hi]
+
+    _nav = []
+    if _chip_page < _max_chip_page:
+        _nav.append(_MORE_CONTACTS_CHIP)
+    if _chip_page > 0:
+        _nav.append(_PREV_CONTACTS_CHIP)
+
     # Wording keys off whether the requested name actually matched — never off
     # the label-disambiguation flag, which can be True purely because two
     # UNRELATED people on the roster share a name.
@@ -1743,7 +1849,18 @@ def _ask_for_bulk_recipient(
             "Who should this go to?"
         )
     else:
-        _ask = f"**{scope}** has {len(names)} contacts. Who should this go to?"
+        # Chips are paged rather than truncated: with 20 contacts the rep
+        # previously saw 8 and had no way to reach the other 12 except by
+        # typing a name exactly right.
+        _shown = min(len(names), _RECIPIENT_CHIP_LIMIT)
+        if len(names) > _RECIPIENT_CHIP_LIMIT:
+            _ask = (
+                f"**{scope}** has {len(names)} contacts — showing "
+                f"{_chip_lo + 1}–{_chip_hi} of {len(names)}. "
+                "Tap a name, or type one."
+            )
+        else:
+            _ask = f"**{scope}** has {len(names)} contacts. Who should this go to?"
 
     _progress = f" ({pos + 1} of {len(queue)})" if len(queue) > 1 else ""
 
@@ -1753,7 +1870,7 @@ def _ask_for_bulk_recipient(
         "bot_message": f"{product_lines}\r\n\r\n{_ask}{_progress}",
         "intent": "guided_flow",
         "products": [],
-        "suggestions": names[:8] + ["Cancel"],
+        "suggestions": _chips + _nav + ["Cancel"],
         "session_id": str(conversation.id),
         "metadata": {
             "flow_state": FlowState.AWAITING_BULK_RECIPIENT.value,
@@ -1789,6 +1906,22 @@ def handle_bulk_recipient_reply(message, store_loader, conversation, user_contex
     lines  = user_context.get("pending_bulk_lines", [])
     queue  = user_context.get("bulk_recipient_queue", []) or []
     pos    = user_context.get("bulk_recipient_pos", 0)
+
+    # ── Chip paging, before any name matching ───────────────────────────────
+    # These are navigation, not answers: re-ask the SAME slot with the next or
+    # previous page of contacts. Matched first so a paging tap can never be
+    # fuzzy-matched to a contact whose name happens to look similar, which
+    # would silently ship to the wrong person.
+    if choice in (_MORE_CONTACTS_CHIP, _PREV_CONTACTS_CHIP):
+        _cur = int(user_context.get("bulk_recipient_chip_page", 0) or 0)
+        user_context["bulk_recipient_chip_page"] = max(
+            0, _cur + (1 if choice == _MORE_CONTACTS_CHIP else -1)
+        )
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+        return _ask_for_bulk_recipient(
+            lines, queue, pos, conversation, user_context, page, start_time,
+        )
 
     # Queue lost (e.g. resumed session) — rebuild from the lines themselves.
     if not queue or pos >= len(queue):
@@ -1858,11 +1991,16 @@ def handle_bulk_recipient_reply(message, store_loader, conversation, user_contex
             "success": True,
             "bot_message": (
                 f"I couldn't match **{choice}** to anyone at **{scope}**."
+                + (
+                    f" Here are the first {_RECIPIENT_CHIP_LIMIT} of "
+                    f"{len(names)} contacts — type a name if it's someone else."
+                    if len(names) > _RECIPIENT_CHIP_LIMIT else ""
+                )
                 if choice else f"Who should this go to at **{scope}**?"
             ),
             "intent": "guided_flow",
             "products": [],
-            "suggestions": names[:8] + ["Cancel"],
+            "suggestions": names[:_RECIPIENT_CHIP_LIMIT] + ["Cancel"],
             "session_id": str(conversation.id),
             "metadata": {
                 "flow_state": FlowState.AWAITING_BULK_RECIPIENT.value,
@@ -1904,11 +2042,15 @@ def handle_bulk_recipient_reply(message, store_loader, conversation, user_contex
 
     # More people still to identify?
     if pos + 1 < len(queue):
+        # Fresh chip page for the next slot — carrying page 3 over would open
+        # the next question part-way down the contact list.
+        user_context["bulk_recipient_chip_page"] = 0
         return _ask_for_bulk_recipient(
             lines, queue, pos + 1,
             conversation, user_context, page, start_time,
         )
 
+    user_context.pop("bulk_recipient_chip_page", None)
     user_context.pop("bulk_recipient_queue", None)
     user_context.pop("bulk_recipient_pos", None)
     user_context.pop("bulk_recipient_mode", None)
@@ -3700,7 +3842,16 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
                 "customer": _order_for,
                 # A merged order covers several products — name them all, or
                 # the summary silently under-reports what was placed.
-                "product": ", ".join(gl["product_name"] for gl in group_lines),
+                #
+                # Per-product quantities, NOT a joined name plus a summed
+                # count: "Elizabeth Mosaic, London ×2" reads as two of a
+                # single thing, when it is one of each. The summary is the
+                # rep's only record of what was actually placed, so it has to
+                # be unambiguous.
+                "product": ", ".join(
+                    f"{gl['product_name']} ×{int(gl.get('quantity') or 0)}"
+                    for gl in group_lines
+                ),
                 "quantity": sum(int(gl.get("quantity") or 0) for gl in group_lines),
             })
             logger.info(
@@ -3742,7 +3893,7 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
     if created_orders:
         bot_message += f"✅ **{len(created_orders)} order(s) placed successfully:**\r\n\r\n"
         for o in created_orders:
-            bot_message += f"• **#{o['order_number']}** — {o['customer']}: {o['product']} ×{o['quantity']}\r\n"
+            bot_message += f"• **#{o['order_number']}** — {o['customer']}: {o['product']}\r\n"
 
     if failed_orders:
         bot_message += f"\r\n⚠️ **{len(failed_orders)} order(s) failed:**\r\n\r\n"

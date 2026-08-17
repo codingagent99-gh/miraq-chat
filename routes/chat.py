@@ -39,6 +39,23 @@ from response_generator import (
 from classifier import classify
 from api_builder import build_api_calls
 from conversation_flow import FlowState, handle_flow_state, is_order_flow, _flow_context_message, is_bare_exit
+
+# Maps a flow-state STRING that used to be a valid FlowState value onto its
+# current replacement. Consulted only when FlowState(conversation.flow_state)
+# raises — i.e. the persisted string no longer matches any live enum member —
+# so a conversation row written before a rename ships still resumes where it
+# left off instead of silently resetting to IDLE.
+#
+# Add an entry here whenever a FlowState member's .value changes; remove it
+# once enough time has passed that no live conversation could still carry the
+# old string (rows are per-session, not long-lived, so this does not need to
+# stay forever).
+_LEGACY_FLOW_STATE_ALIASES = {
+    # "awaiting_order_for_email" -> AWAITING_ORDER_FOR_CUSTOMER: the order-for
+    # flow stopped using email as the customer identifier (name + company
+    # now), and the state name changed to match.
+    "awaiting_order_for_email": FlowState.AWAITING_ORDER_FOR_CUSTOMER,
+}
 from chat_logger import get_logger, sanitize_log_string
 from store_registry import get_store_loader
 from ecommerce import endpoints
@@ -423,7 +440,8 @@ def _dispatch_bulk_action(action, message, role, store_loader, conversation, use
         )
     elif action == "resolve_order_for_email" and role in BULK_ORDER_ROLES:
         return handle_order_for_email_reply(
-            message, conversation, user_context, page, start_time
+            message, conversation, user_context, page, start_time,
+            customer_id=customer_id,
         )
     return None
 
@@ -1619,7 +1637,18 @@ def chat():
         try:
             current_flow_state = FlowState(conversation.flow_state)
         except ValueError:
-            current_flow_state = FlowState.IDLE
+            # Legacy flow-state strings whose enum value was renamed (see
+            # _LEGACY_FLOW_STATE_ALIASES) map onto their replacement so a
+            # session already mid-flow continues normally — the pending
+            # context (order_for_pending_name, etc.) is untouched by the
+            # rename and still sitting in conversation.context_data, so the
+            # rep's next reply is handled exactly as it would have been
+            # before. Anything not in the alias table falls back to IDLE,
+            # same as always: a genuinely stale or corrupt value should not
+            # crash the turn.
+            current_flow_state = _LEGACY_FLOW_STATE_ALIASES.get(
+                conversation.flow_state, FlowState.IDLE
+            )
 
         _wipe_stale_cart(conversation, user_context, current_flow_state)
 

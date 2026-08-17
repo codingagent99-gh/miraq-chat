@@ -30,7 +30,14 @@ class FlowState(Enum):
     AWAITING_CART_CONFIRMATION = "awaiting_cart_confirmation"
     
     # ── Sales rep flows ──────────────────────────────────────────────
-    AWAITING_ORDER_FOR_EMAIL          = "awaiting_order_for_email"   # renamed
+    # No longer email-based (see handlers/sales_rep_handler.py) — the value
+    # changed along with the name, deliberately, so nothing new is ever
+    # persisted under the old string. A session already sitting in the old
+    # "awaiting_order_for_email" state is handled by _LEGACY_FLOW_STATE_ALIASES
+    # in routes/chat.py, which maps the old string onto this member at the
+    # point a request is parsed — not here, since Enum values must be unique
+    # and constant.
+    AWAITING_ORDER_FOR_CUSTOMER       = "awaiting_order_for_customer"
     AWAITING_BULK_ORDER_INPUT         = "awaiting_bulk_order_input"
     AWAITING_BULK_ORDER_CONFIRMATION  = "awaiting_bulk_order_confirmation"
     AWAITING_BULK_ADDRESS_CONFIRMATION = "awaiting_bulk_address_confirmation"
@@ -62,7 +69,7 @@ _ORDER_FLOW_STATES = {
     FlowState.AWAITING_CART_CONFIRMATION,
     FlowState.AWAITING_ORDER_DETAIL,
     FlowState.AWAITING_REORDER_ID,
-    FlowState.AWAITING_ORDER_FOR_EMAIL,
+    FlowState.AWAITING_ORDER_FOR_CUSTOMER,
     FlowState.AWAITING_BULK_ORDER_INPUT,
     FlowState.AWAITING_BULK_ORDER_CONFIRMATION,
     FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION,
@@ -139,7 +146,7 @@ def _flow_context_message(state: FlowState) -> dict:
         FlowState.AWAITING_BULK_ORDER_CONFIRMATION: "Please reply **Yes** to confirm or **No** to cancel",
         FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION:"Please reply **Yes**, **Change**, or **Skip**",
         FlowState.AWAITING_BULK_VARIANT_SELECTION:  "Please select a variant from the options above",
-        FlowState.AWAITING_ORDER_FOR_EMAIL:         "Please provide the customer email address",
+        FlowState.AWAITING_ORDER_FOR_CUSTOMER:         "Please tell me the customer's name and company",
     }
     hint = _hints.get(state, "Please complete the current step")
     return {
@@ -504,11 +511,11 @@ def handle_flow_state(
             "pass_through": False,
         }
         
-    # ── State: Awaiting customer email for order-for flow (rep only) ──
-    if state == FlowState.AWAITING_ORDER_FOR_EMAIL:
+    # ── State: Awaiting customer name+company for order-for flow (rep only) ──
+    if state == FlowState.AWAITING_ORDER_FOR_CUSTOMER:
         return {
             "action":     "resolve_order_for_email",
-            "flow_state": FlowState.AWAITING_ORDER_FOR_EMAIL.value,
+            "flow_state": FlowState.AWAITING_ORDER_FOR_CUSTOMER.value,
             "pass_through": False,
         }
     
