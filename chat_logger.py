@@ -208,3 +208,49 @@ def get_api_logger() -> logging.Logger:
     logger.addHandler(console_handler)
 
     return logger
+
+
+def get_order_logger() -> logging.Logger:
+    """
+    Get a dedicated logger for WooCommerce order-creation calls (POST /orders,
+    admin surface only — not the order list/fetch calls, which stay on the
+    general API logger).
+
+    Writes to logs/YYYY-MM-DD/orders.txt — separate from both chat.txt and
+    api.txt, so order payload/response traffic can be tailed or parsed on
+    its own.
+
+    Always logs at DEBUG level to file so full request/response bodies are
+    captured. Console output follows the LOG_LEVEL env var, same as the main
+    logger.
+
+    Returns:
+        Logger instance named "miraq_orders"
+    """
+    name = "miraq_orders"
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+
+    formatter = _MillisecondFormatter(
+        fmt="[%(asctime)s] [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    try:
+        file_handler = _DailyDirectoryHandler(_LOG_BASE_DIR, "orders.txt")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except OSError as exc:
+        print(f"[chat_logger] WARNING: Could not create orders log file: {exc}")
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    return logger

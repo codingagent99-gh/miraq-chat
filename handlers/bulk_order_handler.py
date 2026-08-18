@@ -397,6 +397,7 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
             "blank_variant_axes": list(getattr(l, "blank_variant_axes", None) or []),
             "candidate_variation_ids": list(getattr(l, "candidate_variation_ids", None) or []),
             "specified_variant_axes": list(getattr(l, "specified_variant_axes", None) or []),
+            "self_contained_variant": bool(getattr(l, "self_contained_variant", False)),
             "variant_meta": {},
             "address_confirmed": False,
             "address_skipped": False,
@@ -815,7 +816,10 @@ def _format_bulk_confirmation_table(lines) -> str:
 
     if skipped_count > 0:
         table += f"\r\n⚠️ {skipped_count} line(s) could not be resolved and will be skipped.\r\n"
-    table += f"✅ {resolved_count} order(s) ready to place."
+    # "line(s)", not "order(s)": several products for one recipient merge into
+    # a single order, and this builder has no address context to group by. The
+    # order count is computed by _planned_order_count where it is available.
+    table += f"✅ {resolved_count} line(s) ready to place."
 
     return table
 
@@ -906,6 +910,10 @@ def _ensure_missing_axes(line, user_context):
     True when the line has a variation that leaves parent axes unset, and
     stamps them onto the line so the prompt knows what to ask.
     """
+    # A self-contained sample form (Chip Card) leaves the other axes as
+    # WooCommerce "Any" by design — they are not applicable, not missing.
+    if line.get("self_contained_variant"):
+        return False
     if line.get("blank_variant_axes"):
         return True
     missing = _missing_variant_axes(line, user_context)
@@ -1155,6 +1163,7 @@ def _build_bulk_confirmation_response(lines_as_dicts, conversation, user_context
             _display_lines.append(_l)
 
     # wrap data inside "payload" key
+    _order_count = _planned_order_count(lines_as_dicts, user_context)
     action = {
         "type": "SHOW_BULK_ORDER_CONFIRMATION",
         "payload": {
@@ -1162,13 +1171,25 @@ def _build_bulk_confirmation_response(lines_as_dicts, conversation, user_context
             "resolved_count": resolved_count,
             "unresolved_count": unresolved_count,
             "skipped_count": skipped_count,
+            # Lines merge into one order per recipient, so these two differ:
+            # four products for one person is 4 line(s) but 1 order. The card
+            # previously read resolved_count as an order count and announced
+            # "4 order(s) ready to place" for a single order.
+            "order_count": _order_count,
+            "line_count": resolved_count,
         },
     }
 
     # Addresses are confirmed before this card is built, so "ready to place"
     # is now literally true and confirming is the final action.
+    if _order_count == resolved_count:
+        _summary = f"{_order_count} order(s) ready to place"
+    else:
+        _summary = (
+            f"{resolved_count} product(s) in {_order_count} order(s) ready to place"
+        )
     bot_message = (
-        f"Here's your bulk order — {resolved_count} order(s) ready to place. "
+        f"Here's your bulk order — {_summary}. "
         "Confirming will place them."
     )
     if unresolved_count:
@@ -2540,6 +2561,11 @@ def handle_bulk_product_reply(message, store_loader, conversation, user_context,
     )
 
 
+# Cache TTL for _company_order_addresses — mirrors checkout_fields.py's
+# _CACHE_TTL_SECONDS (900s / 15 min) for the same reason: bounded staleness
+# instead of caching forever for the life of a chat session.
+_ORDER_ADDRESS_CACHE_TTL_SECONDS = 900
+
 def _company_order_addresses(company, user_context):
     """
     Shipping destinations this company has actually had goods sent to.
@@ -2550,14 +2576,25 @@ def _company_order_addresses(company, user_context):
     returns one account address each, and the THWMA address book is empty on
     this store.
 
-    Cached per company; the whole batch shares one company.
+    Cached per company, with a 15-minute TTL (same convention as the
+    /checkout-fields cache in utils/checkout_fields.py). A forever-cache within
+    the session was wrong here specifically because this data backs the
+    shipping-email fallback: a new order placed mid-session (on the storefront
+    or through a prior bulk order) needs to become visible without the rep
+    having to start a fresh chat session.
     """
     if not company:
         return []
     cache = user_context.setdefault("bulk_order_address_cache", {})
     key = str(company).strip().lower()
-    if key in cache:
-        return cache[key]
+    entry = cache.get(key)
+    # A session whose cache was populated before this TTL change deployed
+    # still has the OLD shape persisted (a bare list, not {"rows", "ts"}).
+    # Treat anything that isn't the new dict shape as a miss rather than
+    # crashing on .get() — it just re-fetches once and overwrites the stale
+    # entry with the correct shape.
+    if isinstance(entry, dict) and (time.time() - entry.get("ts", 0)) < _ORDER_ADDRESS_CACHE_TTL_SECONDS:
+        return entry["rows"]
 
     rows = []
     fetched = False
@@ -2580,11 +2617,11 @@ def _company_order_addresses(company, user_context):
 
     # Cache SUCCESS only. user_context is persisted on the conversation, so
     # caching [] after a failed call silently disables the address step for
-    # the rest of the session — the next turn short-circuits and never even
+    # the rest of the TTL window — the next turn short-circuits and never even
     # retries the API. A successful empty result IS cached; that is a real
     # answer.
     if fetched:
-        cache[key] = rows
+        cache[key] = {"rows": rows, "ts": time.time()}
         user_context["bulk_order_address_cache"] = cache
     logger.info(
         f"bulk_order | company {company!r} → {len(rows)} historical "
@@ -2852,6 +2889,7 @@ def handle_bulk_address_choice_reply(message, store_loader, conversation, user_c
             "state":      picked.get("shipping_state", ""),
             "postcode":   picked.get("shipping_postcode", ""),
             "country":    picked.get("shipping_country", ""),
+            "email":      picked.get("shipping_email", "") or ship.get("email", ""),
         })
         lines[idx]["shipping_address"] = ship
         lines[idx]["address_choice_made"] = True
@@ -3257,6 +3295,7 @@ def handle_bulk_address_confirmation_reply(action, message, conversation, user_c
             )
 
         current_line["address_confirmed"] = True
+        _propagate_address_decision(resolved_lines, idx, user_context, "address_confirmed")
         user_context["bulk_current_line_index"] = idx + 1
         conversation.context_data = user_context
         flag_modified(conversation, "context_data")
@@ -3305,6 +3344,7 @@ def handle_bulk_address_confirmation_reply(action, message, conversation, user_c
             )
 
         current_line["address_confirmed"] = True
+        _propagate_address_decision(resolved_lines, idx, user_context, "address_confirmed")
         user_context.pop("bulk_awaiting_address_text", None)
         user_context["bulk_current_line_index"] = idx + 1
         conversation.context_data = user_context
@@ -3359,6 +3399,7 @@ def handle_bulk_address_confirmation_reply(action, message, conversation, user_c
             )
 
         current_line["address_confirmed"] = True
+        _propagate_address_decision(resolved_lines, idx, user_context, "address_confirmed")
         user_context["bulk_current_line_index"] = idx + 1
         conversation.context_data = user_context
         flag_modified(conversation, "context_data")
@@ -3369,6 +3410,7 @@ def handle_bulk_address_confirmation_reply(action, message, conversation, user_c
     # Step 6: Skip this customer's order
     elif action == "bulk_address_skip":
         current_line["address_skipped"] = True
+        _propagate_address_decision(resolved_lines, idx, user_context, "address_skipped")
         user_context["bulk_current_line_index"] = idx + 1
         conversation.context_data = user_context
         flag_modified(conversation, "context_data")
@@ -3397,6 +3439,90 @@ def handle_bulk_address_confirmation_reply(action, message, conversation, user_c
 # ══════════════════════════════════════════════════════════════
 # ── Function 6: _advance_to_next_address_confirmation (private) ──
 # ══════════════════════════════════════════════════════════════
+
+def _address_identity_key(line, line_idx, user_context):
+    """
+    Identity used to decide that two lines are the same delivery.
+
+    Deliberately mirrors the grouping key in _create_all_confirmed_orders:
+    customer_id AND recipient name AND destination. customer_id alone is not
+    enough — in address-only mode every line carries customer_id=None, so two
+    different people would look identical and one person's confirmation would
+    silently settle another's address.
+
+    The address is computed WITHOUT per-line overrides so a line the rep has
+    just edited still matches its unedited siblings; the override is copied
+    across separately by _propagate_address_decision.
+    """
+    _billing, _shipping = _effective_address_for_line(
+        line, {}, line_idx, user_context.get("rep_email", ""),
+        user_context.get("rep_billing_address"),
+    )
+    return (
+        str(line.get("customer_id")),
+        (
+            line.get("recipient_name")
+            or line.get("customer_display_name")
+            or ""
+        ).strip().lower(),
+        _address_group_key(_billing),
+        _address_group_key(_shipping),
+    )
+
+
+def _propagate_address_decision(resolved_lines, idx, user_context, field):
+    """
+    Apply this line's address decision to every other unsettled line for the
+    same recipient and destination, so the rep confirms an address ONCE per
+    person instead of once per line.
+
+    Ordering "1 each of A, B, C, D for one person" asked the rep to confirm
+    the identical address four times, then merged all four into a single order
+    anyway. Lines that share an identity key are exactly the lines that will be
+    merged, so settling them together cannot change what gets created.
+
+    Returns the number of sibling lines settled.
+    """
+    src = resolved_lines[idx]
+    _has_identity = bool(
+        str(src.get("customer_id") or "").strip()
+        or (
+            src.get("recipient_name") or src.get("customer_display_name") or ""
+        ).strip()
+    )
+    if not _has_identity:
+        # Nothing to prove two lines are the same person — confirm one at a
+        # time rather than risk settling a stranger's address.
+        return 0
+
+    src_key = _address_identity_key(src, idx, user_context)
+    overrides = user_context.get("bulk_address_overrides", {}) or {}
+    src_override = overrides.get(str(idx))
+
+    settled = 0
+    for j, line in enumerate(resolved_lines):
+        if j == idx or line.get("address_confirmed") or line.get("address_skipped"):
+            continue
+        if _address_identity_key(line, j, user_context) != src_key:
+            continue
+        line[field] = True
+        if src_override is not None:
+            # Overrides are keyed by line index, so an inline edit must be
+            # copied onto each sibling index too — otherwise those lines would
+            # quietly fall back to the address on file while the rep believes
+            # they confirmed the edited one.
+            user_context.setdefault("bulk_address_overrides", {})[str(j)] = json.loads(
+                json.dumps(src_override)
+            )
+        settled += 1
+
+    if settled:
+        logger.info(
+            f"bulk_order | {field} on line {idx} applied to {settled} other "
+            f"line(s) for the same recipient — not asking again"
+        )
+    return settled
+
 
 def _advance_to_next_address_confirmation(resolved_lines, idx, conversation, user_context, page, start_time):
     """
@@ -3499,6 +3625,58 @@ def _build_address_card_response(
                 f"for customer_id={current_line.get('customer_id')} | error={exc}"
             )
 
+    # Historical shipping-email fallback. WooCommerce customer records (the
+    # fetch above) have no email on the shipping block — only ORDER HISTORY
+    # captures the store's custom Shipping Email field (the plugin's
+    # /company-order-addresses returns it per row as shipping_email, read
+    # from order meta _shipping_email). The address-choice picker already
+    # carries this across for a customer with 2+ historical addresses; this
+    # covers the common 0-or-1 case, which skips that picker entirely and
+    # would otherwise leave email permanently blank until typed by hand.
+    if not shipping_block.get("email"):
+        _company = user_context.get("bulk_company_scope", "")
+        if _company:
+            _hist_rows = _company_order_addresses(_company, user_context)
+            # Must require shipping_email in the match predicate itself, not
+            # just identity — otherwise this locks onto the person's single
+            # most recent order even when THAT one has a blank email, and
+            # gives up instead of walking back to an older order that has
+            # one. Rows are already date-DESC from the plugin, so the first
+            # row satisfying both conditions is the most recent one with data.
+            _match = None
+            if _cid:
+                _match = next(
+                    (
+                        r for r in _hist_rows
+                        if str(r.get("customer_id") or 0) == str(_cid)
+                        and r.get("shipping_email")
+                    ),
+                    None,
+                )
+            if not _match:
+                _fn = str(shipping_block.get("first_name") or "").strip().lower()
+                _ln = str(shipping_block.get("last_name") or "").strip().lower()
+                if _fn or _ln:
+                    _match = next(
+                        (
+                            r for r in _hist_rows
+                            if str(r.get("shipping_first_name") or "").strip().lower() == _fn
+                            and str(r.get("shipping_last_name") or "").strip().lower() == _ln
+                            and r.get("shipping_email")
+                        ),
+                        None,
+                    )
+            logger.info(
+                f"bulk_order | shipping-email fallback for "
+                f"{current_line.get('customer_display_name', '') or 'unknown'} "
+                f"(customer_id={_cid or 'n/a'}) | found={'yes' if _match else 'no'}"
+            )
+            if _match:
+                shipping_block["email"] = _match["shipping_email"]
+                current_line["shipping_address"] = shipping_block
+                conversation.context_data = user_context
+                flag_modified(conversation, "context_data")
+
     # Prefill from the EFFECTIVE address, not the raw base blocks, so a rep who
     # saved a partial edit and got rejected sees their own values back in the
     # panel instead of the original ones.
@@ -3534,7 +3712,7 @@ def _build_address_card_response(
     _SHIPPING_FIELDS = (
         "first_name", "last_name", "company",
         "address_1", "address_2", "city", "state", "postcode", "country",
-        "order_notes",
+        "email", "order_notes",
     )
 
     def _pick(block, fields):
@@ -3624,6 +3802,61 @@ def _build_address_card_response(
 # ── Function 7: _create_all_confirmed_orders (private) ──
 # ══════════════════════════════════════════════════════════════
 
+def _order_group_key(line, line_idx, address_overrides, rep_email, rep_billing):
+    """
+    Key deciding which lines merge into ONE WooCommerce order.
+
+    Shared by _create_all_confirmed_orders and _planned_order_count so the
+    number the rep is shown on the confirmation card is computed the same way
+    as the orders actually created — the card said "4 order(s)" for four lines
+    that merged into a single order.
+
+    The RECIPIENT NAME is part of the key, not just customer_id. With no
+    customer account (address-only mode) every line carries customer_id=None,
+    so two different people ordering to the same company address collapsed
+    into ONE order labelled with whichever line came first. The effective
+    address is included because two lines for the same person can carry
+    DIFFERENT addresses when the rep edited one in the per-line panel, and an
+    order has exactly one billing and one shipping block.
+    """
+    _billing, _shipping = _effective_address_for_line(
+        line, address_overrides, line_idx, rep_email, rep_billing,
+    )
+    _recipient_key = (
+        line.get("recipient_name")
+        or line.get("customer_display_name")
+        or ""
+    ).strip().lower()
+    return (
+        str(line.get("customer_id")),
+        _recipient_key,
+        _address_group_key(_billing),
+        _address_group_key(_shipping),
+    ), _billing, _shipping
+
+
+def _planned_order_count(lines_as_dicts, user_context) -> int:
+    """
+    How many orders confirming will actually create — distinct recipients,
+    not line count.
+    """
+    overrides = user_context.get("bulk_address_overrides", {}) or {}
+    rep_email = user_context.get("rep_email", "")
+    rep_billing = user_context.get("rep_billing_address")
+    keys = set()
+    for idx, line in enumerate(lines_as_dicts):
+        if line.get("unresolved") or line.get("address_skipped"):
+            continue
+        try:
+            key, _b, _s = _order_group_key(line, idx, overrides, rep_email, rep_billing)
+        except Exception:
+            # Counting must never break the confirmation card; fall back to
+            # treating this line as its own order.
+            key = ("__line__", idx)
+        keys.add(key)
+    return len(keys)
+
+
 def _address_group_key(addr) -> str:
     """
     Canonical key for "is this the same destination?".
@@ -3709,26 +3942,12 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
         if not line.get("address_confirmed"):
             continue
 
-        _billing, _shipping = _effective_address_for_line(
-            line, address_overrides, line_idx, rep_email,
+        # Key, billing and shipping all come from _order_group_key so the
+        # count shown on the confirmation card cannot disagree with what is
+        # created here.
+        _key, _billing, _shipping = _order_group_key(
+            line, line_idx, address_overrides, rep_email,
             user_context.get("rep_billing_address"),
-        )
-        # The RECIPIENT NAME is part of the key, not just customer_id.
-        # With no customer account (address-only mode) every line carries
-        # customer_id=None, so two different people ordering to the same
-        # company address collapsed into ONE order labelled with whichever
-        # line came first — "1× London for Kevin Shuker" when London was
-        # Tamra Smith's. Different named recipients stay separate orders.
-        _recipient_key = (
-            line.get("recipient_name")
-            or line.get("customer_display_name")
-            or ""
-        ).strip().lower()
-        _key = (
-            str(line.get("customer_id")),
-            _recipient_key,
-            _address_group_key(_billing),
-            _address_group_key(_shipping),
         )
         if _key not in _groups:
             _groups[_key] = {
@@ -3776,6 +3995,12 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
         project_name = billing.get("billing_project") or ""
         field_type   = billing.get("billing_field_type") or ""
         order_notes  = shipping.get("order_notes") or ""
+        # WooCommerce core has no set_shipping_email() — unlike billing.email
+        # (a real WC property), a shipping email left nested in the shipping
+        # object is silently dropped by WC_REST_Orders_Controller::update_address()
+        # on order creation. Must go through meta_data like the other custom
+        # fields above, or it never persists no matter how it was prefilled.
+        shipping_email = shipping.get("email") or ""
 
         meta_data = []
         if project_rep:
@@ -3784,11 +4009,17 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
             meta_data.append({"key": "_billing_project_name", "value": project_name})
         if field_type:
             meta_data.append({"key": "_billing_field_type", "value": field_type})
+        if shipping_email:
+            meta_data.append({"key": "_shipping_email", "value": shipping_email})
 
         # Remove custom keys from the Woo address blocks — they live in meta.
+        # Only shipping's email is stripped: billing.email IS a real WC
+        # property (set_billing_email exists) and must stay in the billing
+        # block to keep working as it always has.
         for _k in ("project_rep", "billing_project", "billing_field_type", "order_notes"):
             billing.pop(_k, None)
             shipping.pop(_k, None)
+        shipping.pop("email", None)
 
         payload = {
             "status": "processing",

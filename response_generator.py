@@ -528,6 +528,21 @@ def generate_bot_message(
         variations = [p for p in products[1:] if p.get("type") == "variation"]
         if not variations and parent.get("variations"):
             variations = parent.get("variations", [])
+
+        # When the attributes resolved to specific variation(s), the API returns
+        # ONLY those variations — products[0] is a variation, not the parent. The
+        # lookups above then find nothing after skipping products[0] and the code
+        # concluded "couldn't find matching variations" for a search that had in
+        # fact matched exactly (e.g. "Tara chip card" → variation 17132).
+        # Treat the whole list as the result set, and take the parent name from
+        # the entities so follow-up suggestions read "Tara", not the variation's
+        # own "Tara — Chip Card".
+        if products and all(
+            p.get("type") == "variation" or p.get("parent_id") for p in products
+        ):
+            variations = list(products)
+            parent = dict(parent)
+            parent["name"] = entities.product_name or parent.get("name", "")
             
         has_attributes = bool(entities.attributes)
         has_stock_filter = getattr(entities, 'in_stock', None) is not None

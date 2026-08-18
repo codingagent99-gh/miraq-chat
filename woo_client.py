@@ -11,10 +11,11 @@ from app_config import (
     WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET, WOO_BASE_URL, CUSTOM_API_BASE_URL,
     ECOMMERCE_BACKEND,
 )
-from chat_logger import get_logger, get_api_logger, sanitize_url
+from chat_logger import get_logger, get_api_logger, get_order_logger, sanitize_url
 
 logger = get_logger("miraq_chat")
 api_logger = get_api_logger()
+order_logger = get_order_logger()
 
 # Minimal headers that pass WordPress.com Atomic's bot detection.
 # Full BROWSER_HEADERS with query-string credentials triggered 429s.
@@ -78,6 +79,17 @@ class WooClient:
         params = dict(api_call.params)
         is_custom_api = api_call.surface == "custom_plugin"
 
+        # Order creation (Row 5.4 — POST /orders, admin surface) gets its own
+        # logger per request, isolated from api.txt entirely. list_rep_orders /
+        # list_cs_orders also POST to "/orders" but on the custom_plugin
+        # surface, so the surface check keeps them out of this branch.
+        is_order_create = (
+            api_call.method == "POST"
+            and api_call.endpoint == "/orders"
+            and api_call.surface == "admin"
+        )
+        _api_log = order_logger if is_order_create else api_logger
+
         # Resolve relative endpoints to full URLs
         endpoint = api_call.endpoint
         if not endpoint.startswith("http"):
@@ -101,13 +113,13 @@ class WooClient:
             context = f" | session={api_call.session_id} | q={api_call.user_message!r}"
 
         if api_call.method == "GET":
-            api_logger.info(f"REQUEST GET {sanitized_endpoint} | params={safe_params}{context}")
+            _api_log.info(f"REQUEST GET {sanitized_endpoint} | params={safe_params}{context}")
         else:
             try:
                 body_str = _json.dumps(api_call.body, separators=(",", ":"))
             except Exception:
                 body_str = str(api_call.body)
-            api_logger.info(f"REQUEST {api_call.method} {sanitized_endpoint} | body={body_str}{context}")
+            _api_log.info(f"REQUEST {api_call.method} {sanitized_endpoint} | body={body_str}{context}")
 
         # The body matters as much as the params on POST endpoints — a
         # resolved-but-wrong customer_id is invisible when only params are
@@ -154,6 +166,12 @@ class WooClient:
                 items = data.get("products", [])
             elif isinstance(data, list):
                 items = data
+            elif isinstance(data, dict) and isinstance(data.get("data"), list):
+                # custom_plugin convention: {"success": bool, "count": int, "data": [...]}
+                # (e.g. /company-order-addresses, /saved-addresses). Without this,
+                # every such endpoint logs count=0 regardless of how many rows it
+                # actually returned — indistinguishable from a genuinely empty result.
+                items = data["data"]
             else:
                 items = []
                 if isinstance(data, dict):
@@ -181,13 +199,13 @@ class WooClient:
                 product_summary = ", ".join(
                     f"{p.get('id')}:{p.get('name', '?')}" for p in items[:20]
                 )
-                api_logger.info(
+                _api_log.info(
                     f"RESPONSE {api_call.method} {endpoint_short} | "
                     f"status={resp.status_code} | count={len(items)} | "
                     f"time_ms={_elapsed_ms} | products=[{product_summary}]"
                 )
             else:
-                api_logger.info(
+                _api_log.info(
                     f"RESPONSE {api_call.method} {endpoint_short} | "
                     f"status={resp.status_code} | count={len(items)} | "
                     f"time_ms={_elapsed_ms}{_summary_extra}"
@@ -224,7 +242,7 @@ class WooClient:
                 except Exception:
                     pass
             _elapsed_ms = round((_time.time() - _req_start) * 1000)
-            api_logger.error(
+            _api_log.error(
                 f"RESPONSE {api_call.method} {endpoint_short} | "
                 f"status=ERROR | time_ms={_elapsed_ms} | "
                 f"error={str(e)}{body_preview}"

@@ -1400,6 +1400,71 @@ def handle_quantity_and_variant_check(
                 }), 200
 
             from handlers.chat_utils import build_variant_prompt, _compute_variant_options
+            from handlers.chat_utils import (
+                self_contained_variation_axis,
+                resolve_self_contained_variation,
+            )
+            # Chip Card: nothing left to ask, but quantity is still unknown —
+            # ask for quantity instead of falling through to a variant prompt.
+            #
+            # The variation MUST be resolved here, not later: the quantity reply
+            # is handled by the flow-state machine (prompt_cart_confirmation),
+            # which reads pending_variation_id straight from context and never
+            # re-enters Step 3.6. Leaving it unset would reach add-to-cart with
+            # only a partial attribute set and no variation to pin.
+            if self_contained_variation_axis(getattr(entities, "attributes", {}), _sl):
+                _sc_variations = [p for p in all_products_raw if p.get("parent_id")]
+                if not _sc_variations:
+                    _sc_resp = woo_client.execute(endpoints.list_variants(
+                        product_id=product.get("id"),
+                        per_page=100,
+                        description=f"Fetch variations to resolve sample form for '{product['name']}'",
+                    ))
+                    _sc_variations = _sc_resp.get("data", []) if _sc_resp.get("success") else []
+
+                _sc_vid, _sc_attrs = resolve_self_contained_variation(
+                    _sc_variations, getattr(entities, "attributes", {}), _sl
+                )
+                if not _sc_vid:
+                    # The product has no dedicated variation for this sample
+                    # form (Elizabeth Mosaic, London): every variation is a
+                    # colour, so the colour is still required. Fall through to
+                    # the normal prompt rather than suppressing it and leaving
+                    # the line with no variation to add to the cart.
+                    logger.info(
+                        f"Step 5.5: '{product.get('name')}' has no dedicated "
+                        f"variation for the named sample form — prompting normally"
+                    )
+                else:
+                    logger.info(
+                        f"Step 5.5: self-contained sample form for {product.get('name')} "
+                        f"— asking quantity instead of variant | "
+                        f"variation_id={_sc_vid} attrs={_sc_attrs}"
+                    )
+                    elapsed = time.time() - start_time
+                    _sc_label = " / ".join(str(v) for v in _sc_attrs.values())
+                    _sc_suffix = f" ({_sc_label})" if _sc_label else ""
+                    return jsonify({
+                        "success": True,
+                        "bot_message": (
+                            f"Sure, I can order **{product['name']}**{_sc_suffix} for you! "
+                            f"How many do you need? Type any number of quantities you need in the chat. 🛒"
+                        ),
+                        "intent": intent.value,
+                        "products": products_formatted[:1],
+                        "suggestions": ["Cancel"],
+                        "session_id": session_id,
+                        "metadata": {
+                            "flow_state": FlowState.AWAITING_QUANTITY.value,
+                            "pending_product_name": product["name"],
+                            "pending_product_id": product.get("id"),
+                            "pending_variation_id": _sc_vid,
+                            "resolved_attributes": _sc_attrs,
+                            "response_time_ms": round(elapsed * 1000),
+                        },
+                        "flow_state": FlowState.AWAITING_QUANTITY.value,
+                        "pagination": default_pagination(page),
+                    }), 200
             prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug, resolved_attr_values=resolved_attr_values)
             _variant_options = _compute_variant_options(_raw_for_prompt, getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug)
             _seeded = _seed_resolved_from_entities(entities, _variations_for_cache, _sl)
@@ -1496,6 +1561,17 @@ def handle_quantity_and_variant_check(
             }), 200
 
         from handlers.chat_utils import build_variant_prompt, _compute_variant_options
+        from handlers.chat_utils import self_contained_variation_axis
+        # Chip Card (or any self-contained sample form): the remaining axes do
+        # not apply, so there is nothing to ask. Fall through to Step 3.6,
+        # which resolves the variation from the attributes already given.
+        _self_axis = self_contained_variation_axis(getattr(entities, "attributes", {}), _sl)
+        if _self_axis:
+            logger.info(
+                f"Step 5.5: self-contained sample form on '{_self_axis}' for "
+                f"{product.get('name')} — skipping variant prompt"
+            )
+            return None
         prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug, resolved_attr_values=resolved_attr_values)
         _variant_options = _compute_variant_options(_raw_for_prompt, getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug)
         # Axes the user already stated (e.g. "Adams Beige" → Colors). Returned in

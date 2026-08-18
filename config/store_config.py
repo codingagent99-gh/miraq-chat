@@ -82,6 +82,41 @@ TAG_SLUG_CHIP_CARD  = PRODUCT_TAG_SLUGS.get("chip_card",  "chip-card")
 
 
 # ═══════════════════════════════════════════════════════════════
+# SELF-CONTAINED VARIATION TERMS
+# Variation terms describing a sample form that is complete in itself, so
+# the product's OTHER variation axes do not apply to it.
+#
+# A Chip Card is one physical card showing the whole colour range, so asking
+# "which colour?" / "which finish?" for it is meaningless. The catalog encodes
+# this already — e.g. Tara (16968) has a dedicated Chip Card variation (17132)
+# declaring ONLY Sample Size and leaving Colors/Finish as WooCommerce "Any" —
+# but that shape is indistinguishable from an ordinary partly-specified
+# variation, so the semantics are declared here rather than inferred.
+#
+# Keyed by attribute taxonomy → term names. Matching ignores case, spaces,
+# hyphens and underscores ("Chip Card" == "chip-card" == "chipcard").
+# Override via env var SELF_CONTAINED_VARIATION_TERMS_JSON.
+# ═══════════════════════════════════════════════════════════════
+
+_DEFAULT_SELF_CONTAINED_VARIATION_TERMS = {
+    "pa_sample-size": ["Chip Card"],
+}
+
+def _load_self_contained_variation_terms() -> dict:
+    raw = os.getenv("SELF_CONTAINED_VARIATION_TERMS_JSON", "")
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return {k: list(v) for k, v in parsed.items() if isinstance(v, (list, tuple))}
+        except Exception:
+            pass
+    return {k: list(v) for k, v in _DEFAULT_SELF_CONTAINED_VARIATION_TERMS.items()}
+
+SELF_CONTAINED_VARIATION_TERMS: dict = _load_self_contained_variation_terms()
+
+
+# ═══════════════════════════════════════════════════════════════
 # FALLBACK SEARCH TERM
 # ═══════════════════════════════════════════════════════════════
 

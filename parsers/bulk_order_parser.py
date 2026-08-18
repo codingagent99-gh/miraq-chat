@@ -18,7 +18,7 @@ from woo_client import woo_client
 from ecommerce import endpoints
 from chat_logger import get_logger
 from app_config import BULK_ORDER_ROLES
-from handlers.chat_utils import normalize_spelling_variants, _attribute_display_name
+from handlers.chat_utils import normalize_spelling_variants, _attribute_display_name, variation_declares_self_contained_term, _normalize_term_key
 from models import ExtractedEntities
 from classifier.extractors import extract_attributes
 from api_builder.store_helpers import resolve_attr_filters
@@ -64,6 +64,7 @@ class BulkOrderLine:
     blank_variant_axes: list = field(default_factory=list)  # axes the matched variation leaves as "Any"
     candidate_variation_ids: list = field(default_factory=list)  # hint matched several variations
     specified_variant_axes: list = field(default_factory=list)   # axes the matched variation DOES set
+    self_contained_variant: bool = False  # Chip Card etc — other axes deliberately N/A
 
 # ══════════════════════════════════════════════════════════════
 # INTERNAL: intermediate pre-line structure
@@ -88,6 +89,7 @@ class _PreLine:
     blank_variant_axes: list = field(default_factory=list)
     candidate_variation_ids: list = field(default_factory=list)
     specified_variant_axes: list = field(default_factory=list)
+    self_contained_variant: bool = False
 
 
 # ══════════════════════════════════════════════════════════════
@@ -462,6 +464,38 @@ def parse_bulk_order_utterance(
     if not pre_lines:
         return []
 
+    # ── Step 2.5: Transaction-wide LEADING quantity ───────────────────────────
+    # "Order 1 Harmony, Lager, Adams, Marigold chip card for Gensler" — the
+    # only explicit digit ("1") sits on the FIRST fragment ("1 Harmony").
+    # Every other fragment defaults to quantity=1 anyway, so this happens to
+    # look right for qty=1 — but "Order 5 Harmony, Lager, Adams, Marigold
+    # chip card for Gensler" would silently give Harmony qty=5 and leave the
+    # rest at the default 1, wrong in exactly the way nothing downstream
+    # would flag (a quantity of 1 looks deliberate, not missing).
+    #
+    # Same shape as the "each" distribution above, just without the word
+    # "each" to key off. Mirrors its conservative gate: only fires when
+    # exactly ONE fragment has an explicit quantity and it is the FIRST
+    # fragment (the natural position for a leading shared count) — so it
+    # never touches the documented multi-recipient shape ("20 Harmony White
+    # for ram, 15 Adams Grey for sovan"), where every fragment already
+    # carries its own quantity, and never fires when "each" already handled
+    # distribution (every fragment is already quantity_explicitly_set there).
+    _explicit_qty = [pl for pl in pre_lines if pl.quantity_explicitly_set]
+    _implicit_qty = [pl for pl in pre_lines if not pl.quantity_explicitly_set]
+    if (
+        len(_explicit_qty) == 1 and _implicit_qty
+        and _explicit_qty[0] is pre_lines[0]
+    ):
+        _shared_qty = _explicit_qty[0].quantity
+        for pl in _implicit_qty:
+            pl.quantity = _shared_qty
+            pl.quantity_explicitly_set = True
+        logger.debug(
+            f"bulk_parser | shared leading quantity → {_shared_qty} "
+            f"(applied to {len(_implicit_qty)} line(s) lacking their own)"
+        )
+
     # ── Step 3: Product resolution + variant hint extraction ──────────────────
     for pl in pre_lines:
         if not store_loader or not pl.product_name:
@@ -583,6 +617,28 @@ def parse_bulk_order_utterance(
                                 pl.recipient_name = candidate
                     else:
                         pl.variant_hint = remainder
+                else:
+                    # Nothing follows the product name — try the LEADING text
+                    # instead. "1 each chip card from Harmony" puts the hint
+                    # BEFORE the name, not after: strip the quantity token,
+                    # "each"/"every"/"per", and a trailing connector word
+                    # immediately before the name, and whatever survives is
+                    # the hint. Only meaningful once qty/each are stripped
+                    # away — a bare leading "1 " alone is not a hint.
+                    _lead = pl.product_name[:_name_match.start()]
+                    _lead = re.sub(
+                        r'^\s*(?:\d+|' + '|'.join(_WORD_NUMERALS) + r')\b',
+                        '', _lead, flags=re.I,
+                    )
+                    _lead = re.sub(r'\b(each|every|per)\b', '', _lead, flags=re.I)
+                    _lead = re.sub(r'\b(from|of)\s*$', '', _lead, flags=re.I)
+                    _lead = _lead.strip(" ,.-")
+                    if _lead:
+                        pl.variant_hint = _lead
+                        logger.debug(
+                            f"bulk_parser | leading variant hint → '{_lead}' "
+                            f"(before product name '{matched_catalog_name}')"
+                        )
             pl.product_name = matched_catalog_name
             
         if pl.product_id:
@@ -594,7 +650,38 @@ def parse_bulk_order_utterance(
             logger.debug(
                 f"bulk_parser | unresolved product '{pl.product_name}'"
             )
-            
+
+    # ── Step 3.7: Transaction-wide shared VARIANT HINT (leading or trailing) ──
+    # "Order 1 Harmony, Lager, Adams, Marigold chip card for Gensler" — the
+    # hint trails on the LAST fragment ("Marigold chip card").
+    # "Order 1 each chip card from Harmony, Lager, Adams, Marigold" — the
+    # hint leads on the FIRST fragment instead ("chip card from Harmony").
+    # Same underlying shape as the shared-recipient and each-quantity
+    # problems above either way. Without this, only the one fragment that
+    # textually touches the hint gets a variant_hint and the rest are left
+    # with none, so they fall through to individual colour/finish prompts
+    # even though the hint plainly reads as covering the whole list.
+    #
+    # Conservative by design, same as Step 1.6: only fires when exactly ONE
+    # resolved line has a hint, every other resolved line has none, AND the
+    # hinted line is the FIRST or LAST one — the natural positions for a
+    # shared descriptor. A genuinely mixed set ("Harmony White for X, Adams
+    # chip card for Y") must NOT be collapsed — each line already carries
+    # its own hint and this block leaves those alone.
+    _hinted = [pl for pl in pre_lines if pl.product_id and pl.variant_hint]
+    _unhinted = [pl for pl in pre_lines if pl.product_id and not pl.variant_hint]
+    if (
+        len(_hinted) == 1 and _unhinted and pre_lines
+        and (_hinted[0] is pre_lines[-1] or _hinted[0] is pre_lines[0])
+    ):
+        _shared_hint = _hinted[0].variant_hint
+        for pl in _unhinted:
+            pl.variant_hint = _shared_hint
+        logger.debug(
+            f"bulk_parser | shared variant hint → '{_shared_hint}' "
+            f"(applied to {len(_unhinted)} line(s) lacking their own)"
+        )
+
     # ── Step 3.5: Variation resolution (API call per unique product with a hint) ─
     _variant_cache: dict = {}   # product_id → list[variation dicts]; avoids duplicate calls
     _variant_fetch_failed: set = set()   # product_ids whose lookup errored out
@@ -643,6 +730,16 @@ def parse_bulk_order_utterance(
             # ("ADAMS Gray" vs "Aurora - Misty Grey").
             if any(hint_lower in normalize_spelling_variants(o) for o in _options):
                 _matches.append(var)
+                continue
+            # Whitespace/hyphen-insensitive fallback so "chipcard" and
+            # "chip-card" reach the catalog's "Chip Card" the same way
+            # "chip card" already does.
+            if any(
+                _normalize_term_key(hint_lower) in _normalize_term_key(o)
+                for o in _options
+                if str(o).strip()
+            ):
+                _matches.append(var)
 
         if len(_matches) == 1:
             pl.variation_id = _matches[0]["id"]
@@ -660,12 +757,35 @@ def parse_bulk_order_utterance(
             )
 
         if pl.variation_id:
+            # A self-contained sample form (Chip Card) is complete on its own:
+            # the variation deliberately leaves the other axes as WooCommerce
+            # "Any", so they must NOT be treated as missing and prompted for.
+            _resolved_var = next(
+                (v for v in _variant_cache[pl.product_id] if v.get("id") == pl.variation_id),
+                None,
+            )
+            if _resolved_var and variation_declares_self_contained_term(_resolved_var):
+                pl.self_contained_variant = True
+                logger.info(
+                    f"bulk_parser | product {pl.product_id} variation "
+                    f"{pl.variation_id} is a self-contained sample form — "
+                    f"other axes suppressed, will not prompt"
+                )
+
+        if pl.variation_id:
             # A matched variation can still be only PARTIALLY specified: this
             # catalog has products (Adams) where every variation carries a
             # colour but leaves Finish and Sample Size blank — WooCommerce
             # "Any". The storefront still makes the shopper choose those, so
             # record them and let the handler ask rather than silently
             # ordering an under-specified line.
+            #
+            # This branch must stay paired with the `else` below, which records
+            # a hint we could NOT match: gating the whole branch on
+            # `not self_contained_variant` sent Chip Card lines into that else
+            # and stamped unmatched_variant_hint='chip card' on a line whose
+            # variation had in fact resolved. Only the blank-axis collection is
+            # suppressed for a self-contained form.
             _matched = next(
                 (v for v in _variant_cache[pl.product_id] if v.get("id") == pl.variation_id),
                 None,
@@ -680,7 +800,7 @@ def parse_bulk_order_utterance(
                     for a in _attrs
                     if isinstance(a, dict) and not str(a.get("option") or "").strip()
                 ]
-            pl.blank_variant_axes = [
+            pl.blank_variant_axes = [] if pl.self_contained_variant else [
                 _attribute_display_name(k) for k in _blank if k
             ]
             pl.specified_variant_axes = [
@@ -796,10 +916,21 @@ def parse_bulk_order_utterance(
             # bare [] when nothing matched, so "no such company" can be told
             # apart from an out-of-date plugin build without server access.
             if isinstance(_raw_data, dict) and _raw_data.get("_diagnostic"):
-                logger.warning(
-                    f"bulk_parser | company lookup NO MATCHES | "
-                    f"diagnostic={_raw_data['_diagnostic']}"
-                )
+                # The plugin returns this envelope for "no rows on this page",
+                # which is also what the page AFTER a full page looks like. Only
+                # the first page having no rows means the company is unknown;
+                # later pages just mark the end of the roster, and warning there
+                # made a successful lookup read as a failure in the logs.
+                if company_roster:
+                    logger.debug(
+                        f"bulk_parser | company lookup end of roster at page "
+                        f"{_page} | {len(company_roster)} customer(s) so far"
+                    )
+                else:
+                    logger.warning(
+                        f"bulk_parser | company lookup NO MATCHES | "
+                        f"diagnostic={_raw_data['_diagnostic']}"
+                    )
                 break
 
             _page_rows = [c for c in customers if isinstance(c, dict) and c.get("id")]
@@ -838,6 +969,29 @@ def parse_bulk_order_utterance(
         full_name = (
             f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip()
         )
+        # Some accounts carry a junk name where first and last are the same word
+        # (Andrew_Gazda@gensler.com is stored as "Gazda Gazda"), which showed the
+        # rep a name nobody recognises. Billing usually holds the real one.
+        #
+        # This is deliberately narrow: billing is NOT a better source in general —
+        # eleanor_baker@gensler.com bills as "Jennifer McKinney", and preferring
+        # billing outright would rename her in the picker. Only a degenerate or
+        # empty account name falls back, and only to a billing name that is
+        # actually different and non-empty.
+        _first = str(customer.get("first_name", "") or "").strip()
+        _last = str(customer.get("last_name", "") or "").strip()
+        if not full_name or (_first and _first.casefold() == _last.casefold()):
+            _bill = customer.get("billing", {}) or {}
+            _bill_name = (
+                f"{_bill.get('first_name', '')} {_bill.get('last_name', '')}".strip()
+            )
+            if _bill_name and _bill_name.casefold() != full_name.casefold():
+                logger.debug(
+                    f"bulk_parser | customer {customer.get('id')} account name "
+                    f"'{full_name}' looks degenerate — using billing name "
+                    f"'{_bill_name}'"
+                )
+                full_name = _bill_name
         display = full_name or customer.get("email") or f"Customer #{customer['id']}"
         _ship = customer.get("shipping", {}) or {}
         _bill = customer.get("billing", {}) or {}
@@ -1073,6 +1227,7 @@ def parse_bulk_order_utterance(
             blank_variant_axes=list(pl.blank_variant_axes or []),
             candidate_variation_ids=list(pl.candidate_variation_ids or []),
             specified_variant_axes=list(pl.specified_variant_axes or []),
+            self_contained_variant=pl.self_contained_variant,
         ))
 
     logger.info(

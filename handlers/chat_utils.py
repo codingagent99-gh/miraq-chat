@@ -129,6 +129,146 @@ def _get_safe_options(attrs, store_loader=None):
     return {}
 
 
+def _normalize_term_key(value) -> str:
+    """Case/space/hyphen/underscore-insensitive form used to compare terms."""
+    return re.sub(r"[\s\-_]+", "", str(value or "").strip().lower())
+
+
+def self_contained_variation_axis(resolved_attributes: dict, store_loader=None):
+    """
+    Display name of the axis whose resolved value is a self-contained sample
+    form (e.g. "Sample Size" when the user asked for a Chip Card), or None.
+
+    When this returns an axis, the product's OTHER variation axes do not apply
+    and must not be prompted for — see SELF_CONTAINED_VARIATION_TERMS in
+    config/store_config.py for why this is declared rather than inferred.
+    """
+    if not resolved_attributes:
+        return None
+    try:
+        from config.store_config import SELF_CONTAINED_VARIATION_TERMS
+    except Exception:
+        return None
+
+    resolved_norm = {
+        _normalize_term_key(k): v for k, v in (resolved_attributes or {}).items()
+    }
+    for taxonomy, terms in (SELF_CONTAINED_VARIATION_TERMS or {}).items():
+        axis_display = _attribute_display_name(taxonomy, store_loader)
+        wanted = {_normalize_term_key(t) for t in (terms or [])}
+        for axis_key in (_normalize_term_key(axis_display), _normalize_term_key(taxonomy)):
+            if axis_key not in resolved_norm:
+                continue
+            value = resolved_norm[axis_key]
+            # entities.attributes values may be a comma-joined OR list.
+            values = value if isinstance(value, (list, tuple, set)) else str(value).split(",")
+            if any(_normalize_term_key(v) in wanted for v in values):
+                return axis_display
+    return None
+
+
+def variation_declares_self_contained_term(variation: dict, store_loader=None) -> bool:
+    """True when this variation's OWN attributes carry a self-contained term."""
+    try:
+        from config.store_config import SELF_CONTAINED_VARIATION_TERMS
+    except Exception:
+        return False
+    wanted = {
+        _normalize_term_key(t)
+        for terms in (SELF_CONTAINED_VARIATION_TERMS or {}).values()
+        for t in (terms or [])
+    }
+    if not wanted:
+        return False
+    options = _get_safe_options((variation or {}).get("attributes", []), store_loader)
+    return any(_normalize_term_key(v) in wanted for v in options.values())
+
+
+def _variation_matches_attrs(variation: dict, wanted: dict, store_loader=None) -> bool:
+    """
+    True when the variation explicitly satisfies every wanted axis.
+
+    Both sides are normalised, so the extractor's slug form ("tara-cloud",
+    key "colors") matches the catalog's display form ("Tara Cloud", axis
+    "Colors"). An axis the variation leaves as WooCommerce "Any" does NOT
+    count as a match here — callers want a variation that actually pins it.
+    """
+    options = _get_safe_options((variation or {}).get("attributes", []), store_loader)
+    options_norm = {
+        _normalize_term_key(k): _normalize_term_key(v) for k, v in options.items()
+    }
+    for axis, value in (wanted or {}).items():
+        got = options_norm.get(_normalize_term_key(axis))
+        if not got:
+            return False
+        values = value if isinstance(value, (list, tuple, set)) else str(value).split(",")
+        if not any(_normalize_term_key(v) and _normalize_term_key(v) in got for v in values):
+            return False
+    return True
+
+
+def resolve_self_contained_variation(variations: list, resolved_attributes: dict, store_loader=None):
+    """
+    Resolve a variation for a self-contained sample form without prompting.
+
+    Returns ``(variation_id, resolved_attrs)``, or ``(None, {})`` when this
+    does not apply. Two cases:
+
+      * Only the sample form was named ("chip card") → the dedicated variation
+        that declares it.
+      * A colour/finish was also named ("Tara Cloud chip card") → the
+        colour/finish variation, with the sample form carried in the returned
+        attrs. Those variations leave Sample Size as WooCommerce "Any", so it
+        is supplied as a variation attribute at add-to-cart time.
+
+    Selection among equally valid candidates is by lowest variation id —
+    deterministic, so identical requests never resolve differently.
+    """
+    axis = self_contained_variation_axis(resolved_attributes, store_loader)
+    if not axis or not variations:
+        return None, {}
+
+    axis_norm = _normalize_term_key(axis)
+    others = {
+        k: v for k, v in (resolved_attributes or {}).items()
+        if _normalize_term_key(k) != axis_norm
+    }
+
+    if others:
+        # The user named a colour/finish, so a colour-bearing variation is the
+        # correct target — never the dedicated sample-form variation.
+        candidates = [
+            v for v in variations
+            if isinstance(v, dict)
+            and not variation_declares_self_contained_term(v, store_loader)
+            and _variation_matches_attrs(v, others, store_loader)
+        ]
+    else:
+        candidates = [
+            v for v in variations
+            if isinstance(v, dict) and variation_declares_self_contained_term(v, store_loader)
+        ]
+
+    if not candidates:
+        return None, {}
+
+    chosen = sorted(candidates, key=lambda v: int(v.get("id") or 0))[0]
+    attrs = _get_safe_options(chosen.get("attributes", []), store_loader)
+    self_value = next(
+        (
+            v for k, v in (resolved_attributes or {}).items()
+            if _normalize_term_key(k) == axis_norm
+        ),
+        "",
+    )
+    # The extractor hands over the slug ("chip-card"); the cart label and the
+    # order line should read the way the catalog spells it ("Chip Card").
+    if self_value:
+        self_value = str(self_value).replace("-", " ").replace("_", " ").title()
+    attrs.setdefault(axis, self_value)
+    return chosen.get("id"), {k: v for k, v in attrs.items() if v}
+
+
 _SPELLING_VARIANTS = {
     "grey": "gray",
     "colour": "color",
@@ -529,9 +669,44 @@ def _compute_variant_options(
     log = logging.getLogger("miraq_chat")
 
     resolved = resolved_attributes or {}
-    resolved_keys_lower = {k.lower() for k in resolved.keys()}
+    # Normalised: the extractor emits axis keys in several shapes across the
+    # pipeline ("sample-size", "sample size", "Sample Size"). Comparing raw
+    # lowercase missed the slug form, so an axis the user HAD specified was
+    # asked for again.
+    resolved_keys_lower = {_normalize_term_key(k) for k in resolved.keys()}
     missing_attrs: dict = {}
     store_loader = _get_store_loader_safe()
+
+    # ── STEP 0: Self-contained sample form short-circuit ──
+    # A Tara Chip Card is ONE physical card covering the whole range, so the
+    # other axes do not apply. But that is a property of the CATALOG, not of
+    # the term: Tara has a dedicated Chip Card variation (17132) declaring only
+    # Sample Size, while Elizabeth Mosaic and London have none — every one of
+    # their variations is a colour, and "chip card" there means "a chip card of
+    # ELIZABETH Dusk". Colour is still required for those, so suppression is
+    # gated on a variation actually declaring the term.
+    #
+    # When no real variation records are available (some callers pass the
+    # parent's list of variation IDs), we cannot prove it either way and must
+    # ask — the safe default, and what happened before this rule existed.
+    _self_axis = self_contained_variation_axis(resolved, store_loader)
+    if _self_axis:
+        _variations_for_check = variations_list if variations_list is not None else parent_raw.get("variations", [])
+        _has_dedicated = any(
+            variation_declares_self_contained_term(v, store_loader)
+            for v in (_variations_for_check or [])
+            if isinstance(v, dict)
+        )
+        if _has_dedicated:
+            log.info(
+                f"build_variant_prompt: self-contained sample form on axis "
+                f"'{_self_axis}' — suppressing all other variation axes"
+            )
+            return {}
+        log.info(
+            f"build_variant_prompt: '{_self_axis}' names a self-contained form "
+            f"but no variation declares it — asking for the remaining axes"
+        )
 
     # ── STEP 1: Parent options (authoritative for non-wildcard axes) ──
     parent_defined_axes: set = set()
@@ -542,7 +717,7 @@ def _compute_variant_options(
                 continue
             name = attr.get("name", "")
             nice_name = _attribute_display_name(name, store_loader)
-            if not nice_name or nice_name.lower() in resolved_keys_lower:
+            if not nice_name or _normalize_term_key(nice_name) in resolved_keys_lower:
                 continue
             opts = [
                 _resolve_attribute_term_name(name, o, store_loader).strip()
@@ -574,7 +749,7 @@ def _compute_variant_options(
                 if not val:
                     continue
                 nice_name = _attribute_display_name(k, store_loader)
-                if nice_name.lower() in resolved_keys_lower or nice_name.lower() in parent_defined_axes:
+                if _normalize_term_key(nice_name) in resolved_keys_lower or nice_name.lower() in parent_defined_axes:
                     continue
                 display_value = _resolve_attribute_term_name(k, val, store_loader)
                 missing_attrs.setdefault(nice_name, set()).add(display_value)
@@ -586,7 +761,7 @@ def _compute_variant_options(
                 if not (name and val):
                     continue
                 nice_name = _attribute_display_name(name, store_loader)
-                if nice_name.lower() in resolved_keys_lower or nice_name.lower() in parent_defined_axes:
+                if _normalize_term_key(nice_name) in resolved_keys_lower or nice_name.lower() in parent_defined_axes:
                     continue
                 display_value = _resolve_attribute_term_name(name, val, store_loader)
                 missing_attrs.setdefault(nice_name, set()).add(display_value)

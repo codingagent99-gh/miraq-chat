@@ -778,12 +778,30 @@ def handle_quick_order(
                 all_variations = var_resp.get("data", []) if var_resp.get("success") else []
 
             if all_variations:
-                matched = _filter_variations_by_entities(all_variations, entities)
-                if len(matched) == 1:
-                    _order_variation_id = matched[0]["id"]
-                    logger.info(f"Step 3.6: Resolved variation_id={_order_variation_id} from attributes")
-                else:
-                    logger.info(f"Step 3.6: Attributes matched {len(matched)} variations, asking user")
+                from handlers.chat_utils import resolve_self_contained_variation
+
+                # Chip Card: the suppressed axes are not applicable, so resolve
+                # the variation directly instead of prompting. See
+                # resolve_self_contained_variation for the two cases it covers.
+                _sc_vid, _sc_attrs = resolve_self_contained_variation(
+                    all_variations, entities.attributes
+                )
+                if _sc_vid:
+                    _order_variation_id = _sc_vid
+                    entities.attributes = _sc_attrs
+                    logger.info(
+                        f"Step 3.6: self-contained sample form — resolved "
+                        f"variation_id={_order_variation_id} without prompting | "
+                        f"attrs={entities.attributes}"
+                    )
+
+                if not _order_variation_id:
+                    matched = _filter_variations_by_entities(all_variations, entities)
+                    if len(matched) == 1:
+                        _order_variation_id = matched[0]["id"]
+                        logger.info(f"Step 3.6: Resolved variation_id={_order_variation_id} from attributes")
+                    else:
+                        logger.info(f"Step 3.6: Attributes matched {len(matched)} variations, asking user")
                     if len(matched) > 1 and len(matched) < len(all_variations):
                         variation_labels = [
                             " / ".join(_get_safe_options(v.get("attributes", [])).values())
