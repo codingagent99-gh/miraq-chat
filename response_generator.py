@@ -189,7 +189,7 @@ def _build_search_context_string(entities: ExtractedEntities,  or_pair_breakdown
             branch_descrs.append(f"{label.lower()} {value}")
 
         if len(group) > 1:
-            note = f" — Note: Same product may have {', '.join(branch_descrs)}; in such cases it is counted once only"
+            note = f" - Note: Same product may have {', '.join(branch_descrs)}; in such cases it is counted once only"
         else:
             note = ""
         desc_parts.append(f"**{head_value}** *({' • '.join(suffix_bits)}{note})*")

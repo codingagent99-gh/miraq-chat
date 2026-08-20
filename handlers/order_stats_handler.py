@@ -448,7 +448,7 @@ def handle_order_stats(
         _per_page   = int(data.get("per_page") or ORDER_LIST_PER_PAGE)
         _total_pages = int(data.get("total_pages") or 1)
         msg = (
-            f"**{name}** — **{total_orders} order{'s' if total_orders != 1 else ''}**"
+            f"**{name}** - **{total_orders} order{'s' if total_orders != 1 else ''}**"
             f"{window_str}."
         )
         # Per-rep split before the paging line: an admin who asked about three
@@ -463,15 +463,15 @@ def handle_order_stats(
         # customer and ship to a third party). Without this line an admin
         # sees "Jennifer — 1 order" over a card that names a different
         # person and reasonably concludes the filter is broken.
-        msg += (
-            "\n\n_Includes orders credited to them as sales rep and orders "
-            "they placed themselves — so the billing name on an order may "
-            "differ._"
-        )
+        # msg += (
+        #     "\n\n_Includes orders credited to them as sales rep and orders "
+        #     "they placed themselves — so the billing name on an order may "
+        #     "differ._"
+        # )
         if truncated:
             msg += (
-                f"\n\n⚠️ _Only the most recent {data.get('max_orders_scanned')} orders "
-                f"were scanned — this list is a minimum. Narrow the date range to see all of them._"
+                f"\n\n Only the most recent {data.get('max_orders_scanned')} orders "
+                f"were scanned — this list is a minimum. Narrow the date range to see all of them."
             )
         msg += _unresolved_note(data)
         return _respond(
@@ -509,8 +509,8 @@ def handle_order_stats(
     # than we scan would silently report the cap as their total.
     if truncated:
         msg += (
-            f"\n\n⚠️ _Only the most recent {data.get('max_orders_scanned')} orders "
-            f"were scanned — this is a minimum. Narrow the date range for an exact count._"
+            f"\n\nOnly the most recent {data.get('max_orders_scanned')} orders "
+            f"were scanned — this is a minimum. Narrow the date range for an exact count."
         )
     msg += _unresolved_note(data)
 

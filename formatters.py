@@ -280,7 +280,7 @@ def format_variation(raw: dict, parent: dict = None) -> dict:
         a.get("option", "") for a in attrs if a.get("option")
     )
     parent_name = parent.get("name", "") if parent else ""
-    name = f"{parent_name} — {attr_label}" if attr_label else parent_name
+    name = f"{parent_name} - {attr_label}" if attr_label else parent_name
 
     var_images = variation_image_urls(raw) or (parent.get("images", []) if parent else [])
 

@@ -200,9 +200,9 @@ def get_disambiguation_message() -> dict:
         "bot_message": (
             "I'm sorry, I couldn't understand that. Can we start again? 🤔\n\n"
             "What would you like help with?\n"
-            "• **Product** — Search or get info about a product\n"
-            "• **Category** — Browse a product category\n"
-            "• **Order** — Place a new order or check an existing one"
+            "• **Product** - Search or get info about a product\n"
+            "• **Category** - Browse a product category\n"
+            "• **Order** - Place a new order or check an existing one"
         ),
         "suggestions": [
             "I want information about a product",
