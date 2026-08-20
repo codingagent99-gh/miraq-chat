@@ -18,7 +18,7 @@ access any Woo-specific field that has not yet been normalized.
 """
 
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from chat_logger import get_logger
 from models import WooAPICall
@@ -481,7 +481,7 @@ class WooEndpoints:
         requesting_customer_id,
         date_after: Optional[str] = None,
         date_before: Optional[str] = None,
-        rep: Optional[str] = None,
+        rep: Optional[Union[str, List[str]]] = None,
         statuses: Optional[List[str]] = None,
         include_orders: bool = False,
         page: int = 1,
@@ -516,7 +516,16 @@ class WooEndpoints:
         if date_before:
             params["before"] = date_before
         if rep:
-            params["rep"] = rep
+            # A list rides as one comma-separated `rep` param — the plugin
+            # resolves each name and runs ONE merged query, so the combined
+            # list can be paged and deduped. Sending a request per rep would
+            # give N result sets that cannot be paged together.
+            if isinstance(rep, (list, tuple, set)):
+                _reps = [str(r).strip() for r in rep if str(r).strip()]
+            else:
+                _reps = [str(rep).strip()] if str(rep).strip() else []
+            if _reps:
+                params["rep"] = ",".join(_reps)
         if statuses:
             params["status"] = ",".join(statuses)
         if include_orders:

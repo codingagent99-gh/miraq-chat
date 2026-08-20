@@ -1276,8 +1276,25 @@ def handle_bulk_variant_selection_reply(
     import re as _re
 
     line["variation_id"] = best_match["id"]
-    line["unresolved"] = False
-    line["unresolved_reason"] = None
+
+    # Picking a variation resolves the PRODUCT axis only — it says nothing
+    # about whether a recipient was ever identified. Clearing `unresolved`
+    # here unconditionally made a line's readiness depend on whether it
+    # happened to need a variant prompt, which is how order #1066565 shipped
+    # its two prompted lines and dropped its two chip-card lines.
+    #
+    # Every blocker is now cleared by the step that owns it, so by the time a
+    # line reaches this prompt it should already be resolved: Step 5 skips
+    # lines with no product_id, and the company / recipient / email / address
+    # steps all run before it. If one still arrives unresolved, say so loudly
+    # rather than promoting it into a live order.
+    if line.get("unresolved"):
+        logger.warning(
+            f"bulk_order | line {line_idx} ({line.get('product_name')}) reached "
+            f"the variant prompt still unresolved "
+            f"(reason={line.get('unresolved_reason')}) — leaving it unresolved; "
+            f"a variation choice does not identify a recipient"
+        )
 
     # The variation just chosen may ITSELF leave parent axes unset — "Any"
     # axes that no single variation encodes. Detect that HERE, after stamping.
@@ -2634,16 +2651,20 @@ def _addresses_for_person(rows, first_name, last_name, customer_id=None):
     """
     Historical addresses belonging to one person, de-duplicated.
 
-    Matched on customer_id when the row has one (guest orders carry 0), else
-    on name. Only rows with no street at all are dropped — a partial address
-    is still shown.
+    Matched on NAME first. An order-history row's customer_id is whoever
+    PLACED that order, not who received it — storefront order #1066561 is
+    owned by sovan (272754865) and shipped to Ashlynn Archer — so an id that
+    disagrees means "a rep placed this for them", not "this is someone else".
+    Treating a mismatch as a rejection hid real addresses. customer_id is used
+    only when there is no name to match on.
 
-    These come from past checkouts, so the list includes whatever was typed
-    at the time; an entry like "ASDF" with no city or postcode WILL be
-    offered. That is deliberate: a stricter filter silently hid a real
-    second address for people whose other orders were sloppily entered, and
-    the rep can tell junk from real. The label shows every field present, so
-    a bad entry is visibly bad at the point of choosing.
+    Only rows with no street at all are dropped — a partial address is still
+    shown. These come from past checkouts, so the list includes whatever was
+    typed at the time; an entry like "ASDF" with no city or postcode WILL be
+    offered. That is deliberate: a stricter filter silently hid a real second
+    address for people whose other orders were sloppily entered, and the rep
+    can tell junk from real. The label shows every field present, so a bad
+    entry is visibly bad at the point of choosing.
     """
     def _n(v):
         return re.sub(r"[^a-z0-9]+", " ", str(v or "").lower()).strip()
@@ -2653,11 +2674,12 @@ def _addresses_for_person(rows, first_name, last_name, customer_id=None):
     for r in rows:
         rid = int(r.get("customer_id") or 0)
         row_name = f'{_n(r.get("shipping_first_name"))} {_n(r.get("shipping_last_name"))}'.strip()
-        if customer_id and rid:
+        if want_name:
+            if row_name != want_name:
+                continue
+        elif customer_id and rid:
             if str(rid) != str(customer_id):
                 continue
-        elif want_name and row_name != want_name:
-            continue
 
         a1 = str(r.get("shipping_address_1") or "").strip()
         if not a1:
@@ -2800,6 +2822,26 @@ def _ask_for_bulk_address(
     }), 200
 
 
+# Blockers that picking a delivery address actually clears.
+#
+# In the order-history-address path (Step 4.55 / _ask_for_bulk_recipient
+# fallback) the company has no customer ACCOUNTS, so every line arrives
+# unresolved with one of these reasons and the chosen address is the only
+# resolution there will ever be — the order is placed as a guest order against
+# that address.
+#
+# Deliberately excludes "product_not_found" / "both_not_found" (an address
+# cannot conjure a product) and "recipient_ambiguous" (several people share the
+# name — that is a real ambiguity and must still be asked, not silently closed
+# by an address choice).
+_ADDRESS_RESOLVABLE_REASONS = frozenset({
+    "company_not_provided",
+    "company_not_found",
+    "recipient_required",
+    "recipient_not_found",
+})
+
+
 def handle_bulk_address_choice_reply(message, store_loader, conversation, user_context, page, start_time):
     """
     Called during AWAITING_BULK_ADDRESS_CHOICE.
@@ -2859,6 +2901,7 @@ def handle_bulk_address_choice_reply(message, store_loader, conversation, user_c
             "pagination": default_pagination(page),
         }), 200
 
+    _address_resolved = []
     for idx in slot["line_indices"]:
         if idx >= len(lines):
             continue
@@ -2894,6 +2937,26 @@ def handle_bulk_address_choice_reply(message, store_loader, conversation, user_c
         lines[idx]["shipping_address"] = ship
         lines[idx]["address_choice_made"] = True
 
+        # The chosen address IS the resolution for these lines.
+        #
+        # Nothing downstream cleared it: _create_all_confirmed_orders filters
+        # on `unresolved`, so lines that had just been given a destination were
+        # dropped from the order. They only survived when they happened to need
+        # a variant prompt, because the variant reply cleared the flag as a
+        # side effect — which meant a chip-card line (self-contained sample
+        # form, never prompted) was ALWAYS dropped. Live: order #1066565 kept
+        # Lager and Marigold and silently lost Harmony and Adams.
+        #
+        # On the normal path (_build_address_queue) this is a no-op: that queue
+        # only ever contains lines that already resolved to a customer.
+        if (
+            lines[idx].get("unresolved")
+            and lines[idx].get("unresolved_reason") in _ADDRESS_RESOLVABLE_REASONS
+        ):
+            lines[idx]["unresolved"] = False
+            lines[idx]["unresolved_reason"] = None
+            _address_resolved.append(idx)
+
     user_context["pending_bulk_lines"] = lines
     conversation.context_data = user_context
     flag_modified(conversation, "context_data")
@@ -2902,6 +2965,12 @@ def handle_bulk_address_choice_reply(message, store_loader, conversation, user_c
         f"line(s) {slot['line_indices']} for {slot['name']} "
         f"(slot {pos + 1}/{len(queue)})"
     )
+    if _address_resolved:
+        logger.info(
+            f"bulk_order | chosen address resolved line(s) {_address_resolved} "
+            f"— no customer account for {slot['name']!r}, order(s) will be "
+            f"placed against the address"
+        )
 
     if pos + 1 < len(queue):
         return _ask_for_bulk_address(
@@ -3637,6 +3706,13 @@ def _build_address_card_response(
         _company = user_context.get("bulk_company_scope", "")
         if _company:
             _hist_rows = _company_order_addresses(_company, user_context)
+            # Match on the recipient's NAME first. A row's customer_id is the
+            # person who PLACED that order — for anything a rep entered that
+            # is the rep, so keying on it would return the shipping email of
+            # whoever else that rep last shipped to at this company. The name
+            # identifies the recipient; the id is only a fallback for rows
+            # with no name on them.
+            #
             # Must require shipping_email in the match predicate itself, not
             # just identity — otherwise this locks onto the person's single
             # most recent order even when THAT one has a blank email, and
@@ -3644,7 +3720,19 @@ def _build_address_card_response(
             # one. Rows are already date-DESC from the plugin, so the first
             # row satisfying both conditions is the most recent one with data.
             _match = None
-            if _cid:
+            _fn = str(shipping_block.get("first_name") or "").strip().lower()
+            _ln = str(shipping_block.get("last_name") or "").strip().lower()
+            if _fn or _ln:
+                _match = next(
+                    (
+                        r for r in _hist_rows
+                        if str(r.get("shipping_first_name") or "").strip().lower() == _fn
+                        and str(r.get("shipping_last_name") or "").strip().lower() == _ln
+                        and r.get("shipping_email")
+                    ),
+                    None,
+                )
+            if not _match and _cid:
                 _match = next(
                     (
                         r for r in _hist_rows
@@ -3653,19 +3741,6 @@ def _build_address_card_response(
                     ),
                     None,
                 )
-            if not _match:
-                _fn = str(shipping_block.get("first_name") or "").strip().lower()
-                _ln = str(shipping_block.get("last_name") or "").strip().lower()
-                if _fn or _ln:
-                    _match = next(
-                        (
-                            r for r in _hist_rows
-                            if str(r.get("shipping_first_name") or "").strip().lower() == _fn
-                            and str(r.get("shipping_last_name") or "").strip().lower() == _ln
-                            and r.get("shipping_email")
-                        ),
-                        None,
-                    )
             logger.info(
                 f"bulk_order | shipping-email fallback for "
                 f"{current_line.get('customer_display_name', '') or 'unknown'} "
@@ -3936,6 +4011,27 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
     # Order is preserved (dict keeps insertion order) so the summary still
     # reads in the sequence the rep typed.
     rep_email = user_context.get("rep_email", "")
+
+    # Who is placing these orders. Taken from the session, not from any line —
+    # the lines carry the RECIPIENT. Coerced because conversation.customer_id
+    # arrives as a string on some sessions and WooCommerce wants an int.
+    _placer_customer_id = 0
+    try:
+        _raw_placer = getattr(conversation, "customer_id", None)
+        if _raw_placer:
+            _placer_customer_id = int(_raw_placer)
+    except (TypeError, ValueError):
+        logger.warning(
+            f"bulk_order | unusable session customer_id "
+            f"{getattr(conversation, 'customer_id', None)!r} — orders will be "
+            f"created as guest orders"
+        )
+    if not _placer_customer_id:
+        logger.warning(
+            "bulk_order | no session customer_id — orders will be created as "
+            "guest orders (customer_id 0)"
+        )
+
     _groups: dict = {}
 
     for line_idx, line in enumerate(resolved_lines):
@@ -4002,11 +4098,29 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
         # fields above, or it never persists no matter how it was prefilled.
         shipping_email = shipping.get("email") or ""
 
+        # Four keys, all of them read by something.
+        #
+        # Deliberately NOT written, though storefront checkout writes them:
+        #   _billing_company_name / _shipping_company_name — duplicates of
+        #     billing.company / shipping.company, which are already on the
+        #     order. /company-order-addresses reads the SHIPPING FIELD
+        #     ($order->get_shipping_company()); the _shipping_company_name
+        #     meta_query in class-api.php is a USER meta query for the
+        #     customer roster, not an order one, so an order-level copy is
+        #     never consulted.
+        #   _shipping_address_selector — the storefront's saved-address picker
+        #     value, always empty for orders this flow creates.
+        #
+        # _billing_project is the storefront's key and now the only one used
+        # anywhere. class-api.php previously wrote and read
+        # _billing_project_name — that was the wrong key, not a second valid
+        # one, so both its writer and its reader moved here with no fallback.
+        # Orders already placed under the old key need a one-time meta rename.
         meta_data = []
         if project_rep:
             meta_data.append({"key": "_billing_project_rep", "value": project_rep})
         if project_name:
-            meta_data.append({"key": "_billing_project_name", "value": project_name})
+            meta_data.append({"key": "_billing_project", "value": project_name})
         if field_type:
             meta_data.append({"key": "_billing_field_type", "value": field_type})
         if shipping_email:
@@ -4023,7 +4137,20 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
 
         payload = {
             "status": "processing",
-            "customer_id": line["customer_id"],
+            # The PLACER owns the order, not the recipient.
+            #
+            # This mirrors what the storefront itself produces: order #1066561
+            # was placed by sovan (customer_id 272754865, billing = Silfra
+            # Digital) and shipped to Ashlynn Archer at Abel Design Group —
+            # customer_id is the person checking out, and the recipient lives
+            # entirely in the shipping block. WooCommerce has exactly one
+            # customer_id per order, so it cannot hold both.
+            #
+            # Previously this was line["customer_id"] — the RECIPIENT's account
+            # id — which left an address-only order (company with delivery
+            # history but no customer accounts) posting customer_id: None and
+            # landing as a guest order owned by nobody.
+            "customer_id": _placer_customer_id,
             "payment_method": DEFAULT_PAYMENT_METHOD,
             "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
             "set_paid": False,

@@ -372,30 +372,120 @@ class OrderStatsEvaluator(IntentEvaluator):
         "today", "week", "weeks", "within", "year", "years", "yesterday", "ytd",
     }
 
-    def _extract_rep(self, text: str) -> Optional[str]:
-        """Pull a rep name out of the query, or None if there isn't one.
+    # Separators between names in a multi-rep query: "cs_rep 1, cs_rep 2 and
+    # cs_rep 3". Applied to the text FOLLOWING the name _REP_RE captured, so
+    # the trigger regex above stays exactly as tuned — this only reads further
+    # once a rep has already been found.
+    _REP_CONT_RE = re.compile(
+        r'^\s*(?:,|&|\band\b)\s*(?:rep\s+)?'
+        r'([a-z0-9._@\-]+(?:\s+[a-z0-9._@\-]+){0,2})',
+        re.I,
+    )
 
-        Returns None (not "") when the captured span turns out to be a date
-        phrase or a pronoun — "orders for this week" captures "this week",
-        which _TAIL_STOP then trims away to nothing.
+    # "and" / "&" are word-ish, so a capture allowing up to 3 tokens absorbs
+    # them: "cs_rep 2 and cs_rep 3" captured `cs_rep 2 and` and the scan then
+    # found no separator left to continue on, losing cs_rep 3 — the same
+    # silent drop one name further along. "ram and ram" captured all three
+    # tokens as one name, which fails lookup outright.
+    _SEP_TOKENS = {"and", "&"}
+
+    def _split_names_span(self, span: str):
+        """Cut a captured span at the first separator token.
+
+        Returns ``(name, consumed)`` — the name up to that token, and how far
+        into the span it ran, so the caller can resume scanning AT the
+        separator instead of past it.
         """
-        m_rep = self._REP_RE.search(text)
-        if not m_rep:
-            return None
-        raw = next((g for g in m_rep.groups() if g), "").strip(" .,?")
-        tokens = raw.split()
+        kept, consumed = [], 0
+        for m in re.finditer(r'\S+', span or ""):
+            if m.group(0).lower().strip(" .,?!;:") in self._SEP_TOKENS:
+                break
+            kept.append(m.group(0))
+            consumed = m.end()
+        return " ".join(kept), consumed
+
+    def _clean_rep(self, raw: str) -> Optional[str]:
+        """Trim a captured span down to a usable name, or None if nothing's left.
+
+        Returns None (not "") when the span turns out to be a date phrase or a
+        pronoun — "orders for this week" captures "this week", which
+        _TAIL_STOP then trims away to nothing.
+        """
+        tokens = (raw or "").strip(" .,?").split()
         while tokens and tokens[-1].lower() in self._TAIL_STOP:
             tokens.pop()
         # Strip punctuation AFTER the tail trim, not before: trimming
         # "this" off "ram r. this" exposes a new final token whose
         # trailing period would otherwise survive, and "Ram R." then
         # fails a lookup that "Ram R" passes.
-        raw = " ".join(tokens).strip(" .,?!;:")
+        cleaned = " ".join(tokens).strip(" .,?!;:")
         # "how many did I order" is self-scoped, not a named rep — leave
         # target_rep_name unset so the handler scopes to the caller.
-        if raw and raw.lower() not in self._STOP:
-            return raw
+        if cleaned and cleaned.lower() not in self._STOP:
+            return cleaned
         return None
+
+    def _extract_reps(self, text: str) -> List[str]:
+        """Every rep named in the query, in the order the user typed them.
+
+        _REP_RE finds the first name and gates whether this is a rep query at
+        all. It cannot find the rest: its character class excludes commas, so
+        "orders for cs_rep 1, cs_rep 2, cs_rep 3" captured `cs_rep 1` and
+        stopped — and the admin got a confident report for one rep with no
+        indication the other two had been dropped. Silent, not an error.
+
+        So the trigger regex is left untouched and the remaining names are
+        scanned off the text that follows the one it matched, applying the
+        same cleaning to each.
+        """
+        m_rep = self._REP_RE.search(text)
+        if not m_rep:
+            return []
+
+        # End of the NAME, not of the whole match: the "did <rep> order"
+        # alternative puts the name mid-pattern, so m_rep.end() would skip
+        # past "order" and read the continuation from the wrong place.
+        _idx = next((i for i, g in enumerate(m_rep.groups(), start=1) if g), None)
+        if _idx is None:
+            return []
+
+        _span, _used = self._split_names_span(m_rep.group(_idx))
+        first = self._clean_rep(_span)
+        if not first:
+            # A date phrase or pronoun where the name would be. Not a rep
+            # query — and continuing to scan would attach the names of a
+            # list that has no head.
+            return []
+
+        reps = [first]
+        rest = text[m_rep.start(_idx) + _used:]
+        while True:
+            m_more = self._REP_CONT_RE.match(rest)
+            if not m_more:
+                break
+            _span, _used = self._split_names_span(m_more.group(1))
+            nxt = self._clean_rep(_span)
+            if not nxt:
+                # "cs_rep 1, cs_rep 2 and this week" — the tail is a date
+                # phrase, so the list has ended.
+                break
+            reps.append(nxt)
+            rest = rest[m_more.start(1) + _used:]
+
+        # Same rep twice ("orders for ram and ram") is one rep, not a doubled
+        # total. Case-insensitive, first spelling wins.
+        seen, unique = set(), []
+        for r in reps:
+            k = r.lower()
+            if k not in seen:
+                seen.add(k)
+                unique.append(r)
+        return unique
+
+    def _extract_rep(self, text: str) -> Optional[str]:
+        """First rep named, or None. Retained for callers wanting just one."""
+        reps = self._extract_reps(text)
+        return reps[0] if reps else None
 
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
         is_count_trigger  = bool(self._COUNT_RE.search(text) or self._WHO_RE.search(text))
@@ -406,7 +496,8 @@ class OrderStatsEvaluator(IntentEvaluator):
         if not (is_count_trigger or is_list_trigger or is_report_trigger or has_named_shape):
             return None, 0.0
 
-        rep = self._extract_rep(text)
+        reps = self._extract_reps(text)
+        rep = reps[0] if reps else None
 
         # The "orders by/for X" SHAPE alone does not make a query ours —
         # "show me all orders for the week" has exactly that shape with a
@@ -422,6 +513,7 @@ class OrderStatsEvaluator(IntentEvaluator):
 
         if rep:
             entities.target_rep_name = rep
+            entities.target_rep_names = list(reps)
             entities.scope = "person"
 
         # Precedence: an explicit count/ranking phrase always wins, even

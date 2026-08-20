@@ -195,7 +195,22 @@ class ExtractedEntities:
     # Rep named in an order-stats query ("how many samples did <name> order").
     # Free text as the user typed it — the plugin resolves name → email and
     # refuses ambiguous matches rather than guessing.
+    #
+    # Kept as the FIRST name in target_rep_names, not a separate answer.
+    # Everything downstream that reads a single rep still works unchanged, and
+    # nothing can drift between the two: OrderStatsEvaluator sets both from one
+    # extraction.
     target_rep_name: Optional[str] = None
+
+    # Every rep named in the query, in the order the user typed them.
+    # "orders for cs_rep 1, cs_rep 2, cs_rep 3" → all three.
+    #
+    # A single-rep query fills this with one entry, so callers can read this
+    # field alone; target_rep_name exists for the paths that predate it.
+    # Before this field, the name capture stopped at the first comma and the
+    # admin got a confident report for ONE rep with no sign the others had
+    # been dropped.
+    target_rep_names: List[str] = field(default_factory=list)
 
     # "count" (a number/summary answer) or "list" (actual order cards). Set by
     # OrderStatsEvaluator. "order list for Jennifer" is list; "how many did

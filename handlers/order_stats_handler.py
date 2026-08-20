@@ -81,8 +81,90 @@ def _clear_stats_pending(user_context):
     user_context.pop("pending_order_stats", None)
 
 
+def _join_names(names) -> str:
+    """'a', 'a and b', 'a, b and c' — for reading, not for the API."""
+    names = [str(n).strip() for n in (names or []) if str(n).strip()]
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    return f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def _rep_breakdown(data) -> str:
+    """Per-rep counts, plus the overlap note when the arithmetic needs one.
+
+    The per-rep numbers deliberately do NOT sum to the combined total when an
+    order is credited to one rep and placed by another: it belongs to both,
+    and each would say so. Zeroing it out of one to make the columns add up
+    would be the worse error, so the discrepancy is explained rather than
+    hidden.
+    """
+    reps = data.get("reps") or []
+    if len(reps) < 2:
+        return ""
+
+    lines = []
+    for r in reps:
+        _n = r.get("rep_name") or r.get("rep_email") or "Unknown"
+        _o = int(r.get("order_count") or 0)
+        _i = int(r.get("item_count") or 0)
+        lines.append(
+            f"- **{_n}** — {_o} order{'s' if _o != 1 else ''}, "
+            f"{_i} sample{'s' if _i != 1 else ''}"
+        )
+
+    out = "\n" + "\n".join(lines)
+
+    overlap = int(data.get("overlap_orders") or 0)
+    if overlap:
+        out += (
+            f"\n\n_{overlap} order{'s' if overlap != 1 else ''} "
+            f"{'are' if overlap != 1 else 'is'} credited to one rep and placed "
+            f"by another, so {'they appear' if overlap != 1 else 'it appears'} "
+            f"under both above but count{'' if overlap != 1 else 's'} once in "
+            f"the total._"
+        )
+    return out
+
+
+def _unresolved_note(data) -> str:
+    """Name every rep that could not be looked up.
+
+    A partial report that doesn't say what it left out is worse than a
+    failure: the admin reads the total as covering everyone they asked for.
+    """
+    missing = data.get("unresolved_reps") or []
+    if not missing:
+        return ""
+
+    parts = []
+    for m in missing:
+        _name = m.get("requested") or "that name"
+        if m.get("reason") == "ambiguous_rep":
+            _cands = [
+                c.get("label") or c.get("email") or ""
+                for c in (m.get("matches") or [])
+            ]
+            _cands = [c for c in _cands if c]
+            _hint = f" (matches {_join_names(_cands[:4])})" if _cands else ""
+            parts.append(f"**{_name}** matches more than one rep{_hint}")
+        else:
+            parts.append(f"**{_name}** didn't match any sales rep")
+
+    return (
+        "\n\n⚠️ _Not included: "
+        + "; ".join(parts)
+        + ". Retype "
+        + ("those names" if len(parts) > 1 else "that name")
+        + " to add "
+        + ("them" if len(parts) > 1 else "it")
+        + "._"
+    )
+
+
 def _park_date_range_prompt(conversation, user_context, rep, role, attempts=0,
-                            kind="stats", mode=None, scope=None):
+                            kind="stats", mode=None, scope=None, reps=None):
     """Park the report and ask for a window. Returns the action payload.
 
     `kind` records WHICH report is waiting on the window — "stats" for the
@@ -97,6 +179,11 @@ def _park_date_range_prompt(conversation, user_context, rep, role, attempts=0,
     lost by the time the admin answers it — see handle_date_range_reply and
     handle_rep_choice_reply, which restore both on resume.
 
+    `reps` is the FULL list of named reps. Parking only `rep` would turn a
+    three-rep question into a one-rep answer the moment the admin picked a
+    window — the same silent narrowing the name extraction used to do, just
+    one step later.
+
     The token is the defence against a replayed card: /history re-renders
     stored actions verbatim, so a picker from a finished conversation comes
     back live on reload. A submission carrying a token that no longer matches
@@ -106,6 +193,7 @@ def _park_date_range_prompt(conversation, user_context, rep, role, attempts=0,
     _clear_stats_pending(user_context)
     user_context["pending_order_stats"] = {
         "rep": rep,
+        "reps": list(reps) if reps else ([rep] if rep else []),
         "role": role,
         "token": token,
         "attempts": attempts,
@@ -120,7 +208,13 @@ def _park_date_range_prompt(conversation, user_context, rep, role, attempts=0,
         "type": "SHOW_DATE_RANGE_PICKER",
         "payload": {
             "token": token,
-            "rep_name": rep or None,
+            # The card labels itself with who the report is for. Sending only
+            # the first name told an admin who asked about three reps that
+            # the pending report was about one — the answer would have been
+            # right and the card wrong, which is the harder kind to notice.
+            # Existing single-rep behaviour is unchanged: one name in, the
+            # same one name out.
+            "rep_name": _join_names(reps) if reps else (rep or None),
             "quick_options": ["This week", "This month", "This quarter", "This year"],
         },
     }
@@ -175,6 +269,11 @@ def handle_order_stats(
         )
 
     requested_rep = getattr(entities, "target_rep_name", None)
+    # Every rep named. target_rep_name is the first of these; both are set
+    # from one extraction so they cannot disagree.
+    requested_reps = list(getattr(entities, "target_rep_names", None) or [])
+    if not requested_reps and requested_rep:
+        requested_reps = [requested_rep]
 
     # "list" only means anything when a rep is named — the no-rep branch is
     # a SQL GROUP BY with no order objects behind it (see get_order_stats_by_rep
@@ -195,9 +294,13 @@ def handle_order_stats(
     if not date_after and not date_before and not getattr(entities, "date_range_resolved", False):
         action = _park_date_range_prompt(
             conversation, user_context, requested_rep, role, mode=mode,
+            reps=requested_reps,
         )
-        who = f" for **{requested_rep}**" if requested_rep else ""
-        logger.info(f"order_stats | no date range given — prompting | rep={requested_rep!r} mode={mode!r}")
+        who = f" for **{_join_names(requested_reps)}**" if requested_reps else ""
+        logger.info(
+            f"order_stats | no date range given — prompting | "
+            f"reps={requested_reps!r} mode={mode!r}"
+        )
         return _respond(
             f"Which period should I cover{who}?",
             suggestions=["This week", "This month", "This quarter", "This year", "All time", "Cancel"],
@@ -209,7 +312,11 @@ def handle_order_stats(
         requesting_customer_id=customer_id,
         date_after=date_after,
         date_before=date_before,
-        rep=requested_rep or None,
+        # Every rep named in the query. target_rep_name is the first of these,
+        # kept for the paths that predate the list; sending the list is what
+        # makes "orders for cs_rep 1, cs_rep 2, cs_rep 3" cover all three
+        # rather than silently reporting on the first.
+        rep=(getattr(entities, "target_rep_names", None) or requested_rep or None),
         statuses=list(ORDER_REPORT_STATUSES),
         # Only meaningful with a rep named — see the mode fallback above.
         # The plugin returns order rows alongside the totals when set, using
@@ -301,13 +408,31 @@ def handle_order_stats(
 
     total_items = data.get("total_items", 0)
     truncated   = bool(data.get("truncated"))
-    name        = data.get("rep_filter_label") or requested_rep or "That rep"
+    # Prefer the labels the plugin resolved — they are the real names, while
+    # the request may have carried logins or partial spellings. Falls back to
+    # what was asked for when the plugin is an older build with no `reps`.
+    _resolved_labels = [
+        r.get("rep_name") or r.get("rep_email")
+        for r in (data.get("reps") or [])
+        if (r.get("rep_name") or r.get("rep_email"))
+    ]
+    if _resolved_labels:
+        name = _join_names(_resolved_labels)
+    else:
+        name = data.get("rep_filter_label") or _join_names(requested_reps) or "That rep"
     window      = _describe_range(data.get("date_after"), data.get("date_before"))
     window_str  = f" ({window})" if window else " (all time)"
 
     if total_orders == 0:
+        # Still name what was left out — otherwise "no orders" reads as a
+        # settled answer about everyone asked for, when it may only be an
+        # answer about the names that resolved.
+        _none = f"**{name}** has no orders{window_str}." if name else \
+                f"No orders found{window_str}."
+        if len(_resolved_labels) > 1:
+            _none = f"No orders for {name}{window_str}."
         return _respond(
-            f"**{name}** has no orders{window_str}.",
+            _none + _unresolved_note(data),
             metadata={"total_orders": 0},
         )
 
@@ -326,8 +451,12 @@ def handle_order_stats(
             f"**{name}** — **{total_orders} order{'s' if total_orders != 1 else ''}**"
             f"{window_str}."
         )
+        # Per-rep split before the paging line: an admin who asked about three
+        # reps wants the split first, and the combined list below is what the
+        # page number refers to.
+        msg += _rep_breakdown(data)
         if _total_pages > 1:
-            msg += f" Showing page {_page} of {_total_pages}."
+            msg += f"\n\nShowing page {_page} of {_total_pages}."
         # Say WHICH question this answers. These are orders credited to the
         # rep plus orders they placed themselves — so the billing name on a
         # card is often someone else entirely (bulk orders bill the rep's
@@ -344,12 +473,16 @@ def handle_order_stats(
                 f"\n\n⚠️ _Only the most recent {data.get('max_orders_scanned')} orders "
                 f"were scanned — this list is a minimum. Narrow the date range to see all of them._"
             )
+        msg += _unresolved_note(data)
         return _respond(
             msg,
             metadata={
                 "total_orders": total_orders,
                 "total_items": total_items,
                 "truncated": truncated,
+                "reps": data.get("reps") or [],
+                "unresolved_reps": data.get("unresolved_reps") or [],
+                "overlap_orders": int(data.get("overlap_orders") or 0),
                 "allow_order_download": is_order_report_admin(role),
             },
             orders=orders_list,
@@ -371,6 +504,7 @@ def handle_order_stats(
         f"**{name}** — **{total_orders} order{'s' if total_orders != 1 else ''}**, "
         f"**{total_items} sample{'s' if total_items != 1 else ''}**{window_str}."
     )
+    msg += _rep_breakdown(data)
     # Only surfaced when it actually fires: without it a rep with more orders
     # than we scan would silently report the cap as their total.
     if truncated:
@@ -378,11 +512,15 @@ def handle_order_stats(
             f"\n\n⚠️ _Only the most recent {data.get('max_orders_scanned')} orders "
             f"were scanned — this is a minimum. Narrow the date range for an exact count._"
         )
+    msg += _unresolved_note(data)
 
     return _respond(msg, metadata={
         "total_orders": total_orders,
         "total_items": total_items,
         "truncated": truncated,
+        "reps": data.get("reps") or [],
+        "unresolved_reps": data.get("unresolved_reps") or [],
+        "overlap_orders": int(data.get("overlap_orders") or 0),
     })
 
 
@@ -467,6 +605,7 @@ def handle_rep_choice_reply(
         pass
     entities = _E()
     entities.target_rep_name = picked.get("email")
+    entities.target_rep_names = [picked.get("email")] if picked.get("email") else []
     entities.date_after  = pending.get("date_after")
     entities.date_before = pending.get("date_before")
     # Default True: anything parked by an older build predates this key, and
@@ -643,6 +782,7 @@ def handle_date_range_reply(
 
     # Resolved — clear the prompt and run the report.
     rep  = pending.get("rep")
+    reps = pending.get("reps") or ([rep] if rep else [])
     role = pending.get("role") or (user_context or {}).get("role") or (user_context or {}).get("user_role")
     kind = pending.get("kind", "stats")
     _reset_idle()
@@ -665,6 +805,11 @@ def handle_date_range_reply(
         pass
     entities = _E()
     entities.target_rep_name    = rep
+    # Restored for the same reason kind/mode/date_resolved are: this resume
+    # rebuilds entities from scratch, so anything not read back from
+    # `pending` here is silently lost — and losing this one turns a three-rep
+    # question into a one-rep answer.
+    entities.target_rep_names   = list(reps)
     entities.date_after         = date_after
     entities.date_before        = date_before
     entities.date_range_resolved = True
@@ -674,7 +819,7 @@ def handle_date_range_reply(
     entities.mode = pending.get("mode") or "count"
 
     logger.info(
-        f"date_range | resolved rep={rep!r} "
+        f"date_range | resolved reps={reps!r} "
         f"window={_describe_range(date_after, date_before) or 'all time'}"
     )
 
@@ -715,6 +860,12 @@ def _retry_date_range(conversation, user_context, pending, _respond, reason):
         pending.get("rep"), pending.get("role"), attempts=attempts,
         kind=pending.get("kind", "stats"),
         mode=pending.get("mode"), scope=pending.get("scope"),
+        # Re-parking rebuilds the pending record from scratch, so the rep
+        # list has to be carried explicitly here too — otherwise one
+        # unreadable reply ("last quater") narrows a three-rep question to
+        # one rep, and the report that eventually runs answers something the
+        # admin never asked.
+        reps=pending.get("reps"),
     )
     return _respond(
         f"{reason} Pick a period below, or type one like *\"last quarter\"* "

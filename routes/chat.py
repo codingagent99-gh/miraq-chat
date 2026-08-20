@@ -758,6 +758,18 @@ def _finalize_turn(
     combined_metadata["categories"]  = data.get("categories", [])
     combined_metadata["suggestions"] = data.get("suggestions", [])
     combined_metadata["actions"]     = data.get("actions", [])
+    # Order lists travel at the TOP level of the response, not inside
+    # metadata, so they were never stored here and never came back from
+    # /chat/history — an order list rendered live and then vanished into a
+    # bare paragraph on reload, leaving the summary text above a card list
+    # that no longer existed. The frontend has always been ready for these
+    # (mapHistoryEntryToMessage reads m.orders and m.order_pagination); only
+    # the backend half was missing. Stored only when present, same as
+    # products.
+    if data.get("orders"):
+        combined_metadata["orders"] = data.get("orders")
+        if data.get("order_pagination"):
+            combined_metadata["order_pagination"] = data.get("order_pagination")
 
     # 1. Save Bot Message
     bot_msg = Message(
@@ -858,9 +870,20 @@ def get_chat_history():
                 item["categories"]  = msg.metadata_json.get("categories", [])
                 item["suggestions"] = msg.metadata_json.get("suggestions", [])
                 item["actions"]     = msg.metadata_json.get("actions", [])
+                # Top-level on a live response, so they must be top-level here
+                # too — mapHistoryEntryToMessage reads m.orders, not
+                # m.metadata.orders. Only emitted when the turn actually had
+                # an order list, so ordinary messages are unchanged.
+                _orders = msg.metadata_json.get("orders")
+                if _orders:
+                    item["orders"] = _orders
+                    _opg = msg.metadata_json.get("order_pagination")
+                    if _opg:
+                        item["order_pagination"] = _opg
                 item["metadata"]    = {
                     k: v for k, v in msg.metadata_json.items()
-                    if k not in ("products", "categories", "suggestions", "actions")
+                    if k not in ("products", "categories", "suggestions",
+                                 "actions", "orders", "order_pagination")
                 }
             history.append(item)
 

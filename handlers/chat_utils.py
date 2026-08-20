@@ -610,6 +610,12 @@ def format_order_for_frontend(order: dict) -> dict:
         "item_count": len(items),
         "shipping": order.get("shipping", {}),
         "billing": billing,
+        # Which sales rep(s) a row belongs to, when the caller asked about
+        # named reps. Empty for every other order query. Needed because a
+        # multi-rep list mixes several reps' orders and the billing name is
+        # often a third party — these include orders a rep placed on someone
+        # else's behalf, so the card alone doesn't say whose it is.
+        "rep_names": order.get("rep_names") or [],
     }
 
 def build_out_of_stock_response(product_name: str, product_raw: dict, intent, session_id: str, page: int, start_time: float):
