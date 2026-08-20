@@ -273,14 +273,55 @@ class WooEndpoints:
             slug = term.backend_ref.get("slug") if term and term.backend_ref else None
             return slug or re.sub(r"[^a-z0-9]+", "", str(value).lower())
 
-        def _resolved_payload() -> List[Dict[str, str]]:
-            return [
-                {"attribute": _taxonomy_for(attr_key), "value": _slug_for(attr_key, display_value)}
-                for attr_key, display_value in (resolved_attrs or {}).items()
-            ]
+        def _product_variation_taxonomies() -> Optional[set]:
+            """
+            Taxonomies the PARENT product actually varies on, or None if the
+            lookup failed. None is a distinct "couldn't check" signal so callers
+            fail OPEN (send resolved_attrs as-is) rather than silently stripping
+            a legitimate attribute because of a transient fetch error.
+
+            This check exists because resolved_attrs can carry an attribute that
+            resolves fine against the store's GLOBAL taxonomy list
+            (store_loader.resolve_attribute) without existing on THIS product —
+            e.g. two different attributes sharing a term spelling ("Chip Card")
+            both land in entities.attributes upstream, and only one is real for
+            this product. Sending the other names an attribute in the variation
+            slot that WooCommerce's Store API doesn't recognise for this product,
+            and it rejects the whole add-item call rather than just that field.
+            """
+            try:
+                resp = woo_client.execute(self.fetch_product(
+                    product_id=product_id,
+                    description=f"Fetch parent attributes to validate cart payload for product_id={product_id}",
+                ))
+                data = resp.get("data") if resp.get("success") else None
+                if not isinstance(data, dict):
+                    return None
+                return {
+                    _taxonomy_for(a.get("name", ""))
+                    for a in (data.get("attributes") or [])
+                    if isinstance(a, dict) and a.get("variation") and a.get("name")
+                }
+            except Exception as exc:
+                logger.warning(f"build_cart_variation_payload: parent attr validation failed | error={exc}")
+                return None
+
+        def _resolved_payload(valid_taxonomies: Optional[set] = None) -> List[Dict[str, str]]:
+            payload = []
+            for attr_key, display_value in (resolved_attrs or {}).items():
+                taxonomy = _taxonomy_for(attr_key)
+                if valid_taxonomies is not None and taxonomy not in valid_taxonomies:
+                    logger.warning(
+                        f"build_cart_variation_payload: dropping '{attr_key}' ({taxonomy}) — "
+                        f"not a variation attribute on product_id={product_id}"
+                    )
+                    continue
+                payload.append({"attribute": taxonomy, "value": _slug_for(attr_key, display_value)})
+            return payload
 
         if not variant_id or not product_id:
-            return _resolved_payload()
+            valid = _product_variation_taxonomies() if (resolved_attrs and product_id) else None
+            return _resolved_payload(valid)
 
         try:
             var_resp = woo_client.execute(self.fetch_variant(
@@ -305,9 +346,21 @@ class WooEndpoints:
                     result.append({"attribute": taxonomy, "value": option})
                     fixed.add(taxonomy)
 
-            for attr_key, display_value in (resolved_attrs or {}).items():
+            # Only the axes NOT already fixed by the matched variation need
+            # checking — fixed axes came straight from Woo's own variation
+            # record, so they're valid by construction.
+            remaining = {
+                k: v for k, v in (resolved_attrs or {}).items()
+                if _taxonomy_for(k) not in fixed
+            }
+            valid = _product_variation_taxonomies() if remaining else None
+            for attr_key, display_value in remaining.items():
                 taxonomy = _taxonomy_for(attr_key)
-                if taxonomy in fixed:
+                if valid is not None and taxonomy not in valid:
+                    logger.warning(
+                        f"build_cart_variation_payload: dropping '{attr_key}' ({taxonomy}) — "
+                        f"not a variation attribute on product_id={product_id}"
+                    )
                     continue
                 result.append({"attribute": taxonomy, "value": _slug_for(attr_key, display_value)})
             return result
