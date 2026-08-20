@@ -1105,7 +1105,133 @@ def _ask_for_bulk_variant(
 # ── Private: _build_bulk_confirmation_response ──
 # ══════════════════════════════════════════════════════════════
 
-def _build_bulk_confirmation_response(lines_as_dicts, conversation, user_context, page, start_time):
+def _build_bulk_cart_response(lines_as_dicts, conversation, user_context, page, start_time):
+    """
+    A CUSTOMER's multi-line order: add every line to their cart instead of
+    placing an order.
+
+    A customer can only order for themselves — no company, no recipient, no
+    address to resolve — and the order creation path had nowhere to get
+    billing and shipping from: the parser leaves both None on a self-order
+    line (bulk_order_parser, the `else` branch of `if _is_rep`), and nothing
+    downstream filled them, so these orders posted with an empty shipping
+    block. Routing to the cart removes the question: the widget adds the items
+    with the shopper's own cookie and nonce, and WooCommerce's own checkout
+    fills both blocks from their account.
+
+    It also keeps the backend out of the identity business here. Nothing in
+    this path sends a customer_id, so a session carrying an id WooCommerce
+    does not recognise can still order.
+
+    Reps are never routed here — they order on behalf of others and keep the
+    confirmation table and real order creation.
+
+    Same action vocabulary as the single-item ADD_TO_CART flow in
+    cart_handler: one ADD_TO_CART per line, OPEN_CART_PANEL last.
+    """
+    from store_registry import get_store_loader
+    from ecommerce.cart_actions import build_cart_add_action
+    from core.actions import build_open_cart_panel
+
+    store_loader = get_store_loader()
+
+    actions = []
+    added_labels = []
+    unresolved_count = 0
+    failed_labels = []
+
+    for line in lines_as_dicts:
+        if line.get("unresolved") or not line.get("product_id"):
+            unresolved_count += 1
+            continue
+
+        name = line.get("product_name") or "item"
+        qty = int(line.get("quantity") or 1)
+
+        # build_variation_payload=True on purpose, matching the confirm-add
+        # flow rather than the bare ADD_TO_CART intent: variant_meta holds the
+        # axes the variation itself cannot encode (WooCommerce "Any"
+        # attributes), and those are exactly what the shopper was just asked
+        # for. Dropping them would put an item in the cart missing the finish
+        # and size they chose. Costs one variation fetch per line.
+        action, err = build_cart_add_action(
+            product_id=line["product_id"],
+            quantity=qty,
+            name=name,
+            variation_id=line.get("variation_id") or None,
+            resolved_attrs=line.get("variant_meta") or {},
+            store_loader=store_loader,
+            build_variation_payload=True,
+        )
+
+        if action is None:
+            # Emitting a broken action would fail silently in the browser and
+            # the shopper would see a cart missing an item with no explanation.
+            logger.warning(
+                f"bulk_order | cart add could not resolve a variant for "
+                f"product_id={line['product_id']!r} ({name}) reason={err} — "
+                f"line dropped from the cart batch"
+            )
+            failed_labels.append(name)
+            continue
+
+        actions.append(action)
+        added_labels.append(f"{qty} × **{name}**")
+
+    if not actions:
+        logger.warning("bulk_order | self-order produced no addable cart lines")
+        return _build_bulk_confirmation_response(
+            lines_as_dicts, conversation, user_context, page, start_time,
+            _allow_cart_fork=False,
+        )
+
+    actions.append(build_open_cart_panel())
+
+    bot_message = f"Added {len(added_labels)} item(s) to your cart 🛒\r\n\r\n"
+    bot_message += "\r\n".join(f"- {label}" for label in added_labels)
+    if failed_labels:
+        bot_message += (
+            f"\r\n\r\nI couldn't add {', '.join(failed_labels)} — "
+            "the options weren't specific enough. Search for it and pick the "
+            "variant you want."
+        )
+    if unresolved_count:
+        bot_message += f"\r\n\r\n{unresolved_count} line(s) I couldn't match to a product were skipped."
+
+    logger.info(
+        f"bulk_order | customer self-order → cart | added={len(added_labels)} | "
+        f"failed={len(failed_labels)} | unresolved={unresolved_count}"
+    )
+
+    for k in _BULK_STATE_KEYS:
+        user_context.pop(k, None)
+    for k in ("bulk_variant_line_indices", "bulk_variant_current_pos", "bulk_variant_cache"):
+        user_context.pop(k, None)
+
+    conversation.flow_state = FlowState.IDLE.value
+    conversation.context_data = user_context
+    flag_modified(conversation, "context_data")
+
+    elapsed = round((time.time() - start_time) * 1000)
+    return jsonify({
+        "success": True,
+        "bot_message": bot_message,
+        "intent": "guided_flow",
+        "products": [],
+        "suggestions": ["View cart", "Checkout", "Browse products"],
+        "actions": actions,
+        "session_id": str(conversation.id),
+        "metadata": {
+            "flow_state": FlowState.IDLE.value,
+            "response_time_ms": elapsed,
+        },
+        "flow_state": FlowState.IDLE.value,
+        "pagination": default_pagination(page),
+    }), 200
+
+
+def _build_bulk_confirmation_response(lines_as_dicts, conversation, user_context, page, start_time,
+                                      _allow_cart_fork=True):
     # "Ready to place" must exclude lines the rep skipped at the address step.
     # Counting every resolvable line told them N orders were ready when only
     # N-minus-skipped would actually be created — and the skipped rows also
@@ -1117,6 +1243,45 @@ def _build_bulk_confirmation_response(lines_as_dicts, conversation, user_context
     )
     unresolved_count = len(lines_as_dicts) - resolved_count - skipped_count
     
+    # Everything the rep had was SKIPPED — a different situation from
+    # "nothing parsed", and it must not borrow that message. Skipping the
+    # only line of a single-line order drops resolved_count to 0, so the
+    # guard below answered a deliberate skip with "I couldn't find any
+    # products in that message" and dropped the rep back into bulk-order
+    # input. The skip had worked; the reply said it hadn't, which reads as
+    # the button being broken. Multi-line orders hid this — skipping one of
+    # three still left resolved_count above zero.
+    if resolved_count == 0 and skipped_count:
+        for k in _BULK_STATE_KEYS:
+            user_context.pop(k, None)
+        conversation.flow_state = FlowState.IDLE.value
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+        elapsed = round((time.time() - start_time) * 1000)
+        _noun = "order" if skipped_count == 1 else f"all {skipped_count} orders"
+        logger.info(
+            f"bulk_order | every line skipped ({skipped_count}) — "
+            f"nothing placed, ending the flow"
+        )
+        return jsonify({
+            "success": True,
+            "bot_message": (
+                f"Skipped — {_noun} set aside and nothing was placed. "
+                "What else can I help you with?"
+            ),
+            "intent": "guided_flow",
+            "products": [],
+            "suggestions": ["Browse Products", "Start a bulk order"],
+            "session_id": str(conversation.id),
+            "metadata": {
+                "flow_state": FlowState.IDLE.value,
+                "response_time_ms": elapsed,
+                "skipped_orders": skipped_count,
+            },
+            "flow_state": FlowState.IDLE.value,
+            "pagination": default_pagination(page),
+        }), 200
+
     # Nothing resolvable at all — re-prompt instead of showing a confusing
     # confirmation card with 0 orders ready and the user's own raw text
     # echoed back as a fake "product".
@@ -1146,6 +1311,33 @@ def _build_bulk_confirmation_response(lines_as_dicts, conversation, user_context
             "flow_state": FlowState.AWAITING_BULK_ORDER_INPUT.value,
             "pagination": default_pagination(page),
         }), 200
+
+    # A CUSTOMER's own multi-line order goes to the CART, not to order
+    # creation — see _build_bulk_cart_response. Forked here because every
+    # route into the confirmation table funnels through this function (trigger
+    # parse, quantity reply, variant reply), so one branch covers them all.
+    #
+    # Gated on the ROLE, which is the actual rule: a customer can only ever
+    # order for themselves, never for a company or another recipient, so there
+    # is nothing for the on-behalf-of confirmation table to show them. Reps
+    # keep the table and real order creation even when every line happens to
+    # be for themselves. Testing is_self_order instead would today give the
+    # same answer — the parser sets it only in its non-rep branch — but it is
+    # a consequence of the role, not the rule, and one path in this file
+    # already rewrites that flag on a line.
+    #
+    # Placed after the "no products found" guard above so an unparseable
+    # message still re-prompts.
+    _role = (user_context.get("role") or user_context.get("user_role") or "")
+    if _allow_cart_fork and _role not in BULK_ORDER_ROLES:
+        _live_lines = [
+            l for l in lines_as_dicts
+            if not l.get("unresolved") and not l.get("address_skipped")
+        ]
+        if _live_lines:
+            return _build_bulk_cart_response(
+                lines_as_dicts, conversation, user_context, page, start_time
+            )
 
     # Render rows with the RESOLVED recipient. The card reads
     # customer_display_name straight off each line, which still carries the

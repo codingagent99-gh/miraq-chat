@@ -129,11 +129,80 @@ class StoreQueryMixin:
         specific = [c for c in candidates if c["name"].lower().strip() not in stop_words]
         generic = [c for c in candidates if c["name"].lower().strip() in stop_words]
 
+        # More than one product name in the text is usually not a real
+        # ambiguity — it is one product whose VARIATION is named after
+        # another. "order 1 Aurora - Thunder Black" matches both Aurora
+        # (16969) and Thunder (3965), and the tie-break below is name LENGTH,
+        # so Thunder won on seven characters to six. The parser then stripped
+        # "Thunder" off the phrase, looked for a "Black" variation among
+        # Thunder's four, found none, and reported the product as unresolved —
+        # while the colour the user asked for sat on Aurora the whole time.
+        #
+        # The catalog already knows the answer: phase 1 resolves the Colors
+        # term (`aurora-thunder-black`) off the same message, and terms on
+        # this store are named for the product they belong to
+        # ("Aurora - Misty Grey", "LAGER Abeto"). So when a term present in
+        # the text is prefixed by one candidate and not the others, that
+        # candidate is the product.
+        if len(specific) > 1:
+            narrowed = self.narrow_by_attribute_term(text_lower, specific)
+            if narrowed:
+                logger.debug(
+                    f"get_product_for_text: attribute term narrowed "
+                    f"{[c['name'] for c in specific]} → {narrowed['name']}"
+                )
+                return narrowed
+
         if specific:
             return max(specific, key=lambda x: len(x["name"]))
         if generic:
             return max(generic, key=lambda x: len(x["name"]))
         return None
+
+    def narrow_by_attribute_term(self, text_lower: str, candidates: List[Dict]) -> Optional[Dict]:
+        """Pick the candidate that owns an attribute term appearing in the text.
+
+        Returns None whenever the evidence does not single one out, so the
+        caller falls back to its existing rule — this only ever narrows, never
+        redirects. A store whose terms are not named after their product
+        simply never matches here and behaves exactly as before.
+
+        Longest matching term wins: with products "Aurora" and "Aurora
+        Mosaic" both prefixing a term, the more specific product is the one
+        the longer term names.
+        """
+        best_len = 0
+        best: List[Dict] = []
+
+        for attr in self.attribute_by_key.values():
+            for term in attr.terms:
+                tname = (term.name or "").lower().strip()
+                # Two chars of overlap is coincidence, not evidence.
+                if len(tname) < 4 or tname not in text_lower:
+                    continue
+                tslug = str(term.key or "").lower().strip()
+
+                for c in candidates:
+                    cname = (c.get("name") or "").lower().strip()
+                    cslug = (c.get("slug") or "").lower().strip()
+                    # Slug first — it is canonical. The display-name test is
+                    # the fallback for terms whose key is absent or shaped
+                    # differently from the product slug.
+                    owns = (
+                        (cslug and tslug.startswith(cslug + "-"))
+                        or (cname and tname.startswith(cname))
+                    )
+                    if not owns:
+                        continue
+                    if len(tname) > best_len:
+                        best_len, best = len(tname), [c]
+                    elif len(tname) == best_len and all(
+                        b["numeric_id"] != c["numeric_id"] for b in best
+                    ):
+                        best.append(c)
+
+        # Exactly one owner, or nothing to say.
+        return best[0] if len(best) == 1 else None
 
     # ─── Attribute queries ───
 

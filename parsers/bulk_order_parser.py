@@ -524,13 +524,51 @@ def parse_bulk_order_utterance(
         # 3b.5. Substring scan: find the longest catalog name contained within
         # product_name. Safety net for any verb-prefixed text that slipped
         # through Step 2 cleaning (e.g. "i want to order saga" → "Saga").
+        #
+        # "Longest" is a tie-break, not evidence, and it picks the wrong
+        # product whenever one product's name appears inside another's
+        # VARIATION name: "Aurora - Thunder Black" matches both Aurora (6
+        # chars) and Thunder (7), so Thunder won, the hint was reduced to
+        # "Black", and Thunder has no Black. Same defect as the one in
+        # get_product_for_text, in a second cascade — fixing that one alone
+        # left this path still resolving to Thunder, because the parser
+        # re-resolves each line itself and never consults the entities the
+        # classifier already got right.
+        #
+        # So collect every match first and let the catalog decide: the Colors
+        # term in the text ("Aurora - Thunder Black") is prefixed by exactly
+        # one candidate. Falls through to the length rule untouched whenever
+        # the term evidence does not single one out.
         if pl.product_id is None:
-            for p in sorted(products, key=lambda x: len(x.get("name", "")), reverse=True):
-                p_name = p.get("name", "")
-                if p_name and re.search(r'\b' + re.escape(p_name) + r'\b', pl.product_name, re.I):
-                    pl.product_id = p["id"]
-                    matched_catalog_name = p["name"]
-                    break
+            _named = [
+                p for p in products
+                if p.get("name")
+                and re.search(r'\b' + re.escape(p["name"]) + r'\b', pl.product_name, re.I)
+            ]
+
+            if len(_named) > 1 and hasattr(store_loader, "narrow_by_attribute_term"):
+                _pick = store_loader.narrow_by_attribute_term(
+                    pl.product_name.lower(),
+                    [
+                        {
+                            "name": p.get("name", ""),
+                            "slug": p.get("slug", ""),
+                            "numeric_id": p.get("id"),
+                        }
+                        for p in _named
+                    ],
+                )
+                if _pick:
+                    logger.debug(
+                        f"bulk_parser | attribute term narrowed "
+                        f"{[p.get('name') for p in _named]} → {_pick['name']}"
+                    )
+                    _named = [p for p in _named if p.get("id") == _pick["numeric_id"]]
+
+            if _named:
+                _chosen = max(_named, key=lambda x: len(x.get("name", "")))
+                pl.product_id = _chosen["id"]
+                matched_catalog_name = _chosen["name"]
 
         # 3c. Fuzzy fallback (cutoff=0.6)
         if pl.product_id is None:
