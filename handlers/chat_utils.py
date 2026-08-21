@@ -248,6 +248,26 @@ def resolve_self_contained_variation(variations: list, resolved_attributes: dict
             v for v in variations
             if isinstance(v, dict) and variation_declares_self_contained_term(v, store_loader)
         ]
+        if not candidates:
+            # No dedicated variation for this sample form (Elizabeth Mosaic,
+            # London: every variation is a colour and nothing pins Sample
+            # Size). A chip card is the same physical card whatever colour the
+            # variation names, so there is nothing to ask — take any variation
+            # and carry the sample form on it.
+            #
+            # This exists because the catalog has no chip-card variation with
+            # the other axes set to N/A. Without it the flow prompts for a
+            # colour that does not affect what ships, and — worse — a line
+            # with no variation cannot be added to the cart at all, because
+            # the Store API needs a variation to pin.
+            candidates = [v for v in variations if isinstance(v, dict) and v.get("id")]
+            if candidates:
+                logger.info(
+                    "resolve_self_contained_variation: no dedicated variation for "
+                    "this sample form — falling back to the lowest-id variation "
+                    "so the line can be ordered and added to the cart without "
+                    "prompting for axes a chip card does not have"
+                )
 
     if not candidates:
         return None, {}

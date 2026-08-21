@@ -182,6 +182,58 @@ def build_cart_add_action(
             logger.warning(f"build_cart_add_action: variation payload failed | {exc}")
             variation_attributes = []
 
+        # The payload builder drops attributes the product does not vary on.
+        # If that leaves nothing AND no variation was resolved, the add would
+        # reach the browser as a bare variable-product add and fail there —
+        # the same silent-in-the-backend failure as sending a bogus attribute.
+        # Prompt instead, using the contract the caller already handles.
+        if resolved_attrs and not variation_attributes and not variation_id:
+            logger.info(
+                f"build_cart_add_action: no usable variation attributes left for "
+                f"product_id={product_id} (asked for {sorted(resolved_attrs)}) — "
+                f"prompting instead of emitting an add that would fail"
+            )
+            return None, UNRESOLVED_VARIANT
+
+        # The opposite failure, and the one that produced
+        # "woocommerce_rest_missing_variation_data / Finish and Colors are
+        # required fields": TOO FEW axes.
+        #
+        # wc/v3 omits "Any" axes from a variation's own attribute list, so a
+        # self-contained sample variation (Tara chip card, 17132) reports only
+        # Sample Size while the parent varies on Sample Size, Finish AND
+        # Colors. The orders API accepts that; the Store API does not — it
+        # requires a non-empty value for every one of the parent's variation
+        # attributes. So the same variation can be ordered by a rep and
+        # refused by a shopper's cart.
+        #
+        # Emitting it anyway pushes a raw storefront error into the widget
+        # with nothing in the backend log. Prompting is not the ideal answer
+        # for a chip card — the whole point of that variation is not having to
+        # pick a colour — but it beats an add that cannot succeed. The real
+        # fix is store-side: give those axes explicit terms instead of "Any".
+        if variation_attributes:
+            try:
+                from ecommerce import endpoints
+                _required = endpoints.product_variation_taxonomies(product_id, store_loader)
+            except Exception:
+                _required = None
+            if _required:
+                _supplied = {
+                    a.get("attribute") for a in variation_attributes
+                    if a.get("attribute") and a.get("value")
+                }
+                _missing = set(_required) - _supplied
+                if _missing:
+                    logger.warning(
+                        f"build_cart_add_action: variation {variation_id} for product "
+                        f"{product_id} leaves {sorted(_missing)} unset, but the Store API "
+                        f"requires every parent axis — prompting instead of emitting an "
+                        f"add that would 400. Fix store-side by giving those axes explicit "
+                        f"terms rather than 'Any'."
+                    )
+                    return None, UNRESOLVED_VARIANT
+
     return build_add_to_cart(
         product_id=product_id,
         quantity=quantity,

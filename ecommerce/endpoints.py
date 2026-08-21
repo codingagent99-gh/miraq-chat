@@ -124,6 +124,30 @@ class EcommerceEndpoints(Protocol):
         """Row 4.4 — Advanced product search via custom plugin (custom_plugin surface)."""
         ...
 
+    def product_variation_taxonomies(
+        self,
+        product_id,
+        store_loader=None,
+    ) -> Optional[set]:
+        """Taxonomies the parent product varies on, or None if undeterminable.
+
+        None means "unknown" and callers must not filter or block on it.
+        Shopify has no equivalent (a variant GID carries every option value),
+        so it returns None there and the Woo-only guards simply never fire.
+        """
+        ...
+
+    def product_variation_axes(
+        self,
+        product_id,
+        store_loader=None,
+    ) -> Dict[str, Dict]:
+        """Parent variation axes with their options, keyed by taxonomy.
+
+        Empty dict when unknown or not applicable.
+        """
+        ...
+
     def build_cart_variation_payload(
         self,
         *,

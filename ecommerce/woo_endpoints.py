@@ -250,6 +250,77 @@ class WooEndpoints:
             requires_resolution=requires_resolution or [],
         )
 
+    def product_variation_taxonomies(self, product_id, store_loader=None):
+        """Taxonomies the PARENT product varies on, or None if unknown.
+
+        None means "could not determine" — callers must treat that as
+        "do not filter, do not block", so a failed fetch degrades to the old
+        behaviour rather than breaking every add.
+
+        wc/v3 omits "Any" axes from a VARIATION's own attribute list, so the
+        variation alone cannot tell you what the product requires. The Store
+        API, unlike the orders API, demands a non-empty value for every one of
+        these — which is why an order can be created from a variation the cart
+        refuses. Cached in store_loader.product_variation_schema.
+        """
+        if not product_id:
+            return None
+        cache = getattr(store_loader, "product_variation_schema", None)
+        if cache is None:
+            cache = {}
+        key = int(product_id)
+        if key in cache:
+            return cache[key].get("taxonomies")
+        try:
+            resp = woo_client.execute(self.fetch_product(
+                product_id=product_id,
+                description=f"Fetch parent attributes for cart payload {product_id}",
+            ))
+            data = resp.get("data") if resp.get("success") else None
+            if not isinstance(data, dict):
+                return None
+            taxes = set()
+            opts = {}
+            for a in data.get("attributes") or []:
+                if isinstance(a, dict) and a.get("variation"):
+                    name = str(a.get("name") or "")
+                    tax = (
+                        name.lower() if name.lower().startswith("pa_")
+                        else "pa_" + re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+                    )
+                    taxes.add(tax)
+                    # Options in the order WooCommerce has them, which is the
+                    # order the storefront dropdown shows — so "first" here
+                    # means the same thing a shopper would see first.
+                    opts[tax] = {
+                        "name": name,
+                        "options": [str(o) for o in (a.get("options") or [])],
+                    }
+            cache[key] = {"taxonomies": taxes, "axes": opts}
+            try:
+                store_loader.product_variation_schema = cache
+            except Exception:
+                pass  # loader without the attribute — still works, just uncached
+            return taxes
+        except Exception as exc:
+            logger.warning(
+                f"product_variation_taxonomies: fetch failed for {product_id} | error={exc}"
+            )
+            return None
+
+    def product_variation_axes(self, product_id, store_loader=None):
+        """Parent variation axes with their options, keyed by taxonomy.
+
+        ``{"pa_colors": {"name": "Colors", "options": ["TARA Ash", ...]}}``
+        Shares the cache and the fetch with product_variation_taxonomies().
+        """
+        self.product_variation_taxonomies(product_id, store_loader)
+        cache = getattr(store_loader, "product_variation_schema", None) or {}
+        try:
+            return (cache.get(int(product_id)) or {}).get("axes") or {}
+        except Exception:
+            return {}
+
     def build_cart_variation_payload(
         self,
         *,
@@ -273,55 +344,45 @@ class WooEndpoints:
             slug = term.backend_ref.get("slug") if term and term.backend_ref else None
             return slug or re.sub(r"[^a-z0-9]+", "", str(value).lower())
 
-        def _product_variation_taxonomies() -> Optional[set]:
-            """
-            Taxonomies the PARENT product actually varies on, or None if the
-            lookup failed. None is a distinct "couldn't check" signal so callers
-            fail OPEN (send resolved_attrs as-is) rather than silently stripping
-            a legitimate attribute because of a transient fetch error.
+        def _parent_taxonomies():
+            return self.product_variation_taxonomies(product_id, store_loader)
 
-            This check exists because resolved_attrs can carry an attribute that
-            resolves fine against the store's GLOBAL taxonomy list
-            (store_loader.resolve_attribute) without existing on THIS product —
-            e.g. two different attributes sharing a term spelling ("Chip Card")
-            both land in entities.attributes upstream, and only one is real for
-            this product. Sending the other names an attribute in the variation
-            slot that WooCommerce's Store API doesn't recognise for this product,
-            and it rejects the whole add-item call rather than just that field.
-            """
-            try:
-                resp = woo_client.execute(self.fetch_product(
-                    product_id=product_id,
-                    description=f"Fetch parent attributes to validate cart payload for product_id={product_id}",
-                ))
-                data = resp.get("data") if resp.get("success") else None
-                if not isinstance(data, dict):
-                    return None
-                return {
-                    _taxonomy_for(a.get("name", ""))
-                    for a in (data.get("attributes") or [])
-                    if isinstance(a, dict) and a.get("variation") and a.get("name")
-                }
-            except Exception as exc:
-                logger.warning(f"build_cart_variation_payload: parent attr validation failed | error={exc}")
-                return None
+        # A resolved attribute the product does not vary on is not a harmless
+        # extra: WooCommerce's Store API rejects an add-item whose variation
+        # array names an attribute the product has no matching variation for,
+        # and the whole add fails.
+        #
+        # "order 1 tara chipcard" is the case that surfaced it — "chipcard"
+        # matched BOTH a Sample Size term and a Tile Size term, both landed in
+        # entities.attributes, and the payload carried pa_tile-size for a
+        # product that has no such axis. The rep saw "Couldn't add Tara to
+        # your cart" with nothing in the backend log to explain it, because
+        # the failure happens in the browser.
+        _allowed = _parent_taxonomies()
 
-        def _resolved_payload(valid_taxonomies: Optional[set] = None) -> List[Dict[str, str]]:
-            payload = []
+        def _keep(taxonomy: str) -> bool:
+            if not _allowed:
+                return True   # unknown or no variation axes — do not filter
+            if taxonomy in _allowed:
+                return True
+            logger.info(
+                f"build_cart_variation_payload: dropping {taxonomy!r} — "
+                f"product {product_id} does not vary on it "
+                f"(has {sorted(_allowed)})"
+            )
+            return False
+
+        def _resolved_payload() -> List[Dict[str, str]]:
+            out = []
             for attr_key, display_value in (resolved_attrs or {}).items():
                 taxonomy = _taxonomy_for(attr_key)
-                if valid_taxonomies is not None and taxonomy not in valid_taxonomies:
-                    logger.warning(
-                        f"build_cart_variation_payload: dropping '{attr_key}' ({taxonomy}) — "
-                        f"not a variation attribute on product_id={product_id}"
-                    )
+                if not _keep(taxonomy):
                     continue
-                payload.append({"attribute": taxonomy, "value": _slug_for(attr_key, display_value)})
-            return payload
+                out.append({"attribute": taxonomy, "value": _slug_for(attr_key, display_value)})
+            return out
 
         if not variant_id or not product_id:
-            valid = _product_variation_taxonomies() if (resolved_attrs and product_id) else None
-            return _resolved_payload(valid)
+            return _resolved_payload()
 
         try:
             var_resp = woo_client.execute(self.fetch_variant(
@@ -343,26 +404,93 @@ class WooEndpoints:
                     attr_name = attr.get("name", "")
                     taxonomy = _taxonomy_for(attr_name)
                     option = str(attr.get("option", ""))
-                    result.append({"attribute": taxonomy, "value": option})
+                    # Slug, not the display option. The variation reports
+                    # "Chip Card"; the Store API matches on the term slug
+                    # ("chip-card"), which is what the product permalink
+                    # carries. _slug_for falls back to the squashed value when
+                    # the term cannot be resolved, so this never sends less
+                    # than before.
+                    result.append({
+                        "attribute": taxonomy,
+                        "value": _slug_for(attr_name, option) if option else "",
+                    })
                     fixed.add(taxonomy)
 
-            # Only the axes NOT already fixed by the matched variation need
-            # checking — fixed axes came straight from Woo's own variation
-            # record, so they're valid by construction.
-            remaining = {
-                k: v for k, v in (resolved_attrs or {}).items()
-                if _taxonomy_for(k) not in fixed
-            }
-            valid = _product_variation_taxonomies() if remaining else None
-            for attr_key, display_value in remaining.items():
+            for attr_key, display_value in (resolved_attrs or {}).items():
                 taxonomy = _taxonomy_for(attr_key)
-                if valid is not None and taxonomy not in valid:
-                    logger.warning(
-                        f"build_cart_variation_payload: dropping '{attr_key}' ({taxonomy}) — "
-                        f"not a variation attribute on product_id={product_id}"
-                    )
+                if taxonomy in fixed:
+                    continue
+                if not _keep(taxonomy):
                     continue
                 result.append({"attribute": taxonomy, "value": _slug_for(attr_key, display_value)})
+                fixed.add(taxonomy)
+
+            # ── Self-contained sample forms (Chip Card) only ─────────────────
+            # This variation pins Sample Size and leaves Colors and Finish as
+            # WooCommerce "Any". The orders API accepts that; the Store API
+            # requires a non-empty value for every parent axis and 400s with
+            # woocommerce_rest_missing_variation_data. A chip card is a card
+            # of every colour, so there is no correct colour to send — but
+            # sending nothing means it cannot go in a cart at all.
+            #
+            # So fill the unset axes with the parent's FIRST option, the same
+            # value the storefront dropdown shows first. `id` is the variation
+            # id, so WooCommerce pins the line to THIS variation and these
+            # values ride along as item meta rather than selecting a different
+            # variation.
+            #
+            # Deliberately narrow: gated on the variation declaring a term
+            # from SELF_CONTAINED_VARIATION_TERMS, so an ordinary variation
+            # that is genuinely missing a choice still prompts instead of
+            # having a colour picked for the customer.
+            # Local import: handlers.chat_utils pulls in store/config modules,
+            # and importing it at module scope makes ecommerce → handlers →
+            # ecommerce circular.
+            try:
+                from handlers.chat_utils import (
+                    variation_declares_self_contained_term,
+                    self_contained_variation_axis,
+                )
+                # Either the VARIATION is a dedicated sample form (Tara's
+                # 17132), or the request carries a self-contained term while
+                # the resolved variation is an ordinary colour one (Elizabeth,
+                # London — no dedicated variation exists, so the flow falls
+                # back to any variation). Both need the remaining axes filled:
+                # the Store API demands every parent axis, and for a chip card
+                # none of them describe what ships.
+                _is_self_contained = (
+                    variation_declares_self_contained_term(var_resp["data"], store_loader)
+                    or bool(self_contained_variation_axis(resolved_attrs or {}, store_loader))
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"build_cart_variation_payload: self-contained check failed | {exc}"
+                )
+                _is_self_contained = False
+
+            if _is_self_contained:
+                _axes = {}
+                try:
+                    _axes = self.product_variation_axes(product_id, store_loader)
+                except Exception:
+                    _axes = {}
+                for taxonomy, meta in (_axes or {}).items():
+                    if taxonomy in fixed:
+                        continue
+                    _options = meta.get("options") or []
+                    if not _options:
+                        continue
+                    _first = _options[0]
+                    result.append({
+                        "attribute": taxonomy,
+                        "value": _slug_for(meta.get("name") or taxonomy, _first),
+                    })
+                    fixed.add(taxonomy)
+                    logger.info(
+                        f"build_cart_variation_payload: self-contained variation "
+                        f"{variant_id} leaves {taxonomy!r} unset — filling with the "
+                        f"first option {_first!r} so the Store API accepts the add"
+                    )
             return result
         except Exception as exc:
             logger.warning(f"build_cart_variation_payload fallback | error={exc}")

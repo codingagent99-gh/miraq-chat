@@ -398,7 +398,9 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
             "candidate_variation_ids": list(getattr(l, "candidate_variation_ids", None) or []),
             "specified_variant_axes": list(getattr(l, "specified_variant_axes", None) or []),
             "self_contained_variant": bool(getattr(l, "self_contained_variant", False)),
-            "variant_meta": {},
+            # Seeded from the parser: the chip-card fallback pins Sample Size
+            # itself for products with no dedicated chip-card variation.
+            "variant_meta": dict(getattr(l, "variant_meta", None) or {}),
             "address_confirmed": False,
             "address_skipped": False,
         }

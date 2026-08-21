@@ -65,6 +65,7 @@ class BulkOrderLine:
     candidate_variation_ids: list = field(default_factory=list)  # hint matched several variations
     specified_variant_axes: list = field(default_factory=list)   # axes the matched variation DOES set
     self_contained_variant: bool = False  # Chip Card etc — other axes deliberately N/A
+    variant_meta: dict = field(default_factory=dict)  # axes the parser pinned itself (chip-card fallback)
 
 # ══════════════════════════════════════════════════════════════
 # INTERNAL: intermediate pre-line structure
@@ -90,6 +91,7 @@ class _PreLine:
     candidate_variation_ids: list = field(default_factory=list)
     specified_variant_axes: list = field(default_factory=list)
     self_contained_variant: bool = False
+    variant_meta: dict = field(default_factory=dict)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -861,13 +863,72 @@ def parse_bulk_order_utterance(
                 f"→ variation_id={pl.variation_id}"
             )
         else:
-            # Remember WHAT the user asked for so the variant prompt can say
-            # "I couldn't find Taupe" instead of silently asking them to pick.
-            pl.unmatched_variant_hint = pl.variant_hint
-            logger.debug(
-                f"bulk_parser | unresolved variation hint='{pl.variant_hint}' "
-                f"for product_id={pl.product_id}"
+            # A chip card asked for on a product that has NO dedicated
+            # chip-card variation (Elizabeth Mosaic, London: every variation
+            # pins a Colour and nothing pins Sample Size).
+            #
+            # A chip card is the same physical card whatever colour the
+            # variation names, so the colour/finish carry no meaning here —
+            # asking the rep to choose one is a question with no real answer.
+            # Pin the line to the first variation, record Chip Card as the
+            # sample size, and suppress the prompts the same way a dedicated
+            # chip-card variation does.
+            #
+            # This is a workaround for catalog data: the correct fix is a
+            # chip-card variation per product with the other axes set to N/A.
+            # Keep it gated on SELF_CONTAINED_VARIATION_TERMS so it only ever
+            # fires for the terms declared there, never for an ordinary
+            # unmatched hint like "Taupe".
+            _hint_norm = _normalize_term_key(pl.variant_hint or "")
+            _self_terms = {}
+            try:
+                from config.store_config import SELF_CONTAINED_VARIATION_TERMS
+                _self_terms = SELF_CONTAINED_VARIATION_TERMS or {}
+            except Exception:
+                _self_terms = {}
+            _wanted = [
+                (axis, _normalize_term_key(t), t)
+                for axis, terms in _self_terms.items()
+                for t in (terms or [])
+            ]
+            _match = next(
+                ((axis, term_name) for axis, term_norm, term_name in _wanted
+                 if term_norm and term_norm == _hint_norm),
+                None,
             )
+            _pool = _variant_cache.get(pl.product_id) or []
+
+            if _match and _pool:
+                _axis, _term_name = _match
+                _first = _pool[0]
+                pl.variation_id = _first.get("id")
+                pl.self_contained_variant = True
+                pl.blank_variant_axes = []
+                # Carry the sample size explicitly — it is the one axis that
+                # actually describes what ships, and without it the line is
+                # indistinguishable from an ordinary colour sample.
+                #
+                # The CONFIGURED term name, not the user's spelling: someone
+                # typing "chipcard" must not put "Chipcard" on the order while
+                # the catalog and every other line say "Chip Card".
+                pl.variant_meta = dict(getattr(pl, "variant_meta", None) or {})
+                pl.variant_meta.setdefault(
+                    _attribute_display_name(_axis), _term_name
+                )
+                logger.info(
+                    f"bulk_parser | product {pl.product_id} has no dedicated "
+                    f"chip-card variation — pinning to variation {pl.variation_id} "
+                    f"and recording {_axis} = {_term_name!r}; other axes carry no "
+                    f"meaning for a chip card, so they are not prompted"
+                )
+            else:
+                # Remember WHAT the user asked for so the variant prompt can say
+                # "I couldn't find Taupe" instead of silently asking them to pick.
+                pl.unmatched_variant_hint = pl.variant_hint
+                logger.debug(
+                    f"bulk_parser | unresolved variation hint='{pl.variant_hint}' "
+                    f"for product_id={pl.product_id}"
+                )
 
     # ── Step 4: Customer resolution by email (rep only, batched) ──────────────
     # Non-rep users have no email values, so unique_emails is empty
@@ -1266,6 +1327,7 @@ def parse_bulk_order_utterance(
             candidate_variation_ids=list(pl.candidate_variation_ids or []),
             specified_variant_axes=list(pl.specified_variant_axes or []),
             self_contained_variant=pl.self_contained_variant,
+            variant_meta=dict(getattr(pl, "variant_meta", None) or {}),
         ))
 
     logger.info(

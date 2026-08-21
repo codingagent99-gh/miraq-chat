@@ -167,6 +167,17 @@ class ShopifyEndpoints:
             "Route all product queries through ShopifyQueryExecutor.execute()."
         )
 
+    def product_variation_taxonomies(self, product_id, store_loader=None):
+        """Not applicable on Shopify — a variant GID carries every option
+        value, so there is no "Any" axis for the cart to be missing. Returns
+        None ("unknown"), which the Woo-only cart guards treat as "do not
+        filter, do not block"."""
+        return None
+
+    def product_variation_axes(self, product_id, store_loader=None):
+        """Not applicable on Shopify — see product_variation_taxonomies()."""
+        return {}
+
     def build_cart_variation_payload(
         self,
         *,
