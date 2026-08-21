@@ -45,10 +45,12 @@ from utils.checkout_fields import (
     format_missing_fields,
     get_required_fields,
     has_errors,
+    is_known_rep,
     validate_bulk_address,
 )
 import re
 import difflib
+import unicodedata
 logger = get_logger("miraq_chat")
 
 # How many contact names are offered as tappable chips at the recipient step.
@@ -255,8 +257,22 @@ def _effective_address_for_line(line, address_overrides, line_idx, rep_email, re
     billing = _merge_address_block(_billing_base, override.get("billing"))
     shipping = _merge_address_block(_get(line, "shipping_address"), override.get("shipping"))
 
+    # Auto-fill project_rep with the logged-in user — but ONLY when that email
+    # is one of the options the project_rep field actually offers.
+    #
+    # This used to seed rep_email unconditionally. rep_email is whatever
+    # payload_context["email"] carried, so a non-rep login (an admin, a dev
+    # account) produced a project_rep matching no <option>: the widget's select
+    # rendered BLANK while the value still passed .strip(), so it satisfied the
+    # required-field gate without the rep ever seeing it and rode through to
+    # _billing_project_rep. It also made "orders by rep" reporting track
+    # whoever was logged in rather than a rep.
+    #
+    # Leaving it blank is the correct outcome for a non-rep: project_rep is in
+    # BULK_ADDRESS_REQUIRED_FLOOR["meta"], so the existing gate blocks and asks
+    # for it by name instead of silently inventing an answer.
     if not str(billing.get("project_rep") or "").strip():
-        billing["project_rep"] = rep_email or ""
+        billing["project_rep"] = rep_email if is_known_rep(rep_email) else ""
 
     return billing, shipping
 
@@ -829,9 +845,13 @@ def _format_bulk_confirmation_table(lines) -> str:
 # ── Private: _ask_for_bulk_variant ──
 # ══════════════════════════════════════════════════════════════
 
-def _parent_variation_axes(product_id, user_context):
+def _parent_axis_meta(product_id, user_context):
     """
-    Every axis the PARENT product marks as used-for-variations, with options.
+    Every axis the PARENT product marks as used-for-variations, with the
+    taxonomy slug and attribute id alongside the option names:
+
+        {"Sample Size": {"taxonomy": "pa_sample-size", "attribute_id": 11,
+                         "options": ["Chip Card", '12"x12"']}}
 
     This is the only reliable source for WooCommerce "Any" axes. wc/v3's
     variations endpoint OMITS an attribute a variation leaves as Any rather
@@ -839,11 +859,21 @@ def _parent_variation_axes(product_id, user_context):
     what it failed to specify — Adams 13544 comes back carrying only Colors,
     with no trace of Finish or Sample Size. Comparing against the parent is
     what surfaces them.
+
+    The taxonomy slug and attribute id are kept because line-item meta has to
+    be written under the TAXONOMY key ("pa_sample-size"), not the display name
+    ("Sample Size") — see _variant_meta_entry.
     """
     cache = user_context.setdefault("bulk_parent_axis_cache", {})
     key = str(product_id)
-    if key in cache:
-        return cache[key]
+    cached = cache.get(key)
+    # Sessions persisted before this cache carried taxonomy/id hold the old
+    # {name: [options]} shape. Treat those as a miss and refetch rather than
+    # projecting garbage out of a list.
+    if isinstance(cached, dict) and all(
+        isinstance(v, dict) and "options" in v for v in cached.values()
+    ):
+        return cached
 
     axes = {}
     fetched = False
@@ -861,7 +891,11 @@ def _parent_variation_axes(product_id, user_context):
                 name = str(a.get("name") or "").strip()
                 opts = [str(o) for o in (a.get("options") or []) if str(o).strip()]
                 if name and opts:
-                    axes[name] = opts
+                    axes[name] = {
+                        "taxonomy": str(a.get("slug") or "").strip(),
+                        "attribute_id": a.get("id"),
+                        "options": opts,
+                    }
             fetched = True
     except Exception as exc:
         logger.warning(
@@ -873,6 +907,17 @@ def _parent_variation_axes(product_id, user_context):
         cache[key] = axes
         user_context["bulk_parent_axis_cache"] = cache
     return axes
+
+
+def _parent_variation_axes(product_id, user_context):
+    """
+    {axis name: [option names]} — the shape every prompt-building caller wants.
+    Thin projection of _parent_axis_meta so both share one fetch and one cache.
+    """
+    return {
+        name: meta["options"]
+        for name, meta in _parent_axis_meta(product_id, user_context).items()
+    }
 
 
 def _missing_variant_axes(line, user_context):
@@ -4147,7 +4192,119 @@ def _address_group_key(addr) -> str:
     )
 
 
-def _bulk_line_item(line: dict) -> dict:
+def _slugify(value: str) -> str:
+    """
+    Local stand-in for WordPress sanitize_title(). Used only when the real
+    term list is unreachable — see _term_slug.
+    """
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = text.lower().strip()
+    text = re.sub(r"[^a-z0-9\s-]", "", text)   # '12"x12"' → '12x12'
+    text = re.sub(r"[\s_-]+", "-", text)
+    return text.strip("-")
+
+
+def _attribute_terms(attribute_id, user_context):
+    """
+    {lowercased term name: slug} for one global product attribute.
+
+    Cached per attribute for the session — there are only a handful (Colors,
+    Finish, Sample Size) and they change about never, so this is one call per
+    attribute per conversation, not per line.
+    """
+    cache = user_context.setdefault("bulk_attr_term_cache", {})
+    key = str(attribute_id)
+    if key in cache:
+        return cache[key]
+
+    terms = {}
+    fetched = False
+    try:
+        res = woo_client.execute(
+            endpoints.list_attribute_terms(
+                attribute_id=attribute_id,
+                description=f"Fetch terms for attribute_id={attribute_id}",
+            )
+        )
+        data = res.get("data") if res.get("success") else None
+        if isinstance(data, list):
+            for t in data:
+                if not isinstance(t, dict):
+                    continue
+                name = re.sub(r"\s+", " ", str(t.get("name") or "")).strip().lower()
+                slug = str(t.get("slug") or "").strip()
+                if name and slug:
+                    terms[name] = slug
+            fetched = True
+    except Exception as exc:
+        logger.warning(
+            f"bulk_order | attribute term fetch failed for {attribute_id} | error={exc}"
+        )
+
+    # Cache successes only, for the same reason as the parent axis cache.
+    if fetched:
+        cache[key] = terms
+        user_context["bulk_attr_term_cache"] = cache
+    return terms
+
+
+def _term_slug(attribute_id, option_name, user_context):
+    """
+    Display name → term slug ("Chip Card" → "chip-card").
+
+    Prefers the real term list, because a slug edited by hand in wp-admin will
+    not match what sanitize_title() would have produced. Falls back to
+    slugifying locally when the lookup is unavailable: a best-guess slug that
+    usually resolves beats writing the display name, which never does.
+    """
+    lookup = _attribute_terms(attribute_id, user_context) if attribute_id else {}
+    normalised = re.sub(r"\s+", " ", str(option_name or "")).strip().lower()
+    slug = lookup.get(normalised)
+    if slug:
+        return slug
+    guess = _slugify(option_name)
+    if lookup:
+        logger.warning(
+            f"bulk_order | no term matching {option_name!r} on attribute "
+            f"{attribute_id} — falling back to slugified {guess!r}"
+        )
+    return guess
+
+
+def _variant_meta_entry(product_id, axis, value, user_context):
+    """
+    One line-item meta entry for a rep-chosen "Any" axis.
+
+    Written under the TAXONOMY key with the TERM SLUG — {"key":
+    "pa_sample-size", "value": "chip-card"} — which is what the storefront
+    produces and what everything downstream reads.
+
+    This used to write the display name as the key ({"key": "Sample Size",
+    "value": "Chip Card"}). WooCommerce treated that as ordinary custom meta,
+    so the order carried TWO rows: the free-text one, plus the empty
+    "pa_sample-size" that WC itself writes because
+    WC_Product_Variation::get_variation_attributes() returns every parent
+    attribute including the ones the variation leaves as "Any". The blank
+    value made WC's term lookup fail, so display_key fell back to the raw
+    taxonomy and invoices printed a bare "pa_sample-size:" row. Writing the
+    taxonomy key means update_meta_data() replaces that empty row instead of
+    sitting beside it, and WC derives the label and display value itself.
+
+    Falls back to the old display-name shape if the taxonomy can't be
+    resolved, which is no worse than what it replaces.
+    """
+    meta = (_parent_axis_meta(product_id, user_context) or {}).get(axis) or {}
+    taxonomy = meta.get("taxonomy")
+    if not taxonomy:
+        return {"key": str(axis), "value": str(value)}
+    return {
+        "key": taxonomy,
+        "value": _term_slug(meta.get("attribute_id"), value, user_context),
+    }
+
+
+def _bulk_line_item(line: dict, user_context: dict) -> dict:
     """
     One WooCommerce order line item.
 
@@ -4165,7 +4322,7 @@ def _bulk_line_item(line: dict) -> dict:
     meta = line.get("variant_meta") or {}
     if meta:
         item["meta_data"] = [
-            {"key": str(axis), "value": str(value)}
+            _variant_meta_entry(line.get("product_id"), axis, value, user_context)
             for axis, value in meta.items()
             if str(value).strip()
         ]
@@ -4279,9 +4436,14 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
             continue
 
         # ── Custom CS fields → order meta (not address-block fields) ──
-        # project_rep is already defaulted to the logged-in rep inside
-        # _effective_address_for_line.
-        project_rep  = billing.get("project_rep") or rep_email
+        # project_rep is already defaulted inside _effective_address_for_line,
+        # and only when the logged-in user is a real rep. No `or rep_email`
+        # fallback here: that second, unvalidated seed would have re-applied a
+        # non-rep email at creation time even after the gate and the panel had
+        # both correctly left the field blank. If it is empty at this point the
+        # gate above already refused the line, so this cannot silently drop a
+        # value a rep chose.
+        project_rep  = billing.get("project_rep") or ""
         project_name = billing.get("billing_project") or ""
         field_type   = billing.get("billing_field_type") or ""
         order_notes  = shipping.get("order_notes") or ""
@@ -4349,7 +4511,7 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
             "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
             "set_paid": False,
             "line_items": [
-                _bulk_line_item(gl) for gl in group_lines
+                _bulk_line_item(gl, user_context) for gl in group_lines
             ],
         }
         if meta_data:

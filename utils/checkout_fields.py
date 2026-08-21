@@ -99,6 +99,19 @@ _DEFAULT_LABELS = {
 
 _live_labels: dict = {}
 
+# Option VALUES (emails) registered on the project_rep select, harvested from
+# the same /checkout-fields response the required-field union is built from.
+#
+# This is the authoritative "who is a rep" list: it is what the storefront
+# checkout renders and what every existing _billing_project_rep value was
+# chosen from. It is NOT the same set as /wp-json/custom-api/v1/reps, which
+# returns users holding a role in WC_Chat_Security::rep_roles() — an address
+# can carry a project_rep that is valid here and absent there, or vice versa.
+#
+# Empty means "not known yet / fetch failed", never "nobody is a rep" —
+# callers must fail open rather than block ordering on a plugin outage.
+_rep_option_values: set = set()
+
 # Cache is keyed by the custom-api base URL, which is this deployment's store
 # identity. On a multi-tenant build where that URL is resolved per tenant rather
 # than being a module constant, this key stays correct; if it ever becomes
@@ -138,6 +151,44 @@ def _absorb_live_labels(short_key: str, cfg: dict) -> None:
     label = (cfg or {}).get("label")
     if isinstance(label, str) and label.strip():
         _live_labels[short_key] = label.strip()
+
+
+def _absorb_rep_options(short_key: str, cfg: dict) -> None:
+    """Harvest project_rep's option values. WC serialises them value → label."""
+    if short_key != "project_rep":
+        return
+    options = (cfg or {}).get("options")
+    if not isinstance(options, dict):
+        return
+    values = {
+        str(value).strip().lower()
+        for value in options.keys()
+        if str(value).strip()          # drop the blank "Select Rep" placeholder
+    }
+    if values:
+        _rep_option_values.clear()
+        _rep_option_values.update(values)
+
+
+def is_known_rep(email: str) -> bool:
+    """
+    True when `email` appears in the project_rep option list.
+
+    Fails OPEN: when the option list could not be fetched, every non-empty
+    email is accepted, because a plugin outage must not stop a rep from
+    placing an order. Callers that use this to decide whether to AUTO-FILL
+    project_rep therefore keep their old behaviour during an outage.
+    """
+    email = str(email or "").strip().lower()
+    if not email:
+        return False
+    # Cheap on the hot path — cached for _CACHE_TTL_SECONDS. Called here so the
+    # option list is populated even if this is the first lookup of the process,
+    # before any validation pass has run.
+    get_required_fields()
+    if not _rep_option_values:
+        return True
+    return email in _rep_option_values
 
 
 def _fetch_live_fields() -> Optional[dict]:
@@ -206,6 +257,7 @@ def get_required_fields(force_refresh: bool = False) -> dict:
                     continue
                 short = _form_key(wc_key, group)
                 _absorb_live_labels(short, cfg)
+                _absorb_rep_options(short, cfg)
                 if not cfg.get("required"):
                     continue
                 # Route the CS custom fields to "meta" regardless of the address
