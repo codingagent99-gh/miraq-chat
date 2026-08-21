@@ -15,8 +15,9 @@ import logging
 from datetime import datetime, timezone
 from chat_logger import get_logger
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
 
 from app_config import PORT, DEBUG, STORE_NAME, USE_RELOADER
 from store_registry import set_store_loader, get_store_loader
@@ -55,6 +56,17 @@ migrate = Migrate(app, db)
 database_uri = os.getenv('DATABASE_URL', 'postgresql://postgres:admin@localhost:5432/miraq_chat')
 app.config['SQLALCHEMY_DATABASE_URI'] = database_uri
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+# Postgres (or anything between us and it) drops connections that have sat
+# idle. Without pre_ping, SQLAlchemy hands a dead connection straight to the
+# first request after a quiet spell and it fails with "server closed the
+# connection unexpectedly" — a 500 the user sees, on a request that was
+# perfectly valid. pre_ping costs one trivial round trip per checkout and
+# transparently reconnects; recycle retires connections before the far end
+# is likely to have done it for us.
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    "pool_pre_ping": True,
+    "pool_recycle": 280,
+}
 
 def ensure_database_exists(db_uri):
     """
@@ -122,9 +134,27 @@ def handle_global_exception(e):
     Catches ALL unhandled exceptions across the entire Flask app.
     Forces the full traceback into our daily chat.txt log file,
     and prevents the frontend chatbot from receiving a broken HTML 500 page.
+
+    HTTPExceptions are deliberately let through. Flask's _find_error_handler
+    walks the class MRO, and werkzeug's NotFound/MethodNotAllowed/BadRequest
+    all inherit from HTTPException -> Exception, so without this check an
+    ordinary 404 for an unrouted URL ends up here: logged as CRITICAL with a
+    routing traceback, and answered with a 500 body telling the caller the
+    server broke. It did not — the URL simply does not exist, and the client
+    needs the real status code to behave correctly.
     """
     logger = get_logger("miraq_chat")
-    logger.critical(f"🔥 UNHANDLED CRASH: {str(e)}", exc_info=True)
+
+    # The method and path are logged in BOTH branches. Without them a 404 line
+    # says only that *something* hit a bad URL, which is not enough to tell a
+    # frontend bug from a bot probe.
+    where = f"{request.method} {request.path}"
+
+    if isinstance(e, HTTPException):
+        logger.warning(f"HTTP {e.code} | {where} | {e.name}")
+        return e  # Flask renders the response the exception already carries
+
+    logger.critical(f"🔥 UNHANDLED CRASH: {where} | {str(e)}", exc_info=True)
 
     try:
         db.session.rollback()
@@ -133,7 +163,7 @@ def handle_global_exception(e):
 
     return jsonify({
         "success": False,
-        "bot_message": "Oops! I encountered an unexpected Error.",
+        "bot_message": "Oops! Something went wrong. Please try again in a moment.",
         "intent": "error",
         "products": [],
         "suggestions": ["Start over", "Show me all products"],
