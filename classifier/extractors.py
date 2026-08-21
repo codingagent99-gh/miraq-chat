@@ -498,8 +498,30 @@ def _resolve_attribute_or_tag(
             term.get("slug", term.get("name", "")),
         )
         entities.attributes[attr_key] = term_key
-        entities.attribute_slug = taxonomy
-        entities.attribute_term_ids = [term["id"]]
+        # attribute_slug / attribute_term_ids are SINGLE-valued, but
+        # extract_attributes calls this once per taxonomy that matched. An
+        # unconditional assignment therefore left whichever taxonomy came LAST
+        # in loader order — silently, with nothing in the log to say a choice
+        # had been made at all.
+        #
+        # "chipcard" is the live case: it matches a term in pa_sample-size AND
+        # one in pa_tile-size, and pa_tile-size won purely by position, so the
+        # term id handed downstream described tile size on a chip-card request.
+        # ("chip card", with the space, matches only pa_sample-size — which is
+        # why the spaced spelling worked and the closed-up one did not.)
+        #
+        # First match wins now, and a collision is logged. entities.attributes
+        # still carries every taxonomy that matched, so nothing is discarded —
+        # a later product-aware tiebreak can pick from there.
+        if entities.attribute_slug and entities.attribute_slug != taxonomy:
+            logger.warning(
+                f"[AttrAmbiguity] term {term_name_lower!r} matches both "
+                f"{entities.attribute_slug} and {taxonomy} — keeping "
+                f"{entities.attribute_slug}. Both stay in entities.attributes."
+            )
+        else:
+            entities.attribute_slug = taxonomy
+            entities.attribute_term_ids = [term["id"]]
 
 # ══════════════════════════════════════════════════════════════
 # TAG EXTRACTION

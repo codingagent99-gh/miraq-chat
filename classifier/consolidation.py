@@ -14,7 +14,6 @@ from models import Intent, ExtractedEntities
 from store_registry import get_store_loader
 from chat_logger import get_logger
 from classifier.utils import normalize_for_tag_compare
-from classifier.extractors import extract_category
 from config.store_config import ATTRIBUTE_VALUE_PHRASES
 logger = get_logger("miraq_chat")
 
@@ -186,6 +185,8 @@ def _resolve_series_tag_conflict(entities: ExtractedEntities, text: str):
 
     logger.info(f"Conflict: Series tag found. Dropping product_id {entities.product_id}")
     if not getattr(entities, 'target_category_slugs', set()):
+        from classifier.extractors import extract_category
+
         extract_category(text, entities)
         if entities.category_name:
             logger.info(f"Restored category '{entities.category_name}' after product drop.")

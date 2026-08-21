@@ -111,7 +111,32 @@ class MultipleCompaniesError(ValueError):
 
 
 # "for company Beck LTD" — the explicit, unambiguous form.
-_FOR_COMPANY_RE = re.compile(r'\bfor\s+company\s+([^,]+)', re.I)
+_FOR_COMPANY_RE = re.compile(
+    r'\bfor\s+company\s+([^,]+)'        # "for company Gensler"
+    r'|\bfor\s+([^,]+?)\s+company\b',   # "for Gensler company"
+    re.I,
+)
+
+# Both orderings are in live use. Only the keyword-first one was recognised,
+# so "order allspice chipcard for gensler company" carried no company scope at
+# all — the tail was stripped as noise and the rep was then asked who the order
+# was for, having just said so in the message.
+
+# Text that names a company EXPLICITLY — a scope marker plus the word
+# "company", or a trailing "at <name>". Deliberately excludes a bare
+# "for <name>" tail: that is genuinely ambiguous between a person and a
+# company, and is resolved later against the roster rather than guessed at
+# classification time.
+#
+# BulkOrderEvaluator imports this. Same single-source-of-truth reason as
+# COMPANY_SCOPE_TAIL_RE below: a marker added here must not need a second
+# edit somewhere else to take effect.
+EXPLICIT_COMPANY_SCOPE_RE = re.compile(
+    r'\bfor\s+company\s+[^,]+'
+    r'|\bfor\s+[^,]+?\s+company\b'
+    r'|\bat\s+[^,]+$',
+    re.I,
+)
 
 # Any "for <something>" tail on a fragment.
 _FOR_TAIL_RE = re.compile(r'\bfor\s+(.+)$', re.I)
@@ -157,16 +182,19 @@ def _extract_company_scope(text: str):
     """
     Pull the transaction-wide company out of the raw utterance.
 
-    Handles the explicit form only ("... for company Beck LTD"); the implicit
-    trailing form ("Order A, B, C for Beck LTD") is resolved later, once the
-    text has been split into fragments and we can tell a lone trailing "for"
-    from per-line recipients.
+    Handles the explicit forms only ("... for company Beck LTD" and
+    "... for Beck LTD company"); the implicit trailing form ("Order A, B, C
+    for Beck LTD") is resolved later, once the text has been split into
+    fragments and we can tell a lone trailing "for" from per-line recipients.
 
     Returns (company_name, cleaned_text).
     Raises MultipleCompaniesError if two different companies are named.
     """
     names = []
-    for raw in _FOR_COMPANY_RE.findall(text):
+    # Two alternatives, so findall yields a tuple per match — exactly one
+    # group is non-empty.
+    for groups in _FOR_COMPANY_RE.findall(text):
+        raw = next((g for g in groups if g), "")
         name = raw.strip().strip(' ,.')
         if name and not any(name.lower() == seen.lower() for seen in names):
             names.append(name)

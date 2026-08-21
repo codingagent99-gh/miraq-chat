@@ -152,7 +152,7 @@ chat_bp = Blueprint("chat", __name__)
 # ─── MODULE-LEVEL HELPERS ───
 # ══════════════════════════════════════════════════════════════
 
-from parsers.bulk_order_parser import COMPANY_SCOPE_TAIL_RE
+from parsers.bulk_order_parser import COMPANY_SCOPE_TAIL_RE, EXPLICIT_COMPANY_SCOPE_RE
 
 
 def _recipient_scope_tokens(message: str, is_bulk: bool = False) -> list:
@@ -214,6 +214,22 @@ def _is_inline_bulk_order(message: str, store_loader=None) -> bool:
             if re.search(r"\b" + re.escape(name) + r"\b", message, re.I)
         )
         if resolved_count >= 2:
+            return True
+
+        # Check 3: ONE product + an explicit company. Mirrors the matching
+        # branch in BulkOrderEvaluator, and must stay in step with it.
+        #
+        # This function gates _company_scope_tokens, which runs BEFORE
+        # classification. Without this branch, "order allspice chipcard for
+        # gensler company" was not bulk here, so "company" never reached the
+        # suppressed-token list — and the typo corrector tied it against
+        # 'romano'/'bombay' at edit distance 3 and hijacked the turn into a
+        # clarification chip. The classifier never saw the message at all, so
+        # the evaluator's own company branch could not fire.
+        #
+        # The guard already named "company" as a token to protect; it simply
+        # could not be reached for a single-product message.
+        if resolved_count >= 1 and EXPLICIT_COMPANY_SCOPE_RE.search(message):
             return True
 
     return False

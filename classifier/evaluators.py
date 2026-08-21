@@ -774,11 +774,42 @@ class BulkOrderEvaluator(IntentEvaluator):
         if self._EACH_QTY.search(text) and self._count_catalog_products(text) >= 2:
             return Intent.BULK_ORDER, 0.92
 
-        # ── Check 2: order trigger + 2+ resolvable catalog products ──
+        # ── Check 2: order trigger + resolvable catalog products ──
+        # Two products is the general rule; ONE product plus an EXPLICIT
+        # company also qualifies.
+        #
         # Handles all separators: comma-only, "and"-only, "A, B and C",
         # comma+email, any mix — no digit requirement.
+        #
+        # The one-product case exists because every check above needs two, so
+        # "order allspice chipcard for gensler company" fell through to
+        # OrderActionEvaluator and became a quick_order. Quick order has no
+        # concept of company scope, so the company was dropped as noise and
+        # the rep was then asked who the order was for — a question they had
+        # already answered in the message. Company scope is a property of the
+        # REQUEST, not of how many products it happens to name, and the bulk
+        # flow is what knows how to resolve a company to a recipient and an
+        # address. It handles single-line orders perfectly well.
+        #
+        # Gated on EXPLICIT_COMPANY_SCOPE_RE rather than any "for" tail, so
+        # "order allspice for sovan" stays a quick order: a bare tail is
+        # ambiguous between a person and a company, and there is an open bug
+        # where Step 1.5 claims such a tail as a company before the
+        # shared-recipient rule sees it. Widening this to bare tails would
+        # feed that bug, so it requires the word "company" or a trailing
+        # "at <name>".
         if self._ORDER_VERBS.search(text):
-            if self._count_catalog_products(text) >= 2:
+            # Imported lazily: classifier/__init__ imports this module, and
+            # bulk_order_parser imports classifier.extractors — which triggers
+            # that __init__. A module-level import here closes the cycle and
+            # breaks startup. The regex still lives in the parser, so the
+            # marker list stays in one place.
+            from parsers.bulk_order_parser import EXPLICIT_COMPANY_SCOPE_RE
+
+            product_count = self._count_catalog_products(text)
+            if product_count >= 2:
+                return Intent.BULK_ORDER, 0.92
+            if product_count >= 1 and EXPLICIT_COMPANY_SCOPE_RE.search(text):
                 return Intent.BULK_ORDER, 0.92
 
         return None, 0.0
