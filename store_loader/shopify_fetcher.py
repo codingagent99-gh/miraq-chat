@@ -17,7 +17,8 @@ Pagination:
 """
 
 import time
-from typing import Dict, List, Optional
+from decimal import Decimal, InvalidOperation
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
@@ -184,6 +185,59 @@ def _slugify(s: str) -> str:
     )
 
 
+def _money(val) -> Optional[Decimal]:
+    """Parse a Shopify money string to Decimal, or None if absent/unparseable.
+
+    Decimal rather than float: these values are compared for strict
+    inequality to decide whether something is on sale, and float rounding
+    turns "19.99" vs "19.99" into a discount of 2e-15.
+    """
+    if val is None or val == "":
+        return None
+    try:
+        return Decimal(str(val))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _sale_split(price, compare_at) -> Tuple[str, str, str]:
+    """Map Shopify's (price, compareAtPrice) onto Woo's (price, regular, sale).
+
+    The two models do NOT line up field for field, and the previous mapping
+    had them inverted:
+
+      Shopify — ``price`` is what the shopper pays right now. ``compareAtPrice``
+        is the ORIGINAL "was" price, and is only meaningful when it is
+        strictly GREATER than ``price``. Merchants routinely leave it set to
+        the same value as price, or lower, after a promotion ends; Shopify
+        renders those as not-on-sale and so must we.
+
+      Woo — ``regular_price`` is the list price, ``sale_price`` is the
+        DISCOUNTED price and is EMPTY when nothing is discounted, and
+        ``price`` is what the shopper pays now.
+
+    So ``sale_price = compareAtPrice`` was wrong twice over: it put the
+    higher original price in the field the widget renders as the sale price,
+    and it filled that field on every variant that had a compareAtPrice at
+    all. ``formatters.py`` (``is_on_sale = bool(sale_price_raw)``) derives the
+    on-sale flag from mere presence, so the widget showed a SALE badge on
+    everything, with the "sale" price above the real one.
+
+    Returns ``(price, regular_price, sale_price)`` as strings, matching the
+    string-typed money fields the Woo fetcher produces.
+    """
+    price_str = str(price) if price not in (None, "") else ""
+    p = _money(price)
+    c = _money(compare_at)
+
+    if p is not None and c is not None and c > p:
+        # Genuinely discounted: original goes to regular, current to sale.
+        return price_str, str(compare_at), price_str
+
+    # Not on sale — leave sale_price empty so nothing downstream flags it.
+    return price_str, price_str, ""
+
+
 def _normalise_collection(c: dict, idx: int) -> dict:
     """Shopify collection → Woo-shaped category dict consumed by lookup_builder."""
     return {
@@ -205,13 +259,20 @@ def _normalise_product(p: dict, idx: int, store_domain: str = "") -> dict:
 
     # Variants → Woo-shaped variation dicts
     variation_dicts = []
+    any_variant_on_sale = False
     for v in variants:
+        v_price, v_regular, v_sale = _sale_split(
+            v.get("price"), v.get("compareAtPrice")
+        )
+        if v_sale:
+            any_variant_on_sale = True
         variation_dicts.append({
             "id":            v.get("id"),
             "sku":           v.get("sku") or "",
-            "price":         v.get("price") or "",
-            "regular_price": v.get("price") or "",
-            "sale_price":    v.get("compareAtPrice") or "",
+            "price":         v_price,
+            "regular_price": v_regular,
+            "sale_price":    v_sale,
+            "on_sale":       bool(v_sale),
             "in_stock":      bool(v.get("availableForSale")),
             "stock_status":  "instock" if v.get("availableForSale") else "outofstock",
             "attributes": [
@@ -248,7 +309,14 @@ def _normalise_product(p: dict, idx: int, store_domain: str = "") -> dict:
         "sku":           variants[0].get("sku") if variants else "",
         "price":         min_price,
         "regular_price": min_price,
+        # Parent-level sale_price stays empty and on_sale is derived from the
+        # variants — the same shape WC REST returns for a variable product,
+        # where the parent carries the flag but no single sale price (each
+        # variation has its own). formatters.py reads on_sale for the product
+        # card and sale_price for the detail panel, so this gives an accurate
+        # SALE badge without inventing a parent price that does not exist.
         "sale_price":    "",
+        "on_sale":       any_variant_on_sale,
         "stock_status":  "instock" if (p.get("totalInventory") or 0) > 0 else "outofstock",
         "in_stock":      (p.get("totalInventory") or 0) > 0,
         "permalink":     f"https://{store_domain}/products/{p.get('handle','')}",
