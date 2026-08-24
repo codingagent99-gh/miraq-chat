@@ -45,6 +45,7 @@ request BODY in an ``X-Shopify-Hmac-Sha256`` header. This is the query-string
 scheme, and the two are not interchangeable.
 """
 
+import base64
 import hashlib
 import hmac
 import time
@@ -196,3 +197,32 @@ def resolve_shopify_customer_id(
         )
 
     return resolved, None
+
+
+def verify_events_hmac(raw_body: bytes, header_value: Optional[str], client_secret: str) -> Tuple[bool, str]:
+    """Verify an Events (or webhook) HTTPS delivery. See the module docstring's
+    note on the distinction from the App Proxy scheme above — this is the
+    OTHER one: base64 HMAC-SHA256 over the raw request body, not a
+    query-string signature.
+
+    Must be computed over the exact bytes Shopify sent, before any JSON
+    parsing — re-serializing the parsed body can reorder keys or change
+    whitespace and silently break every signature.
+
+    Returns ``(ok, reason)``, same shape as ``verify_app_proxy_signature`` and
+    for the same reason: every failure path returns False, with no
+    "couldn't check, allow anyway" branch.
+    """
+    if not client_secret:
+        return False, "no_client_secret_configured"
+    if not header_value:
+        return False, "missing_hmac_header"
+
+    expected = base64.b64encode(
+        hmac.new(client_secret.encode("utf-8"), raw_body, hashlib.sha256).digest()
+    ).decode("utf-8")
+
+    if not hmac.compare_digest(expected, header_value):
+        return False, "signature_mismatch"
+
+    return True, "ok"

@@ -9,7 +9,7 @@ from chat_logger import get_logger
 from store_loader.config import SHOPIFY_STORE_DOMAIN
 from models.shopify_token import ShopifyToken
 from ecommerce.shopify_endpoints import ShopifyEndpoints
-from ecommerce.shopify_proxy import resolve_shopify_customer_id
+from ecommerce.shopify_proxy import resolve_shopify_customer_id, verify_events_hmac
 from app_config import SHOPIFY_CUSTOMER_AUTH, SHOPIFY_PROXY_MAX_AGE
 from store_loader.config import SHOPIFY_CLIENT_SECRET
 
@@ -139,3 +139,38 @@ def get_customer_addresses():
         "addresses": addresses,
         "default_address_id": default_id,
     })
+
+
+@shopify_bp.route("/events/product-update", methods=["POST"])
+def shopify_product_update_event():
+    """Minimal receiver for the Product/update Events subscription declared in
+    shopify.app.miraq-commerce-agent.toml.
+
+    Nothing in the app currently NEEDS this data — it exists purely to give
+    ``shopify app deploy`` a real, working endpoint instead of a stub that
+    would fail every delivery. Right now it does exactly one thing: verify
+    the delivery is genuinely from Shopify, log it, and acknowledge.
+
+    Deliberately not idempotency-guarded yet: with no side effects, receiving
+    the same delivery twice is harmless. If this grows into something that
+    actually acts on the payload (e.g. invalidating a cached product ahead of
+    StoreLoader's 6-hourly refresh), de-dupe on the Shopify-Webhook-Id header
+    before doing so.
+    """
+    raw_body = request.get_data()  # must be the exact bytes Shopify signed —
+    # request.json / request.get_json() re-serializes and would break this.
+    header_hmac = request.headers.get("Shopify-Hmac-Sha256")
+
+    ok, reason = verify_events_hmac(raw_body, header_hmac, SHOPIFY_CLIENT_SECRET)
+    if not ok:
+        logger.warning(f"shopify events: rejected /events/product-update delivery | reason={reason}")
+        return jsonify({"error": "unverified_request"}), 401
+
+    delivery_id = request.headers.get("Shopify-Webhook-Id", "")
+    shop_domain = request.headers.get("Shopify-Shop-Domain", "")
+    logger.info(
+        f"shopify events: Product/update delivery accepted | "
+        f"delivery_id={delivery_id!r} shop={shop_domain!r}"
+    )
+
+    return jsonify({"received": True}), 200
