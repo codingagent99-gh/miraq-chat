@@ -3941,16 +3941,29 @@ def _build_address_card_response(
     # carries this across for a customer with 2+ historical addresses; this
     # covers the common 0-or-1 case, which skips that picker entirely and
     # would otherwise leave email permanently blank until typed by hand.
+    #
+    # The recipient's WooCommerce ACCOUNT email is deliberately NOT used as a
+    # fallback: Shipping Email can legitimately differ from it (a receiving
+    # desk inbox), so a wrong-but-plausible address would be worse than a
+    # blank one the rep is told about. Blank + a warning is the agreed
+    # behaviour.
+    email_miss_reason = ""
     if not shipping_block.get("email"):
         _company = user_context.get("bulk_company_scope", "")
-        if _company:
+        if not _company:
+            email_miss_reason = "no_company"
+        else:
             _hist_rows = _company_order_addresses(_company, user_context)
-            # Match on the recipient's NAME first. A row's customer_id is the
-            # person who PLACED that order — for anything a rep entered that
-            # is the rep, so keying on it would return the shipping email of
-            # whoever else that rep last shipped to at this company. The name
-            # identifies the recipient; the id is only a fallback for rows
-            # with no name on them.
+            # Match on the recipient's NAME. A row's customer_id is the person
+            # who PLACED that order, which for anything a rep entered is the
+            # rep — so it answers a different question than the one being
+            # asked here and is not used at all.
+            #
+            # It used to be a fallback, and could return the WRONG PERSON'S
+            # email: it matched rows placed BY the recipient, so if they had
+            # ever ordered for a colleague at this company, that colleague's
+            # shipping email was stamped on this order unverified. Rare, silent
+            # and unchecked afterwards — removed.
             #
             # Must require shipping_email in the match predicate itself, not
             # just identity — otherwise this locks onto the person's single
@@ -3958,32 +3971,55 @@ def _build_address_card_response(
             # gives up instead of walking back to an older order that has
             # one. Rows are already date-DESC from the plugin, so the first
             # row satisfying both conditions is the most recent one with data.
+            _fn = _norm_name(shipping_block.get("first_name"))
+            _ln = _norm_name(shipping_block.get("last_name"))
             _match = None
-            _fn = str(shipping_block.get("first_name") or "").strip().lower()
-            _ln = str(shipping_block.get("last_name") or "").strip().lower()
+            _tier = ""
+
             if _fn or _ln:
+                # Tier 1 — exact on both names, after normalisation.
                 _match = next(
                     (
                         r for r in _hist_rows
-                        if str(r.get("shipping_first_name") or "").strip().lower() == _fn
-                        and str(r.get("shipping_last_name") or "").strip().lower() == _ln
+                        if _norm_name(r.get("shipping_first_name")) == _fn
+                        and _norm_name(r.get("shipping_last_name")) == _ln
                         and r.get("shipping_email")
                     ),
                     None,
                 )
-            if not _match and _cid:
+                _tier = "exact" if _match else ""
+
+            if not _match and _ln and _fn:
+                # Tier 2 — surname exact, forename initial. Catches a middle
+                # name sitting in first_name, an initial instead of a name,
+                # and "Jacquelyn"/"Jacqueline"-style spelling drift.
+                #
+                # Stops here on purpose: general fuzzy matching on a person's
+                # name is not safe at this scale, because two J. Smiths at one
+                # firm is entirely plausible and a wrong email is worse than
+                # the miss it would save.
                 _match = next(
                     (
                         r for r in _hist_rows
-                        if str(r.get("customer_id") or 0) == str(_cid)
+                        if _norm_name(r.get("shipping_last_name")) == _ln
+                        and _norm_name(r.get("shipping_first_name"))[:1] == _fn[:1]
                         and r.get("shipping_email")
                     ),
                     None,
                 )
+                _tier = "surname+initial" if _match else ""
+
+            if not _match:
+                email_miss_reason = (
+                    "no_history" if not _hist_rows else "no_email_in_history"
+                )
+
             logger.info(
                 f"bulk_order | shipping-email fallback for "
                 f"{current_line.get('customer_display_name', '') or 'unknown'} "
-                f"(customer_id={_cid or 'n/a'}) | found={'yes' if _match else 'no'}"
+                f"| company={_company!r} rows={len(_hist_rows)} "
+                f"| found={_tier or 'no'}"
+                + (f" reason={email_miss_reason}" if not _match else "")
             )
             if _match:
                 shipping_block["email"] = _match["shipping_email"]
@@ -4069,6 +4105,33 @@ def _build_address_card_response(
         if not current_line.get("is_self_order") else "**Your order** "
     ) + f"({idx + 1} of {len(resolved_lines)})\r\n\r\n"
 
+    # A blank Shipping Email otherwise only surfaces AFTER the rep hits
+    # confirm, as a generic "missing N required fields" rejection. We already
+    # know here both that it is blank and why, so say so up front and name the
+    # reason — the rep can act on "nothing on file for this person" but not on
+    # "field missing".
+    email_notice = ""
+    if not effective_shipping.get("email"):
+        _who = _line_recipient_display(current_line)
+        _co = user_context.get("bulk_company_scope", "")
+        if email_miss_reason == "no_company":
+            email_notice = (
+                "✉️ No Shipping Email — this order has no company scope, so "
+                "there is no order history to look one up in. Please add it below."
+            )
+        elif email_miss_reason == "no_history":
+            email_notice = (
+                f"✉️ No Shipping Email — no past deliveries on file for "
+                f"**{_co}** to take one from. Please add it below."
+            )
+        elif email_miss_reason == "no_email_in_history":
+            email_notice = (
+                f"✉️ No Shipping Email — none of **{_who}**'s past orders at "
+                f"**{_co}** recorded one. Please add it below."
+            )
+        else:
+            email_notice = "✉️ No Shipping Email on file. Please add it below."
+
     if has_errors(validation_errors):
         missing_count = count_missing(validation_errors)
         bot_message = (
@@ -4091,6 +4154,7 @@ def _build_address_card_response(
             header
             + f"📦 {items_text}\r\n"
             + f"📍 Shipping to: {addr_str}\r\n\r\n"
+            + (f"{email_notice}\r\n\r\n" if email_notice else "")
             + "Confirm this address?"
         )
         suggestions = ["Yes, confirm", "Change address", "Skip this order"]
@@ -4302,6 +4366,23 @@ def _variant_meta_entry(product_id, axis, value, user_context):
         "key": taxonomy,
         "value": _term_slug(meta.get("attribute_id"), value, user_context),
     }
+
+
+def _norm_name(value) -> str:
+    """
+    Normalise a person's name for comparison against order-history rows.
+
+    Case-folded, accents removed, and every non-word character INCLUDING
+    whitespace dropped. Removing spaces as well as punctuation is what makes
+    both directions work: "Smith-Jones"/"smith jones" and "O'Brien"/"o brien"
+    each collapse to one form, where stripping punctuation alone fixes one and
+    breaks the other. Also folds "Van Der Berg"/"Vanderberg".
+
+    Used only to compare two spellings of the same name, never to display one.
+    """
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return re.sub(r"[^\w]", "", text).lower()
 
 
 def _bulk_line_item(line: dict, user_context: dict) -> dict:
