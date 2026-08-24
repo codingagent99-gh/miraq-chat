@@ -88,11 +88,21 @@ def resolve_shopify_variant_gid(
 
     p_id_str = str(product_id) if product_id is not None else ""
     product = None
+    # Two passes, GID first. Product ids are now the numeric tail of the
+    # Shopify GID rather than a positional counter, so a product numeric and
+    # a variant numeric live in the same value space and could in principle
+    # coincide. An exact GID match is unambiguous by construction, so it must
+    # never lose to a numeric one — hence the ordering rather than a single
+    # combined `or`.
     for candidate in (getattr(store_loader, "products", None) or []):
-        if (str(candidate.get("id", "")) == p_id_str
-                or str(candidate.get("_shopify_gid", "")) == p_id_str):
+        if p_id_str and str(candidate.get("_shopify_gid", "")) == p_id_str:
             product = candidate
             break
+    if product is None:
+        for candidate in (getattr(store_loader, "products", None) or []):
+            if p_id_str and str(candidate.get("id", "")) == p_id_str:
+                product = candidate
+                break
 
     if not product:
         logger.warning(
@@ -136,6 +146,7 @@ def build_cart_add_action(
     resolved_attrs: Optional[Dict[str, str]] = None,
     store_loader=None,
     build_variation_payload: bool = True,
+    suppress_result: bool = False,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Build the add-to-cart action for the active backend.
 
@@ -151,6 +162,11 @@ def build_cart_add_action(
     cart_handler.py has always emitted the action without them (and calling
     the Woo payload builder there would introduce a new API call). It is
     ignored on Shopify, where the variant GID carries all option values.
+
+    ``suppress_result`` is passed straight through to whichever action
+    builder runs — see build_add_to_cart() for what it does and why a
+    multi-line caller (bulk order) sets it while a single-item caller
+    (confirm_add_to_cart) does not.
     """
     if ECOMMERCE_BACKEND == "shopify":
         variant_gid = resolve_shopify_variant_gid(
@@ -165,6 +181,7 @@ def build_cart_add_action(
             variant_gid=variant_gid,
             quantity=quantity,
             name=name,
+            suppress_result=suppress_result,
         ), None
 
     # ── WooCommerce (unchanged contract) ──────────────────────────────────
@@ -240,4 +257,5 @@ def build_cart_add_action(
         name=name,
         variation_id=variation_id,
         variation=variation_attributes,
+        suppress_result=suppress_result,
     ), None

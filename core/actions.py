@@ -58,12 +58,20 @@ def build_add_to_cart(
     name: Optional[str] = None,
     variation_id: Optional[int] = None,
     variation: Optional[List[Dict[str, Any]]] = None,
+    suppress_result: bool = False,
 ) -> Dict[str, Any]:
     """
     Build an ``ADD_TO_CART`` action.
 
     Required: ``product_id``, ``quantity``.
     Optional: ``name``, ``variation_id``, ``variation`` (list of ``{attribute, value}`` dicts).
+
+    ``suppress_result`` tells the widget not to post this add back to
+    /chat/cart-result and not to append its own per-item confirmation. Set it
+    when the response ALREADY names what was added: a multi-line bulk order
+    emits one action per line plus its own itemised summary, so without this
+    the shopper sees that summary followed by one duplicate confirmation line
+    per item, and pays a redundant round trip for each.
     """
     if product_id is None:
         raise ValueError("build_add_to_cart: product_id is required")
@@ -80,6 +88,8 @@ def build_add_to_cart(
         payload["variation_id"] = _to_cart_id(variation_id)
     if variation:
         payload["variation"] = variation
+    if suppress_result:
+        payload["suppress_result"] = True
 
     return {"type": ActionType.ADD_TO_CART, "payload": payload}
 
@@ -142,7 +152,13 @@ def build_shopify_add_to_cart(
     variant_gid: str,
     quantity: int,
     name: Optional[str] = None,
+    suppress_result: bool = False,
 ) -> Dict[str, Any]:
+    """Build a ``SHOPIFY_ADD_TO_CART`` action.
+
+    ``suppress_result`` behaves exactly as in build_add_to_cart() — see there
+    for why a multi-line add needs it.
+    """
     # Extract numeric ID from "gid://shopify/ProductVariant/51453276684586"
     variant_numeric_id = variant_gid.split("/")[-1]
     payload = {
@@ -152,6 +168,8 @@ def build_shopify_add_to_cart(
     }
     if name:
         payload["name"] = name
+    if suppress_result:
+        payload["suppress_result"] = True
     return {"type": ActionType.SHOPIFY_ADD_TO_CART, "payload": payload}
 
 def build_open_checkout_panel() -> Dict[str, Any]:

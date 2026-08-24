@@ -97,8 +97,14 @@ _MESSAGES = {
         ["Show me the catalogue", "Browse products"],
     ),
     Intent.BULK_ORDER: (
-        "Bulk ordering isn't available on this store. I can add items to your "
-        "cart one at a time.",
+        # Fires only for the rep multi-recipient flow (company scoping,
+        # recipient rosters, address pickers) — see the role check in
+        # routes/chat.py right before this module is consulted. Ordinary
+        # multi-line ordering ("order 2 Harmony, 1 Marigold chip card") is
+        # supported and never reaches this message.
+        "Ordering on behalf of other people isn't available on this store. "
+        "I can add several products to your own cart in one message though — "
+        "just list what you'd like.",
         ["Browse products", "View cart"],
     ),
 }

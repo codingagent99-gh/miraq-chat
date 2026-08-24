@@ -2236,13 +2236,30 @@ def chat():
                     flag_modified(conversation, "context_data")
                     return _ft(clarification_resp)
 
-        # Shopify: BULK_ORDER bypasses build_api_calls entirely (see the
-        # `_resolve_variant or intent == Intent.BULK_ORDER` branch below), so
-        # the unsupported-intent guard there would never see it. Answer here
-        # instead of letting the bulk flow start and fail mid-way.
-        if intent == Intent.BULK_ORDER and ECOMMERCE_BACKEND == "shopify":
+        # Shopify: only the REP multi-recipient flow is unsupported — company
+        # scoping, recipient rosters, address pickers, "order for X at Y".
+        # That flow is out of scope entirely on Shopify (see the module intro
+        # to bulk_order_parser and app_config.BULK_ORDER_ROLES): there is no
+        # rep role on this deployment, and the app's widget block
+        # (shopify-app/.../miraq_widget.liquid) can only ever send
+        # data-customer-role="customer" or "guest" — never a rep role — so
+        # this branch is a backstop for a role that cannot currently reach
+        # here, not a live path.
+        #
+        # Customer multi-LINE ordering (several products + variants in one
+        # message, added to the shopper's own cart) is fully supported and
+        # must not be blocked here — it bypasses build_api_calls the same
+        # way the rep flow does (see the `_resolve_variant or intent ==
+        # Intent.BULK_ORDER` branch below), which is why this check has to
+        # happen before that branch rather than relying on the unsupported-
+        # call guard further down.
+        if (intent == Intent.BULK_ORDER and ECOMMERCE_BACKEND == "shopify"
+                and role in BULK_ORDER_ROLES):
             _msg, _sugg = unsupported_message_for(Intent.BULK_ORDER)
-            logger.info("Shopify: BULK_ORDER unsupported — returning guidance")
+            logger.info(
+                "Shopify: BULK_ORDER rep multi-recipient flow unsupported "
+                f"(role={role!r}) — returning guidance"
+            )
             elapsed = round((time.time() - start_time) * 1000)
             return _ft((jsonify({
                 "success":     True,

@@ -17,7 +17,7 @@ from typing import Optional, List
 from woo_client import woo_client
 from ecommerce import endpoints
 from chat_logger import get_logger
-from app_config import BULK_ORDER_ROLES
+from app_config import BULK_ORDER_ROLES, ECOMMERCE_BACKEND
 from handlers.chat_utils import normalize_spelling_variants, _attribute_display_name, variation_declares_self_contained_term, _normalize_term_key
 from models import ExtractedEntities
 from classifier.extractors import extract_attributes
@@ -635,11 +635,49 @@ def parse_bulk_order_utterance(
                     in_stock=True,
                     description=f"Bulk order attribute resolve: '{pl.product_name}'",
                 )
-                _attr_result = woo_client.execute(_attr_call)
-                _attr_data = _attr_result.get("data") or {}
-                _attr_products = _attr_data.get("products", []) if isinstance(_attr_data, dict) else []
 
-                if _attr_result.get("success") and len(_attr_products) == 1:
+                # Backend dispatch. The call body is identical either way —
+                # build_advanced_filter_call emits taxonomies in Woo-shaped
+                # form ("pa_color") and the Shopify executor strips the
+                # "pa_" prefix itself (_taxonomy_match), so no filter
+                # rewriting is needed.
+                #
+                # ShopifyGraphQLExecutor, deliberately, and NOT the in-memory
+                # ShopifyQueryExecutor: routes/chat.py:1047 runs ordinary
+                # product search through the GraphQL one, and if this used a
+                # different engine then "matte grey" could resolve to one
+                # product when searched and a different one (or nothing)
+                # when bulk-ordered. Same engine, same answer.
+                _attr_ok = False
+                _attr_products = []
+                if ECOMMERCE_BACKEND == "shopify":
+                    try:
+                        from api_builder.shopify_graphql_executor import (
+                            ShopifyGraphQLExecutor,
+                        )
+                        _attr_data = ShopifyGraphQLExecutor(
+                            store_loader
+                        ).execute_from_body(_attr_call.body)
+                        _attr_products = (_attr_data or {}).get("products", [])
+                        _attr_ok = True
+                    except Exception as exc:
+                        # Mirrors the Woo failure branch: leave the line
+                        # unresolved so the shopper is asked, rather than
+                        # guessing a product from a query that never ran.
+                        logger.warning(
+                            f"bulk_parser | shopify attribute resolve failed for "
+                            f"'{pl.product_name}' | error={exc}"
+                        )
+                else:
+                    _attr_result = woo_client.execute(_attr_call)
+                    _attr_data = _attr_result.get("data") or {}
+                    _attr_products = (
+                        _attr_data.get("products", [])
+                        if isinstance(_attr_data, dict) else []
+                    )
+                    _attr_ok = bool(_attr_result.get("success"))
+
+                if _attr_ok and len(_attr_products) == 1:
                     matched_catalog_name = _attr_products[0].get("name")
                     pl.product_id = _attr_products[0].get("id")
                     logger.debug(
@@ -647,7 +685,7 @@ def parse_bulk_order_utterance(
                         f"'{matched_catalog_name}' (id={pl.product_id}) "
                         f"via {_attr_entities.attributes}"
                     )
-                elif _attr_result.get("success") and len(_attr_products) > 1:
+                elif _attr_ok and len(_attr_products) > 1:
                     logger.info(
                         f"bulk_parser | attribute match for '{pl.product_name}' "
                         f"({_attr_entities.attributes}) is ambiguous — "
@@ -759,27 +797,33 @@ def parse_bulk_order_utterance(
             continue
 
         if pl.product_id not in _variant_cache and pl.product_id not in _variant_fetch_failed:
-            var_call = endpoints.list_variants(
+            # Backend-neutral: Woo fetches over REST, Shopify reads the
+            # variants the store loader already holds. Going through
+            # woo_client.execute() directly here meant this lookup was
+            # refused outright on a Shopify deployment (by design — see the
+            # guard in woo_client), so every hinted line fell into
+            # _variant_fetch_failed and prompted.
+            #
+            # None means "could not determine" and [] means "genuinely none";
+            # only the former belongs in _variant_fetch_failed.
+            data = endpoints.list_variants_resolved(
                 product_id=pl.product_id,
+                store_loader=store_loader,
                 per_page=100,
-                description=f"Fetch variations for product_id={pl.product_id}",
             )
-            var_result = woo_client.execute(var_call)
-            data = var_result.get("data", [])
-            if var_result.get("success") and isinstance(data, list):
-                _variant_cache[pl.product_id] = data
-            else:
-                # A transport failure returns {"success": False, "data": []},
-                # which is indistinguishable from "this product has no
-                # variations" once cached. Track it separately so a dropped
-                # connection is never reported to the rep as "that option
-                # isn't in the catalog".
+            if data is None:
+                # A transport failure used to return {"success": False,
+                # "data": []}, which is indistinguishable from "this product
+                # has no variations" once cached. Track it separately so a
+                # dropped connection is never reported to the rep as "that
+                # option isn't in the catalog".
                 _variant_fetch_failed.add(pl.product_id)
                 logger.warning(
                     f"bulk_parser | variation lookup FAILED for product_id="
-                    f"{pl.product_id} | hint='{pl.variant_hint}' | "
-                    f"error={var_result.get('error')}"
+                    f"{pl.product_id} | hint='{pl.variant_hint}'"
                 )
+            else:
+                _variant_cache[pl.product_id] = data
 
         if pl.product_id in _variant_fetch_failed:
             # Leave variation_id unset so the variant prompt still fires, but

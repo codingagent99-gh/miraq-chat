@@ -16,6 +16,8 @@ Pagination:
     boot and on webhook refresh.
 """
 
+import hashlib
+import re
 import time
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional, Tuple
@@ -185,6 +187,75 @@ def _slugify(s: str) -> str:
     )
 
 
+_GID_TAIL_RE = re.compile(r"/(\d+)(?:\?.*)?$")
+
+
+def _gid_numeric(gid, fallback: Optional[int] = None) -> Optional[int]:
+    """Extract the permanent numeric id from a Shopify GID.
+
+    ``gid://shopify/Product/8123456789012`` → ``8123456789012``.
+
+    This is the id Shopify itself uses everywhere — the admin URL, the Ajax
+    Cart API, webhook payloads — so it is both globally unique and permanent.
+    Returns ``fallback`` when the value is missing or not a GID, so a
+    malformed record degrades to the old positional behaviour for that one
+    entry instead of colliding on ``None``.
+    """
+    if gid is None:
+        return fallback
+    match = _GID_TAIL_RE.search(str(gid))
+    if not match:
+        return fallback
+    try:
+        return int(match.group(1))
+    except (ValueError, TypeError):
+        return fallback
+
+
+def _stable_id(key: str) -> int:
+    """Deterministic id derived from a key string alone.
+
+    For tags and aggregated attributes there is no Shopify GID to borrow —
+    a tag is a bare string, and a "global attribute" is something we
+    synthesise by grouping option names across products. Numbering them by
+    enumeration order made their ids a function of catalog *content*, so
+    adding one product with a new option value renumbered unrelated
+    attributes.
+
+    Hashing the key instead makes the id a function of the key alone: the
+    same tag slug gets the same id on every load, forever, regardless of what
+    else is in the catalog — and, because it is pure, the per-product copy
+    and the aggregated global copy always agree.
+
+    blake2b rather than the builtin ``hash()``: string hashing is salted per
+    process, so ``hash()`` would produce different ids after every restart —
+    the same bug in a less obvious costume.
+    """
+    digest = hashlib.blake2b((key or "").encode("utf-8"), digest_size=4).digest()
+    return int.from_bytes(digest, "big") or 1
+
+
+def _warn_on_id_collisions(label: str, entries: List[dict], id_key: str, name_key: str):
+    """Log loudly if two distinct keys hashed to the same id.
+
+    A 32-bit space makes this vanishingly unlikely at catalog scale, but the
+    consequence (one entry silently overwriting another in loader.tag_by_id /
+    attribute_by_id) is invisible otherwise, so it is worth a line in the log.
+    """
+    seen: Dict[int, str] = {}
+    for entry in entries:
+        _id = entry.get(id_key)
+        _name = str(entry.get(name_key, ""))
+        if _id in seen and seen[_id] != _name:
+            logger.error(
+                f"ShopifyFetcher: {label} id collision — {_name!r} and "
+                f"{seen[_id]!r} both hash to {_id}. One will be dropped from "
+                f"the id index; rename one of them to resolve."
+            )
+        else:
+            seen[_id] = _name
+
+
 def _money(val) -> Optional[Decimal]:
     """Parse a Shopify money string to Decimal, or None if absent/unparseable.
 
@@ -241,7 +312,9 @@ def _sale_split(price, compare_at) -> Tuple[str, str, str]:
 def _normalise_collection(c: dict, idx: int) -> dict:
     """Shopify collection → Woo-shaped category dict consumed by lookup_builder."""
     return {
-        "id":          idx + 1,           # synthetic numeric id
+        # Permanent numeric from the GID, not the position in this fetch —
+        # see _gid_numeric. idx is kept only as a degraded fallback.
+        "id":          _gid_numeric(c.get("id"), idx + 1),
         "name":        c.get("title", ""),
         "slug":        c.get("handle", ""),
         "description": c.get("description") or "",
@@ -299,7 +372,16 @@ def _normalise_product(p: dict, idx: int, store_domain: str = "") -> dict:
     min_price = ((price_range.get("minVariantPrice") or {}).get("amount") or "0")
 
     return {
-        "id":            idx + 1,                  # synthetic numeric id
+        # Permanent numeric from the GID — see _gid_numeric. Previously
+        # idx + 1, i.e. the product's POSITION in the fetch result, which
+        # silently repointed every id after a deleted product on the next
+        # 6-hourly refresh while parked conversation state still held the old
+        # numbers. idx is kept only as a degraded fallback.
+        #
+        # This also fixes fetch_single_product(), which calls this function
+        # with idx=0 and therefore used to mint id=1 — colliding with the
+        # first product in the catalog.
+        "id":            _gid_numeric(p.get("id"), idx + 1),
         "name":          p.get("title", ""),
         "slug":          p.get("handle", ""),
         "type":          "variable" if len(variants) > 1 else "simple",
@@ -322,15 +404,22 @@ def _normalise_product(p: dict, idx: int, store_domain: str = "") -> dict:
         "permalink":     f"https://{store_domain}/products/{p.get('handle','')}",
         "categories": [
             {
-                "id":   i + 1,
+                # Same GID-derived id the global categories list uses, so a
+                # product's category id and loader.category_by_id agree.
+                # Previously this was the index within THIS product's
+                # collection edges, which matched nothing.
+                "id":   _gid_numeric(e["node"].get("id"), i + 1),
                 "name": e["node"].get("title", ""),
                 "slug": e["node"].get("handle", ""),
             }
             for i, e in enumerate(cat_edges)
         ],
         "tags": [
-            {"id": i + 1, "name": t, "slug": _slugify(t)}
-            for i, t in enumerate(p.get("tags") or [])
+            # Shopify tags are bare strings with no GID, so the id is a
+            # stable hash of the slug — the same value _aggregate_tags
+            # assigns, so per-product and global tag ids always agree.
+            {"id": _stable_id(_slugify(t)), "name": t, "slug": _slugify(t)}
+            for t in (p.get("tags") or [])
         ],
         "attributes":  attribute_dicts,
         "variations":  variation_dicts,
@@ -364,7 +453,12 @@ def _aggregate_attributes(products: List[dict]) -> List[dict]:
             for value in opt.get("options", []):
                 if value not in slot:
                     slot[value] = {
-                        "id":    len(slot) + 1,
+                        # Was len(slot) + 1 — the term's position within
+                        # whichever product happened to introduce it first,
+                        # so the whole term numbering shifted whenever a
+                        # product was added or removed. Hash the term slug
+                        # instead: same value, same id, every load.
+                        "id":    _stable_id(_slugify(value)),
                         "name":  value,
                         "slug":  _slugify(value),
                         "count": 0,
@@ -372,9 +466,16 @@ def _aggregate_attributes(products: List[dict]) -> List[dict]:
                 slot[value]["count"] += 1
 
     aggregated = []
-    for idx, (name, term_map) in enumerate(by_name.items()):
+    for name, term_map in by_name.items():
+        terms = list(term_map.values())
+        _warn_on_id_collisions(f"attribute term ({name})", terms, "id", "slug")
         aggregated.append({
-            "attribute_id":    idx + 1,
+            # Was idx + 1 over dict insertion order, i.e. a function of
+            # catalog iteration order. attribute_id is cast to int in
+            # load_from_shopify's attribute_terms map and used as a dict key
+            # in lookup_builder.attribute_by_id — neither needs it dense or
+            # small, only stable.
+            "attribute_id":    _stable_id(_slugify(name)),
             "attribute_name":  _slugify(name),
             "attribute_label": name,
             "type":            "select",
@@ -394,14 +495,21 @@ def _aggregate_tags(products: List[dict]) -> List[dict]:
             slug = tag.get("slug")
             if slug and slug not in seen:
                 seen[slug] = {
-                    "id":    len(seen) + 1,
+                    # Was len(seen) + 1 — discovery order across the whole
+                    # catalog, so every tag id moved when a product carrying
+                    # an earlier-sorted tag was removed. Same pure hash
+                    # _normalise_product uses, so the two agree by
+                    # construction rather than by convention.
+                    "id":    _stable_id(slug),
                     "name":  tag.get("name", ""),
                     "slug":  slug,
                     "count": 0,
                 }
             if slug:
                 seen[slug]["count"] += 1
-    return list(seen.values())
+    tags = list(seen.values())
+    _warn_on_id_collisions("tag", tags, "id", "slug")
+    return tags
 
 
 # ══════════════════════════════════════════════════════════════

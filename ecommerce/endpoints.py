@@ -148,6 +148,36 @@ class EcommerceEndpoints(Protocol):
         """
         ...
 
+    def list_variants_resolved(
+        self,
+        product_id,
+        store_loader=None,
+        per_page: int = 100,
+    ) -> Optional[List[Dict]]:
+        """Variations for a product, already fetched — or None if undeterminable.
+
+        Distinct from ``list_variants``, which returns a ``WooAPICall`` for the
+        caller to execute. Callers that need the variations themselves (bulk
+        order line resolution, variant prompts) cannot use that on Shopify:
+        ``woo_client.execute()`` refuses every request on a Shopify deployment
+        by design, so the call comes back empty and the caller cannot tell
+        "this product has no variations" from "the request was blocked".
+
+        Return contract, which callers depend on:
+          - ``None``  — could not determine (transport failure, product not in
+            the catalog). The caller MUST NOT tell the user a variant does not
+            exist; it never got to look.
+          - ``[]``    — determined, and the product genuinely has none.
+          - ``list``  — the variations, in the backend's own shape. Each item
+            carries ``attributes`` as either a list of ``{name, option}`` dicts
+            or the custom-API flat dict; use ``_get_safe_options`` to read them.
+
+        WooCommerce fetches over the REST API; Shopify reads them out of
+        ``store_loader``, where ``shopify_fetcher`` has already stored every
+        variant with its full ``selectedOptions``.
+        """
+        ...
+
     def build_cart_variation_payload(
         self,
         *,

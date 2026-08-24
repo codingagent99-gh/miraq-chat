@@ -31,6 +31,7 @@ from app_config import (
     DEFAULT_PAYMENT_METHOD,
     DEFAULT_PAYMENT_METHOD_TITLE,
     BULK_ORDER_ROLES,
+    ECOMMERCE_BACKEND,
 )
 from conversation_flow import FlowState
 from chat_logger import get_logger
@@ -877,6 +878,23 @@ def _parent_axis_meta(product_id, user_context):
 
     axes = {}
     fetched = False
+
+    # Shopify variants are fully-specified option combinations — there is no
+    # "Any", so there are no blank axes for this function to discover and
+    # nothing to compare a variation against. endpoints.product_variation_
+    # taxonomies already returns None on Shopify for the same reason, so
+    # every caller downstream is built to cope with an empty result.
+    #
+    # Returning early rather than letting the call through: woo_client
+    # refuses every request on a Shopify deployment by design, so this would
+    # otherwise be a guaranteed-failed fetch per product per prompt, logged
+    # as a warning each time. The empty dict IS the correct answer here, not
+    # a degraded one, so it is cached like any other success.
+    if ECOMMERCE_BACKEND == "shopify":
+        cache[key] = axes
+        user_context["bulk_parent_axis_cache"] = cache
+        return axes
+
     try:
         call = endpoints.fetch_product(
             product_id=product_id,
@@ -986,17 +1004,33 @@ def _ask_for_bulk_variant(
     cache_key = str(product_id)
 
     if cache_key not in cache:
-        var_call = endpoints.list_variants(
+        from store_registry import get_store_loader
+
+        # Backend-neutral (see the Protocol): Woo fetches over REST, Shopify
+        # reads what the store loader already holds. The direct
+        # woo_client.execute() this replaces was refused on a Shopify
+        # deployment, so the prompt rendered with zero options.
+        raw = endpoints.list_variants_resolved(
             product_id=product_id,
+            store_loader=get_store_loader(),
             per_page=100,
-            description=f"Fetch variations for bulk order product_id={product_id}",
         )
-        var_result = woo_client.execute(var_call)
-        raw = var_result.get("data", []) if var_result.get("success") else []
-        cache[cache_key] = raw if isinstance(raw, list) else []
-        user_context["bulk_variant_cache"] = cache
-        conversation.context_data = user_context
-        flag_modified(conversation, "context_data")
+        if raw is None:
+            # Undetermined — do NOT write [] into the cache. This cache lives
+            # in conversation.context_data, so caching a failed lookup as
+            # "no variations" would poison it for the rest of the
+            # conversation and the shopper would be re-prompted with an empty
+            # option list every time. Falling through with an empty local
+            # list leaves the next turn free to retry.
+            logger.warning(
+                f"bulk_order | variation lookup undetermined for "
+                f"product_id={product_id} — prompting without cached options"
+            )
+        else:
+            cache[cache_key] = raw
+            user_context["bulk_variant_cache"] = cache
+            conversation.context_data = user_context
+            flag_modified(conversation, "context_data")
 
     variations = cache.get(cache_key, [])
 
@@ -1152,6 +1186,45 @@ def _ask_for_bulk_variant(
 # ── Private: _build_bulk_confirmation_response ──
 # ══════════════════════════════════════════════════════════════
 
+def _line_product_is_live(line, store_loader):
+    """True when a parked line's product_id still exists in the current catalog.
+
+    Bulk lines are parked in conversation.context_data while the shopper is
+    asked for variants and quantities, and that state outlives the catalog:
+    StoreLoader reloads every 6 hours (_refresh_interval) while the
+    conversation sits open. Nothing invalidated the parked product_id, so a
+    line resolved before a reload was trusted verbatim after it.
+
+    Before the ids became GID-derived, that was actively dangerous: ids were
+    positional (idx + 1), so deleting one product shifted every later id down
+    by one, and a parked line silently resolved to a DIFFERENT product. The
+    add succeeded, the cart filled with the wrong items, and the confirmation
+    named the products the shopper had asked for — because the label comes
+    from the parked line, not from what was added. No error anywhere.
+
+    Ids are permanent now, so the remaining case is the honest one: the
+    product was deleted or unpublished mid-conversation and the id resolves
+    to nothing. This also catches any state parked under the old positional
+    scheme, since a small ordinal will not match a 13-digit Shopify id.
+
+    Returns True when the loader is unavailable or the product is found —
+    "unknown" must never block an add, only a positive miss does.
+    """
+    if not store_loader:
+        return True
+
+    products = getattr(store_loader, "products", None)
+    if not products:
+        return True
+
+    pid = str(line.get("product_id"))
+    for candidate in products:
+        if (str(candidate.get("id", "")) == pid
+                or str(candidate.get("_shopify_gid", "")) == pid):
+            return True
+    return False
+
+
 def _build_bulk_cart_response(lines_as_dicts, conversation, user_context, page, start_time):
     """
     A CUSTOMER's multi-line order: add every line to their cart instead of
@@ -1186,6 +1259,7 @@ def _build_bulk_cart_response(lines_as_dicts, conversation, user_context, page, 
     added_labels = []
     unresolved_count = 0
     failed_labels = []
+    stale_labels = []
 
     for line in lines_as_dicts:
         if line.get("unresolved") or not line.get("product_id"):
@@ -1194,6 +1268,20 @@ def _build_bulk_cart_response(lines_as_dicts, conversation, user_context, page, 
 
         name = line.get("product_name") or "item"
         qty = int(line.get("quantity") or 1)
+
+        # The catalog can reload between the line being parked and the shopper
+        # finishing the flow — see _line_product_is_live. Checked before
+        # building the action, because build_cart_add_action would happily
+        # emit an add for whatever the id now points at.
+        if not _line_product_is_live(line, store_loader):
+            logger.warning(
+                f"bulk_order | parked line product_id={line['product_id']!r} "
+                f"({name}) is no longer in the catalog — catalog reloaded "
+                f"mid-order, or state predates the GID-derived ids. Line "
+                f"dropped rather than added blind."
+            )
+            stale_labels.append(name)
+            continue
 
         # build_variation_payload=True on purpose, matching the confirm-add
         # flow rather than the bare ADD_TO_CART intent: variant_meta holds the
@@ -1209,6 +1297,13 @@ def _build_bulk_cart_response(lines_as_dicts, conversation, user_context, page, 
             resolved_attrs=line.get("variant_meta") or {},
             store_loader=store_loader,
             build_variation_payload=True,
+            # This function ALWAYS builds its own itemised bot_message below
+            # (added_labels), so each ADD_TO_CART/SHOPIFY_ADD_TO_CART action
+            # must not also trigger the widget's per-item confirmation —
+            # that duplicated the summary with one "✅ Added X" line per
+            # product, plus a redundant /chat/cart-result round trip and a
+            # re-dispatched OPEN_CART_PANEL for each. See build_add_to_cart().
+            suppress_result=True,
         )
 
         if action is None:
@@ -1242,12 +1337,21 @@ def _build_bulk_cart_response(lines_as_dicts, conversation, user_context, page, 
             "the options weren't specific enough. Search for it and pick the "
             "variant you want."
         )
+    if stale_labels:
+        # Deliberately a separate sentence from failed_labels: "be more
+        # specific" is useless advice when the product is simply gone.
+        bot_message += (
+            f"\r\n\r\n{', '.join(stale_labels)} is no longer available in the "
+            "catalogue, so I left it out. Search for it and I'll show you "
+            "what's in stock."
+        )
     if unresolved_count:
         bot_message += f"\r\n\r\n{unresolved_count} line(s) I couldn't match to a product were skipped."
 
     logger.info(
         f"bulk_order | customer self-order → cart | added={len(added_labels)} | "
-        f"failed={len(failed_labels)} | unresolved={unresolved_count}"
+        f"failed={len(failed_labels)} | stale={len(stale_labels)} | "
+        f"unresolved={unresolved_count}"
     )
 
     for k in _BULK_STATE_KEYS:

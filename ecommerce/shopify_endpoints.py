@@ -178,6 +178,49 @@ class ShopifyEndpoints:
         """Not applicable on Shopify — see product_variation_taxonomies()."""
         return {}
 
+    def list_variants_resolved(self, product_id, store_loader=None, per_page: int = 100):
+        """Read a product's variants out of store_loader. See the Protocol.
+
+        No API call: shopify_fetcher._normalise_product already stores every
+        variant with its full selectedOptions under the product's
+        ``variations`` key, so the catalog in memory is the source of truth
+        and a round-trip would only add latency.
+
+        Returns None when the product is not in the loader rather than [].
+        "Not in the catalog" is genuinely undetermined here — the loader may
+        be mid-refresh, degraded, or the product may post-date the last
+        6-hourly load — and reporting [] would let the caller tell the shopper
+        a variant does not exist when it was never checked.
+
+        ``per_page`` is accepted for Protocol compatibility and ignored; the
+        loader already holds every variant the GraphQL query returned.
+        """
+        if product_id is None or not store_loader:
+            return None
+
+        products = getattr(store_loader, "products", None) or []
+        p_id_str = str(product_id)
+
+        # GID before numeric — same precedence as build_cart_variation_payload.
+        match = next(
+            (p for p in products
+             if p_id_str and str(p.get("_shopify_gid", "")) == p_id_str),
+            None,
+        ) or next(
+            (p for p in products
+             if p.get("id") == product_id or str(p.get("id", "")) == p_id_str),
+            None,
+        )
+
+        if match is None:
+            logger.warning(
+                f"ShopifyEndpoints.list_variants_resolved: product {product_id!r} "
+                "not in store loader — returning None (undetermined), not []"
+            )
+            return None
+
+        return [v for v in (match.get("variations") or []) if isinstance(v, dict)]
+
     def build_cart_variation_payload(
         self,
         *,
@@ -195,8 +238,8 @@ class ShopifyEndpoints:
           1. variant_id already known → use it directly.
           2. Walk store_loader.products in-memory to find the variant whose
              selectedOptions match resolved_attrs (case-insensitive).
-             Checks both synthetic numeric id and _shopify_gid so callers
-             using either form are handled correctly.
+             Checks both the numeric id and _shopify_gid so callers using
+             either form are handled correctly, GID first.
         """
         if variant_id:
             return [{"variant_id": str(variant_id)}]
@@ -204,14 +247,21 @@ class ShopifyEndpoints:
         if not store_loader or not resolved_attrs:
             return []
 
-        for product in (store_loader.products or []):
-            p_id      = product.get("id")
-            p_gid     = str(product.get("_shopify_gid", ""))
-            p_id_str  = str(product_id)
+        # GID before numeric, for the same reason as
+        # cart_actions.resolve_shopify_variant_gid: product ids are the
+        # numeric tail of the GID now, so they share a value space with
+        # variant numerics and an exact GID match must take precedence.
+        p_id_str = str(product_id)
+        products = list(store_loader.products or [])
+        matched = [
+            p for p in products
+            if p_id_str and str(p.get("_shopify_gid", "")) == p_id_str
+        ] or [
+            p for p in products
+            if p.get("id") == product_id or str(p.get("id", "")) == p_id_str
+        ]
 
-            if p_id != product_id and p_gid != p_id_str:
-                continue
-
+        for product in matched:
             for var in (product.get("variations") or []):
                 var_opts = {
                     a.get("name", "").lower(): a.get("option", "").lower()

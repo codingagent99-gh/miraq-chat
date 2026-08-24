@@ -321,6 +321,44 @@ class WooEndpoints:
         except Exception:
             return {}
 
+    def list_variants_resolved(self, product_id, store_loader=None, per_page: int = 100):
+        """Fetch a product's variations over the REST API. See the Protocol.
+
+        Deliberately uncached: both existing callers (bulk_order_parser's
+        _variant_cache and bulk_order_handler's bulk_variant_cache) already
+        memoise per flow, and adding a third layer with its own lifetime would
+        change when a rep sees a freshly-edited variation.
+
+        The None-vs-[] distinction is the whole point of the method. A
+        transport failure previously came back as {"success": False,
+        "data": []}, indistinguishable from "this product has no variations"
+        once stored, which is how a dropped connection got reported to the
+        user as "that option isn't in the catalog".
+        """
+        if not product_id:
+            return None
+        try:
+            result = woo_client.execute(self.list_variants(
+                product_id=product_id,
+                per_page=per_page,
+                description=f"Fetch variations for product_id={product_id}",
+            ))
+        except Exception as exc:
+            logger.warning(
+                f"list_variants_resolved: fetch raised for product_id={product_id} | {exc}"
+            )
+            return None
+
+        data = result.get("data")
+        if result.get("success") and isinstance(data, list):
+            return data
+
+        logger.warning(
+            f"list_variants_resolved: lookup FAILED for product_id={product_id} | "
+            f"error={result.get('error')}"
+        )
+        return None
+
     def build_cart_variation_payload(
         self,
         *,
