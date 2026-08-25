@@ -89,6 +89,7 @@ CONTROL_PHRASE_WORDS = frozenset({
     # read at all. These words carry meaning for the bulk parser ("N each of")
     # and must never be rewritten to a catalog term.
     "each", "every", "per", "both", "all", "some", "any", "of",
+    "chip", "card", "chipcard",
 })
 
 # A single unambiguous winner — applied immediately, no user involved.
