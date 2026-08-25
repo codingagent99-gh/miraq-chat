@@ -17,7 +17,7 @@ from typing import Optional, List
 from woo_client import woo_client
 from ecommerce import endpoints
 from chat_logger import get_logger
-from app_config import BULK_ORDER_ROLES, ECOMMERCE_BACKEND
+from app_config import BULK_ORDER_FULL_SCOPE_ROLES, BULK_ORDER_ROLES, ECOMMERCE_BACKEND
 from handlers.chat_utils import normalize_spelling_variants, _attribute_display_name, variation_declares_self_contained_term, _normalize_term_key
 from models import ExtractedEntities
 from classifier.extractors import extract_attributes
@@ -227,7 +227,37 @@ def parse_bulk_order_utterance(
       5. Reorder resolution (API call per reorder line with resolved customer)
       6. Assemble final BulkOrderLine objects
     """
-    _is_rep = role in BULK_ORDER_ROLES
+    # Company/recipient-scoped resolution for the bulk-order flow: reps (and
+    # cs/pm roles) plus "customer" — a customer bulk-ordering to a named
+    # recipient/company still goes through real resolution, not just
+    # self-scoped cart behavior. See BULK_ORDER_FULL_SCOPE_ROLES. This governs
+    # whether the company/recipient PARSING machinery below (Steps 0/1.5/1.6/2)
+    # runs at all — it must run for "customer" too, so a customer's "for
+    # Ashlynn at Beck LTD" gets parsed the same way a rep's does.
+    _is_rep = role in BULK_ORDER_FULL_SCOPE_ROLES
+    # _is_true_rep: the ORIGINAL rep-tier roles only (unchanged set). These
+    # roles have no self-order fallback — they must always resolve to a named
+    # company/recipient, exactly as before this change. "customer" is
+    # deliberately NOT in this set: a customer who names nothing at all
+    # (no company, no recipient, no email) is ordering for themselves, same
+    # as their pre-existing self-checkout behavior — see the self-fallback in
+    # Step 6 below, gated on `not _is_true_rep`.
+    _is_true_rep = role in BULK_ORDER_ROLES
+
+    # Shopify has no company/recipient-roster backend at all — ShopifyEndpoints
+    # implements neither search_customers_by_company nor
+    # search_customers_by_email (the DynamicEndpointsRouter would raise
+    # AttributeError trying to dispatch either). True rep roles never reach
+    # this deployment (the widget can only send role="customer"/"guest" — see
+    # the backstop in routes/chat.py), so this was never exercised before.
+    # "customer" now being in BULK_ORDER_FULL_SCOPE_ROLES changes that: force
+    # full self-scoped behavior on Shopify for every role EXCEPT a true rep,
+    # so a Shopify customer's "for Ashlynn at Beck LTD" is silently ignored
+    # (stripped as noise, same as any other unrecognised text) exactly as it
+    # already was before this change, instead of crashing. True reps are left
+    # alone here since that path is unreachable in practice today.
+    if _is_rep and not _is_true_rep and ECOMMERCE_BACKEND == "shopify":
+        _is_rep = False
 
     # ── Step 0: Transaction-wide company scope ("... for company Beck LTD") ──
     # Bulk orders are scoped to ONE company; naming two raises immediately.
@@ -1292,7 +1322,20 @@ def parse_bulk_order_utterance(
 
     for pl in pre_lines:
         _recipient_matches = 0
-        if _is_rep:
+        # A "customer" (full-scope but not a true rep — see _is_true_rep)
+        # who named nothing at all for THIS line — no email, no
+        # transaction-wide company scope, no per-line recipient — is
+        # ordering for themselves, exactly as before "customer" was added to
+        # BULK_ORDER_FULL_SCOPE_ROLES. True reps get no such fallback: they
+        # must always resolve to a named company/recipient (unchanged). The
+        # moment a customer names ANY of those three signals, they fall
+        # through to the same real resolution a rep gets — that's the whole
+        # point of this expansion.
+        _customer_self_fallback = (
+            _is_rep and not _is_true_rep
+            and not pl.email and not company_scope and not pl.recipient_name
+        )
+        if _is_rep and not _customer_self_fallback:
             resolution = email_resolution_cache.get(pl.email) if pl.email else None
 
             # Fall back to the company roster when no email was given.
@@ -1338,6 +1381,8 @@ def parse_bulk_order_utterance(
                 else:
                     customer_display_name = "⚠️ Recipient required"
         else:
+            # Either a non-full-scope role (guest, etc.) or a full-scope
+            # customer line that fell back to self-ordering above.
             customer_id = self_customer_id
             customer_display_name = "Order"
             is_self_order = True

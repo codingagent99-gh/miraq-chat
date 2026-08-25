@@ -30,7 +30,7 @@ from ecommerce import endpoints
 from app_config import (
     DEFAULT_PAYMENT_METHOD,
     DEFAULT_PAYMENT_METHOD_TITLE,
-    BULK_ORDER_ROLES,
+    BULK_ORDER_FULL_SCOPE_ROLES,
     ECOMMERCE_BACKEND,
 )
 from conversation_flow import FlowState
@@ -540,7 +540,7 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
     # Skipped once the rep has chosen "Continue anyway" — they have already
     # been shown that no records exist and said to proceed, so asking again on
     # any re-entry into this function would be a loop they cannot leave.
-    if role in BULK_ORDER_ROLES and not user_context.get("bulk_company_skipped"):
+    if role in BULK_ORDER_FULL_SCOPE_ROLES and not user_context.get("bulk_company_skipped"):
         company_missing = [
             l for l in lines_as_dicts
             if l.get("unresolved_reason") in ("company_not_provided", "company_not_found")
@@ -675,7 +675,7 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
     # "Harmony for Ashlynn, Adams for Claire" is two separate questions. Lines
     # that named nobody share a single slot, since one pick genuinely covers
     # them all.
-    if role in BULK_ORDER_ROLES:
+    if role in BULK_ORDER_FULL_SCOPE_ROLES:
         queue = _build_recipient_queue(lines_as_dicts)
         if queue:
             # Several lines named nobody — one person or several? Ask before
@@ -698,7 +698,7 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
     # every recipient resolves straight from the roster (unresolved=0) this
     # function goes directly to the quantity prompt and never reaches that
     # shared exit, so the gate there alone never fired.
-    if role in BULK_ORDER_ROLES:
+    if role in BULK_ORDER_FULL_SCOPE_ROLES:
         _addr_queue = _build_address_queue(lines_as_dicts, user_context)
         if _addr_queue:
             user_context["bulk_address_queue"] = _addr_queue
@@ -708,8 +708,8 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
                 conversation, user_context, page, start_time,
             )
 
-    # Step 4.6: Rep lines missing an email → ask before proceeding
-    if role in BULK_ORDER_ROLES:
+    # Step 4.6: Rep (and customer, full-scope) lines missing an email → ask before proceeding
+    if role in BULK_ORDER_FULL_SCOPE_ROLES:
         email_missing = [l for l in lines_as_dicts if l.get("unresolved_reason") == "email_not_provided"]
         if email_missing:
             conversation.flow_state = FlowState.AWAITING_BULK_EMAIL.value
@@ -1463,32 +1463,37 @@ def _build_bulk_confirmation_response(lines_as_dicts, conversation, user_context
             "pagination": default_pagination(page),
         }), 200
 
-    # A CUSTOMER's own multi-line order goes to the CART, not to order
-    # creation — see _build_bulk_cart_response. Forked here because every
-    # route into the confirmation table funnels through this function (trigger
-    # parse, quantity reply, variant reply), so one branch covers them all.
+    # An order with nothing but self-scoped lines goes to the CART, not to
+    # order creation — see _build_bulk_cart_response. Forked here because
+    # every route into the confirmation table funnels through this function
+    # (trigger parse, quantity reply, variant reply), so one branch covers
+    # them all.
     #
-    # Gated on the ROLE, which is the actual rule: a customer can only ever
-    # order for themselves, never for a company or another recipient, so there
-    # is nothing for the on-behalf-of confirmation table to show them. Reps
-    # keep the table and real order creation even when every line happens to
-    # be for themselves. Testing is_self_order instead would today give the
-    # same answer — the parser sets it only in its non-rep branch — but it is
-    # a consequence of the role, not the rule, and one path in this file
-    # already rewrites that flag on a line.
+    # Gated on is_self_order across the LIVE lines, not on role. A true rep
+    # (BULK_ORDER_ROLES) never gets is_self_order=True from the parser — it
+    # has no self-fallback — so this is unchanged for them: always the table,
+    # never the cart. A "customer" (full-scope, see BULK_ORDER_FULL_SCOPE_ROLES)
+    # CAN now have is_self_order=True on some or all lines: True on any line
+    # where nothing was named (company/recipient/email) — an ordinary
+    # self-order, same as their pre-existing behavior — and False the moment
+    # they name a company/recipient/email for a line, exactly like a rep.
+    # A message can mix both: only when EVERY live line is still self-scoped
+    # does the whole thing go to cart; the moment even one line resolved to
+    # someone else, everything routes through the confirmation table instead
+    # (order creation has no role gate, so a self-scoped line riding along in
+    # that batch still creates a normal order for the customer's own account).
     #
     # Placed after the "no products found" guard above so an unparseable
     # message still re-prompts.
-    _role = (user_context.get("role") or user_context.get("user_role") or "")
-    if _allow_cart_fork and _role not in BULK_ORDER_ROLES:
-        _live_lines = [
-            l for l in lines_as_dicts
-            if not l.get("unresolved") and not l.get("address_skipped")
-        ]
-        if _live_lines:
-            return _build_bulk_cart_response(
-                lines_as_dicts, conversation, user_context, page, start_time
-            )
+    _live_lines = [
+        l for l in lines_as_dicts
+        if not l.get("unresolved") and not l.get("address_skipped")
+    ]
+    _all_self_order = bool(_live_lines) and all(l.get("is_self_order") for l in _live_lines)
+    if _allow_cart_fork and _all_self_order:
+        return _build_bulk_cart_response(
+            lines_as_dicts, conversation, user_context, page, start_time
+        )
 
     # Render rows with the RESOLVED recipient. The card reads
     # customer_display_name straight off each line, which still carries the
@@ -3374,7 +3379,7 @@ def _continue_after_addresses_chosen(lines_as_dicts, store_loader, conversation,
         )
 
     # Email still missing on any line?
-    if role in BULK_ORDER_ROLES:
+    if role in BULK_ORDER_FULL_SCOPE_ROLES:
         email_missing = [l for l in lines_as_dicts if l.get("unresolved_reason") == "email_not_provided"]
         if email_missing:
             conversation.flow_state = FlowState.AWAITING_BULK_EMAIL.value
@@ -3941,10 +3946,11 @@ def _advance_to_next_address_confirmation(resolved_lines, idx, conversation, use
     Walk forward to the next line still needing address confirmation and show
     its card. When every line has been confirmed or skipped, place the orders.
     """
-    # A CUSTOMER's own multi-line order goes to the CART, not to order
-    # creation — same rule and same reasoning as the fork in
+    # An order with nothing but self-scoped lines goes to the CART, not to
+    # order creation — same rule and same reasoning as the fork in
     # _build_bulk_confirmation_response (see its comment for the full
-    # rationale). That fork alone was NOT enough: this function is called
+    # rationale, including why this is gated on is_self_order rather than
+    # role). That fork alone was NOT enough: this function is called
     # from 8 separate sites (trigger parse, quantity reply, variant reply,
     # and several address-flow continuations), and the "every route funnels
     # through _build_bulk_confirmation_response" comment there stopped being
@@ -3957,17 +3963,16 @@ def _advance_to_next_address_confirmation(resolved_lines, idx, conversation, use
     # Checked here, at the top, so it fires before EITHER branch below ever
     # builds an address-confirmation card — not just in the terminal branch
     # that already happened to call _build_bulk_confirmation_response.
-    _role = (user_context.get("role") or user_context.get("user_role") or "")
-    if _role not in BULK_ORDER_ROLES:
-        _live_lines = [
-            l for l in resolved_lines
-            if not l.get("unresolved") and not l.get("address_skipped")
-        ]
-        if _live_lines:
-            lines = user_context.get("pending_bulk_lines", [])
-            return _build_bulk_cart_response(
-                lines, conversation, user_context, page, start_time
-            )
+    _live_lines = [
+        l for l in resolved_lines
+        if not l.get("unresolved") and not l.get("address_skipped")
+    ]
+    _all_self_order = bool(_live_lines) and all(l.get("is_self_order") for l in _live_lines)
+    if _all_self_order:
+        lines = user_context.get("pending_bulk_lines", [])
+        return _build_bulk_cart_response(
+            lines, conversation, user_context, page, start_time
+        )
 
     # Step 1: Skip already-processed lines
     while idx < len(resolved_lines):
@@ -4648,14 +4653,47 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
             )
             continue
 
+        # ── Defence in depth: project_rep must resolve against the REAL rep
+        # list ──
+        # is_known_rep() is only enforced at auto-fill time
+        # (_effective_address_for_line: billing["project_rep"] = rep_email if
+        # is_known_rep(rep_email) else "") and was never re-checked at
+        # submission. Autofill only ever seeds a value FROM the validated rep
+        # list, but nothing stops a raw API call — or a frontend gap in
+        # BulkAddressConfirmationCard.tsx, which isn't in this codebase to
+        # verify — from setting billing.project_rep to any non-blank string
+        # and having it persist straight into the _billing_project_rep order
+        # meta with nothing to stop it. Re-validate here, the same
+        # defence-in-depth pattern as the address check just above, so this
+        # can never be bypassed regardless of how the field got set. Reuses
+        # is_known_rep()'s existing fail-OPEN behaviour during a plugin
+        # outage (an empty option list accepts any non-empty value) — the
+        # same tradeoff already accepted for autofill, kept consistent here
+        # rather than inventing a stricter, inconsistent rule for submission.
+        _rep_value = billing.get("project_rep") or ""
+        if _rep_value and not is_known_rep(_rep_value):
+            failed_orders.append({
+                "customer": line["customer_display_name"],
+                "product": ", ".join(gl["product_name"] for gl in group_lines),
+                "error": f"Invalid rep selection: {_rep_value!r} is not a recognised rep.",
+            })
+            logger.warning(
+                f"bulk_order | refused to create order for {line['customer_display_name']} "
+                f"| project_rep {_rep_value!r} not in known rep list — rejected at "
+                f"submission (autofill/frontend validation was bypassed or absent)"
+            )
+            continue
+
         # ── Custom CS fields → order meta (not address-block fields) ──
         # project_rep is already defaulted inside _effective_address_for_line,
-        # and only when the logged-in user is a real rep. No `or rep_email`
-        # fallback here: that second, unvalidated seed would have re-applied a
-        # non-rep email at creation time even after the gate and the panel had
-        # both correctly left the field blank. If it is empty at this point the
-        # gate above already refused the line, so this cannot silently drop a
-        # value a rep chose.
+        # and only when the logged-in user is a real rep, AND re-validated
+        # against the real rep list just above (the "Defence in depth"
+        # project_rep gate). No `or rep_email` fallback here: that second,
+        # unvalidated seed would have re-applied a non-rep email at creation
+        # time even after the gate and the panel had both correctly left the
+        # field blank. Whatever survives to this line is either blank or has
+        # already passed is_known_rep(), so this cannot silently drop a value
+        # a rep chose nor let an unvalidated one through.
         project_rep  = billing.get("project_rep") or ""
         project_name = billing.get("billing_project") or ""
         field_type   = billing.get("billing_field_type") or ""

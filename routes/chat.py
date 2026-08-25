@@ -25,6 +25,7 @@ from app_config import (
     ORDER_CREATE_INTENTS,
     CLASSIFIER_PROVIDER_TAG,
     BULK_ORDER_ROLES,
+    BULK_ORDER_FULL_SCOPE_ROLES,
     ECOMMERCE_BACKEND,
     get_currency_symbol,
 )
@@ -2246,6 +2247,19 @@ def chat():
         # this branch is a backstop for a role that cannot currently reach
         # here, not a live path.
         #
+        # Deliberately still keyed on BULK_ORDER_ROLES (the true-rep set),
+        # NOT BULK_ORDER_FULL_SCOPE_ROLES, even though "customer" is now
+        # full-scope on WooCommerce (see below). Swapping this to the
+        # full-scope constant would turn every Shopify customer bulk order
+        # into an "unsupported" bounce — role="customer" is always in that
+        # set, and Shopify customer multi-line ordering is fully supported
+        # (see the next comment block). The actual Shopify safety net for the
+        # "customer" case lives in the parser itself (bulk_order_parser.py:
+        # forces self-scoped-only behavior whenever ECOMMERCE_BACKEND ==
+        # "shopify" for any non-true-rep role), so a Shopify customer's "for
+        # Ashlynn at Beck LTD" is silently stripped as noise there rather than
+        # surfacing here as an error message.
+        #
         # Customer multi-LINE ordering (several products + variants in one
         # message, added to the shopper's own cart) is fully supported and
         # must not be blocked here — it bypasses build_api_calls the same
@@ -2278,23 +2292,33 @@ def chat():
             }), 200))
 
         # Bulk order is available to EVERY role, but it means different things.
-        # For rep roles it is the full multi-recipient flow: company scope,
-        # recipient resolution, address picking. For everyone else it is
-        # multi-LINE ordering only — several products and quantities in one
-        # message, always shipped to the person placing it.
+        # For true rep roles (BULK_ORDER_ROLES) it is the full multi-recipient
+        # flow: company scope, recipient resolution, address picking, and
+        # they must always resolve to a named company/recipient — no self
+        # fallback. "customer" (BULK_ORDER_FULL_SCOPE_ROLES) gets the same
+        # full flow WHEN they name a company/recipient/email, but falls back
+        # to plain self-scoped multi-line ordering — several products and
+        # quantities in one message, shipped to the person placing it — the
+        # moment they name nothing at all. Everyone else (guest, etc.) only
+        # ever gets the self-scoped behavior; there is no fallback to reach
+        # for since they were never full-scope to begin with. On Shopify,
+        # every non-true-rep role is forced into self-scoped-only regardless
+        # of what's named (see the parser-level guard, and the backstop
+        # above) since the backend has no company/roster support at all.
         #
-        # Nothing extra is needed to make that safe here. The parser gates
-        # company scope, recipient names and email extraction on the same role
-        # set (`_is_rep` in bulk_order_parser) and routes non-rep lines through
-        # its self-order branch, and every on-behalf-of step in
-        # bulk_order_handler is likewise gated. A non-rep therefore cannot
-        # reach another person's roster or address book through this path even
-        # when the message names someone — the "for <person>" tail is stripped
-        # as part of product-name cleanup and never resolved.
-        if intent == Intent.BULK_ORDER and role not in BULK_ORDER_ROLES:
+        # Nothing extra is needed to make the WooCommerce customer case safe
+        # here. The parser gates company scope, recipient names and email
+        # extraction on BULK_ORDER_FULL_SCOPE_ROLES (`_is_rep` in
+        # bulk_order_parser) and every on-behalf-of step in
+        # bulk_order_handler is gated the same way — so a customer only ever
+        # reaches another person's roster or address book when they
+        # EXPLICITLY name a company, recipient, or email; naming nothing
+        # keeps them in their own self-order branch exactly as before.
+        if intent == Intent.BULK_ORDER and role not in BULK_ORDER_FULL_SCOPE_ROLES:
             logger.info(
-                "BULK_ORDER: non-rep role %r — proceeding as SELF-scoped "
-                "multi-line order (no company/recipient/address resolution)",
+                "BULK_ORDER: role %r has no full-scope bulk-order resolution — "
+                "proceeding as SELF-scoped multi-line order "
+                "(no company/recipient/address resolution)",
                 role,
             )
                 

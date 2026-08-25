@@ -260,6 +260,17 @@ def _load_custom_order_roles() -> frozenset:
 CUSTOM_ORDER_ROLES: frozenset = _load_custom_order_roles()
 # BULK_ORDER_ROLES: frozenset = CUSTOM_ORDER_ROLES | frozenset({"sales_rep"})
 BULK_ORDER_ROLES: frozenset = CUSTOM_ORDER_ROLES | frozenset({"sales_rep", "administrator"})
+# BULK_ORDER_FULL_SCOPE_ROLES: roles allowed to use company/recipient-scoped
+# resolution in the *bulk order* flow specifically (i.e. bulk-order to a
+# resolved company/recipient, not just to themselves). This is
+# BULK_ORDER_ROLES plus "customer" — deliberately kept as its own constant
+# rather than folded into BULK_ORDER_ROLES so nothing else that reads
+# BULK_ORDER_ROLES (order-for identity flow, order reporting, the custom
+# order API surface) is affected by this expansion. Orders remain billed to
+# whoever is placing them — this does not grant account impersonation, and
+# project_rep still must resolve against the real rep list (see
+# is_known_rep in utils/rep_utils.py), validated at submission time.
+BULK_ORDER_FULL_SCOPE_ROLES: frozenset = BULK_ORDER_ROLES | frozenset({"customer"})
 # ── Order reporting (rep sample counts, order lists by date range) ───────────
 # Roles allowed to see reporting ACROSS reps/customers. The rep roles above are
 # scoped to their own book; this tier is not. Override with ORDER_REPORT_ADMIN_ROLES_JSON.
