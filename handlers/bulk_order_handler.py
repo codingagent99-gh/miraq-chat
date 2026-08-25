@@ -3941,6 +3941,34 @@ def _advance_to_next_address_confirmation(resolved_lines, idx, conversation, use
     Walk forward to the next line still needing address confirmation and show
     its card. When every line has been confirmed or skipped, place the orders.
     """
+    # A CUSTOMER's own multi-line order goes to the CART, not to order
+    # creation — same rule and same reasoning as the fork in
+    # _build_bulk_confirmation_response (see its comment for the full
+    # rationale). That fork alone was NOT enough: this function is called
+    # from 8 separate sites (trigger parse, quantity reply, variant reply,
+    # and several address-flow continuations), and the "every route funnels
+    # through _build_bulk_confirmation_response" comment there stopped being
+    # true the moment any of those sites started calling this function
+    # directly instead. A customer whose order needed a variant prompt
+    # reached this function with every line still unconfirmed and got shown
+    # a "No address on file — 18 required fields missing" card before the
+    # role check downstream ever ran.
+    #
+    # Checked here, at the top, so it fires before EITHER branch below ever
+    # builds an address-confirmation card — not just in the terminal branch
+    # that already happened to call _build_bulk_confirmation_response.
+    _role = (user_context.get("role") or user_context.get("user_role") or "")
+    if _role not in BULK_ORDER_ROLES:
+        _live_lines = [
+            l for l in resolved_lines
+            if not l.get("unresolved") and not l.get("address_skipped")
+        ]
+        if _live_lines:
+            lines = user_context.get("pending_bulk_lines", [])
+            return _build_bulk_cart_response(
+                lines, conversation, user_context, page, start_time
+            )
+
     # Step 1: Skip already-processed lines
     while idx < len(resolved_lines):
         line = resolved_lines[idx]
