@@ -69,12 +69,25 @@ def _words_in_regex_literals(source: str) -> Set[str]:
 
 
 def build_classifier_keywords() -> frozenset:
-    """Union of every evaluator's declared KEYWORDS."""
+    """Union of every evaluator's declared KEYWORDS, plus the extractors'."""
     from classifier.evaluators import DEFAULT_EVALUATORS
 
     words: Set[str] = set()
     for ev in DEFAULT_EVALUATORS:
         words.update(w.lower() for w in getattr(ev, "KEYWORDS", frozenset()))
+
+    # Extractors run alongside the evaluators and key off their own
+    # vocabulary, but declare no KEYWORDS — nothing was protecting their
+    # words. "time" is one edit from both "tile" and "tide", so "…ordered all
+    # time" was answered with a "did you mean tile or tide?" chip instead of
+    # reaching the classifier. Failing soft: a missing/renamed constant must
+    # never block vocab build, same as the evaluator union above.
+    try:
+        from classifier.extractors import TIME_RANGE_KEYWORDS
+        words.update(w.lower() for w in TIME_RANGE_KEYWORDS)
+    except Exception as exc:
+        logger.error(f"build_classifier_keywords: extractor keywords failed: {exc}")
+
     return frozenset(words)
 
 

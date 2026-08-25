@@ -345,7 +345,13 @@ class OrderStatsEvaluator(IntentEvaluator):
     # email or a display name.
     _REP_RE = re.compile(
         r'\b(?:ordered|placed)\s+by\s+([a-z0-9._@\-]+(?:\s+[a-z0-9._@\-]+){0,2})'
-        r'|\bdid\s+([a-z0-9._@\-]+(?:\s+[a-z0-9._@\-]+){0,2})\s+order\b'
+        # order(?:ed|s)? — "did Ram ordered this month" / "did Ram orders" are
+        # ungrammatical but very common, and a bare \border\b cannot match
+        # inside "ordered". Missing them extracted NO rep, and the handler then
+        # answered a question about ONE person with a store-wide all-reps
+        # report, confidently and with no sign a name had been dropped. Same
+        # silent-drop class as the comma and "and"/"&" bugs in _split_names_span.
+        r'|\bdid\s+([a-z0-9._@\-]+(?:\s+[a-z0-9._@\-]+){0,2})\s+order(?:ed|s)?\b'
         r'|\bby\s+(?:rep\s+)([a-z0-9._@\-]+(?:\s+[a-z0-9._@\-]+){0,2})'
         # "orders by/for <rep>", "order list for <rep>" — the same shape
         # _NAMED_LIST_RE triggers on, captured here so the name extraction

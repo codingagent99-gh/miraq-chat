@@ -870,6 +870,52 @@ def extract_order_scope(text: str, entities: ExtractedEntities):
         entities.scope = "all"
 
 
+# ── Vocabulary extract_time_range() keys off ────────────────────────────────
+# Declared here, next to the function that owns it, and unioned into the
+# typo corrector's protected set by classifier/keywords.py — exactly the way
+# each evaluator's KEYWORDS is.
+#
+# WHY: the corrector rewrites any out-of-vocabulary token >= 4 chars to the
+# nearest catalog term. Calendar words are OOV against a tile catalog and sit
+# right next to real product vocabulary — "time" is ONE edit from both "tile"
+# and "tide", so "how many samples did Ram ordered all time" never reached
+# the classifier at all: it opened a "did you mean tile or tide?" chip, and
+# the user had to cancel out of it.
+#
+# The evaluators were already covered by this mechanism. extract_time_range
+# is an EXTRACTOR, not an evaluator, so nothing was collecting its words —
+# that gap is what this closes. Keep in sync with the regexes below; adding
+# a new period phrasing means adding its words here.
+# Phrases meaning "no date bound at all". Kept in sync with the same list in
+# handlers/order_stats_handler.py's date-reply branch — that one matches the
+# WHOLE reply ("All time" as an answer to the picker); this one has to match
+# INSIDE a longer sentence ("...ordered all time"), so it is anchored on word
+# boundaries rather than equality. "of all time" is excluded: that is a
+# superlative ("best seller of all time"), not a window the user is choosing.
+_ALL_TIME_RE = re.compile(
+    r'(?<!\bof\s)\ball[\s\-]?time\b'
+    r'|\b(?:for\s+)?ever\b(?=\s*$)',
+)
+
+TIME_RANGE_KEYWORDS = frozenset({
+    "between", "current", "date", "dates", "day", "days", "from", "last",
+    "month", "months", "mtd", "past", "period", "qtd", "quarter", "quarters",
+    "range", "this", "time", "today", "until", "week", "weeks", "year",
+    "years", "ytd",
+    # Recognised phrasings whose words don't appear as literals in the
+    # regexes above (they arrive via dateparser or numeric forms), but which
+    # a user types and which must survive correction just the same.
+    "times", "yesterday", "tomorrow", "recent", "recently", "since",
+    "previous", "earlier", "prior", "ago", "alltime",
+    # Month names — "march" is 2 edits from "arch"/"marsh", "may"/"june" are
+    # short enough to be skipped, but the long ones are live risks.
+    "january", "february", "march", "april", "june", "july", "august",
+    "september", "october", "november", "december",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sept", "oct", "nov",
+    "dec",
+})
+
+
 def extract_time_range(text: str, entities: ExtractedEntities):
     """Extract date/time ranges for order history queries."""
     text_lower = text.lower()
@@ -878,6 +924,20 @@ def extract_time_range(text: str, entities: ExtractedEntities):
     def _set(start: datetime, end: datetime):
         entities.date_after  = start.replace(hour=0,  minute=0,  second=0,  microsecond=0).isoformat()
         entities.date_before = end.replace(  hour=23, minute=59, second=59, microsecond=999999).isoformat()
+
+    # ── "all time" / "ever" — a DELIBERATE unbounded window ─────────────────
+    # Checked before everything else: it names no dates, so every branch below
+    # would miss it and the caller would read "no window given" and prompt.
+    #
+    # Both bounds stay None (unbounded is the point); `date_range_resolved`
+    # is what tells the handler this was a CHOICE rather than silence — see
+    # models/domain.py, and the identical rule in order_stats_handler's
+    # date-reply branch. That reply handler already accepted "all time", but
+    # only as a whole message, so answering the prompt worked while saying it
+    # inline in the original question did not.
+    if _ALL_TIME_RE.search(text_lower):
+        entities.date_range_resolved = True
+        return
 
     # ── Explicit numeric range: "01/02/2026 to 03/15/2026", "2026-01-02 - 2026-03-15"
     # Checked FIRST. An explicit range is the most specific signal a user can
