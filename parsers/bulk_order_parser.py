@@ -1225,13 +1225,41 @@ def parse_bulk_order_utterance(
         if not needle:
             return None, 0
 
+        # Haystacks must be normalised the SAME WAY as the needle. They were
+        # only .lower()'d before, which failed on this store's real data:
+        # Andrew_Gazda@gensler.com gives an email local part of
+        # "andrew_gazda", and the needle "Andrew Gazda" normalises to
+        # "andrew gazda" — the underscore alone defeated both passes below,
+        # since a multi-word needle can never be an element of h.split()
+        # either. Same class of failure for any separator (dots in
+        # first.last@, hyphens in double-barrelled surnames).
+        _norm = lambda s: re.sub(r'[^a-z0-9]+', ' ', str(s or "").lower()).strip()
+
         matches = []
         for c in company_roster:
-            first = str(c.get("first_name", "") or "").lower()
-            last = str(c.get("last_name", "") or "").lower()
+            first = _norm(c.get("first_name", ""))
+            last = _norm(c.get("last_name", ""))
             full = f"{first} {last}".strip()
-            email_local = str(c.get("email", "") or "").split("@")[0].lower()
-            haystacks = {h for h in (first, last, full, email_local) if h}
+            email_local = _norm(str(c.get("email", "") or "").split("@")[0])
+            # Billing name as an ADDITIONAL haystack, never a replacement:
+            # some accounts carry a degenerate account name (this store has
+            # "Gazda Gazda") where billing holds the real one. The existing
+            # repair for that lives in _roster_entry_to_resolution(), which
+            # runs for DISPLAY only and AFTER matching — so it never helped
+            # the lookup itself. Added here rather than moved, because
+            # billing is NOT a better source in general (eleanor_baker@
+            # bills as "Jennifer McKinney"); matching on either is right,
+            # preferring billing outright is not.
+            _bill = c.get("billing", {}) or {}
+            bill_first = _norm(_bill.get("first_name", ""))
+            bill_last = _norm(_bill.get("last_name", ""))
+            bill_full = f"{bill_first} {bill_last}".strip()
+            haystacks = {
+                h for h in (
+                    first, last, full, email_local,
+                    bill_first, bill_last, bill_full,
+                ) if h
+            }
             if any(needle == h for h in haystacks) or any(
                 needle in h.split() for h in haystacks
             ):
