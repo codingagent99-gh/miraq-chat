@@ -209,6 +209,252 @@ def _extract_company_scope(text: str):
     return "", text
 
 
+# ── Optional checkout-field clauses ("rep X", "order type Y", ...) ──────────
+# Keyword-introduced clauses that may appear ANYWHERE in a bulk order message
+# and in any order:
+#
+#   Order 1 each allspice, adams for Andrew Gazda at Gensler,
+#           rep John Smith, order type new deal
+#
+# They MUST be stripped before Step 1 splits on commas. That split turns every
+# comma-separated chunk into an order fragment, so ", rep John Smith" would
+# otherwise be resolved as a product line. Removing the clauses first is also
+# exactly what makes them position-independent: what remains is the plain
+# product/recipient text the existing parser already handles.
+#
+# Each clause runs to the next comma or end of string. Comma-only, not
+# "next keyword", deliberately: order-type labels are multi-word ("New Deal",
+# "Presentation/Library") and a project name may legitimately contain a word
+# that also opens a clause.
+_FIELD_CLAUSE_KEYWORDS = {
+    # canonical slot  ->  accepted openers, longest first so "order type"
+    #                     wins over a bare "type"
+    "project_rep":        [r"rep", r"sales\s+rep", r"cs\s+rep"],
+    "billing_field_type": [r"order\s+type", r"field\s+type", r"deal\s+type"],
+    # Free-text project/job name — "... for Gensler, project Midtown Office".
+    # Unlike the two slots above, there is no dropdown behind this one
+    # (checkout_fields.py's billing_project is a plain <input>, not a
+    # <select>), so there is nothing to validate against — see
+    # _resolve_project_clause.
+    "billing_project":    [r"project"],
+}
+
+# Shared opener list, longest-pattern-first so a multi-word opener ("order
+# type") wins over a bare one ("type") at the same position. Built once and
+# reused by both _FIELD_CLAUSE_RE (parsing) and FIELD_CLAUSE_SCOPE_TAIL_RE
+# (typo-guard export below) so the two can never drift apart the way
+# COMPANY_SCOPE_TAIL_RE's comment warns about.
+_FIELD_CLAUSE_OPENERS = sorted(
+    (kw for kws in _FIELD_CLAUSE_KEYWORDS.values() for kw in kws),
+    key=len,
+    reverse=True,
+)
+
+_FIELD_CLAUSE_RE = re.compile(
+    r"(?:^|,)\s*(?P<kw>"
+    + "|".join(_FIELD_CLAUSE_OPENERS)
+    # A clause value ends at a comma or end of string — but ALSO at a bare
+    # " for "/" at ", because those are the order's own company/recipient
+    # markers. Without this, "order type new deal, rep John Smith for Gensler"
+    # captures "John Smith for Gensler" as the rep name AND silently eats the
+    # company tail, leaving the order unscoped. Same silent-drop shape as the
+    # _FOR_COMPANY_RE over-capture bug.
+    + r")\s+(?P<val>[^,]+?)(?=\s*,|\s*$|\s+(?:for|at)\s+)",
+    re.I,
+)
+
+# Any FIELD-CLAUSE scope tail ("rep John Smith", "order type new deal",
+# "project Midtown Office") — used ONLY for typo-guard token extraction, not
+# for parsing (that's _FIELD_CLAUSE_RE above). Same single-source-of-truth
+# contract as COMPANY_SCOPE_TAIL_RE below: routes/chat.py imports this (and
+# the marker words themselves, FIELD_CLAUSE_MARKER_WORDS) so a keyword added
+# to _FIELD_CLAUSE_KEYWORDS above is protected from typo correction
+# automatically, without a second edit in chat.py. This is the same class of
+# bug COMPANY_SCOPE_TAIL_RE's comment describes for "at Beck" → "at back" —
+# "project Midtown Office" → "product Midtown onice" was that bug's
+# reappearance one keyword over, because this export didn't exist yet.
+FIELD_CLAUSE_SCOPE_TAIL_RE = re.compile(
+    r"\b(?:" + "|".join(_FIELD_CLAUSE_OPENERS) + r")\s+([^,]+)",
+    re.I,
+)
+
+# The bare opener words themselves ("rep", "project", "type", ...) — these
+# must never be rewritten either, independent of whatever value follows them.
+# Derived from the same source so a new keyword is covered without a second
+# edit here.
+FIELD_CLAUSE_MARKER_WORDS = frozenset(
+    word
+    for kws in _FIELD_CLAUSE_KEYWORDS.values()
+    for kw in kws
+    for word in kw.split(r"\s+")   # literal "\s+" substring inside the pattern text
+)
+
+
+def _slot_for_keyword(kw: str) -> str:
+    norm = re.sub(r"\s+", " ", kw.strip().lower())
+    for slot, patterns in _FIELD_CLAUSE_KEYWORDS.items():
+        for pat in patterns:
+            if re.fullmatch(pat, norm, re.I):
+                return slot
+    return ""
+
+
+def _extract_field_clauses(text: str):
+    """Strip optional checkout-field clauses out of `text`.
+
+    Returns (remaining_text, values, notices) where `values` maps the address
+    block's own field keys (project_rep / billing_field_type) to resolved
+    values, and `notices` carries a human-readable line per clause that could
+    NOT be resolved.
+
+    Nothing here guesses. An unrecognised or ambiguous value is left UNSET and
+    reported — which lands it on the address card's existing missing-field
+    prompt, the same review step a blank field already reaches, rather than
+    writing something the storefront cannot render.
+    """
+    values, notices = {}, []
+    if not text:
+        return text, values, notices
+
+    def _replace(m):
+        slot = _slot_for_keyword(m.group("kw"))
+        raw = (m.group("val") or "").strip(" .;:")
+        if not slot or not raw:
+            return m.group(0)          # not ours — leave the text alone
+
+        if slot == "project_rep":
+            resolved, note = _resolve_rep_clause(raw)
+        elif slot == "billing_field_type":
+            resolved, note = _resolve_order_type_clause(raw)
+        else:
+            resolved, note = _resolve_project_clause(raw)
+
+        if resolved:
+            values[slot] = resolved
+        if note:
+            notices.append(note)
+        # Consume the clause either way: it was clearly a field clause, not an
+        # order line, so leaving it in would make the parser hunt for a product
+        # called "John Smith".
+        return "," if m.group(0).lstrip().startswith(",") else ""
+
+    remaining = _FIELD_CLAUSE_RE.sub(_replace, text)
+    remaining = re.sub(r",\s*,", ",", remaining)
+    remaining = remaining.strip().strip(",").strip()
+    return remaining, values, notices
+
+
+def _resolve_rep_clause(raw: str):
+    """Validate a typed rep name against the project_rep dropdown options.
+
+    Stores the rep's EMAIL, which is what `_billing_project_rep` holds and
+    what the widget's <select> matches on — the label is only what a human
+    types. Unknown or ambiguous returns no value plus a notice.
+    """
+    try:
+        from utils.checkout_fields import rep_directory
+        directory = rep_directory()
+    except Exception:
+        directory = {}
+
+    if not directory:
+        # Options unreachable — fail OPEN rather than blocking the order, same
+        # contract as is_known_rep(). Nothing is stored: an unvalidated email
+        # guess here would be exactly the blank-<select> bug.
+        logger.warning(f"[FieldClause] rep options unavailable — '{raw}' not applied")
+        return "", (
+            f"⚠️ Couldn't check the rep list right now, so **{raw}** wasn't "
+            f"applied. You can set the rep on the review step below."
+        )
+
+    needle = re.sub(r"[^a-z0-9]+", " ", raw.lower()).strip()
+    exact, partial = [], []
+    for email, name in directory.items():
+        n = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+        if not n:
+            continue
+        if n == needle:
+            exact.append((name, email))
+        elif needle and (n.startswith(needle) or needle in n):
+            partial.append((name, email))
+
+    hits = exact or partial
+    if len(hits) == 1:
+        name, email = hits[0]
+        logger.info(f"[FieldClause] rep '{raw}' → {name} <{email}>")
+        return email, ""
+    if len(hits) > 1:
+        names = ", ".join(sorted(n for n, _ in hits))
+        return "", (
+            f"⚠️ **{raw}** matches more than one rep ({names}). "
+            f"Pick the right one on the review step below."
+        )
+    return "", (
+        f"⚠️ **{raw}** isn't one of the reps on file. "
+        f"Choose a rep on the review step below."
+    )
+
+
+def _resolve_order_type_clause(raw: str):
+    """Validate a typed order type and translate label → stored value."""
+    try:
+        from utils.checkout_fields import match_order_type
+        res = match_order_type(raw)
+    except Exception as exc:
+        logger.warning(f"[FieldClause] order type check failed: {exc}")
+        return "", (
+            f"⚠️ Couldn't check the order types right now, so **{raw}** "
+            f"wasn't applied. You can set it on the review step below."
+        )
+
+    status = res.get("status")
+    if status == "matched":
+        logger.info(f"[FieldClause] order type '{raw}' → {res['value']} ({res['label']})")
+        return res["value"], ""
+    if status == "unvalidated":
+        logger.warning(f"[FieldClause] order type '{raw}' stored unvalidated")
+        return res["value"], ""
+    if status == "ambiguous":
+        opts = ", ".join(res.get("candidates") or [])
+        return "", (
+            f"⚠️ **{raw}** matches more than one order type ({opts}). "
+            f"Pick one on the review step below."
+        )
+    opts = ", ".join(res.get("candidates") or [])
+    return "", (
+        f"⚠️ **{raw}** isn't a valid order type"
+        + (f". Valid options: {opts}." if opts else ".")
+        + " Set it on the review step below."
+    )
+
+
+def _resolve_project_clause(raw: str):
+    """Clean up a free-text project/job name. No option list to validate
+    against — checkout_fields.py registers billing_project as a plain
+    <input> (see its _META_KEYS / _DEFAULT_LABELS: "Project Name"), not a
+    <select> like project_rep or billing_field_type. There is no stored
+    VALUE distinct from what was typed, so unlike _resolve_rep_clause /
+    _resolve_order_type_clause there is no label→value translation and no
+    "matches the wrong <option>" failure to guard against — whatever the
+    shopper typed is what the invoice should show.
+
+    Still routed through the same clause machinery as rep/order-type
+    (rather than left for the generic parser) so it is stripped before the
+    comma split and doesn't get treated as a product line, and so the
+    corresponding keyword is auto-covered by FIELD_CLAUSE_SCOPE_TAIL_RE /
+    FIELD_CLAUSE_MARKER_WORDS below for typo-guard purposes.
+
+    Only fails (returns "") on genuinely empty input after trimming
+    punctuation — never "unknown" or "ambiguous", since there is no known
+    set to be unknown or ambiguous against.
+    """
+    cleaned = raw.strip(" .,;:'\"")
+    if not cleaned:
+        return "", ""
+    logger.info(f"[FieldClause] project '{raw}' → {cleaned!r}")
+    return cleaned, ""
+
+
 def parse_bulk_order_utterance(
     text: str,
     store_loader,
@@ -258,6 +504,25 @@ def parse_bulk_order_utterance(
     # alone here since that path is unreachable in practice today.
     if _is_rep and not _is_true_rep and ECOMMERCE_BACKEND == "shopify":
         _is_rep = False
+
+    # ── Step -0.5: Optional checkout-field clauses ("rep X", "order type Y") ─
+    # Runs BEFORE company scope and before the comma split. Company extraction
+    # scans trailing "for"/"at" tails and the split turns commas into order
+    # fragments, so a trailing ", rep John Smith" would otherwise be read as
+    # either a company tail or a product line. Stripping the clauses first is
+    # what makes them order-independent.
+    text, _field_clause_values, _field_clause_notices = _extract_field_clauses(text)
+    if _field_clause_values or _field_clause_notices:
+        logger.info(
+            f"bulk_parser | field clauses | values={_field_clause_values} "
+            f"| notices={len(_field_clause_notices)}"
+        )
+    if meta_out is not None:
+        # The handler stamps these onto the address block and surfaces the
+        # notices on the address card. Always set (even when empty) so the
+        # handler can distinguish "parsed, nothing given" from "key absent".
+        meta_out["field_clause_values"] = dict(_field_clause_values)
+        meta_out["field_clause_notices"] = list(_field_clause_notices)
 
     # ── Step 0: Transaction-wide company scope ("... for company Beck LTD") ──
     # Bulk orders are scoped to ONE company; naming two raises immediately.

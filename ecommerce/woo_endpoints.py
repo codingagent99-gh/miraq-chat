@@ -113,6 +113,34 @@ class WooEndpoints:
             requires_resolution=requires_resolution or [],
         )
 
+    def fetch_order_types(
+        self,
+        description: str = "",
+        requires_resolution: Optional[List[str]] = None,
+    ) -> WooAPICall:
+        """GET /order-types — options for the billing_field_type select.
+
+        Returns [{value, label}, ...] e.g. {"value": "new_deal",
+        "label": "New Deal"}. NOTE the value and the label differ: the order
+        meta `_billing_field_type` stores the VALUE ("new_deal"), while a user
+        types the label ("New Deal"). Anything that accepts this field from
+        free text must translate label → value here, or it writes a string the
+        storefront's <select> cannot render and the required-field gate still
+        passes — see utils/checkout_fields.match_order_type().
+
+        Separate from /checkout-fields on purpose: THWCFE stores these options
+        outside the standard WC checkout-fields filter, so the plugin reads
+        them from its own option row (with a hardcoded fallback list).
+        """
+        return WooAPICall(
+            method="GET",
+            endpoint="/order-types",
+            params={},
+            surface="custom_plugin",
+            description=description or "Fetch order type (billing_field_type) options",
+            requires_resolution=requires_resolution or [],
+        )
+
     def list_categories(
         self,
         page: int,

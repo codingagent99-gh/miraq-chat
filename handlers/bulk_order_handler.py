@@ -390,6 +390,13 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
     # people instead of falling back to asking for an email address.
     user_context["bulk_company_roster"] = _parse_meta.get("company_roster", [])
     user_context["bulk_company_scope"]  = _parse_meta.get("company_scope", "")
+    # Optional checkout-field clauses ("rep X", "order type Y") lifted out of
+    # the message by the parser's clause pre-pass. Stored on the session so
+    # they survive every prompt detour (variant, quantity, recipient, address)
+    # between here and the address card that applies them — the same reason
+    # bulk_company_scope is stored rather than threaded through.
+    user_context["bulk_field_clause_values"] = _parse_meta.get("field_clause_values", {})
+    user_context["bulk_field_clause_notices"] = _parse_meta.get("field_clause_notices", [])
     # Whether the roster above is the company's FULL membership or just the
     # part we managed to read — governs whether "not found" can be asserted.
     user_context["bulk_company_roster_truncated"] = _parse_meta.get(

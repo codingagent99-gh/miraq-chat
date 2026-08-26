@@ -292,6 +292,142 @@ def find_reps_in_text(text: str, catalog_words: Optional[set] = None) -> list:
     return out
 
 
+_ORDER_TYPE_CACHE = {"value": None, "key": None, "expires_at": 0.0}
+
+
+def _fetch_order_types() -> Optional[list]:
+    """GET /order-types. None on any failure — callers must fail OPEN."""
+    try:
+        from woo_client import woo_client
+        from ecommerce import endpoints
+
+        result = woo_client.execute(
+            endpoints.fetch_order_types(
+                description="Fetch order type options for bulk order parsing",
+            )
+        )
+    except Exception as exc:
+        logger.warning(f"[OrderTypes] fetch raised | error={exc}")
+        return None
+
+    data = result.get("data") if isinstance(result, dict) else None
+    if not result.get("success") or not isinstance(data, list):
+        logger.warning(f"[OrderTypes] fetch unsuccessful | error={result.get('error')!r}")
+        return None
+    return data
+
+
+def order_type_options() -> list:
+    """
+    [{"value": "new_deal", "label": "New Deal"}, ...] for billing_field_type.
+
+    Empty means "not fetched / fetch failed", NEVER "this field has no valid
+    values" — same fail-open contract as is_known_rep().
+    """
+    from app_config import CUSTOM_API_BASE_URL
+
+    now = time.time()
+    if (
+        _ORDER_TYPE_CACHE["value"] is not None
+        and _ORDER_TYPE_CACHE["key"] == CUSTOM_API_BASE_URL
+        and _ORDER_TYPE_CACHE["expires_at"] > now
+    ):
+        return list(_ORDER_TYPE_CACHE["value"])
+
+    raw = _fetch_order_types()
+    if raw is None:
+        # Cache nothing on failure so the next turn retries, and return empty
+        # so the caller falls open rather than rejecting every value.
+        return []
+
+    opts = []
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        value = str(row.get("value") or "").strip()
+        label = str(row.get("label") or "").strip() or value
+        if value:
+            opts.append({"value": value, "label": label})
+
+    _ORDER_TYPE_CACHE["value"] = list(opts)
+    _ORDER_TYPE_CACHE["key"] = CUSTOM_API_BASE_URL
+    _ORDER_TYPE_CACHE["expires_at"] = now + _CACHE_TTL_SECONDS
+    logger.info(f"[OrderTypes] cached {len(opts)} option(s): {[o['label'] for o in opts]}")
+    return list(opts)
+
+
+def _norm_option(s: str) -> str:
+    """Fold case, and treat _ - / as spaces.
+
+    Needed on BOTH sides: the stored value is "new_deal" while the label is
+    "New Deal", and "Presentation/Library" carries a slash. Folding all three
+    separators lets a user type any of those shapes and land on one option.
+    """
+    return re.sub(r"[\s_\-/]+", " ", str(s or "").strip().lower()).strip()
+
+
+def match_order_type(text: str) -> dict:
+    """
+    Resolve typed text to a billing_field_type VALUE.
+
+    Returns {"status": ..., "value": ..., "label": ..., "candidates": [...]}
+    where status is one of:
+        "matched"    — exactly one option; `value` is what to store
+        "ambiguous"  — several options matched; `candidates` lists their labels
+        "unknown"    — no option matched; `candidates` lists every valid label
+        "unvalidated"— option list unavailable; `value` is the raw text
+
+    WHY this exists rather than storing what was typed: `_billing_field_type`
+    holds the option VALUE ("new_deal"), not the label ("New Deal"). A raw
+    typed string is non-empty, so it satisfies the required-field gate, but
+    the widget's <select> has no matching <option> and renders BLANK — the
+    exact bug already fixed once for project_rep. So free text here is not
+    "usually right"; it is wrong every time.
+
+    "unvalidated" deliberately passes the text through: if /order-types is
+    unreachable we must not block ordering, matching is_known_rep()'s
+    fail-open contract. It is logged so the pass-through is visible.
+    """
+    needle = _norm_option(text)
+    if not needle:
+        return {"status": "unknown", "value": "", "label": "", "candidates": []}
+
+    opts = order_type_options()
+    if not opts:
+        logger.warning(
+            f"[OrderTypes] options unavailable — accepting {text!r} unvalidated"
+        )
+        return {"status": "unvalidated", "value": str(text).strip(),
+                "label": str(text).strip(), "candidates": []}
+
+    all_labels = [o["label"] for o in opts]
+
+    # Exact on label or value first — an exact hit must never be beaten by a
+    # prefix hit on a different option.
+    exact = [o for o in opts
+             if needle in (_norm_option(o["label"]), _norm_option(o["value"]))]
+    if len(exact) == 1:
+        return {"status": "matched", "value": exact[0]["value"],
+                "label": exact[0]["label"], "candidates": []}
+
+    # Then prefix/containment, requiring EXACTLY ONE match. "existing" hits
+    # only Existing Deal; "deal" hits both New Deal and Existing Deal and must
+    # ask rather than guess — the same exactly-one rule used when repairing an
+    # over-captured rep name.
+    partial = [o for o in opts
+               if _norm_option(o["label"]).startswith(needle)
+               or _norm_option(o["value"]).startswith(needle)
+               or needle in _norm_option(o["label"])]
+    if len(partial) == 1:
+        return {"status": "matched", "value": partial[0]["value"],
+                "label": partial[0]["label"], "candidates": []}
+    if len(partial) > 1:
+        return {"status": "ambiguous", "value": "", "label": "",
+                "candidates": [o["label"] for o in partial]}
+
+    return {"status": "unknown", "value": "", "label": "", "candidates": all_labels}
+
+
 def is_known_rep(email: str) -> bool:
     """
     True when `email` appears in the project_rep option list.

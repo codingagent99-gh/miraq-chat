@@ -119,7 +119,8 @@ def _rep_billing_address(conversation, user_context):
     )
     return billing
 
-def _effective_address_for_line(line, address_overrides, line_idx, rep_email, rep_billing=None):
+def _effective_address_for_line(line, address_overrides, line_idx, rep_email,
+                                rep_billing=None, user_context=None):
     """
     Return (billing, shipping) for one bulk line.
 
@@ -162,6 +163,24 @@ def _effective_address_for_line(line, address_overrides, line_idx, rep_email, re
     # Leaving it blank is the correct outcome for a non-rep: project_rep is in
     # BULK_ADDRESS_REQUIRED_FLOOR["meta"], so the existing gate blocks and asks
     # for it by name instead of silently inventing an answer.
+    # Values the user typed as explicit clauses ("rep John Smith",
+    # "order type new deal"). Applied BEFORE the auto-fill below so an
+    # explicitly named rep always beats the logged-in-user default — the
+    # whole point of typing it. Still only fills a BLANK field, so a value
+    # the user edited on the card in a previous turn is never overwritten.
+    #
+    # These are already validated: the parser stores the option VALUE
+    # (project_rep holds the rep's email, billing_field_type holds e.g.
+    # "new_deal"), never the raw typed label, so the widget's <select> can
+    # render them. Anything that failed validation was left out entirely and
+    # reported as a notice, which is what routes it to the missing-field
+    # prompt below instead of writing an unrenderable string.
+    _clause_values = (user_context or {}).get("bulk_field_clause_values") or {}
+    for _slot in ("project_rep", "billing_field_type", "billing_project"):
+        _typed = str(_clause_values.get(_slot) or "").strip()
+        if _typed and not str(billing.get(_slot) or "").strip():
+            billing[_slot] = _typed
+
     if not str(billing.get("project_rep") or "").strip():
         billing["project_rep"] = rep_email if is_known_rep(rep_email) else ""
 
@@ -683,6 +702,7 @@ def handle_bulk_address_confirmation_reply(action, message, conversation, user_c
             idx,
             user_context.get("rep_email", ""),
             user_context.get("rep_billing_address"),
+            user_context=user_context,
         )
         errors = validate_bulk_address(billing, shipping, get_required_fields())
         if has_errors(errors):
@@ -732,6 +752,7 @@ def handle_bulk_address_confirmation_reply(action, message, conversation, user_c
         billing, shipping = _effective_address_for_line(
             current_line, overrides, idx, user_context.get("rep_email", ""),
             user_context.get("rep_billing_address"),
+            user_context=user_context,
         )
         errors = validate_bulk_address(billing, shipping, get_required_fields())
         if has_errors(errors):
@@ -787,6 +808,7 @@ def handle_bulk_address_confirmation_reply(action, message, conversation, user_c
         billing, shipping = _effective_address_for_line(
             current_line, overrides, idx, user_context.get("rep_email", ""),
             user_context.get("rep_billing_address"),
+            user_context=user_context,
         )
         errors = validate_bulk_address(billing, shipping, get_required_fields())
         if has_errors(errors):
@@ -852,6 +874,7 @@ def _address_identity_key(line, line_idx, user_context):
     _billing, _shipping = _effective_address_for_line(
         line, {}, line_idx, user_context.get("rep_email", ""),
         user_context.get("rep_billing_address"),
+        user_context=user_context,
     )
     return (
         str(line.get("customer_id")),
@@ -1154,6 +1177,7 @@ def _build_address_card_response(
         idx,
         user_context.get("rep_email", ""),
         user_context.get("rep_billing_address"),
+        user_context=user_context,
     )
 
     addr_parts = [
@@ -1250,6 +1274,15 @@ def _build_address_card_response(
         else:
             email_notice = "✉️ No Shipping Email on file. Please add it below."
 
+    # Clauses the user typed that could NOT be validated ("rep John Smith"
+    # when no such rep exists, an unrecognised order type). Shown on the card
+    # BEFORE confirm, next to the missing-field list, so the reason a field is
+    # blank is visible at the moment it can be fixed. Shown in BOTH branches:
+    # an unusable clause is exactly what tends to leave a required field empty
+    # and land the rep in the rejection branch.
+    _clause_notices = (user_context or {}).get("bulk_field_clause_notices") or []
+    clause_notice = "\r\n".join(_clause_notices)
+
     if has_errors(validation_errors):
         missing_count = count_missing(validation_errors)
         bot_message = (
@@ -1259,6 +1292,7 @@ def _build_address_card_response(
             + f"⚠️ This order is missing {missing_count} required "
             + ("field" if missing_count == 1 else "fields")
             + f": {format_missing_fields(validation_errors)}.\r\n\r\n"
+            + (f"{clause_notice}\r\n\r\n" if clause_notice else "")
             + "Please update the address, or skip this order."
         )
         suggestions = ["Change address", "Skip this order"]
@@ -1273,6 +1307,7 @@ def _build_address_card_response(
             + f"📦 {items_text}\r\n"
             + f"📍 Shipping to: {addr_str}\r\n\r\n"
             + (f"{email_notice}\r\n\r\n" if email_notice else "")
+            + (f"{clause_notice}\r\n\r\n" if clause_notice else "")
             + "Confirm this address?"
         )
         suggestions = ["Yes, confirm", "Change address", "Skip this order"]

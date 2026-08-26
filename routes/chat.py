@@ -153,28 +153,40 @@ chat_bp = Blueprint("chat", __name__)
 # ─── MODULE-LEVEL HELPERS ───
 # ══════════════════════════════════════════════════════════════
 
-from parsers.bulk_order_parser import COMPANY_SCOPE_TAIL_RE, EXPLICIT_COMPANY_SCOPE_RE
+from parsers.bulk_order_parser import (
+    COMPANY_SCOPE_TAIL_RE, EXPLICIT_COMPANY_SCOPE_RE,
+    FIELD_CLAUSE_SCOPE_TAIL_RE, FIELD_CLAUSE_MARKER_WORDS,
+)
 
 
 def _recipient_scope_tokens(message: str, is_bulk: bool = False) -> list:
     """
-    Tokens sitting in a bulk-order scope tail — after "for" or "at".
+    Tokens sitting in a bulk-order scope tail — after "for"/"at" (company),
+    or after a field-clause keyword ("rep", "order type", "project").
 
-    These are proper nouns ("... Adams Grey at Beck", "... for Abel Design
-    Group") and must never be fuzzy-matched against catalog vocabulary. Left
-    unprotected, "beck" is corrected to the attribute term "back" and the
-    company lookup silently runs against the wrong company; "abel" ties against
-    ['abeto','azul','area','panel'] and hijacks the turn into a typo
-    clarification chip before the parser ever sees it.
+    These are proper nouns or free text ("... Adams Grey at Beck", "... for
+    Abel Design Group", "project Midtown Office") and must never be
+    fuzzy-matched against catalog vocabulary. Left unprotected, "beck" is
+    corrected to the attribute term "back" and the company lookup silently
+    runs against the wrong company; "abel" ties against ['abeto','azul',
+    'area','panel'] and hijacks the turn into a typo clarification chip
+    before the parser ever sees it. "project Midtown Office" was this same
+    bug one keyword over: "project" itself sits 2 edits from the catalog
+    term "product" and got silently rewritten, then "office" (now orphaned
+    under the wrong header word) was corrected again to the attribute
+    "onice".
 
     ONLY applied to bulk orders. The marker words are far too common in
     ordinary questions — "look at the blue tiles", "show me bella at 12x12" —
     to blanket-protect; doing so would switch typo correction off across much
     of the catalog vocabulary.
 
-    The marker list comes from COMPANY_SCOPE_TAIL_RE in the bulk parser, so a
-    marker added to the format is protected here automatically rather than
-    needing the same edit in two files.
+    The marker lists come from COMPANY_SCOPE_TAIL_RE and
+    FIELD_CLAUSE_SCOPE_TAIL_RE / FIELD_CLAUSE_MARKER_WORDS in the bulk
+    parser, so a marker added to either format is protected here
+    automatically rather than needing the same edit in two files — the exact
+    drift that let "at Beck" get corrected to "at back" once already, and
+    "project" a second time.
 
     Returned lowercase for correct_message(suppressed_tokens=...), which passes
     them through verbatim and does not raise them as ambiguities.
@@ -185,9 +197,14 @@ def _recipient_scope_tokens(message: str, is_bulk: bool = False) -> list:
     # The marker words themselves must be protected too. "company" is not a
     # catalog term, so the corrector ties it against distant tile names
     # ('bombay', 'romano' at edit distance 3) and hijacks the whole turn
-    # into a typo-clarification chip before the parser ever runs.
-    tokens = ["for", "at", "company"]
+    # into a typo-clarification chip before the parser ever runs. Same for
+    # the field-clause openers ("rep", "order", "type", "project", ...).
+    tokens = ["for", "at", "company", *FIELD_CLAUSE_MARKER_WORDS]
     for tail in COMPANY_SCOPE_TAIL_RE.findall(message):
+        for tok in re.split(r'[^A-Za-z]+', tail):
+            if len(tok) > 1:
+                tokens.append(tok.lower())
+    for tail in FIELD_CLAUSE_SCOPE_TAIL_RE.findall(message):
         for tok in re.split(r'[^A-Za-z]+', tail):
             if len(tok) > 1:
                 tokens.append(tok.lower())
@@ -231,6 +248,21 @@ def _is_inline_bulk_order(message: str, store_loader=None) -> bool:
         # The guard already named "company" as a token to protect; it simply
         # could not be reached for a single-product message.
         if resolved_count >= 1 and EXPLICIT_COMPANY_SCOPE_RE.search(message):
+            return True
+
+        # Check 4: ONE product + a field-clause tail ("rep X", "order type Y",
+        # "project Z"). Same shape and same reason as Check 3, one keyword
+        # family over: "Order 1 allspice for Gensler, project Midtown Office"
+        # was not bulk here (only one resolvable product, and this message
+        # has no EXPLICIT company marker — "for Gensler" alone doesn't match
+        # Check 3's pattern either), so "project"/"midtown"/"office" never
+        # reached the suppressed-token list and the typo corrector rewrote
+        # "project" → "product" and tied "midtown" against unrelated catalog
+        # terms — the exact bug this guard exists to prevent, just
+        # unreachable below two products. Uses FIELD_CLAUSE_SCOPE_TAIL_RE
+        # rather than a second keyword list, so it can't drift from the
+        # parser's own clause openers the way two independent lists would.
+        if resolved_count >= 1 and FIELD_CLAUSE_SCOPE_TAIL_RE.search(message):
             return True
 
     return False

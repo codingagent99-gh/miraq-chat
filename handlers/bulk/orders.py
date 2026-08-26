@@ -567,7 +567,8 @@ def handle_bulk_confirmation_unclear(conversation, page, start_time):
 # ── Function 7: _create_all_confirmed_orders (private) ──
 # ══════════════════════════════════════════════════════════════
 
-def _order_group_key(line, line_idx, address_overrides, rep_email, rep_billing):
+def _order_group_key(line, line_idx, address_overrides, rep_email, rep_billing,
+                     user_context=None):
     """
     Key deciding which lines merge into ONE WooCommerce order.
 
@@ -586,6 +587,7 @@ def _order_group_key(line, line_idx, address_overrides, rep_email, rep_billing):
     """
     _billing, _shipping = _effective_address_for_line(
         line, address_overrides, line_idx, rep_email, rep_billing,
+        user_context=user_context,
     )
     _recipient_key = (
         line.get("recipient_name")
@@ -612,7 +614,8 @@ def _planned_order_count(lines_as_dicts, user_context) -> int:
         if line.get("unresolved") or line.get("address_skipped"):
             continue
         try:
-            key, _b, _s = _order_group_key(line, idx, overrides, rep_email, rep_billing)
+            key, _b, _s = _order_group_key(line, idx, overrides, rep_email, rep_billing,
+                                           user_context=user_context)
         except Exception:
             # Counting must never break the confirmation card; fall back to
             # treating this line as its own order.
@@ -710,6 +713,7 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
         _key, _billing, _shipping = _order_group_key(
             line, line_idx, address_overrides, rep_email,
             user_context.get("rep_billing_address"),
+            user_context=user_context,
         )
         if _key not in _groups:
             _groups[_key] = {
