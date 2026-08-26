@@ -376,6 +376,17 @@ class OrderStatsEvaluator(IntentEvaluator):
         "from", "in", "last", "month", "months", "mtd", "on", "over", "past",
         "qtd", "quarter", "quarters", "since", "so", "the", "this", "to",
         "today", "week", "weeks", "within", "year", "years", "yesterday", "ytd",
+        # The VERB, which trails the name in every continuation phrasing:
+        # "did Ram and Jennifer ordered" captures "ram and jennifer", splits
+        # at "and", then scans "jennifer ordered" as the second name. Without
+        # these the verb stays glued on, "jennifer ordered" resolves against
+        # nobody, and the plugin quietly reports on Ram alone (reps=1) with no
+        # sign a name was dropped — the same silent-drop class as the comma
+        # and "and"/"&" bugs this set already guards.
+        "order", "ordered", "orders", "ordering",
+        "place", "placed", "places", "placing",
+        "buy", "buys", "bought", "purchase", "purchased", "purchases",
+        "get", "got", "gets",
     }
 
     # Separators between names in a multi-rep query: "cs_rep 1, cs_rep 2 and
@@ -431,6 +442,57 @@ class OrderStatsEvaluator(IntentEvaluator):
             return cleaned
         return None
 
+    def _reps_from_directory(self, text: str) -> List[str]:
+        """Rep names recognised from the project_rep directory, not grammar.
+
+        Runs ONLY when _REP_RE matched nothing, so it can never change a query
+        that already works — it is a floor, not a replacement.
+
+        Why it exists: _REP_RE has to infer a person from sentence shape
+        ("did <X> order"), and every phrasing it does not anticipate silently
+        yields NO rep, which the handler reads as "report on everyone". That
+        is how "how many samples did Ram ordered this month" returned a
+        store-wide 14-rep report. Matching on the known NAME instead is immune
+        to verb form and word order.
+
+        Fails closed to the old behaviour: an unfetched or empty directory
+        returns [], leaving the regex result (nothing) exactly as it was.
+        """
+        try:
+            from utils.checkout_fields import find_reps_in_text
+        except Exception:
+            return []
+
+        # Product/attribute vocabulary, so a single-token name that is also a
+        # catalog term cannot hijack a product query. Best-effort: if the
+        # loader is not reachable, pass nothing and let find_reps_in_text
+        # apply its stricter full-name-only rule.
+        catalog_words = set()
+        try:
+            from store_registry import get_store_loader
+            _loader = get_store_loader()
+            # fuzzy_vocab_types is CATALOG TERMS ONLY, which is what the
+            # collision rule needs. fuzzy_vocab_terms would be wrong here — it
+            # also contains stop/noise/protected words, so every common word
+            # would look like a catalog collision and suppress real matches.
+            catalog_words = set(getattr(_loader, "fuzzy_vocab_types", None) or {})
+        except Exception:
+            pass
+
+        try:
+            hits = find_reps_in_text(text, catalog_words=catalog_words)
+        except Exception as exc:
+            logger.debug(f"[RepDirectory] lookup failed, ignoring: {exc}")
+            return []
+
+        names = [self._clean_rep(n) or n for n, _e in hits]
+        names = [n for n in names if n]
+        if names:
+            logger.info(
+                f"[RepDirectory] _REP_RE found no rep; matched by name instead: {names}"
+            )
+        return names
+
     def _extract_reps(self, text: str) -> List[str]:
         """Every rep named in the query, in the order the user typed them.
 
@@ -446,7 +508,7 @@ class OrderStatsEvaluator(IntentEvaluator):
         """
         m_rep = self._REP_RE.search(text)
         if not m_rep:
-            return []
+            return self._reps_from_directory(text)
 
         # End of the NAME, not of the whole match: the "did <rep> order"
         # alternative puts the name mid-pattern, so m_rep.end() would skip
@@ -486,7 +548,60 @@ class OrderStatsEvaluator(IntentEvaluator):
             if k not in seen:
                 seen.add(k)
                 unique.append(r)
-        return unique
+        return self._repair_against_directory(unique, text)
+
+    def _repair_against_directory(self, reps: List[str], text: str) -> List[str]:
+        """Trim stray tokens off captured names using the known rep directory.
+
+        _TAIL_STOP handles the suffixes we've anticipated, but the capture is
+        "up to 3 word-ish tokens" and every unanticipated trailing word rides
+        along silently: "jennifer ordered" resolves against nobody, the plugin
+        reports on the remaining names, and nothing says a rep was dropped.
+
+        So each captured name is checked against the project_rep directory. If
+        the name as captured is not a known rep but exactly ONE known rep name
+        is contained within it, the captured span is replaced by that name.
+        Anything ambiguous or unrecognised is left EXACTLY as-is — this only
+        repairs a provable over-capture, and never invents or drops a name.
+        Unknown names must still reach the plugin, which is what produces the
+        `unresolved_reps` note the admin sees.
+        """
+        if not reps:
+            return reps
+        try:
+            from utils.checkout_fields import rep_directory
+            directory = rep_directory()
+        except Exception:
+            return reps
+        if not directory:                      # not fetched — leave untouched
+            return reps
+
+        known = {}
+        for name in directory.values():
+            norm = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+            if norm:
+                known[norm] = name
+
+        out = []
+        for r in reps:
+            r_norm = re.sub(r"[^a-z0-9]+", " ", r.lower()).strip()
+            if not r_norm or r_norm in known:
+                out.append(r)
+                continue
+            r_tokens = set(r_norm.split())
+            matches = [
+                full for norm, full in known.items()
+                if set(norm.split()) <= r_tokens
+            ]
+            if len(matches) == 1:
+                logger.info(
+                    f"[RepDirectory] repaired over-captured rep name "
+                    f"{r!r} -> {matches[0]!r}"
+                )
+                out.append(matches[0])
+            else:
+                out.append(r)
+        return out
 
     def _extract_rep(self, text: str) -> Optional[str]:
         """First rep named, or None. Retained for callers wanting just one."""

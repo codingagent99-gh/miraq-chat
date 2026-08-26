@@ -391,6 +391,25 @@ def build_fuzzy_vocab(loader):
     except Exception as exc:          # never block vocab build on this
         logger.error(f"build_fuzzy_vocab: classifier keyword union failed: {exc}")
 
+    # Rep display names from the project_rep directory. A person's name is
+    # out-of-vocabulary against a tile catalog and therefore a prime candidate
+    # for being "corrected" into a product word — the same failure that turned
+    # "all time" into a "did you mean tile or tide?" prompt.
+    #
+    # This only stops the token being REWRITTEN. It does not add it to
+    # vocab_types, so a name that is also a catalog term (this store has an
+    # "Adams" product) still matches the product exactly as before; the
+    # rep-vs-product decision is made later, by find_reps_in_text's collision
+    # rule, not here.
+    try:
+        from utils.checkout_fields import rep_name_tokens
+        _reps = rep_name_tokens()
+        if _reps:
+            protected.update(_reps)
+            logger.debug(f"build_fuzzy_vocab: protected {len(_reps)} rep name token(s)")
+    except Exception as exc:          # never block vocab build on this
+        logger.error(f"build_fuzzy_vocab: rep name union failed: {exc}")
+
     loader.fuzzy_vocab_types = vocab_types
     loader.fuzzy_protected_words = frozenset(protected)
     loader.fuzzy_vocab_terms = list(protected)  # superset: catalog ∪ glue words

@@ -40,6 +40,7 @@ fields, so no address-level check would ever catch them. They live on the
 billing block in the panel payload, so they are validated against `billing`.
 """
 
+import re
 import time
 from typing import Optional
 
@@ -112,6 +113,24 @@ _live_labels: dict = {}
 # callers must fail open rather than block ordering on a plugin outage.
 _rep_option_values: set = set()
 
+# email → display label, harvested from the SAME options dict as
+# _rep_option_values above. WooCommerce serialises the select as value→label,
+# so the emails are the keys and the human names are the values — and the
+# values were previously read and thrown away.
+#
+# The names are what a user actually types ("how many did Ram order"), so
+# without them rep extraction had to infer a person from sentence grammar
+# alone ("did <X> order"), which is why a single missing verb form ("did Ram
+# ordered") silently produced a store-wide report. Products never had this
+# problem because they have a loaded vocabulary; this gives reps one too.
+#
+# Kept SEPARATE from _rep_option_values rather than replacing it: that set
+# backs is_known_rep()'s auto-fill gate and its fail-open contract, which must
+# not change. Empty here means the same thing it means there — "not fetched
+# yet", never "there are no reps" — so every reader below must fall back to
+# its existing behaviour rather than concluding a name is not a rep.
+_rep_labels_by_email: dict = {}
+
 # Cache is keyed by the custom-api base URL, which is this deployment's store
 # identity. On a multi-tenant build where that URL is resolved per tenant rather
 # than being a module constant, this key stays correct; if it ever becomes
@@ -165,9 +184,112 @@ def _absorb_rep_options(short_key: str, cfg: dict) -> None:
         for value in options.keys()
         if str(value).strip()          # drop the blank "Select Rep" placeholder
     }
+    # Same pass, same source: keep the LABELS too. A label that is blank or is
+    # just the email repeated carries no name, so it is skipped rather than
+    # stored — otherwise "r.ramnaresh.007@gmail.com" would enter the name
+    # vocabulary as if it were something a person would type.
+    labels = {}
+    for value, label in options.items():
+        email = str(value).strip().lower()
+        name = str(label or "").strip()
+        if not email or not name or name.lower() == email:
+            continue
+        labels[email] = name
+
     if values:
         _rep_option_values.clear()
         _rep_option_values.update(values)
+    # Guarded independently of `values`: a fetch that returned options but no
+    # usable labels must not wipe a directory a previous fetch populated.
+    if labels:
+        _rep_labels_by_email.clear()
+        _rep_labels_by_email.update(labels)
+
+
+def rep_directory() -> dict:
+    """
+    email → display name for every rep on the project_rep select.
+
+    Empty means "not fetched yet / fetch failed", NEVER "there are no reps".
+    Callers must treat empty as "I don't know" and fall back to whatever they
+    did before, exactly as is_known_rep() fails open.
+    """
+    get_required_fields()          # cached; populates on first use
+    return dict(_rep_labels_by_email)
+
+
+def rep_name_tokens() -> set:
+    """
+    Lowercase word tokens from every rep display name, >= 3 chars.
+
+    Used to protect these words from typo correction — "ram" must never be
+    rewritten toward a catalog term the way "time" was rewritten to "tile".
+    Protection only prevents REWRITING a token; it never stops that token from
+    matching a product, so a rep surname that is also a product name (this
+    store has both an "Adams" product and Adams-like surnames) is unaffected.
+    """
+    tokens = set()
+    for name in rep_directory().values():
+        for tok in re.split(r"[^a-z0-9]+", name.lower()):
+            if len(tok) >= 3:
+                tokens.add(tok)
+    return tokens
+
+
+def find_reps_in_text(text: str, catalog_words: Optional[set] = None) -> list:
+    """
+    Find rep display names occurring in `text`. Returns [(name, email), ...],
+    longest name first so "Ram R" wins over a bare "Ram".
+
+    This is the vocabulary-backed counterpart to the grammar-based
+    `_REP_RE` extraction: it recognises a rep because the NAME is known, not
+    because the sentence was phrased as "did <X> order". That makes it immune
+    to verb form, word order and punctuation.
+
+    COLLISION RULE — the reason `catalog_words` exists. A single-token match
+    is accepted only when that token is NOT also a catalog term, so "order
+    adams" stays a product order rather than becoming a query about a rep
+    named Adams. A multi-token full-name match ("john adams") is always
+    accepted: two words landing on a person's full name is not a coincidence.
+    Pass the store's product/attribute vocabulary in; omitting it disables the
+    guard, which is only safe when the caller has already established the
+    message is not about products.
+    """
+    text_l = f" {re.sub(r'[^a-z0-9]+', ' ', str(text or '').lower()).strip()} "
+    if text_l.strip() == "":
+        return []
+    catalog_words = {w.lower() for w in (catalog_words or set())}
+
+    hits = []
+    for email, name in rep_directory().items():
+        norm = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+        if not norm:
+            continue
+        toks = norm.split()
+        if f" {norm} " in text_l:
+            hits.append((len(toks), name, email))
+            continue
+        # Fall back to the surname/first-name alone, subject to the collision
+        # rule above. Skipped entirely for 1-token names, which the exact
+        # check above has already covered.
+        if len(toks) > 1:
+            for tok in toks:
+                if len(tok) < 3 or tok in catalog_words:
+                    continue
+                if f" {tok} " in text_l:
+                    hits.append((1, name, email))
+                    break
+        elif toks and toks[0] not in catalog_words:
+            pass                     # already handled by the exact check
+
+    hits.sort(key=lambda h: -h[0])
+    seen, out = set(), []
+    for _, name, email in hits:
+        if email in seen:
+            continue
+        seen.add(email)
+        out.append((name, email))
+    return out
 
 
 def is_known_rep(email: str) -> bool:
