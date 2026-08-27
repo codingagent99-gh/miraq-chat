@@ -66,6 +66,11 @@ class BulkOrderLine:
     # parent product. Carried through so the variant prompt can pre-select
     # them instead of asking for a value the rep already supplied.
     unmatched_variant_terms: list = field(default_factory=list)
+    # Terms each valid on their own that NO single variation carries
+    # together (Allspice has no Beleza + Honed). Separate from
+    # unmatched_variant_terms because those are PRE-SELECTED, and
+    # pre-selecting one of these would offer an unorderable pairing.
+    conflicting_variant_terms: list = field(default_factory=list)
     blank_variant_axes: list = field(default_factory=list)  # axes the matched variation leaves as "Any"
     candidate_variation_ids: list = field(default_factory=list)  # hint matched several variations
     specified_variant_axes: list = field(default_factory=list)   # axes the matched variation DOES set
@@ -123,6 +128,11 @@ class _PreLine:
     # whole string, which would repeat the silent/opaque-drop pattern one
     # level down.
     unmatched_variant_terms: list = field(default_factory=list)
+    # Terms each valid on their own that NO single variation carries
+    # together (Allspice has no Beleza + Honed). Separate from
+    # unmatched_variant_terms because those are PRE-SELECTED, and
+    # pre-selecting one of these would offer an unorderable pairing.
+    conflicting_variant_terms: list = field(default_factory=list)
     variation_id: Optional[int] = None
     unmatched_variant_hint: str = ""
     blank_variant_axes: list = field(default_factory=list)
@@ -1559,6 +1569,36 @@ def parse_bulk_order_utterance(
                 var for var in _variant_cache[pl.product_id]
                 if all(_term_hits(t, _var_options(var)) for t in _effective)
             ] if _effective else []
+
+            # Every term is individually valid, yet NO variation carries them
+            # together — Allspice sells Beleza in Polished and Silky, but there
+            # is no Beleza + Honed.
+            #
+            # Do NOT pick a winner. "Beleza, Honed" is genuinely ambiguous:
+            # the rep may want Beleza in another finish, or Honed in another
+            # colour, and only they know which. An earlier version kept the
+            # FIRST term purely because it was typed first, narrowed to its
+            # variations, and announced that the other one was unavailable —
+            # so a rep who wanted Honed in Pure White had Pure White thrown
+            # away before they ever saw the picker.
+            #
+            # Instead: settle NOTHING. Every variation stays a candidate, so
+            # the picker opens with the full option list and the UI's own
+            # combination filtering guides them whichever way they choose
+            # first. Both terms are recorded so the message can name them and
+            # say why it is asking again.
+            #
+            # Kept out of unmatched_variant_terms deliberately: those get
+            # PRE-SELECTED, which would re-introduce exactly the silent choice
+            # this branch exists to avoid.
+            if _effective and not _matches:
+                pl.conflicting_variant_terms = list(_effective)
+                _matches = list(_variant_cache[pl.product_id])
+                logger.warning(
+                    f"bulk_parser | product {pl.product_id}: no variation has "
+                    f"{_effective} together — settling nothing and offering the "
+                    f"full picker so the rep chooses which one to keep"
+                )
         else:
             _matches = []
             for var in _variant_cache[pl.product_id]:
@@ -2210,6 +2250,7 @@ def parse_bulk_order_utterance(
             unresolved_reason=unresolved_reason,
             unmatched_variant_hint=pl.unmatched_variant_hint,
             unmatched_variant_terms=list(pl.unmatched_variant_terms or []),
+            conflicting_variant_terms=list(pl.conflicting_variant_terms or []),
             blank_variant_axes=list(pl.blank_variant_axes or []),
             candidate_variation_ids=list(pl.candidate_variation_ids or []),
             specified_variant_axes=list(pl.specified_variant_axes or []),

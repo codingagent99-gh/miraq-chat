@@ -322,6 +322,7 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
             # missing here is silently dropped between parser and prompt
             # however correct both ends are.
             "unmatched_variant_terms": list(getattr(l, "unmatched_variant_terms", None) or []),
+            "conflicting_variant_terms": list(getattr(l, "conflicting_variant_terms", None) or []),
             # getattr, not attribute access: these fields were added to
             # BulkOrderLine alongside this handler, so a half-deploy where
             # the parser is older would otherwise 500 on every bulk order

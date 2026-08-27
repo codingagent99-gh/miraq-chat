@@ -303,7 +303,12 @@ def _ask_for_bulk_variant(
         # something they already said.
         _cands = [v for v in variations
                   if v.get("id") in set(line.get("candidate_variation_ids") or [])]
-        if len(_cands) > 1:
+        # A conflict means the rep named two things that cannot coexist, and
+        # the parser deliberately settled nothing so THEY choose. If every
+        # candidate happened to agree on some axis we would settle it here and
+        # undo that — worse, it could settle the very axis in dispute. Leave
+        # the whole picker open in that case.
+        if len(_cands) > 1 and not (line.get("conflicting_variant_terms") or []):
             _per_axis = {}
             for _v in _cands:
                 for _n, _o in _get_safe_options(_v.get("attributes", [])).items():
@@ -335,6 +340,11 @@ def _ask_for_bulk_variant(
 
     _leftover = [t for t in (line.get("unmatched_variant_terms") or []) if str(t).strip()]
     _still_bad = []
+    # Terms the rep gave that are valid individually but not TOGETHER.
+    # Surfaced as its own message: silently re-asking looks like we ignored
+    # what they typed, which is what happened with "Beleza, Honed".
+    _conflicting = [t for t in (line.get("conflicting_variant_terms") or [])
+                    if str(t).strip()]
     for _term in _leftover:
         _tk = _optkey(_term)
         _hit = None
@@ -419,6 +429,20 @@ def _ask_for_bulk_variant(
             f"I couldn't find **{_bad_hint}** for **{line['product_name']}** — "
             f"that option isn't in the catalog. Please pick from the available "
             f"options instead ({_line_label}):"
+        )
+    elif _conflicting:
+        # Name BOTH terms and blame neither. The rep may have wanted
+        # either one; picking a winner here is what the parser
+        # deliberately stopped doing. The message has to say what failed
+        # and why we are asking again, or an untouched picker looks like
+        # their input was ignored.
+        _conf = " + ".join(f"**{t}**" for t in _conflicting)
+        _bot_message = (
+            f"**{line['product_name']}** isn't made in {_conf} together, "
+            f"so I couldn't tell which one you wanted. Pick either one "
+            f"below and the other list updates to what's actually "
+            f"available with it — options that don't pair are struck "
+            f"through ({_line_label}):"
         )
     elif _still_bad:
         # A term that matched no option on any axis. Said out loud rather
