@@ -172,6 +172,57 @@ def _ensure_missing_axes(line, user_context):
         return True
     missing = _missing_variant_axes(line, user_context)
     if missing:
+        # The rep may have already named these. Tara resolved to variation
+        # 17133 (Cloud + Matte) leaving only Sample Size "Any", and the rep
+        # had typed 12"x24" — the prompt still opened, pre-ticked that single
+        # value, and asked them to confirm what they had just said.
+        #
+        # So: settle from their own wording FIRST, and only ask about what is
+        # genuinely still open. Uses the same option source and the same
+        # matching key as the pre-selection in _ask_for_bulk_variant, so a
+        # term that would be pre-ticked there is settled here instead.
+        _terms = [t for t in (line.get("unmatched_variant_terms") or [])
+                  if str(t).strip()]
+        if _terms and not (line.get("conflicting_variant_terms") or []):
+            def _optkey(s):
+                return re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
+
+            _axis_opts = _parent_any_axis_options(
+                line.get("product_id"), missing, user_context
+            )
+            _settled = dict(line.get("variant_meta") or {})
+            _still_missing = []
+            for _axis in missing:
+                _opts = _axis_opts.get(_axis) or set()
+                _hit = next(
+                    (o for o in _opts
+                     if any(_optkey(t) == _optkey(o) for t in _terms)),
+                    None,
+                )
+                if _hit:
+                    _settled[_axis] = _hit
+                    logger.info(
+                        f"bulk_order | {_axis}='{_hit}' taken from the rep's own "
+                        f"wording — not asking again for product "
+                        f"{line.get('product_id')}"
+                    )
+                else:
+                    _still_missing.append(_axis)
+
+            if not _still_missing:
+                # Everything they left open, they had already answered.
+                line["variant_meta"] = _settled
+                line["specified_variant_axes"] = list(
+                    (line.get("specified_variant_axes") or [])
+                ) + list(missing)
+                line["blank_variant_axes"] = []
+                logger.info(
+                    f"bulk_order | product {line.get('product_id')} fully "
+                    f"specified from the rep's wording — no prompt needed"
+                )
+                return False
+            missing = _still_missing
+
         line["blank_variant_axes"] = missing
         logger.info(
             f"bulk_order | product {line.get('product_id')} variation "
@@ -436,14 +487,26 @@ def _ask_for_bulk_variant(
         # deliberately stopped doing. The message has to say what failed
         # and why we are asking again, or an untouched picker looks like
         # their input was ignored.
-        _conf = " + ".join(f"**{t}**" for t in _conflicting)
-        _bot_message = (
-            f"**{line['product_name']}** isn't made in {_conf} together, "
-            f"so I couldn't tell which one you wanted. Pick either one "
-            f"below and the other list updates to what's actually "
-            f"available with it — options that don't pair are struck "
-            f"through ({_line_label}):"
-        )
+        # Guard the single-term case explicitly. "isn't made in X together"
+        # is nonsense with one name, and that is exactly what rendered when
+        # a stale parser sent only the DROPPED term instead of both.
+        if len(_conflicting) >= 2:
+            _conf = " + ".join(f"**{t}**" for t in _conflicting)
+            _bot_message = (
+                f"**{line['product_name']}** isn't made in {_conf} "
+                f"together, so I couldn't tell which one you wanted. Pick "
+                f"either one below and the other list updates to what's "
+                f"actually available with it — options that don't pair are "
+                f"struck through ({_line_label}):"
+            )
+        else:
+            _conf = ", ".join(f"**{t}**" for t in _conflicting)
+            _bot_message = (
+                f"{_conf} isn't available in that combination for "
+                f"**{line['product_name']}**. Pick the options you want "
+                f"below — anything that doesn't pair with your choice is "
+                f"struck through ({_line_label}):"
+            )
     elif _still_bad:
         # A term that matched no option on any axis. Said out loud rather
         # than dropped, so the rep is not left assuming a value they typed
