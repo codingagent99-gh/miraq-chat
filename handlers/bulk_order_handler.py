@@ -314,6 +314,14 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
             "unresolved_reason": l.unresolved_reason,
             "quantity_explicitly_set":  l.quantity_explicitly_set,
             "unmatched_variant_hint": getattr(l, "unmatched_variant_hint", "") or "",
+            # Terms the rep typed that no VARIATION enumerates — the axis is
+            # "Any" on the variations and its real options live on the parent.
+            # _ask_for_bulk_variant resolves these against the parent options
+            # and pre-selects them, so the rep isn't asked again for a size
+            # they already gave. This dict is built field-by-field, so a field
+            # missing here is silently dropped between parser and prompt
+            # however correct both ends are.
+            "unmatched_variant_terms": list(getattr(l, "unmatched_variant_terms", None) or []),
             # getattr, not attribute access: these fields were added to
             # BulkOrderLine alongside this handler, so a half-deploy where
             # the parser is older would otherwise 500 on every bulk order

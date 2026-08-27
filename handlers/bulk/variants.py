@@ -1,4 +1,10 @@
-"""Variant/axis selection for the bulk-order flow. """
+"""Variant/axis selection for the bulk-order flow.
+
+Split verbatim out of handlers/bulk_order_handler.py — pure move, no logic
+changes. Function bodies are byte-identical to what they replaced; the only
+additions are this module's imports and three deferred imports (marked
+below) that exist solely to break the import cycle back into the handler.
+"""
 
 import time
 import re
@@ -280,6 +286,83 @@ def _ask_for_bulk_variant(
                 for n, o in _get_safe_options(_matched_var.get("attributes", [])).items()
                 if n and o
             }
+    else:
+        # No single variation pinned, but the rep's terms may still have
+        # settled some axes: if EVERY surviving candidate carries the same
+        # value on an axis, that axis is decided no matter which candidate
+        # they end up on.
+        #
+        # This is how Adams differs from Allspice and Tara. Adams's variations
+        # DO enumerate 12"x12", so the term matched and narrowed 32 → 5 — which
+        # meant it never became an "unmatched" term and the pre-selection above
+        # had nothing to work with, even though all 5 survivors share that size
+        # AND the Matte finish. Allspice and Tara took the other route because
+        # their Sample Size axis is "Any" on the variations.
+        #
+        # Both routes end in the same place: the rep is not asked again for
+        # something they already said.
+        _cands = [v for v in variations
+                  if v.get("id") in set(line.get("candidate_variation_ids") or [])]
+        if len(_cands) > 1:
+            _per_axis = {}
+            for _v in _cands:
+                for _n, _o in _get_safe_options(_v.get("attributes", [])).items():
+                    if _n and _o:
+                        _per_axis.setdefault(_n, set()).add(_o)
+            _agreed = {n: next(iter(vals)) for n, vals in _per_axis.items()
+                       if len(vals) == 1}
+            if _agreed:
+                _resolved_axes = dict(_agreed)
+                logger.info(
+                    f"bulk_order | product {product_id}: {len(_cands)} candidate "
+                    f"variations agree on {_agreed} — treating as settled"
+                )
+
+    # Terms the rep typed that matched no VARIATION, because that axis is
+    # "Any" on the variations and its options live on the parent — the
+    # _any_axes just merged in above. The parser could not use them to narrow,
+    # so without this they were logged and dropped, and the prompt asked for a
+    # size the rep had already given (and a genuinely wrong term vanished
+    # silently). Resolve each against the merged axis options and pre-select
+    # the ones that check out.
+    # Compare on a key that drops EVERY non-alphanumeric, not _slugify:
+    # _slugify keeps hyphens, so '5"x10"' and '5" x 10"' produce "5x10" vs
+    # "5-x-10" and would not match. This mirrors the parser's own
+    # _normalize_term_key, so both sides agree on what "the same option"
+    # means — the catalog writes these sizes both ways.
+    def _optkey(s):
+        return re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
+
+    _leftover = [t for t in (line.get("unmatched_variant_terms") or []) if str(t).strip()]
+    _still_bad = []
+    for _term in _leftover:
+        _tk = _optkey(_term)
+        _hit = None
+        for _axis_name, _opts in attr_axes.items():
+            for _opt in _opts:
+                if _tk and _tk == _optkey(_opt):
+                    _hit = (_axis_name, _opt)
+                    break
+            if _hit:
+                break
+        if _hit and _hit[0] not in _resolved_axes:
+            _resolved_axes[_hit[0]] = _hit[1]
+            logger.info(
+                f"bulk_order | pre-selected {_hit[0]}='{_hit[1]}' for product "
+                f"{product_id} from the rep's own wording ('{_term}')"
+            )
+        elif not _hit:
+            _still_bad.append(_term)
+
+    # Anything that matched no option anywhere is a real mistake. Naming it
+    # keeps it from being silently ignored — the same rule the
+    # unmatched_variant_hint message below follows.
+    if _still_bad:
+        logger.warning(
+            f"bulk_order | product {product_id}: terms {_still_bad} match no "
+            f"option on any axis — surfacing to the rep"
+        )
+
     # Use the same derived list the attribute options came from, so the
     # wording ("just need the Finish, Sample Size") matches what's rendered
     # even on the first prompt, where the line carries no blank_variant_axes.
@@ -336,6 +419,15 @@ def _ask_for_bulk_variant(
             f"I couldn't find **{_bad_hint}** for **{line['product_name']}** — "
             f"that option isn't in the catalog. Please pick from the available "
             f"options instead ({_line_label}):"
+        )
+    elif _still_bad:
+        # A term that matched no option on any axis. Said out loud rather
+        # than dropped, so the rep is not left assuming a value they typed
+        # was applied.
+        _bad_list = ", ".join(f"**{t}**" for t in _still_bad)
+        _bot_message = (
+            f"I couldn't find {_bad_list} for **{line['product_name']}** — "
+            f"please pick from the available options ({_line_label}):"
         )
     else:
         if _resolved_axes and _open_axes:

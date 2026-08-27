@@ -61,6 +61,11 @@ class BulkOrderLine:
     unresolved: bool
     unresolved_reason: Optional[str]
     unmatched_variant_hint: str = ""   # hint the user typed that matched no variation
+    # Terms the rep typed that no VARIATION enumerates — typically because
+    # that axis is "Any" on the variations and its real options live on the
+    # parent product. Carried through so the variant prompt can pre-select
+    # them instead of asking for a value the rep already supplied.
+    unmatched_variant_terms: list = field(default_factory=list)
     blank_variant_axes: list = field(default_factory=list)  # axes the matched variation leaves as "Any"
     candidate_variation_ids: list = field(default_factory=list)  # hint matched several variations
     specified_variant_axes: list = field(default_factory=list)   # axes the matched variation DOES set
@@ -85,6 +90,39 @@ class _PreLine:
     customer_id: Optional[str] = None
     reorder_source_order_id: Optional[int] = None
     variant_hint: str = ""
+    # The hint split into individual attribute terms, e.g. "Beleza, Honed,
+    # 5\"x10\"" → ["Beleza", "Honed", "5\"x10\""]. A variation must satisfy
+    # EVERY term to match (see Step 3.5), which is what lets one product carry
+    # colour + finish + size at once.
+    #
+    # Deliberately ADDITIVE rather than replacing variant_hint: the hint
+    # string is still what the single-term path, the shared-hint propagation
+    # in Step 3.7 and the unmatched-hint message all read, so existing shapes
+    # keep their exact behaviour. Empty here means "single-term line" and the
+    # original matching runs unchanged.
+    variant_terms: list = field(default_factory=list)
+    # A descriptor typed BEFORE the product name ("Order 1 Chip Card each
+    # Allspice Beleza..."). Held separately from variant_hint because it
+    # usually applies to the WHOLE order, not just the line it touches —
+    # Step 3.75 propagates it. Kept apart so it can never overwrite the line's
+    # own attribute.
+    leading_hint: str = ""
+    # True only when THIS fragment's own text carried a count. Distinct from
+    # quantity_explicitly_set, which is also set when a shared count is
+    # distributed across every line by the "each" rule (Step 1.6) or the
+    # leading-quantity rule (Step 2.5).
+    #
+    # Attribute absorption needs the narrow question: "and 3 Adams" is a new
+    # order line, but a 1 propagated onto every line from the front of the
+    # message is not evidence of anything. Reading the broad flag meant that
+    # after Step 2.5 ran, EVERY line looked explicitly quantified and no
+    # attribute fragment could ever be absorbed.
+    quantity_self_declared: bool = False
+    # Terms that matched no option on this product — reported individually so
+    # a three-term hint can say WHICH term failed instead of rejecting the
+    # whole string, which would repeat the silent/opaque-drop pattern one
+    # level down.
+    unmatched_variant_terms: list = field(default_factory=list)
     variation_id: Optional[int] = None
     unmatched_variant_hint: str = ""
     blank_variant_axes: list = field(default_factory=list)
@@ -231,23 +269,57 @@ _FIELD_CLAUSE_KEYWORDS = {
     #                     wins over a bare "type"
     "project_rep":        [r"rep", r"sales\s+rep", r"cs\s+rep"],
     "billing_field_type": [r"order\s+type", r"field\s+type", r"deal\s+type"],
-    # Free-text project/job name — "... for Gensler, project Midtown Office".
-    # Unlike the two slots above, there is no dropdown behind this one
-    # (checkout_fields.py's billing_project is a plain <input>, not a
-    # <select>), so there is nothing to validate against — see
-    # _resolve_project_clause.
+    # Free text — billing_project is a plain <input> on the checkout form, not
+    # a <select>, so there is no option list to validate against and whatever
+    # the user types IS the value. Contrast project_rep / billing_field_type,
+    # which are selects and must resolve to a real option or be left unset.
     "billing_project":    [r"project"],
 }
 
-# Shared opener list, longest-pattern-first so a multi-word opener ("order
-# type") wins over a bare one ("type") at the same position. Built once and
-# reused by both _FIELD_CLAUSE_RE (parsing) and FIELD_CLAUSE_SCOPE_TAIL_RE
-# (typo-guard export below) so the two can never drift apart the way
-# COMPANY_SCOPE_TAIL_RE's comment warns about.
+# Tile/sample dimensions: 5"x10", 12" x 12", 5x10, 12 X 24, 5'x10'.
+# Matched so the quantity scanner can remove them before looking for a count —
+# every one of these starts with a digit and would otherwise be read as "order
+# N of something". Also covers a lone measurement ('12"') for the same reason.
+_DIMENSION_RE = re.compile(
+    r'\b\d+\s*(?:["\u201d\u2033\'\u2032]|in\.?|inch(?:es)?)?\s*[x\u00d7]\s*'
+    r'\d+\s*(?:["\u201d\u2033\'\u2032]|in\.?|inch(?:es)?)?'
+    r'|\b\d+\s*(?:["\u201d\u2033]|inch(?:es)?)',
+    re.I,
+)
+
 _FIELD_CLAUSE_OPENERS = sorted(
     (kw for kws in _FIELD_CLAUSE_KEYWORDS.values() for kw in kws),
     key=len,
     reverse=True,
+)
+
+# Any FIELD-CLAUSE scope tail ("rep John Smith", "order type new deal",
+# "project Midtown Office") — used ONLY for typo-guard token extraction, not
+# for parsing (that's _FIELD_CLAUSE_RE below). Same single-source-of-truth
+# contract as COMPANY_SCOPE_TAIL_RE: routes/chat.py imports this and the
+# marker words, so a keyword added to _FIELD_CLAUSE_KEYWORDS above is
+# protected from typo correction automatically, with no second edit in
+# chat.py. Without it, "project Midtown Office" was corrected to "product
+# Midtown onice" — the same class of bug COMPANY_SCOPE_TAIL_RE guards against
+# for "at Beck" → "at back", one keyword over.
+FIELD_CLAUSE_SCOPE_TAIL_RE = re.compile(
+    r"\b(?:" + "|".join(_FIELD_CLAUSE_OPENERS) + r")\s+([^,]+)",
+    re.I,
+)
+
+# The bare opener words themselves ("rep", "project", "type", ...) — these
+# must never be rewritten either, independent of whatever value follows.
+#
+# Derived from the same source, but split on ANY whitespace pattern rather
+# than the literal "\s+" substring: keying on one exact spelling meant that
+# writing a future keyword as r"order\s*type" or r"order type" would silently
+# yield one junk token instead of two, with no error anywhere.
+FIELD_CLAUSE_MARKER_WORDS = frozenset(
+    word
+    for kws in _FIELD_CLAUSE_KEYWORDS.values()
+    for kw in kws
+    for word in re.split(r"\\s[+*]|\s+", kw)
+    if word and word.isalpha()
 )
 
 _FIELD_CLAUSE_RE = re.compile(
@@ -261,32 +333,6 @@ _FIELD_CLAUSE_RE = re.compile(
     # _FOR_COMPANY_RE over-capture bug.
     + r")\s+(?P<val>[^,]+?)(?=\s*,|\s*$|\s+(?:for|at)\s+)",
     re.I,
-)
-
-# Any FIELD-CLAUSE scope tail ("rep John Smith", "order type new deal",
-# "project Midtown Office") — used ONLY for typo-guard token extraction, not
-# for parsing (that's _FIELD_CLAUSE_RE above). Same single-source-of-truth
-# contract as COMPANY_SCOPE_TAIL_RE below: routes/chat.py imports this (and
-# the marker words themselves, FIELD_CLAUSE_MARKER_WORDS) so a keyword added
-# to _FIELD_CLAUSE_KEYWORDS above is protected from typo correction
-# automatically, without a second edit in chat.py. This is the same class of
-# bug COMPANY_SCOPE_TAIL_RE's comment describes for "at Beck" → "at back" —
-# "project Midtown Office" → "product Midtown onice" was that bug's
-# reappearance one keyword over, because this export didn't exist yet.
-FIELD_CLAUSE_SCOPE_TAIL_RE = re.compile(
-    r"\b(?:" + "|".join(_FIELD_CLAUSE_OPENERS) + r")\s+([^,]+)",
-    re.I,
-)
-
-# The bare opener words themselves ("rep", "project", "type", ...) — these
-# must never be rewritten either, independent of whatever value follows them.
-# Derived from the same source so a new keyword is covered without a second
-# edit here.
-FIELD_CLAUSE_MARKER_WORDS = frozenset(
-    word
-    for kws in _FIELD_CLAUSE_KEYWORDS.values()
-    for kw in kws
-    for word in kw.split(r"\s+")   # literal "\s+" substring inside the pattern text
 )
 
 
@@ -395,6 +441,22 @@ def _resolve_rep_clause(raw: str):
     )
 
 
+def _resolve_project_clause(raw: str):
+    """Pass a typed project name straight through.
+
+    No validation, deliberately: billing_project is a plain <input> on the
+    checkout form, not a <select>, so there is no option list to check against
+    and whatever the user types IS the value. The other two clause slots are
+    selects, where an unrecognised value must be left unset or it renders
+    blank in the widget while still satisfying the required-field gate.
+    """
+    cleaned = str(raw or "").strip(" .;:,-")
+    if not cleaned:
+        return "", ""
+    logger.info(f"[FieldClause] project → {cleaned!r}")
+    return cleaned, ""
+
+
 def _resolve_order_type_clause(raw: str):
     """Validate a typed order type and translate label → stored value."""
     try:
@@ -426,33 +488,6 @@ def _resolve_order_type_clause(raw: str):
         + (f". Valid options: {opts}." if opts else ".")
         + " Set it on the review step below."
     )
-
-
-def _resolve_project_clause(raw: str):
-    """Clean up a free-text project/job name. No option list to validate
-    against — checkout_fields.py registers billing_project as a plain
-    <input> (see its _META_KEYS / _DEFAULT_LABELS: "Project Name"), not a
-    <select> like project_rep or billing_field_type. There is no stored
-    VALUE distinct from what was typed, so unlike _resolve_rep_clause /
-    _resolve_order_type_clause there is no label→value translation and no
-    "matches the wrong <option>" failure to guard against — whatever the
-    shopper typed is what the invoice should show.
-
-    Still routed through the same clause machinery as rep/order-type
-    (rather than left for the generic parser) so it is stripped before the
-    comma split and doesn't get treated as a product line, and so the
-    corresponding keyword is auto-covered by FIELD_CLAUSE_SCOPE_TAIL_RE /
-    FIELD_CLAUSE_MARKER_WORDS below for typo-guard purposes.
-
-    Only fails (returns "") on genuinely empty input after trimming
-    punctuation — never "unknown" or "ambiguous", since there is no known
-    set to be unknown or ambiguous against.
-    """
-    cleaned = raw.strip(" .,;:'\"")
-    if not cleaned:
-        return "", ""
-    logger.info(f"[FieldClause] project '{raw}' → {cleaned!r}")
-    return cleaned, ""
 
 
 def parse_bulk_order_utterance(
@@ -567,6 +602,83 @@ def parse_bulk_order_utterance(
                     continue
             expanded.append(sub)
         final_fragments.extend(expanded)
+
+    # Pass 3: PRODUCT-ANCHORED split ────────────────────────────────────────
+    # Passes 1-2 only break on commas and "and", which is not enough once a
+    # product can carry its own comma-separated attribute list. Concretely,
+    # 'Allspice Beleza, Honed, 5"x10" and Adams Beige' leaves the fragment
+    # '5"x10" and Adams Beige' intact, because the "and" split needs a catalog
+    # name on BOTH sides and the left side here is a size. Step 2 then resolves
+    # that fragment to Adams and reads '5"x10" and' as ADAMS's variant hint —
+    # so Allspice silently loses its size and Adams silently gains one. Wrong
+    # answer, no error: the failure mode this codebase keeps getting bitten by.
+    #
+    # So: inside a fragment, a catalog product name that does not start the
+    # fragment begins a NEW fragment, and whatever preceded it belongs to the
+    # product before it (Diya's rule — attributes attach to the product
+    # immediately before them).
+    #
+    # Gated on "some earlier fragment already named a product". Without that
+    # gate this would also split the FIRST fragment's leading hint away:
+    # "Order 1 Chip Card each Allspice Beleza" would become ["Order 1 Chip
+    # Card each", "Allspice Beleza"] and the shared Chip Card hint would be
+    # lost. Leading text before the first product is a hint; leading text
+    # after one is a trailing attribute of that earlier product.
+    _anchored = []
+    _seen_product = False
+    for frag in final_fragments:
+        _has_name = any(n in frag.lower() for n in _catalog_names)
+        if not _seen_product or not _has_name:
+            _anchored.append(frag)
+            _seen_product = _seen_product or _has_name
+            continue
+
+        # Earliest product-name occurrence, longest name first so "Adams
+        # Mosaic" is preferred over "Adams" at the same position.
+        _cut = None
+        for _p in _products_by_name_len:
+            _m = re.search(r'\b' + re.escape(_p["name"]) + r'\b', frag, re.I)
+            if _m and _m.start() > 0 and (_cut is None or _m.start() < _cut):
+                _cut = _m.start()
+        if _cut is None:
+            _anchored.append(frag)
+            _seen_product = True
+            continue
+
+        _before = frag[:_cut].strip(" ,.-")
+        # Text before the product name is only a NEW-LINE marker, not an
+        # attribute, when it is just a quantity and/or a connector: "3 Adams
+        # Beige" and "and Tara Cloud" must stay whole. Splitting them stranded
+        # the "3" as its own fragment (so Adams silently lost its quantity)
+        # and left a bare "and" that Step 2 reported as an unknown product.
+        _before_core = re.sub(
+            r'\b(?:and|each|every|per|order|buy|purchase|reorder|re-order)\b',
+            ' ', _before, flags=re.I,
+        )
+        _before_core = re.sub(
+            r'\b(?:\d+|' + '|'.join(_WORD_NUMERALS) + r')\b',
+            ' ', _before_core, flags=re.I,
+        ).strip(" ,.-")
+
+        if not _before_core:
+            # Keep the fragment whole, minus any leading connector so the
+            # product-name matcher and the leading-hint logic see clean text.
+            _anchored.append(re.sub(r'^\s*and\s+', '', frag, flags=re.I).strip())
+            _seen_product = True
+            continue
+
+        # _before_core is ONLY an emptiness probe — it has had digits stripped
+        # out, so emitting it would mangle a size ('5"x10"' → '"x10"'). The
+        # fragment that goes out is the original text, minus a leading or
+        # trailing connector.
+        _before_clean = re.sub(
+            r'^\s*and\s+|\s+and\s*$', '', _before, flags=re.I
+        ).strip(" ,.-")
+        _anchored.append(_before_clean or _before)
+        _anchored.append(frag[_cut:].strip())
+        _seen_product = True
+
+    final_fragments = _anchored
 
     # ── Step 1.5: Implicit trailing company ──────────────────────────────────
     # Three shapes reach here, all without the explicit "for company" keyword:
@@ -715,6 +827,17 @@ def parse_bulk_order_utterance(
         else:
             qty_scan_text = fragment
 
+        # A DIMENSION is not a count. '5"x10"' begins with a digit, so the
+        # bare \d+ scan below read it as quantity 5 and left '"x10"' behind,
+        # which then failed to resolve as a product ('unresolved product
+        # "x10"'). It also set quantity_explicitly_set, which suppressed the
+        # attribute-absorption step — so the size was lost twice over.
+        #
+        # Stripped before the scan rather than pattern-matched around, so a
+        # real count sitting next to a size still works: "Order 3 12x12 Adams"
+        # loses the 12x12 here and correctly finds 3.
+        qty_scan_text = _DIMENSION_RE.sub(' ', qty_scan_text)
+
         qty_match = re.search(r'\b(\d+)\b', qty_scan_text)
         quantity = int(qty_match.group(1)) if qty_match else 1
         quantity_explicitly_set = qty_match is not None
@@ -780,6 +903,9 @@ def parse_bulk_order_utterance(
             company_name=company_scope,
             recipient_name=recipient_name,
             email=email,
+            # Captured from THIS fragment's own text, before any shared-count
+            # distribution below can overwrite quantity_explicitly_set.
+            quantity_self_declared=(qty_match is not None),
             product_name=product_name,
             quantity=quantity,
             quantity_explicitly_set=quantity_explicitly_set,
@@ -820,6 +946,44 @@ def parse_bulk_order_utterance(
             f"bulk_parser | shared leading quantity → {_shared_qty} "
             f"(applied to {len(_implicit_qty)} line(s) lacking their own)"
         )
+
+    # ── Variation lookup helpers (shared) ────────────────────────────────────
+    # Declared BEFORE Step 3 because three separate steps need the same
+    # variation data and must not fetch it three times: Step 3c's guard
+    # against fuzzy-matching an attribute word to a product name, Step 3.4's
+    # attribute absorption, and Step 3.5's variation matching.
+    _variant_cache: dict = {}   # product_id → list[variation dicts]
+    _variant_fetch_failed: set = set()   # product_ids whose lookup errored out
+
+    def _variations_for(product_id):
+        """Fetch-and-cache variations. None means 'could not determine'."""
+        if product_id in _variant_fetch_failed:
+            return None
+        if product_id not in _variant_cache:
+            data = endpoints.list_variants_resolved(
+                product_id=product_id,
+                store_loader=store_loader,
+                per_page=100,
+            )
+            if data is None:
+                _variant_fetch_failed.add(product_id)
+                return None
+            _variant_cache[product_id] = data
+        return _variant_cache[product_id]
+
+    def _option_values(product_id):
+        """Every option string across every variation of a product."""
+        out = set()
+        for var in (_variations_for(product_id) or []):
+            _al = var.get("attributes", [])
+            _opts = (
+                list(_al.values()) if isinstance(_al, dict)
+                else [a.get("option", "") for a in _al if isinstance(a, dict)]
+            )
+            for o in _opts:
+                if str(o).strip():
+                    out.add(_normalize_term_key(normalize_spelling_variants(str(o))))
+        return out
 
     # ── Step 3: Product resolution + variant hint extraction ──────────────────
     for pl in pre_lines:
@@ -897,16 +1061,79 @@ def parse_bulk_order_utterance(
 
         # 3c. Fuzzy fallback (cutoff=0.6)
         if pl.product_id is None:
-            product_names = [p.get("name", "") for p in products]
-            matches = difflib.get_close_matches(
-                pl.product_name, product_names, n=1, cutoff=0.6
+            # An ATTRIBUTE word must never become a product here. At cutoff
+            # 0.6 "Matte" reaches "Hattie" and "Honed" reaches "Monet" — both
+            # real catalog products, neither anywhere in the message. That
+            # produced phantom order lines AND stole the sizes that followed:
+            # '12"x12"' was absorbed into "Hattie" because Hattie had, by
+            # then, become the nearest preceding product.
+            #
+            # Only fragments that could plausibly be an attribute of the
+            # product before them are protected, and only when that product's
+            # own options confirm it — so a genuine typo'd product name
+            # ("Allspce") still fuzzy-matches as before. Checked before the
+            # fuzzy call rather than after, because once product_id is set the
+            # attribute is indistinguishable from a real match.
+            _skip_fuzzy = False
+            _frag_key = _normalize_term_key(
+                normalize_spelling_variants(pl.product_name.strip(" ,.-"))
             )
-            if matches:
-                matched_catalog_name = matches[0]
-                pl.product_id = next(
-                    (p["id"] for p in products if p.get("name") == matched_catalog_name),
-                    None,
+
+            # Guard A — the catalog's OWN typing of the term. store_loader
+            # classifies every catalog term as category/tag/attribute/
+            # product_word, so "matte" and "honed" are already known to be
+            # attributes. Nothing consulted that here: fuzzy_protected_words
+            # is read only by utils/typo_correction.py, so these words were
+            # correctly shielded from the TYPO corrector (which is why they
+            # arrived intact) and then mangled by this second, unrelated
+            # fuzzy matcher a few steps later.
+            #
+            # Safe at this point specifically: exact product-name matches were
+            # already taken in 3a/3b, so anything reaching 3c is not a catalog
+            # product name, and a term the catalog calls an attribute is not
+            # about to become a product by approximation.
+            if _frag_key and store_loader is not None:
+                _types = getattr(store_loader, "fuzzy_vocab_types", None) or {}
+                _raw = pl.product_name.strip(" ,.-").lower()
+                if _types.get(_raw) == "attribute":
+                    _skip_fuzzy = True
+                    logger.info(
+                        f"bulk_parser | '{pl.product_name}' is a catalog ATTRIBUTE "
+                        f"term — not fuzzy-matching it to a product name"
+                    )
+
+            # Guard B — this specific product's own options. Narrower and
+            # independent of how the catalog types the word, so it still
+            # covers terms Guard A misses (a value indexed under a different
+            # type, or one that is also a word inside some product's name).
+            _prev_pid = None
+            if not _skip_fuzzy:
+                for _q in reversed(pre_lines[:pre_lines.index(pl)]):
+                    if _q.product_id:
+                        _prev_pid = _q.product_id
+                        break
+            if _prev_pid and _frag_key:
+                for _o in _option_values(_prev_pid):
+                    if _frag_key == _o or _frag_key in _o:
+                        _skip_fuzzy = True
+                        logger.info(
+                            f"bulk_parser | '{pl.product_name}' is an option of "
+                            f"product {_prev_pid} — not fuzzy-matching it to a "
+                            f"product name; leaving it for attribute absorption"
+                        )
+                        break
+
+            if not _skip_fuzzy:
+                product_names = [p.get("name", "") for p in products]
+                matches = difflib.get_close_matches(
+                    pl.product_name, product_names, n=1, cutoff=0.6
                 )
+                if matches:
+                    matched_catalog_name = matches[0]
+                    pl.product_id = next(
+                        (p["id"] for p in products if p.get("name") == matched_catalog_name),
+                        None,
+                    )
 
         # 3c.5. Attribute-based fallback: the line may describe a product by
         # its ATTRIBUTES rather than its name (e.g. "Grey Marble" = colour
@@ -1018,7 +1245,29 @@ def parse_bulk_order_utterance(
                                 pl.recipient_name = candidate
                     else:
                         pl.variant_hint = remainder
-                else:
+
+                # LEADING text is captured in BOTH branches, not just when the
+                # remainder is empty. "Order 1 Chip Card each Allspice Beleza,
+                # Honed" has a shared descriptor in front AND the product's own
+                # attribute behind: reading only the remainder dropped "Chip
+                # Card" on the floor with no warning. Kept in its own field so
+                # it can be propagated across lines (Step 3.75) without
+                # competing with the line's own hint.
+                _lead_raw = pl.product_name[:_name_match.start()]
+                _lead_raw = re.sub(
+                    r'^\s*(?:\d+|' + '|'.join(_WORD_NUMERALS) + r')\b',
+                    '', _lead_raw, flags=re.I,
+                )
+                _lead_raw = re.sub(r'\b(each|every|per)\b', '', _lead_raw, flags=re.I)
+                _lead_raw = re.sub(
+                    r'\b(order|buy|purchase|reorder|re-order)\b', '', _lead_raw, flags=re.I
+                )
+                _lead_raw = re.sub(r'\b(from|of|and)\s*$', '', _lead_raw, flags=re.I)
+                _lead_raw = _lead_raw.strip(" ,.-")
+                if _lead_raw and _lead_raw.lower() != (pl.variant_hint or "").lower():
+                    pl.leading_hint = _lead_raw
+
+                if not remainder:
                     # Nothing follows the product name — try the LEADING text
                     # instead. "1 each chip card from Harmony" puts the hint
                     # BEFORE the name, not after: strip the quantity token,
@@ -1052,6 +1301,76 @@ def parse_bulk_order_utterance(
                 f"bulk_parser | unresolved product '{pl.product_name}'"
             )
 
+    # ── Step 3.4: Absorb orphan ATTRIBUTE fragments into the product before ──
+    # "Order 1 Allspice Beleza, Honed, 5\"x10\"" splits on commas. Only the
+    # first fragment carries a product; the rest are attribute terms
+    # belonging to the product immediately before them.
+    #
+    # Absorbed only after confirming the fragment is a real option on that
+    # product (or is a dimension, which is never a product name), so a
+    # genuinely unknown product still stays unresolved and reports as it
+    # always did. Nothing is guessed.
+    _absorbed_idx = set()
+    for _i, pl in enumerate(pre_lines):
+        if pl.product_id or pl.email:
+            continue
+        if pl.quantity_self_declared:
+            # An explicit quantity in THIS fragment's own text marks a new
+            # order line ("... and 3 Adams"), never a trailing attribute.
+            # Deliberately NOT quantity_explicitly_set: that is also true for
+            # a count distributed across every line from the front of the
+            # message, which would block absorption on all of them.
+            continue
+        _candidate = (pl.product_name or "").strip(" ,.-")
+        # An attribute fragment may carry the RECIPIENT for the product it
+        # belongs to: '... Beleza, Honed, 5"x10" for Annabelle Damon, Adams
+        # ...'. The size is Allspice's and so is Annabelle. Absorb the term
+        # and hand the recipient to the same product, rather than skipping
+        # the fragment and stranding both.
+        _carried_recipient = pl.recipient_name or ""
+        if not _candidate and _carried_recipient:
+            continue
+        if not _candidate:
+            continue
+        _prev = None
+        for _j in range(_i - 1, -1, -1):
+            if _j in _absorbed_idx:
+                continue
+            if pre_lines[_j].product_id:
+                _prev = pre_lines[_j]
+                break
+        if _prev is None:
+            continue
+        _opts = _option_values(_prev.product_id)
+        if not _opts:
+            continue                      # fetch failed or no variations — leave alone
+        _key = _normalize_term_key(normalize_spelling_variants(_candidate))
+        if not _key:
+            continue
+        # A DIMENSION is never a product name, so it needs no proof from the
+        # option list. It often can't get one: a variation may leave an axis
+        # blank ("Any"), with the real options living on the PARENT product —
+        # which is why Adams (whose 32 variations enumerate 12"x12") absorbed
+        # its size while Allspice and Tara, whose variations leave Sample Size
+        # blank, rejected theirs and left them as phantom order lines.
+        _is_dimension = bool(_DIMENSION_RE.fullmatch(_candidate.strip()))
+        if _is_dimension or any(_key == o or _key in o for o in _opts):
+            _prev.variant_terms.append(_candidate)
+            if _carried_recipient and not _prev.recipient_name:
+                _prev.recipient_name = _carried_recipient
+                logger.info(
+                    f"bulk_parser | recipient '{_carried_recipient}' carried from "
+                    f"attribute fragment to product {_prev.product_id}"
+                )
+            _absorbed_idx.add(_i)
+            logger.info(
+                f"bulk_parser | absorbed attribute fragment '{_candidate}' into "
+                f"product {_prev.product_id} ('{_prev.product_name}')"
+            )
+
+    if _absorbed_idx:
+        pre_lines = [p for i, p in enumerate(pre_lines) if i not in _absorbed_idx]
+
     # ── Step 3.7: Transaction-wide shared VARIANT HINT (leading or trailing) ──
     # "Order 1 Harmony, Lager, Adams, Marigold chip card for Gensler" — the
     # hint trails on the LAST fragment ("Marigold chip card").
@@ -1083,9 +1402,70 @@ def parse_bulk_order_utterance(
             f"(applied to {len(_unhinted)} line(s) lacking their own)"
         )
 
+    # ── Step 3.75: Shared LEADING descriptor → every line's terms ────────────
+    # "Order 1 Chip Card each Allspice Beleza, Honed, 5\"x10\" and Adams Beige,
+    # Matte, 12\"x12\"" — "Chip Card" sits in front of the whole list and
+    # applies to every product, while each product also carries its own
+    # colour/finish/size.
+    #
+    # Step 3.7 above cannot express this: it MOVES a single hint onto lines
+    # that have none, so here (where every line already has its own hint) it
+    # correctly declines to fire, and the shared descriptor was simply lost.
+    # This adds it as an EXTRA term instead of replacing anything, which is
+    # the only way a line can carry both.
+    #
+    # Conservative in the same way as 3.7 and Step 1.6: fires only when
+    # exactly ONE line carries a leading descriptor and that line is the
+    # FIRST — the only position where the text reads as covering the whole
+    # order. A descriptor in front of the third product describes the third
+    # product, and is left alone.
+    _leading = [pl for pl in pre_lines if pl.product_id and pl.leading_hint]
+    if len(_leading) == 1 and pre_lines and _leading[0] is pre_lines[0]:
+        _shared_lead = _leading[0].leading_hint
+        _applied = 0
+        for pl in pre_lines:
+            if not pl.product_id:
+                continue
+            # Seed from the line's own hint first so ordering stays as typed
+            # and the shared descriptor never displaces it.
+            if not pl.variant_terms and pl.variant_hint:
+                pl.variant_terms = [pl.variant_hint]
+            if not any(
+                _normalize_term_key(t) == _normalize_term_key(_shared_lead)
+                for t in pl.variant_terms
+            ):
+                pl.variant_terms.append(_shared_lead)
+                _applied += 1
+        if _applied:
+            logger.info(
+                f"bulk_parser | shared leading descriptor '{_shared_lead}' "
+                f"applied as a term to {_applied} line(s)"
+            )
+
+    # Seed variant_terms from the line's own trailing hint so the matcher has
+    # the full list in one place. Done after absorption so the product's own
+    # remainder ("Beleza") leads and the absorbed ones follow, preserving the
+    # order the user typed.
+    #
+    # Idempotent: Step 3.75 may already have seeded this line before appending
+    # the shared descriptor. Inserting again would put the hint in twice —
+    # harmless for the AND-match (a term matching itself twice is still one
+    # constraint) but it would show up doubled in the unmatched-term message.
+    for pl in pre_lines:
+        if not pl.variant_hint:
+            continue
+        if not pl.variant_terms:
+            continue                      # single-term line — original path
+        if not any(
+            _normalize_term_key(t) == _normalize_term_key(pl.variant_hint)
+            for t in pl.variant_terms
+        ):
+            pl.variant_terms.insert(0, pl.variant_hint)
+
     # ── Step 3.5: Variation resolution (API call per unique product with a hint) ─
-    _variant_cache: dict = {}   # product_id → list[variation dicts]; avoids duplicate calls
-    _variant_fetch_failed: set = set()   # product_ids whose lookup errored out
+    # NOTE: _variant_cache / _variant_fetch_failed are declared in Step 3.4
+    # above, which already populated them for any product it inspected.
+    # Re-declaring them here would discard that work and re-fetch.
 
     for pl in pre_lines:
         if not pl.product_id or not pl.variant_hint:
@@ -1126,27 +1506,77 @@ def parse_bulk_order_utterance(
             continue
 
         hint_lower = normalize_spelling_variants(pl.variant_hint)
-        _matches = []
-        for var in _variant_cache[pl.product_id]:
-            _attr_list = var.get("attributes", [])
-            if isinstance(_attr_list, dict):
-                _options = list(_attr_list.values())
-            else:
-                _options = [a.get("option", "") for a in _attr_list if isinstance(a, dict)]
-            # Normalise BOTH sides — this catalog mixes US and UK spellings
-            # ("ADAMS Gray" vs "Aurora - Misty Grey").
-            if any(hint_lower in normalize_spelling_variants(o) for o in _options):
-                _matches.append(var)
-                continue
-            # Whitespace/hyphen-insensitive fallback so "chipcard" and
-            # "chip-card" reach the catalog's "Chip Card" the same way
-            # "chip card" already does.
-            if any(
-                _normalize_term_key(hint_lower) in _normalize_term_key(o)
-                for o in _options
-                if str(o).strip()
-            ):
-                _matches.append(var)
+
+        def _var_options(var):
+            _al = var.get("attributes", [])
+            return (
+                list(_al.values()) if isinstance(_al, dict)
+                else [a.get("option", "") for a in _al if isinstance(a, dict)]
+            )
+
+        def _term_hits(term, options):
+            """Does `term` match ANY option on this variation?
+
+            Same two-tier comparison the single-hint path has always used:
+            spelling-normalised substring first (this catalog mixes US/UK
+            spellings), then a whitespace/hyphen-insensitive key so "chipcard"
+            reaches "Chip Card".
+            """
+            _t = normalize_spelling_variants(term)
+            if any(_t in normalize_spelling_variants(o) for o in options):
+                return True
+            _tk = _normalize_term_key(_t)
+            return bool(_tk) and any(
+                _tk in _normalize_term_key(o) for o in options if str(o).strip()
+            )
+
+        if pl.variant_terms:
+            # A term that NO variation enumerates cannot narrow anything —
+            # typically because that axis is blank ("Any") on the variations,
+            # with the real options on the parent product. Constraining on it
+            # would return zero matches and fail the whole line over a term
+            # the rep supplied correctly.
+            #
+            # So: narrow using the terms that CAN narrow, and record the rest
+            # rather than dropping them. They still reach the user through
+            # unmatched_variant_terms, so a genuinely wrong term is reported
+            # by name instead of silently ignored — it just no longer takes
+            # the valid terms down with it.
+            _all_opts = [o for var in _variant_cache[pl.product_id]
+                         for o in _var_options(var)]
+            pl.unmatched_variant_terms = [
+                t for t in pl.variant_terms if not _term_hits(t, _all_opts)
+            ]
+            _effective = [t for t in pl.variant_terms
+                          if t not in pl.unmatched_variant_terms]
+            if pl.unmatched_variant_terms:
+                logger.info(
+                    f"bulk_parser | terms {pl.unmatched_variant_terms} match no "
+                    f"variation of product {pl.product_id} (axis likely 'Any' on "
+                    f"the parent) — narrowing on {_effective or 'nothing'} instead"
+                )
+            _matches = [
+                var for var in _variant_cache[pl.product_id]
+                if all(_term_hits(t, _var_options(var)) for t in _effective)
+            ] if _effective else []
+        else:
+            _matches = []
+            for var in _variant_cache[pl.product_id]:
+                _options = _var_options(var)
+                # Normalise BOTH sides — this catalog mixes US and UK spellings
+                # ("ADAMS Gray" vs "Aurora - Misty Grey").
+                if any(hint_lower in normalize_spelling_variants(o) for o in _options):
+                    _matches.append(var)
+                    continue
+                # Whitespace/hyphen-insensitive fallback so "chipcard" and
+                # "chip-card" reach the catalog's "Chip Card" the same way
+                # "chip card" already does.
+                if any(
+                    _normalize_term_key(hint_lower) in _normalize_term_key(o)
+                    for o in _options
+                    if str(o).strip()
+                ):
+                    _matches.append(var)
 
         if len(_matches) == 1:
             pl.variation_id = _matches[0]["id"]
@@ -1263,11 +1693,57 @@ def parse_bulk_order_utterance(
                  if term_norm and term_norm == _hint_norm),
                 None,
             )
+            # The self-contained term may be one of SEVERAL terms rather than
+            # the whole hint: "Chip Card Allspice Beleza, Honed, 5\"x10\"" puts
+            # Beleza in variant_hint and Chip Card in variant_terms (via the
+            # shared leading descriptor). Keying only on variant_hint meant
+            # the AND-match failed on "Chip Card" and this fallback then
+            # declined to fire — so a combination that used to work as a bare
+            # "chip card" order broke the moment attributes were added.
+            _self_norm = ""
+            if not _match and pl.variant_terms:
+                for _axis_c, _term_norm_c, _term_name_c in _wanted:
+                    if _term_norm_c and any(
+                        _normalize_term_key(t) == _term_norm_c for t in pl.variant_terms
+                    ):
+                        _match = (_axis_c, _term_name_c)
+                        _self_norm = _term_norm_c
+                        break
             _pool = _variant_cache.get(pl.product_id) or []
 
             if _match and _pool:
                 _axis, _term_name = _match
+                # Narrow by the terms that are NOT the self-contained one.
+                # The rep asked for a chip card OF a particular colour/finish/
+                # size, so pin the variation carrying those rather than
+                # _pool[0] — the arbitrary pick is only right when nothing
+                # else was specified.
+                _other_terms = [
+                    t for t in (pl.variant_terms or [])
+                    if _normalize_term_key(t) != (_self_norm or _hint_norm)
+                ]
                 _first = _pool[0]
+                if _other_terms:
+                    _narrowed = [
+                        v for v in _pool
+                        if all(_term_hits(t, _var_options(v)) for t in _other_terms)
+                    ]
+                    if _narrowed:
+                        _first = _narrowed[0]
+                        logger.info(
+                            f"bulk_parser | chip card narrowed by {_other_terms} → "
+                            f"variation {_first.get('id')}"
+                        )
+                    else:
+                        # Those attributes exist on the product but not in
+                        # combination. Say so instead of silently pinning an
+                        # unrelated variation and shipping the wrong card.
+                        pl.unmatched_variant_terms = list(_other_terms)
+                        logger.warning(
+                            f"bulk_parser | chip card requested with "
+                            f"{_other_terms}, which match no single variation "
+                            f"of product {pl.product_id}"
+                        )
                 pl.variation_id = _first.get("id")
                 pl.self_contained_variant = True
                 pl.blank_variant_axes = []
@@ -1733,6 +2209,7 @@ def parse_bulk_order_utterance(
             unresolved=unresolved,
             unresolved_reason=unresolved_reason,
             unmatched_variant_hint=pl.unmatched_variant_hint,
+            unmatched_variant_terms=list(pl.unmatched_variant_terms or []),
             blank_variant_axes=list(pl.blank_variant_axes or []),
             candidate_variation_ids=list(pl.candidate_variation_ids or []),
             specified_variant_axes=list(pl.specified_variant_axes or []),

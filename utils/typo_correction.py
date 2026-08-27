@@ -73,6 +73,15 @@ CONTROL_PHRASE_WORDS = frozenset({
     "reorder", "purchase", "buy", "confirm", "confirmed", "track",
     "tracking", "status", "history", "invoice", "receipt", "refund",
     "return", "returns", "cancelation", "cancellation",
+    # bulk-order format markers — "Order N each X, Y for Company, project
+    # Name" — "project" sits 2 edits from the catalog term "product"
+    # ("projEct"→"prodUct" swapping e/u and j/d), so left unprotected it
+    # self-corrects into the wrong keyword before the bulk parser ever sees
+    # it: "project Midtown Office" became "product Midtown onice" (and
+    # "office", now flagged OOV under the wrong header word, went on to get
+    # its own bogus correction). "project" is a structural marker like
+    # "order"/"for", not a catalog word, so it must never be rewritten.
+    "project",
     # navigation / chips
     "browse", "view", "load", "more", "back", "next", "previous", "skip",
     "done", "continue", "select", "choose", "change", "edit", "update",
@@ -296,6 +305,20 @@ def correct_message(message: str, loader, suppressed_tokens=None) -> tuple[str, 
             if _w and _w.isalpha() and _w not in _DATE_TAIL_WORDS:
                 _suppressed.add(_w)
 
+    # NOTE: project-NAME text ("project Midtown Office") is intentionally NOT
+    # protected here. That protection now lives in routes/chat.py's
+    # _recipient_scope_tokens(), gated on is_bulk — same place and same
+    # is_bulk gate as the company-scope-tail protection, via
+    # FIELD_CLAUSE_SCOPE_TAIL_RE (bulk_order_parser.py). Doing it here
+    # instead would blanket-suppress correction after the word "project" in
+    # EVERY message, bulk or not, which is exactly what this module's
+    # design comment above warns against for glue/marker words: the marker
+    # list must have one source of truth, and that source is the bulk
+    # parser, not this generic utility. See CONTROL_PHRASE_WORDS above for
+    # why the bare word "project" itself is still protected unconditionally
+    # (it's a real English word, not a proper noun — same category as
+    # "order" already in that set) — only the free-text VALUE after it is
+    # scoped to bulk orders.
 
     corrections: list = []
     ambiguities: list = []
