@@ -2140,8 +2140,19 @@ def parse_bulk_order_utterance(
         # moment a customer names ANY of those three signals, they fall
         # through to the same real resolution a rep gets — that's the whole
         # point of this expansion.
+        #
+        # ALSO gated on line count: the self-order cart route is only taken
+        # for a SINGLE line. Two or more lines is a bulk order, so a customer
+        # gets the same company -> recipient -> address flow a rep gets, even
+        # when they named nobody. Without this the lines resolve to the
+        # customer themselves, `unresolved_reason` is None, and every asking
+        # gate downstream (Step 4.55 company, 4.56 recipient, 4.57 address)
+        # finds an empty list and silently falls through to the cart — which
+        # is why a rep could complete this order and a customer could not.
+        # Counted in LINES, not units: 5x of one product is still one line.
         _customer_self_fallback = (
             _is_rep and not _is_true_rep
+            and len(pre_lines) <= 1
             and not pl.email and not company_scope and not pl.recipient_name
         )
         if _is_rep and not _customer_self_fallback:

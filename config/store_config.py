@@ -421,7 +421,7 @@ _DEFAULT_BULK_ADDRESS_REQUIRED_FLOOR = {
         "first_name", "last_name", "company", "country",
         "address_1", "city", "state", "postcode", "email",
     ],
-    "meta": ["billing_field_type", "billing_project", "project_rep"],
+    "meta": ["billing_field_type", "billing_project"],
 }
 
 
