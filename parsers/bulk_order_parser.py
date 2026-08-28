@@ -66,6 +66,12 @@ class BulkOrderLine:
     # parent product. Carried through so the variant prompt can pre-select
     # them instead of asking for a value the rep already supplied.
     unmatched_variant_terms: list = field(default_factory=list)
+    # EVERY term the rep typed for this line, matched or not. Carried out of
+    # the parser because unmatched_variant_terms alone is the wrong basis for
+    # deciding what still needs asking: it holds only terms NO variation
+    # enumerates, whereas whether a term is already answered depends on which
+    # axes the CHOSEN variation leaves "Any".
+    variant_terms: list = field(default_factory=list)
     # Terms each valid on their own that NO single variation carries
     # together (Allspice has no Beleza + Honed). Separate from
     # unmatched_variant_terms because those are PRE-SELECTED, and
@@ -1364,7 +1370,29 @@ def parse_bulk_order_utterance(
         # its size while Allspice and Tara, whose variations leave Sample Size
         # blank, rejected theirs and left them as phantom order lines.
         _is_dimension = bool(_DIMENSION_RE.fullmatch(_candidate.strip()))
-        if _is_dimension or any(_key == o or _key in o for o in _opts):
+        # Same blank-axis problem, but for NON-dimension terms. "Polished" is a
+        # finish, and Enduring 2.0 leaves Finish 'Any' on its variations, so it
+        # appeared in no option list and was not a dimension either — it failed
+        # both tests and survived as a phantom order line called "Polished"
+        # with product_id null and "Recipient required" against it.
+        #
+        # The catalog already knows the word is an attribute value: Guard A in
+        # Step 3c uses `fuzzy_vocab_types` for exactly this, to stop such a term
+        # being fuzzy-matched into a product name. Reused here rather than
+        # fetching the parent, and safe for the same reason it is safe there —
+        # 3a/3b already took every exact product-name match, so a fragment that
+        # reaches this point with no product_id is not a product.
+        # Any non-product catalog type counts, not "attribute" alone.
+        # build_fuzzy_vocab adds categories and tags BEFORE attributes and
+        # skips a word already present (`word not in vocab_types`), so a value
+        # that is also a category or tag name is typed as THAT — "Polished" is
+        # one, which is why an == "attribute" test never fired for it and the
+        # phantom line survived. product_word is excluded because a real
+        # product name must keep failing this gate and stay unresolved.
+        _vocab_types = getattr(store_loader, "fuzzy_vocab_types", None) or {}
+        _cand_type = _vocab_types.get(_candidate.lower())
+        _is_catalog_attr = bool(_cand_type) and _cand_type != "product_word"
+        if _is_dimension or _is_catalog_attr or any(_key == o or _key in o for o in _opts):
             _prev.variant_terms.append(_candidate)
             if _carried_recipient and not _prev.recipient_name:
                 _prev.recipient_name = _carried_recipient
@@ -2317,6 +2345,7 @@ def parse_bulk_order_utterance(
             unresolved_reason=unresolved_reason,
             unmatched_variant_hint=pl.unmatched_variant_hint,
             unmatched_variant_terms=list(pl.unmatched_variant_terms or []),
+            variant_terms=list(pl.variant_terms or []),
             conflicting_variant_terms=list(pl.conflicting_variant_terms or []),
             blank_variant_axes=list(pl.blank_variant_axes or []),
             candidate_variation_ids=list(pl.candidate_variation_ids or []),

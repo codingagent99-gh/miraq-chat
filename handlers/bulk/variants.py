@@ -240,8 +240,22 @@ def _ensure_missing_axes(line, user_context):
         # genuinely still open. Uses the same option source and the same
         # matching key as the pre-selection in _ask_for_bulk_variant, so a
         # term that would be pre-ticked there is settled here instead.
-        _terms = [t for t in (line.get("unmatched_variant_terms") or [])
-                  if str(t).strip()]
+        #
+        # Draws on the line's FULL variant_terms, not just the unmatched ones.
+        # unmatched_variant_terms holds only terms that NO variation of the
+        # product enumerates, which is the wrong test here: whether a term is
+        # already answered depends on the axes the CHOSEN variation leaves
+        # blank, not on whether some other variation happens to list it.
+        # Pembroke's '12\"x12\"' is enumerated by some of its 42 variations, so
+        # it never reached unmatched_variant_terms — yet variation 4585 is
+        # 'Any' on Sample Size, so the size the rep typed was asked for again.
+        # Enduring 2.0 only worked because it has two variations and neither
+        # lists a size.
+        _terms = [
+            t for t in list(line.get("unmatched_variant_terms") or [])
+            + list(line.get("variant_terms") or [])
+            if str(t).strip()
+        ]
         if _terms and not (line.get("conflicting_variant_terms") or []):
             def _optkey(s):
                 return re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
@@ -251,6 +265,8 @@ def _ensure_missing_axes(line, user_context):
             )
             _settled = dict(line.get("variant_meta") or {})
             _still_missing = []
+            _consumed = []
+            _newly_settled = []
             for _axis in missing:
                 _opts = _axis_opts.get(_axis) or set()
                 _hit = next(
@@ -260,6 +276,8 @@ def _ensure_missing_axes(line, user_context):
                 )
                 if _hit:
                     _settled[_axis] = _hit
+                    _newly_settled.append(_axis)
+                    _consumed += [t for t in _terms if _optkey(t) == _optkey(_hit)]
                     logger.info(
                         f"bulk_order | {_axis}='{_hit}' taken from the rep's own "
                         f"wording — not asking again for product "
@@ -268,12 +286,29 @@ def _ensure_missing_axes(line, user_context):
                 else:
                     _still_missing.append(_axis)
 
-            if not _still_missing:
-                # Everything they left open, they had already answered.
+            # Persist what WAS settled even when other axes are still open.
+            #
+            # This used to be written only in the all-settled branch below, so
+            # a partial match threw the settled values away: "Enduring 2.0 Taj
+            # Mahal, Polished, 12\"x24\"" logged Sample Size='12\"x24\"' taken
+            # from the rep's own wording, then asked for Finish alone and ended
+            # with variant_meta {'Finish': 'Polished'} — the size silently gone
+            # from the order. It also left the term in unmatched_variant_terms,
+            # so the same size was reported back as matching "no option on any
+            # axis" one turn after being accepted.
+            if _newly_settled:
                 line["variant_meta"] = _settled
                 line["specified_variant_axes"] = list(
                     (line.get("specified_variant_axes") or [])
-                ) + list(missing)
+                ) + _newly_settled
+                if _consumed:
+                    line["unmatched_variant_terms"] = [
+                        t for t in (line.get("unmatched_variant_terms") or [])
+                        if t not in _consumed
+                    ]
+
+            if not _still_missing:
+                # Everything they left open, they had already answered.
                 line["blank_variant_axes"] = []
                 logger.info(
                     f"bulk_order | product {line.get('product_id')} fully "
