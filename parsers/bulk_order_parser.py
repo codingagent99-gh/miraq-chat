@@ -1524,6 +1524,26 @@ def parse_bulk_order_utterance(
                 else [a.get("option", "") for a in _al if isinstance(a, dict)]
             )
 
+        def _var_attr_map(var):
+            """Variation attributes as axis -> value, keeping blanks.
+
+            _var_options() flattens to a bare value list, which discards which
+            axis a value belongs to AND makes a blank ("Any") axis look like a
+            value that simply matches nothing. Both matter when deciding
+            whether a variation can serve a term.
+            """
+            _al = var.get("attributes", [])
+            if isinstance(_al, dict):
+                return {str(k): (v or "") for k, v in _al.items()}
+            _out = {}
+            for a in _al:
+                if not isinstance(a, dict):
+                    continue
+                _key = a.get("name") or a.get("slug") or a.get("id")
+                if _key is not None:
+                    _out[str(_key)] = a.get("option", "") or ""
+            return _out
+
         def _term_hits(term, options):
             """Does `term` match ANY option on this variation?
 
@@ -1565,9 +1585,45 @@ def parse_bulk_order_utterance(
                     f"variation of product {pl.product_id} (axis likely 'Any' on "
                     f"the parent) — narrowing on {_effective or 'nothing'} instead"
                 )
+
+            # A blank axis on a variation is WooCommerce "Any" — that variation
+            # serves every option on that axis, so it must satisfy any term for
+            # it. Matching a flat list of the variation's values got this wrong:
+            # Pembroke's Cool Mix variation is Any on Finish and Sample Size, so
+            # requiring 'Matte' and '12\"x12\"' to literally appear in its own
+            # values excluded it, and a combination the store really does sell
+            # was reported as "no variation has these together".
+            #
+            # Terms are mapped to an axis using the values other variations DO
+            # enumerate; a term matching several axes stays satisfiable by any
+            # of them, so the pa_colors/pa_chip-size ambiguity cannot wrongly
+            # disqualify a variation here.
+            _axis_values = {}
+            for _v in _variant_cache[pl.product_id]:
+                for _ax, _val in _var_attr_map(_v).items():
+                    if str(_val).strip():
+                        _axis_values.setdefault(_ax, []).append(_val)
+
+            def _axes_for_term(term):
+                return [ax for ax, vals in _axis_values.items()
+                        if _term_hits(term, vals)]
+
+            def _var_satisfies(var, term):
+                _axes = _axes_for_term(term)
+                _map = _var_attr_map(var)
+                if not _axes:
+                    return _term_hits(term, _var_options(var))
+                for _ax in _axes:
+                    _val = _map.get(_ax, "")
+                    if not str(_val).strip():
+                        return True          # "Any" — serves every option
+                    if _term_hits(term, [_val]):
+                        return True
+                return False
+
             _matches = [
                 var for var in _variant_cache[pl.product_id]
-                if all(_term_hits(t, _var_options(var)) for t in _effective)
+                if all(_var_satisfies(var, t) for t in _effective)
             ] if _effective else []
 
             # Every term is individually valid, yet NO variation carries them

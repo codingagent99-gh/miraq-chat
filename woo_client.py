@@ -3,6 +3,7 @@ WooCommerce API client for executing API calls.
 """
 
 from typing import List
+import json as _json
 import requests as http_requests
 from requests.auth import HTTPBasicAuth
 
@@ -16,6 +17,50 @@ from chat_logger import get_logger, get_api_logger, get_order_logger, sanitize_u
 logger = get_logger("miraq_chat")
 api_logger = get_api_logger()
 order_logger = get_order_logger()
+
+def _parse_json_tolerant(resp, endpoint_short):
+    """resp.json(), but survives a body with PHP notices printed in front of it.
+
+    A misbehaving WP plugin that emits warnings during a REST request writes them
+    to the output stream BEFORE WordPress serialises its response, so the body is
+    literally `<br /><b>Warning</b>: ...` followed by perfectly good JSON, served
+    with Content-Type: application/json and a 200. Strict json.loads() rejects the
+    whole thing at column 1 and a complete, valid payload is thrown away.
+
+    raw_decode() from the first brace parses the first complete JSON value and
+    ignores anything after it, which also covers notices emitted at the end.
+
+    Deliberately loud: this masks a real server-side fault, and a silent recovery
+    would let it sit there forever. Every salvage logs an error with the leading
+    junk so the offending plugin and file stay visible in the logs.
+    """
+    try:
+        return resp.json(), False
+    except ValueError as exc:
+        _strict_error = exc
+
+    text = resp.text or ""
+    start = min(
+        (i for i in (text.find("{"), text.find("[")) if i != -1),
+        default=-1,
+    )
+    if start == -1:
+        raise _strict_error
+
+    try:
+        data, _end = _json.JSONDecoder().raw_decode(text[start:])
+    except ValueError:
+        # No complete JSON value after the junk either — the body really is
+        # broken. Surface the ORIGINAL decode error so the failure log and the
+        # caller-visible error read exactly as they did before this helper.
+        raise _strict_error
+
+    logger.error(
+        f"API body polluted before JSON: {endpoint_short} | "
+        f"salvaged {len(text) - start} of {len(text)} bytes | "
+        f"leading_junk={text[:start][:300]!r}"
+    )
+    return data, True
 
 # Minimal headers that pass WordPress.com Atomic's bot detection.
 # Full BROWSER_HEADERS with query-string credentials triggered 429s.
@@ -132,6 +177,13 @@ class WooClient:
 
         _req_start = _time.time()
 
+        # Bound before the try so the failure handler below can still describe
+        # the response when the request SUCCEEDED and only parsing blew up —
+        # requests' JSONDecodeError carries no .response, which is why a 2xx
+        # with an empty or HTML body used to log nothing but "Expecting value:
+        # line 1 column 1 (char 0)".
+        resp = None
+
         try:
             if api_call.method == "GET":
                 resp = self.session.get(
@@ -154,7 +206,7 @@ class WooClient:
 
             resp.raise_for_status()
             _elapsed_ms = round((_time.time() - _req_start) * 1000)
-            data = resp.json()
+            data, _salvaged = _parse_json_tolerant(resp, endpoint_short)
 
             # ── Response logging ──────────────────────────────────────────────
             # `count` is the number of ITEMS in a list-shaped response. Aggregate
@@ -239,6 +291,22 @@ class WooClient:
             if hasattr(e, "response") and e.response is not None:
                 try:
                     body_preview = f" | response_body={e.response.text[:500]!r}"
+                except Exception:
+                    pass
+            # A 2xx whose body will not parse leaves body_preview empty above,
+            # so the log said only that JSON decoding failed and never what
+            # actually came back. Status, content type, byte length and a short
+            # preview separate an empty body from an HTML error page from a
+            # truncated payload — the difference between three very different
+            # server-side faults.
+            if not body_preview and resp is not None:
+                try:
+                    body_preview = (
+                        f" | status={resp.status_code}"
+                        f" | content_type={resp.headers.get('Content-Type')!r}"
+                        f" | length={len(resp.content)}"
+                        f" | response_preview={resp.text[:300]!r}"
+                    )
                 except Exception:
                     pass
             _elapsed_ms = round((_time.time() - _req_start) * 1000)

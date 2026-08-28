@@ -505,12 +505,55 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
                 # `options` must be ROW DICTS (the handler calls
                 # _address_label on each), and `line_indices` drives the loop
                 # that copies the address onto the lines.
-                user_context["bulk_address_queue"] = [{
-                    "name": _tried_co,
-                    "company": _tried_co,
-                    "options": _addr_rows,
-                    "line_indices": list(range(len(lines_as_dicts))),
-                }]
+                # One slot PER NAMED RECIPIENT, not one slot for the company.
+                #
+                # This used to be a single company-wide slot carrying
+                # `range(len(lines_as_dicts))`, which threw away the recipient
+                # the rep had already typed: "1 Curie for Annabelle Damon, 2
+                # Enduring for Andrew Gazda" collapsed into one address applied
+                # to every line, so both people got the same delivery and the
+                # message asked for names the rep had ALREADY given.
+                #
+                # `recipient_name` survives on the line even when the roster
+                # lookup fails, so it is still the best key here. Options are
+                # narrowed to that person's own historical rows when any match,
+                # which is usually an exact hit — the same order history that
+                # produced this company also shipped to these people.
+                _by_recipient = {}
+                for _i, _l in enumerate(lines_as_dicts):
+                    _by_recipient.setdefault(
+                        str(_l.get("recipient_name") or "").strip(), []
+                    ).append(_i)
+
+                _queue = []
+                for _rname, _idxs in _by_recipient.items():
+                    _own = [
+                        _r for _r in _addr_rows
+                        if _norm_name(
+                            f"{_r.get('shipping_first_name') or ''} "
+                            f"{_r.get('shipping_last_name') or ''}"
+                        ) == _norm_name(_rname)
+                    ] if _rname else []
+                    if _rname and _own:
+                        logger.info(
+                            f"bulk_order | roster unavailable — matched "
+                            f"'{_rname}' to {len(_own)} order-history "
+                            f"address(es) for line(s) {_idxs}"
+                        )
+                    elif _rname:
+                        logger.warning(
+                            f"bulk_order | roster unavailable and no order "
+                            f"history for '{_rname}' — offering all "
+                            f"{len(_addr_rows)} company address(es) for "
+                            f"line(s) {_idxs}"
+                        )
+                    _queue.append({
+                        "name": _rname or _tried_co,
+                        "company": _tried_co,
+                        "options": _own or _addr_rows,
+                        "line_indices": _idxs,
+                    })
+                user_context["bulk_address_queue"] = _queue
                 user_context["bulk_address_pos"] = 0
                 conversation.context_data = user_context
                 flag_modified(conversation, "context_data")
@@ -524,7 +567,10 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
                         f"Got it:\r\n{_pl}\r\n\r\n"
                         f"I don't have contact records for **{_tried_co}**, but it has "
                         f"been shipped to before. Pick a delivery address and I'll use "
-                        f"it — you can add the recipient's name at confirmation."
+                        f"it" + (
+                            "." if any(_by_recipient) and "" not in _by_recipient
+                            else " — you can add the recipient's name at confirmation."
+                        )
                     ),
                     "intent": "guided_flow",
                     "products": [],

@@ -39,6 +39,45 @@ def _is_variable_product(product_id: int, store_loader) -> bool:
 # ── Private: _ask_for_bulk_variant ──
 # ══════════════════════════════════════════════════════════════
 
+def _axes_from_variation_schema(product_id):
+    """Parent variation axes recovered from store_loader.product_variation_schema.
+
+    Fallback ONLY — used when the live parent-product fetch fails. That cache is
+    populated by ecommerce.endpoints.product_variation_axes() during cart-payload
+    builds, so it often already holds the same axes the failed call would have
+    returned, and it is process-level rather than per-conversation.
+
+    Read straight out of the cache dict instead of calling product_variation_axes():
+    that method re-runs the very fetch_product() call that just failed, so calling
+    it here would cost a second guaranteed failure per prompt.
+
+    Shape is converted to _parent_axis_meta's: the schema cache is keyed by
+    taxonomy with the display name inside, this returns the reverse. attribute_id
+    is unavailable from that cache and comes back None — _term_slug() already
+    treats a falsy attribute_id as "no term list" and slugifies locally, which is
+    the documented degraded path, not a new one.
+    """
+    try:
+        from store_registry import get_store_loader
+        cache = getattr(get_store_loader(), "product_variation_schema", None) or {}
+        entry = cache.get(int(product_id)) or {}
+    except Exception:
+        return {}
+
+    axes = {}
+    for _tax, _meta in (entry.get("axes") or {}).items():
+        if not isinstance(_meta, dict):
+            continue
+        _name = str(_meta.get("name") or "").strip()
+        _opts = [str(o) for o in (_meta.get("options") or []) if str(o).strip()]
+        if _name and _opts:
+            axes[_name] = {
+                "taxonomy": str(_tax or "").strip(),
+                "attribute_id": None,
+                "options": _opts,
+            }
+    return axes
+
 def _parent_axis_meta(product_id, user_context):
     """
     Every axis the PARENT product marks as used-for-variations, with the
@@ -112,6 +151,26 @@ def _parent_axis_meta(product_id, user_context):
         logger.warning(
             f"bulk_order | parent attribute fetch failed for {product_id} | error={exc}"
         )
+
+    # The fetch failing must not make a real axis vanish. Without this, a
+    # product whose Sample Size is WooCommerce "Any" loses that axis entirely
+    # the moment the parent call fails: the variations never declare it, so
+    # the picker renders no Sample Size options AND a size the rep actually
+    # typed is reported back as matching "no option on any axis". Products
+    # like Adams, whose variations enumerate every axis, were unaffected and
+    # masked the problem.
+    #
+    # `fetched` stays False on purpose so this is NOT cached and the next turn
+    # still retries the live call — the fallback is a stopgap for a failing
+    # endpoint, never a replacement for it.
+    if not fetched:
+        axes = _axes_from_variation_schema(product_id)
+        if axes:
+            logger.warning(
+                f"bulk_order | parent attribute fetch failed for {product_id} "
+                f"— falling back to the cached variation schema "
+                f"({len(axes)} axis/axes recovered)"
+            )
 
     # Success only — a cached failure would disable the prompt for the session.
     if fetched:
