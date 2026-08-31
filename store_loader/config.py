@@ -75,7 +75,10 @@ CURRENCY_MAP = {
 
 # ── Platform selection ────────────────────────────────────────────────────────
 
-ECOMMERCE_BACKEND    = os.getenv("ECOMMERCE_BACKEND",    "woocommerce").lower()
+# Re-exported from platform_config (the single validated read) rather than a
+# second independent os.getenv -- see that module's docstring for why.
+from platform_config import ECOMMERCE_BACKEND  # noqa: F401  (re-export)
+
 SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "")
 
 # ── Shopify OAuth (client credentials flow) ───────────────────────────────────

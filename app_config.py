@@ -139,8 +139,15 @@ DEFAULT_PAYMENT_METHOD_TITLE = "Cash on Delivery"
 # ECOMMERCE BACKEND
 # ═══════════════════════════════════════════════════════════════
 
-# Supported values: "woocommerce", "shopify"
-ECOMMERCE_BACKEND = os.getenv("ECOMMERCE_BACKEND", "woocommerce").lower()
+# Supported values: "woocommerce", "shopify".
+#
+# Read and VALIDATED once in platform_config, then re-exported here so every
+# existing `from app_config import ECOMMERCE_BACKEND` call site keeps working
+# unchanged. Previously this line did its own os.getenv with a silent
+# "woocommerce" fallback, as did store_loader/config.py and
+# ecommerce/__init__.py -- three independent reads, three independent chances
+# to quietly resolve to the wrong platform. See platform_config's docstring.
+from platform_config import ECOMMERCE_BACKEND  # noqa: F401  (re-export)
 
 # ── Shopify customer identity ─────────────────────────────────────────────
 #   "app_proxy" (default, required in production)

@@ -67,8 +67,27 @@ class ShopifyTokenManager:
         """
         Load (or fetch) the initial token then start the background refresh loop.
         Call this once at server startup, after db.init_app() and db.create_all().
+
+        A failed INITIAL fetch is deliberately not fatal. _do_refresh() logs and
+        re-raises so that get_token() still surfaces the failure to whoever
+        actually needs a token -- but letting that escape from here killed the
+        whole process on a transient network blip at boot, while load_all() hit
+        the very same failure, caught it, and carried on degraded. Two paths,
+        two answers, and the strict one won by accident of ordering.
+
+        Boot degraded instead: log loudly, start the retry loop anyway, and let
+        the first request that genuinely needs a token be the thing that fails.
         """
-        self._ensure_valid_token()
+        try:
+            self._ensure_valid_token()
+        except Exception as e:
+            logger.error(
+                "ShopifyTokenManager: ⚠️  startup token fetch failed — starting "
+                "DEGRADED. Background loop will retry every "
+                f"{_RETRY_INTERVAL // 60} min; requests needing a token will "
+                f"fail until one succeeds. {type(e).__name__}: {e}",
+                exc_info=True,
+            )
         self._start_background_loop()
 
     def get_token(self) -> str:
@@ -254,7 +273,15 @@ class ShopifyTokenManager:
 
         def _loop():
             while True:
-                time.sleep(_CHECK_INTERVAL)
+                # Retry on the SHORT interval while we hold no usable token at
+                # all (i.e. the startup fetch failed and we booted degraded),
+                # and on the normal health-check cadence once one is in hand.
+                # Sleeping the full check interval first would leave a degraded
+                # boot unrecoverable for 30 minutes even after the network came
+                # back.
+                with self._lock:
+                    _have_token = bool(self._current_token)
+                time.sleep(_CHECK_INTERVAL if _have_token else _RETRY_INTERVAL)
                 try:
                     row = self._load_from_db()
                     if not row or row.needs_refresh:

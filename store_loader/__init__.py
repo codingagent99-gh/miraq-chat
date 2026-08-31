@@ -279,9 +279,21 @@ class StoreLoader(StoreQueryMixin):
         Start the background thread that periodically reloads store data.
         Also boots the Shopify token manager's refresh loop (if active).
         """
-        # Start Shopify token auto-refresh
+        # Start Shopify token auto-refresh.
+        #
+        # Guarded on purpose: the token manager now boots degraded on a failed
+        # fetch, but this call runs BEFORE the catalog refresh thread is set up
+        # below, so anything escaping here costs us both the token loop AND the
+        # catalog loop — and on a Shopify deployment that meant the server never
+        # started at all. A token problem must stay a token problem.
         if self._token_manager:
-            self._token_manager.start()
+            try:
+                self._token_manager.start()
+            except Exception as e:
+                logger.error(
+                    f"StoreLoader: Shopify token manager failed to start — {e}",
+                    exc_info=True,
+                )
 
         if DEV_CACHE_ENABLED:
             logger.info("StoreLoader: 🛑 Catalog background refresh DISABLED in dev mode")
