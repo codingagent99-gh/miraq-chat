@@ -4,6 +4,8 @@ WooCommerce API client for executing API calls.
 
 from typing import List
 import json as _json
+import threading as _threading
+import time as _health_time
 import requests as http_requests
 from requests.auth import HTTPBasicAuth
 
@@ -17,6 +19,104 @@ from chat_logger import get_logger, get_api_logger, get_order_logger, sanitize_u
 logger = get_logger("miraq_chat")
 api_logger = get_api_logger()
 order_logger = get_order_logger()
+
+# ══════════════════════════════════════════════════════════════════════
+# Upstream (WooCommerce/WordPress) health, observed from real traffic.
+#
+# An HTTP status code is not enough to tell whether the store is usable.
+# wp-social returned 200 with Content-Type: application/json while every
+# parent-product body was unparseable — any status-only probe would have
+# reported a perfectly healthy store throughout the outage.
+#
+# So health is recorded from the calls the app already makes, rather than
+# from a synthetic probe: no extra traffic, and it measures exactly what
+# the app actually experiences.
+#
+# Three outcomes, deliberately distinct:
+#   ok       — parsed first time
+#   salvaged — body was polluted but valid JSON was recovered. DEGRADED,
+#              not down: the caller got correct data. Surfacing it as an
+#              outage would black out the widget for a working store.
+#   failed   — no usable data at all.
+# ══════════════════════════════════════════════════════════════════════
+_UPSTREAM_LOCK = _threading.Lock()
+_UNHEALTHY_AFTER = 3        # consecutive hard failures before "down"
+_SALVAGE_WINDOW_S = 300     # a salvage older than this stops mattering
+
+_UPSTREAM = {
+    "consecutive_failures": 0,
+    "last_success_ts": None,
+    "last_failure_ts": None,
+    "last_failure_endpoint": "",
+    "last_failure_error": "",
+    "last_salvage_ts": None,
+    "last_salvage_endpoint": "",
+    "salvage_count": 0,
+}
+
+
+def _record_upstream(outcome, endpoint="", error=""):
+    """Record one API outcome: 'ok', 'salvaged' or 'failed'."""
+    _now = _health_time.time()
+    with _UPSTREAM_LOCK:
+        if outcome == "failed":
+            _UPSTREAM["consecutive_failures"] += 1
+            _UPSTREAM["last_failure_ts"] = _now
+            _UPSTREAM["last_failure_endpoint"] = str(endpoint)
+            _UPSTREAM["last_failure_error"] = str(error)[:200]
+            return
+        # Any usable response clears the failure streak.
+        _UPSTREAM["consecutive_failures"] = 0
+        _UPSTREAM["last_success_ts"] = _now
+        if outcome == "salvaged":
+            _UPSTREAM["salvage_count"] += 1
+            _UPSTREAM["last_salvage_ts"] = _now
+            _UPSTREAM["last_salvage_endpoint"] = str(endpoint)
+
+
+def upstream_health():
+    """Snapshot for /health. 'down' | 'degraded' | 'ok'.
+
+    down     — _UNHEALTHY_AFTER consecutive hard failures, nothing usable since
+    degraded — usable, but a body needed salvaging recently (a real server-side
+               fault that has not yet cost the user anything)
+    """
+    _now = _health_time.time()
+    with _UPSTREAM_LOCK:
+        _snap = dict(_UPSTREAM)
+
+    _fails = _snap["consecutive_failures"]
+    _recent_salvage = (
+        _snap["last_salvage_ts"] is not None
+        and (_now - _snap["last_salvage_ts"]) <= _SALVAGE_WINDOW_S
+    )
+
+    if _fails >= _UNHEALTHY_AFTER:
+        _status, _reasons = "down", [
+            f"{_fails} consecutive upstream failures",
+            f"last: {_snap['last_failure_endpoint']} — {_snap['last_failure_error']}",
+        ]
+    elif _recent_salvage:
+        _status, _reasons = "degraded", [
+            "upstream returned a polluted response body that had to be salvaged",
+            f"last: {_snap['last_salvage_endpoint']}",
+        ]
+    elif _fails:
+        _status, _reasons = "degraded", [f"{_fails} recent upstream failure(s)"]
+    else:
+        _status, _reasons = "ok", []
+
+    return {
+        "status": _status,
+        "reasons": _reasons,
+        "consecutive_failures": _fails,
+        "salvage_count": _snap["salvage_count"],
+        "seconds_since_success": (
+            round(_now - _snap["last_success_ts"], 1)
+            if _snap["last_success_ts"] else None
+        ),
+    }
+
 
 def _parse_json_tolerant(resp, endpoint_short):
     """resp.json(), but survives a body with PHP notices printed in front of it.
@@ -207,6 +307,7 @@ class WooClient:
             resp.raise_for_status()
             _elapsed_ms = round((_time.time() - _req_start) * 1000)
             data, _salvaged = _parse_json_tolerant(resp, endpoint_short)
+            _record_upstream("salvaged" if _salvaged else "ok", endpoint_short)
 
             # ── Response logging ──────────────────────────────────────────────
             # `count` is the number of ITEMS in a list-shaped response. Aggregate
@@ -310,6 +411,7 @@ class WooClient:
                 except Exception:
                     pass
             _elapsed_ms = round((_time.time() - _req_start) * 1000)
+            _record_upstream("failed", endpoint_short, str(e))
             _api_log.error(
                 f"RESPONSE {api_call.method} {endpoint_short} | "
                 f"status=ERROR | time_ms={_elapsed_ms} | "

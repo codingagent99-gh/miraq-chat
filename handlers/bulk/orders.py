@@ -415,11 +415,49 @@ def _build_bulk_confirmation_response(lines_as_dicts, conversation, user_context
     # prepared order with a confirmed address and a named recipient displayed
     # as if nothing had been found. Shallow copies only: the underlying lines
     # keep the original label, which the unresolved-line paths still rely on.
+    #
+    # Each resolved, non-skipped line also gets a group_index: several
+    # products for the same recipient share one index, so the card can show
+    # the shipping address ONCE per order instead of once per product row.
+    # Built with the exact same key _planned_order_count uses below
+    # (_order_group_key) so the address grouping can never disagree with the
+    # "N order(s)" wording already on this card — same reason it's also used
+    # to overwrite shipping_address/billing_address with the EFFECTIVE
+    # address (per-line panel edits + rep-default fallback merged in): the
+    # raw parsed block on the line can still be blank or stale at this point,
+    # and showing that instead of what's actually going to ship would make
+    # this feature actively misleading rather than just absent.
+    _address_overrides = user_context.get("bulk_address_overrides", {}) or {}
+    _rep_email = user_context.get("rep_email", "")
+    _rep_billing = user_context.get("rep_billing_address")
+    _group_index_by_key = {}
     _display_lines = []
-    for _l in lines_as_dicts:
+    for _idx, _l in enumerate(lines_as_dicts):
         if isinstance(_l, dict):
             _c = dict(_l)
             _c["customer_display_name"] = _line_recipient_display(_l)
+            if not _c.get("unresolved") and not _c.get("address_skipped"):
+                try:
+                    _key, _eff_billing, _eff_shipping = _order_group_key(
+                        _l, _idx, _address_overrides, _rep_email, _rep_billing,
+                        user_context=user_context,
+                    )
+                except Exception as exc:
+                    # Must never break the card over a display-only lookup —
+                    # fall back to a group of one, same as _planned_order_count.
+                    logger.warning(
+                        f"bulk_order | group-key lookup failed for line {_idx} "
+                        f"({_c.get('customer_display_name')}) | error={exc} — "
+                        f"showing it as its own group"
+                    )
+                    _key = ("__line__", _idx)
+                    _eff_billing = _c.get("billing_address")
+                    _eff_shipping = _c.get("shipping_address")
+                if _key not in _group_index_by_key:
+                    _group_index_by_key[_key] = len(_group_index_by_key)
+                _c["group_index"] = _group_index_by_key[_key]
+                _c["billing_address"] = _eff_billing
+                _c["shipping_address"] = _eff_shipping
             _display_lines.append(_c)
         else:
             _display_lines.append(_l)

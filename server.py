@@ -180,15 +180,54 @@ def health():
     Lightweight liveness check.
     Returns 200 OK if the server is running, 503 if store is degraded.
     """
+    from woo_client import upstream_health
+
     loader = get_store_loader()
-    degraded = loader._degraded if loader else True
-    status_code = 503 if degraded else 200
+    store_degraded = loader._degraded if loader else True
+    store_reasons = (
+        loader._degraded_reasons if loader else ["store not initialised"]
+    )
+    upstream = upstream_health()
+
+    # Three states:
+    #   down     — block the UI. This backend is up (it answered), but the
+    #              store it depends on is not usable, so letting someone type
+    #              an order only produces a failure later.
+    #   degraded — keep working, surface nothing or a soft notice. Salvaged
+    #              bodies land here: the data was correct, so blacking out the
+    #              widget would be a worse outcome than the fault itself.
+    #   ok       — normal.
+    #
+    # If the backend is unreachable the client never gets a reply at all —
+    # that is the client's own "down" signal and needs no representation here.
+    if store_degraded or upstream["status"] == "down":
+        overall = "down"
+    elif upstream["status"] == "degraded":
+        overall = "degraded"
+    else:
+        overall = "ok"
+
+    reasons = list(store_reasons or []) if store_degraded else []
+    reasons += upstream["reasons"]
+
     return jsonify({
-        "status": "degraded" if degraded else "ok",
+        "status": overall,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "degraded": degraded,
-        "degraded_reasons": loader._degraded_reasons if loader else ["store not initialised"],
-    }), status_code
+        # `degraded` kept as-is for existing callers: it has always meant
+        # "the store loader is unhealthy" and other code reads it.
+        "degraded": store_degraded,
+        "degraded_reasons": reasons or store_reasons,
+        "blocking": overall == "down",
+        "components": {
+            "backend": "ok",   # reaching this line proves it
+            "store": "degraded" if store_degraded else "ok",
+            "upstream": upstream["status"],
+        },
+        "upstream": upstream,
+        # Poll interval hint so the client does not have to hard-code one and
+        # does not hammer a struggling server while it recovers.
+        "retry_after_seconds": 5 if overall == "down" else 30,
+    }), (503 if overall == "down" else 200)
 
 
 @app.route("/status", methods=["GET"])

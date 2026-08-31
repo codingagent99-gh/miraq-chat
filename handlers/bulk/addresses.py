@@ -783,8 +783,12 @@ def handle_bulk_address_confirmation_reply(action, message, conversation, user_c
         user_context.pop("bulk_awaiting_address_text", None)
         conversation.context_data = user_context
         flag_modified(conversation, "context_data")
+        # allow_auto_confirm=False: the rep explicitly asked to edit this
+        # address, so show the panel even if it's already complete — don't
+        # let the auto-confirm shortcut re-settle it out from under them.
         return _build_address_card_response(
             resolved_lines, idx, conversation, user_context, page, start_time,
+            allow_auto_confirm=False,
         )
 
     # Step 5: Legacy free-text override.
@@ -1017,7 +1021,7 @@ def _reprompt_address_with_errors(
 
 def _build_address_card_response(
     resolved_lines, idx, conversation, user_context, page, start_time,
-    validation_errors=None,
+    validation_errors=None, allow_auto_confirm=True,
 ):
     """
     Build the SHOW_BULK_ADDRESS_CONFIRMATION card for resolved_lines[idx].
@@ -1032,6 +1036,14 @@ def _build_address_card_response(
     yes|yeah|confirm|ok|sure|correct to the bulk_address_confirmed action, so
     leaving the chip on screen would invite the rep straight back into the
     rejection they just hit.
+
+    When `allow_auto_confirm` is True (the default, used by the normal
+    advance path) and this is a fresh display (`validation_errors is None`),
+    an address that already satisfies every required field is confirmed
+    automatically — same effect as the rep replying "Yes, confirm" — and the
+    "Confirm this address?" prompt is skipped entirely. Callers that need the
+    card shown unconditionally (the rep explicitly asked to change/edit the
+    address) pass `allow_auto_confirm=False`.
     """
     current_line = resolved_lines[idx]
     user_context["bulk_current_line_index"] = idx
@@ -1179,6 +1191,36 @@ def _build_address_card_response(
         user_context.get("rep_billing_address"),
         user_context=user_context,
     )
+
+    # Auto-confirm when nothing is missing. Re-validates against the SAME
+    # effective address and the SAME required-fields set the "Yes, confirm"
+    # path checks (validate_bulk_address / get_required_fields), using the
+    # already-enriched blocks above (customer-fetch fallback, shipping-email
+    # lookup) so this can't be stricter or looser than what a manual confirm
+    # would have accepted. Only on a fresh display of the card
+    # (validation_errors is None) and only when the caller allows it — the
+    # explicit "Change address" path always passes allow_auto_confirm=False
+    # so the rep can still open the panel on an address that's technically
+    # complete but wrong.
+    if allow_auto_confirm and validation_errors is None:
+        _auto_errors = validate_bulk_address(
+            effective_billing, effective_shipping, get_required_fields()
+        )
+        if not has_errors(_auto_errors):
+            current_line["address_confirmed"] = True
+            _propagate_address_decision(resolved_lines, idx, user_context, "address_confirmed")
+            user_context["bulk_current_line_index"] = idx + 1
+            conversation.context_data = user_context
+            flag_modified(conversation, "context_data")
+            logger.info(
+                f"bulk_order | line {idx} "
+                f"({current_line.get('customer_display_name')}) address already "
+                f"has every required field — auto-confirmed, skipping the "
+                f"confirmation prompt"
+            )
+            return _advance_to_next_address_confirmation(
+                resolved_lines, idx + 1, conversation, user_context, page, start_time,
+            )
 
     addr_parts = [
         effective_shipping.get("address_1", ""),
