@@ -300,6 +300,13 @@ class OrderStatsEvaluator(IntentEvaluator):
         "of", "order", "ordered", "orders", "ordering", "pieces", "placed",
         "qtd", "quarter", "rep", "reps", "report", "samples", "sold",
         "summary", "who", "ytd",
+        # Team-scope wording (_TEAM_SCOPE_RE). Declared here for the same
+        # reason as everything above: an undeclared literal is fair game for
+        # the typo corrector, which would rewrite "team" to a catalog term
+        # before the regex ever sees it — the exact failure the chip-card
+        # fix dealt with.
+        "analytics", "direct", "group", "our", "performance", "reports",
+        "stats", "team", "totals",
     })
 
     # "how many samples/orders …", "how many did X order"
@@ -608,13 +615,43 @@ class OrderStatsEvaluator(IntentEvaluator):
         reps = self._extract_reps(text)
         return reps[0] if reps else None
 
+    # "my team" / "my reports" / "the team" — the caller asking about their own
+    # direct reports rather than a named rep.
+    #
+    # ADDITIVE: this only ever SETS entities.team_scope. It never claims a
+    # query that wasn't already claimed, never suppresses rep extraction, and
+    # never changes the returned intent or confidence — so with no manager in
+    # play every existing query behaves exactly as before.
+    #
+    # "my"/"our" is required for the possessive forms so "the sales team's
+    # numbers" said by an admin about someone else's team doesn't silently
+    # become the admin's own team. Bare "the team" is accepted because it is
+    # only ever ACTED on for a MANAGER_ROLES caller, for whom it is
+    # unambiguous.
+    _TEAM_SCOPE_RE = re.compile(
+        r"\b(?:"
+        r"(?:my|our)\s+(?:team|reports|direct\s+reports|group)"
+        r"|(?:the\s+)?team(?:'s|s')?\s+(?:orders?|numbers?|stats|analytics|"
+        r"performance|report|totals?|samples?)"
+        r"|(?:orders?|samples?|stats|analytics)\s+(?:for|by)\s+(?:my|our|the)\s+team"
+        r")\b",
+        re.IGNORECASE,
+    )
+
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
         is_count_trigger  = bool(self._COUNT_RE.search(text) or self._WHO_RE.search(text))
         is_list_trigger   = bool(self._LIST_RE.search(text))
         is_report_trigger = bool(self._REPORT_RE.search(text))
         has_named_shape   = bool(self._NAMED_LIST_RE.search(text))
 
-        if not (is_count_trigger or is_list_trigger or is_report_trigger or has_named_shape):
+        # Team wording is its own trigger: "how is my team doing this month"
+        # carries no count/list/report keyword and no rep name, so without
+        # this it would fall through to ORDER_HISTORY and the manager would
+        # get their own orders instead of their team's.
+        is_team_trigger = bool(self._TEAM_SCOPE_RE.search(text))
+
+        if not (is_count_trigger or is_list_trigger or is_report_trigger
+                or has_named_shape or is_team_trigger):
             return None, 0.0
 
         reps = self._extract_reps(text)
@@ -636,6 +673,12 @@ class OrderStatsEvaluator(IntentEvaluator):
             entities.target_rep_name = rep
             entities.target_rep_names = list(reps)
             entities.scope = "person"
+
+        # Set only. The handler decides whether to act on it, and does so only
+        # for a MANAGER_ROLES caller — so this is inert for every existing
+        # user and cannot change any current behaviour.
+        if is_team_trigger:
+            entities.team_scope = True
 
         # Precedence: an explicit count/ranking phrase always wins, even
         # when show/list wording is also present — "show me how many orders

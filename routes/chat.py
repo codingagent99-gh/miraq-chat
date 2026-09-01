@@ -159,6 +159,57 @@ from parsers.bulk_order_parser import (
 )
 
 
+def _person_scope_tokens(message: str) -> list:
+    """Name tokens to shield from typo correction in an ANALYTICS query.
+
+    Rep names are already protected store-wide: rep_name_tokens() unions every
+    project_rep display name into the fuzzy vocabulary's protected set in
+    build_fuzzy_vocab(). That works because the rep directory is small and
+    bounded.
+
+    Customers are not on that directory, and there is no bounded list of them
+    to union — so admin customer-analytics ("how many did <customer> order")
+    had no protection at all, and a customer surname could still be rewritten
+    toward a catalog term exactly as "Bullock" once became "Block". Org-chart
+    team members who are not on the project_rep select have the same gap.
+
+    So this protects per MESSAGE rather than per vocabulary, and it does it by
+    asking the evaluator itself which names it will read out of this text,
+    rather than re-implementing the name grammar here. That matters twice
+    over: the protected set is exactly the tokens that would otherwise break,
+    and it cannot drift from the extraction it is protecting.
+
+    Self-gating, so it is safe to run on every message: _extract_reps returns
+    names only for analytics-shaped phrasings, so "show me blue tiles for the
+    bathroom" yields nothing and ordinary catalog wording keeps full typo
+    correction. Deliberately narrower than _recipient_scope_tokens below,
+    which blanket-protects every for/at tail and is therefore gated to bulk
+    orders only.
+
+    Returned lowercase for correct_message(suppressed_tokens=...).
+    """
+    if not message:
+        return []
+    try:
+        from classifier.evaluators import OrderStatsEvaluator
+        names = OrderStatsEvaluator()._extract_reps(message)
+    except Exception as exc:
+        # Never block a turn on this. Losing the guard costs a possible
+        # mis-correction; raising here would cost the whole message.
+        logger.debug(f"_person_scope_tokens: skipped ({exc})")
+        return []
+
+    tokens = []
+    for name in names or []:
+        for tok in re.split(r'[^A-Za-z]+', str(name)):
+            # >= 3 chars, matching rep_name_tokens(): shorter fragments are
+            # initials and articles, and protecting those would start
+            # switching off correction for ordinary words.
+            if len(tok) >= 3:
+                tokens.append(tok.lower())
+    return tokens
+
+
 def _recipient_scope_tokens(message: str, is_bulk: bool = False) -> list:
     """
     Tokens sitting in a bulk-order scope tail — after "for"/"at" (company),
@@ -1823,17 +1874,24 @@ def chat():
                     message, is_bulk=_is_inline_bulk_order(message, store_loader)
                 )
             )
+            # Computed on the RAW message, before correction — the whole point
+            # is to name the tokens the corrector must leave alone.
+            _suppressed.extend(_person_scope_tokens(message))
             _corrected, _typo_corrections, _typo_ambiguities = correct_message(
                 message, store_loader,
                 suppressed_tokens=_suppressed,
             )
-            # Keep the ORIGINAL wording. Rep-name resolution matches against
-            # this rather than the corrected text, because correction rewrites
-            # tokens toward catalog vocabulary — "Bullock" became "Block" (a
-            # mosaic-type attribute), so the rep lookup searched for someone
-            # who does not exist. Matching the raw message sidesteps that
-            # entirely instead of trying to protect names positionally.
-            user_context["raw_message_for_names"] = message
+            # Rep and customer names are protected from being REWRITTEN by the
+            # typo corrector, not recovered afterwards. Two layers do it:
+            #   * rep names — vocabulary-wide, via rep_name_tokens() unioned
+            #     into the protected set in build_fuzzy_vocab().
+            #   * anyone else named in an analytics query (a CUSTOMER, an
+            #     org-chart team member) — per message, via
+            #     _person_scope_tokens() above, since there is no bounded
+            #     directory to union for those.
+            # This is what stops "Bullock" becoming "Block" (a mosaic
+            # attribute) and the lookup then searching for someone who does
+            # not exist.
 
             if _typo_corrections:
                 message = _corrected

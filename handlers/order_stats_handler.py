@@ -163,6 +163,73 @@ def _unresolved_note(data) -> str:
     )
 
 
+def _customer_breakdown(data) -> str:
+    """The placed/shipped split, and the per-person rows when several were asked for.
+
+    Rendered as two named figures rather than one total because on this store
+    they are routinely different sets: bulk orders record the PLACER as the
+    order's customer and the recipient only in the shipping block, so a
+    colleague ordered for by a rep owns none of their orders under the
+    "placed" sense at all. Collapsing them would answer a question nobody
+    asked.
+    """
+    people = data.get("customers") or []
+    placed  = int(data.get("placed_orders") or 0)
+    shipped = int(data.get("shipped_orders") or 0)
+    both    = int(data.get("both_orders") or 0)
+
+    out = (
+        f"\n\n- Placed by them: **{placed} order{'s' if placed != 1 else ''}**"
+        f"\n- Shipped to them: **{shipped} order{'s' if shipped != 1 else ''}**"
+    )
+    if both:
+        # Without this the two numbers look like they should sum to the total
+        # and do not. Naming the overlap is the difference between an
+        # explained figure and one that reads as a bug.
+        out += (
+            f"\n\n{both} order{'s are' if both != 1 else ' is'} in both — "
+            "they placed it and it shipped to them."
+        )
+
+    if len(people) > 1:
+        out += "\n"
+        for p in people:
+            _n = p.get("customer_name") or p.get("customer_email") or "Unknown"
+            out += (
+                f"\n- **{_n}** — {int(p.get('placed_orders') or 0)} placed, "
+                f"{int(p.get('shipped_orders') or 0)} shipped"
+            )
+        _overlap = int(data.get("overlap_orders") or 0)
+        if _overlap:
+            out += (
+                f"\n\n{_overlap} order{'s are' if _overlap != 1 else ' is'} counted "
+                "for more than one person, so the rows above add up to more than "
+                "the combined total."
+            )
+    return out
+
+
+def _unresolved_customer_note(data) -> str:
+    """Name every customer left out, so a partial report never reads as complete."""
+    missing = data.get("unresolved_customers") or []
+    if not missing:
+        return ""
+    parts = []
+    for m in missing:
+        asked = m.get("requested") or "that name"
+        if m.get("reason") == "ambiguous_customer":
+            cands = [
+                c.get("label") or c.get("email") or ""
+                for c in (m.get("matches") or [])
+            ]
+            cands = [c for c in cands if c]
+            _c = f" ({', '.join(cands[:4])})" if cands else ""
+            parts.append(f"**{asked}** matches several accounts{_c}")
+        else:
+            parts.append(f"**{asked}** didn't match any account")
+    return "\n\n Left out: " + "; ".join(parts) + "."
+
+
 def _park_date_range_prompt(conversation, user_context, rep, role, attempts=0,
                             kind="stats", mode=None, scope=None, reps=None):
     """Park the report and ask for a window. Returns the action payload.
@@ -220,6 +287,192 @@ def _park_date_range_prompt(conversation, user_context, rep, role, attempts=0,
     }
 
 
+def _customer_report(
+    names, role, customer_id, conversation, user_context, page, start_time,
+    date_after, date_before, mode, _respond,
+):
+    """Run and render the CUSTOMER-sense report for one or more named people.
+
+    Split out of handle_order_stats rather than inlined because it is reached
+    from three places — the direct route when the admin has already chosen
+    "customer", the fall-through when a name resolves to no rep, and the
+    picker re-run — and those must not drift into three renderings of the
+    same data.
+    """
+    call = endpoints.order_stats_by_customer(
+        requesting_customer_id=customer_id,
+        customer=names,
+        date_after=date_after,
+        date_before=date_before,
+        statuses=list(ORDER_REPORT_STATUSES),
+        include_orders=(mode == "list"),
+        page=page,
+        per_page=ORDER_LIST_PER_PAGE if mode == "list" else None,
+        description="Order counts by customer",
+    )
+    result = woo_client.execute(call)
+    data = result.get("data") or {}
+    asked = _join_names(names) or "that name"
+
+    if not result.get("success") or not isinstance(data, dict):
+        code = result.get("error_code")
+        if code == "customer_not_found":
+            return _respond(
+                f"I couldn't find a rep or a customer called **{asked}**. "
+                "Check the spelling, or try their full name as it appears in "
+                "WordPress.",
+                metadata={"error_code": code, "reason": "no_such_name",
+                          "requested_name": asked},
+            )
+        if code == "forbidden":
+            return _respond(
+                "Your account doesn't have permission to run that report."
+            )
+        if code == "rest_no_route":
+            # The endpoint is new. Say so plainly instead of "try again in a
+            # moment", which sends the admin to retry something that cannot
+            # succeed until the plugin is redeployed.
+            logger.warning(
+                "order_stats | /order-stats-by-customer missing — plugin build "
+                "predates customer reporting"
+            )
+            return _respond(
+                "Customer-level reporting isn't available on the store yet — "
+                "the plugin needs updating. Rep reports still work."
+            )
+        logger.warning(
+            f"order_stats | customer lookup failed: code={code!r} "
+            f"err={result.get('error')}"
+        )
+        return _respond(
+            "I couldn't pull the order figures just now. Please try again in a moment."
+        )
+
+    # ── Several accounts match the name — let the admin choose ──────────────
+    if data.get("ambiguous_customer"):
+        matches = data.get("matches") or []
+        _asked  = data.get("requested_name") or asked
+        options = [
+            f"{m.get('label')} — {m.get('email')}" if m.get("label") and m.get("email")
+            else (m.get("label") or m.get("email") or "")
+            for m in matches
+        ]
+        _clear_stats_pending(user_context)
+        user_context["pending_rep_choice"] = {
+            # kind rides on every candidate so the re-run knows which report
+            # to produce. Reusing this one picker for reps and customers is
+            # deliberate — a second, near-identical flow is how the two would
+            # drift apart on the parked keys (date_resolved, mode) that were
+            # each added here after a real bug.
+            "candidates": [
+                {"label": m.get("label"), "email": m.get("email"), "kind": "customer"}
+                for m in matches
+            ],
+            "date_after":  date_after,
+            "date_before": date_before,
+            "date_resolved": True,
+            "requested":   _asked,
+            "mode": mode,
+        }
+        conversation.flow_state = FlowState.AWAITING_REP_CHOICE.value
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+        return _respond(
+            f"**{len(matches)}** accounts match **{_asked}**. Which one did you mean?",
+            suggestions=options[:8] + ["Cancel"],
+            metadata={"flow_state": FlowState.AWAITING_REP_CHOICE.value,
+                      "candidates": options, "requested_name": _asked},
+        )
+
+    total_orders = int(data.get("total_orders") or 0)
+    total_items  = int(data.get("total_items") or 0)
+    truncated    = bool(data.get("truncated"))
+
+    # Prefer the names the PLUGIN resolved — the admin may have typed a login
+    # or a partial spelling, and echoing that back in the header makes a
+    # correct report look like it answered a different question.
+    _labels = [
+        c.get("customer_name") or c.get("customer_email")
+        for c in (data.get("customers") or [])
+        if (c.get("customer_name") or c.get("customer_email"))
+    ]
+    name       = _join_names(_labels) if _labels else asked
+    window     = _describe_range(data.get("date_after"), data.get("date_before"))
+    window_str = f" ({window})" if window else " (all time)"
+
+    if total_orders == 0:
+        return _respond(
+            f"**{name}** has no orders{window_str} — neither placed by them "
+            f"nor shipped to them." + _unresolved_customer_note(data),
+            metadata={"total_orders": 0, "person_kind": "customer"},
+        )
+
+    _meta = {
+        "total_orders": total_orders,
+        "total_items": total_items,
+        "truncated": truncated,
+        "person_kind": "customer",
+        "customers": data.get("customers") or [],
+        "unresolved_customers": data.get("unresolved_customers") or [],
+        "placed_orders": int(data.get("placed_orders") or 0),
+        "shipped_orders": int(data.get("shipped_orders") or 0),
+        "both_orders": int(data.get("both_orders") or 0),
+        "overlap_orders": int(data.get("overlap_orders") or 0),
+    }
+
+    if mode == "list":
+        raw_orders  = data.get("orders") or []
+        orders_list = [format_order_for_frontend(o) for o in raw_orders]
+        _page        = int(data.get("page") or page or 1)
+        _per_page    = int(data.get("per_page") or ORDER_LIST_PER_PAGE)
+        _total_pages = int(data.get("total_pages") or 1)
+
+        msg = (
+            f"**{name}** — **{total_orders} order{'s' if total_orders != 1 else ''}**"
+            f"{window_str}."
+        )
+        msg += _customer_breakdown(data)
+        if _total_pages > 1:
+            msg += f"\n\nShowing page {_page} of {_total_pages}."
+        if truncated:
+            msg += (
+                f"\n\nOnly the most recent {data.get('max_orders_scanned')} orders "
+                f"were scanned — this list is a minimum. Narrow the date range to "
+                f"see all of them."
+            )
+        msg += _unresolved_customer_note(data)
+
+        _meta["allow_order_download"] = is_order_report_admin(role)
+        return _respond(
+            msg,
+            metadata=_meta,
+            orders=orders_list,
+            order_pagination={
+                "page": _page,
+                "per_page": _per_page,
+                "total_items": total_orders,
+                "total_pages": _total_pages,
+                "has_more": _page < _total_pages,
+            },
+            flow_state=FlowState.IDLE.value,
+        )
+
+    msg = (
+        f"**{name}** — **{total_orders} order{'s' if total_orders != 1 else ''}**, "
+        f"**{total_items} item{'s' if total_items != 1 else ''}**{window_str}."
+    )
+    msg += _customer_breakdown(data)
+    if truncated:
+        msg += (
+            f"\n\nOnly the most recent {data.get('max_orders_scanned')} orders "
+            f"were scanned — this is a minimum. Narrow the date range for an "
+            f"exact count."
+        )
+    msg += _unresolved_customer_note(data)
+
+    return _respond(msg, metadata=_meta)
+
+
 def handle_order_stats(
     entities, role, customer_id, conversation, page, start_time,
     user_context=None,
@@ -262,7 +515,15 @@ def handle_order_stats(
     # ── Access: administrators only ─────────────────────────────────────────
     # Refuse explicitly. An unauthorized user must not get a zeroed report
     # that reads like "nobody ordered anything".
-    if not is_order_report_admin(role):
+    #
+    # ADDITIVE exception: a MANAGER asking about their own team. This grants
+    # no cross-team visibility on its own — the request goes to
+    # /order-stats-by-team, which derives the team from the caller's own WP
+    # account and refuses anyone not in the org chart. Every other query from
+    # a manager still falls to the refusal below, exactly as before.
+    _is_team_request = bool(getattr(entities, "team_scope", False)) and is_team_manager(role)
+
+    if not is_order_report_admin(role) and not _is_team_request:
         logger.info(f"order_stats | refused for role={role!r}")
         return _respond(
             "Order reporting is only available to administrators."
@@ -283,6 +544,12 @@ def handle_order_stats(
     mode = getattr(entities, "mode", None) or "count"
     if mode == "list" and not requested_rep:
         mode = "count"
+
+    # Which SENSE of the named person this is about. None means undecided, and
+    # the rep report is tried first (it is the narrower, better-attributed
+    # answer); "customer" means the admin already resolved that — via the
+    # picker, or because no rep matched — and asking again would loop.
+    person_kind = getattr(entities, "target_person_kind", None)
 
     date_after  = getattr(entities, "date_after", None)
     date_before = getattr(entities, "date_before", None)
@@ -308,67 +575,150 @@ def handle_order_stats(
             actions=[action],
         )
 
-    call = endpoints.order_stats_by_rep(
-        requesting_customer_id=customer_id,
-        date_after=date_after,
-        date_before=date_before,
-        # Every rep named in the query. target_rep_name is the first of these,
-        # kept for the paths that predate the list; sending the list is what
-        # makes "orders for cs_rep 1, cs_rep 2, cs_rep 3" cover all three
-        # rather than silently reporting on the first.
-        rep=(getattr(entities, "target_rep_names", None) or requested_rep or None),
-        statuses=list(ORDER_REPORT_STATUSES),
-        # Only meaningful with a rep named — see the mode fallback above.
-        # The plugin returns order rows alongside the totals when set, using
-        # the SAME merged (credited + self-placed) query as the count, so
-        # "how many did Jennifer order" and "show me orders by Jennifer"
-        # never disagree about which orders are hers.
-        include_orders=(mode == "list"),
-        page=page,
-        per_page=ORDER_LIST_PER_PAGE if mode == "list" else None,
-        description="Order/sample counts by rep",
-    )
-    result = woo_client.execute(call)
-    data = result.get("data") or {}
+    if person_kind == "customer" and requested_reps:
+        logger.info(f"order_stats | customer-sense report for {requested_reps!r}")
+        return _customer_report(
+            requested_reps, role, customer_id, conversation, user_context,
+            page, start_time, date_after, date_before, mode, _respond,
+        )
 
-    if not result.get("success") or not isinstance(data, dict):
-        # woo_client surfaces the plugin's own error code; use it rather than
-        # collapsing every failure into "try again", which sends the user to
-        # retry a query that will never succeed.
-        code = result.get("error_code")
-        if code == "rep_not_found":
-            # The plugin distinguishes "no user by that name" from "the user
-            # exists but has no cs_rep role" — the latter is a role-assignment
-            # problem, and reporting it as a spelling issue sends the admin
-            # hunting for a typo that isn't there.
-            _msg = result.get("error_message") or ""
-            if "cs_rep role" in _msg:
-                return _respond(
-                    f"**{requested_rep}** has a user account, but it isn't "
-                    "assigned the sales rep role, so no orders are credited to "
-                    "them. An administrator can add that role in WordPress.",
-                    metadata={"error_code": code, "reason": "not_a_rep",
-                              "requested_name": requested_rep},
+    if _is_team_request:
+        # Team-scoped. Names travel as MEMBERS: the plugin resolves each,
+        # checks it against the caller's own team, and reports any that are
+        # not on it rather than querying them. No names = the whole team.
+        #
+        # The team is never sent — it is derived plugin-side from the
+        # requesting user, so nothing here can widen the scope.
+        call = endpoints.order_stats_by_team(
+            requesting_customer_id=customer_id,
+            date_after=date_after,
+            date_before=date_before,
+            member=(getattr(entities, "target_rep_names", None) or requested_rep or None),
+            statuses=list(ORDER_REPORT_STATUSES),
+            include_orders=(mode == "list"),
+            page=page,
+            per_page=ORDER_LIST_PER_PAGE if mode == "list" else None,
+            description="Order/sample counts for the caller's team",
+        )
+    else:
+        call = endpoints.order_stats_by_rep(
+            requesting_customer_id=customer_id,
+            date_after=date_after,
+            date_before=date_before,
+            # Every rep named in the query. target_rep_name is the first of these,
+            # kept for the paths that predate the list; sending the list is what
+            # makes "orders for cs_rep 1, cs_rep 2, cs_rep 3" cover all three
+            # rather than silently reporting on the first.
+            rep=(getattr(entities, "target_rep_names", None) or requested_rep or None),
+            statuses=list(ORDER_REPORT_STATUSES),
+            # Only meaningful with a rep named — see the mode fallback above.
+            # The plugin returns order rows alongside the totals when set, using
+            # the SAME merged (credited + self-placed) query as the count, so
+            # "how many did Jennifer order" and "show me orders by Jennifer"
+            # never disagree about which orders are hers.
+            include_orders=(mode == "list"),
+            page=page,
+            per_page=ORDER_LIST_PER_PAGE if mode == "list" else None,
+            # Only for a single, not-yet-decided name. One name can be both a rep
+            # and a customer, and those are different sets of orders — the plugin
+            # hands the choice back instead of picking one silently. Left off for
+            # multi-rep queries so that live-tested path is unchanged.
+            check_collision=(len(requested_reps) == 1 and not person_kind),
+            description="Order/sample counts by rep",
+        )
+        result = woo_client.execute(call)
+        data = result.get("data") or {}
+
+        if not result.get("success") or not isinstance(data, dict):
+            # woo_client surfaces the plugin's own error code; use it rather than
+            # collapsing every failure into "try again", which sends the user to
+            # retry a query that will never succeed.
+            code = result.get("error_code")
+            if code == "rep_not_found":
+                # Not a rep — but it may well be an ordinary customer, which is a
+                # perfectly good thing to report on. Fall through to that sense
+                # rather than dead-ending on a spelling suggestion.
+                #
+                # This covers BOTH of the plugin's not-found reasons on purpose.
+                # "exists but has no cs_rep role" used to be reported as a
+                # role-assignment problem, which was the right answer only while
+                # reps were the only people reportable; now that same person is
+                # exactly who the customer report is for.
+                logger.info(
+                    f"order_stats | {requested_reps!r} matched no rep — "
+                    f"trying the customer sense"
                 )
-            return _respond(
-                f"I couldn't find a rep called **{requested_rep}**. "
-                "Check the spelling, or try their full name as it appears in "
-                "WordPress.",
-                metadata={"error_code": code, "reason": "no_such_name",
-                          "requested_name": requested_rep},
-            )
-        if code == "forbidden":
-            return _respond(
-                "Your account doesn't have permission to run that report."
-            )
-        logger.warning(
-            f"order_stats | lookup failed: code={code!r} err={result.get('error')}"
+                return _customer_report(
+                    requested_reps, role, customer_id, conversation, user_context,
+                    page, start_time, date_after, date_before, mode, _respond,
+                )
+            if code == "forbidden":
+                return _respond(
+                    "Your account doesn't have permission to run that report."
+                )
+            logger.warning(
+                f"order_stats | lookup failed: code={code!r} err={result.get('error')}"
         )
         return _respond(
             "I couldn't pull the order figures just now. Please try again in a moment."
         )
 
     total_orders  = data.get("total_orders", 0)
+
+    # ── The name is BOTH a rep and a customer — let the admin choose ────────
+    # Two different sets of orders, so neither answer is safe to assume. The
+    # candidates carry `kind`, which is what the re-run reads to decide which
+    # report to build.
+    if data.get("role_collision"):
+        matches = data.get("matches") or []
+        asked   = data.get("requested_name") or requested_rep or "that name"
+        options = [
+            f"{m.get('label')} ({'sales rep' if m.get('kind') == 'rep' else 'customer'})"
+            for m in matches
+        ]
+        _clear_stats_pending(user_context)
+        user_context["pending_rep_choice"] = {
+            "candidates": [
+                {"label": m.get("label"), "email": m.get("email"),
+                 "kind": m.get("kind") or "rep"}
+                for m in matches
+            ],
+            "date_after":  date_after,
+            "date_before": date_before,
+            "date_resolved": True,
+            "requested":   asked,
+            "mode": mode,
+        }
+        conversation.flow_state = FlowState.AWAITING_REP_CHOICE.value
+        conversation.context_data = user_context
+        flag_modified(conversation, "context_data")
+        logger.info(f"order_stats | rep/customer collision on {asked!r} — asking")
+        return _respond(
+            f"**{asked}** is both a sales rep and a customer account, and "
+            "those are different sets of orders. Which did you mean?\n\n"
+            "- **Sales rep** — orders credited to them\n"
+            "- **Customer** — orders they placed, and orders shipped to them",
+            suggestions=options[:8] + ["Cancel"],
+            metadata={"flow_state": FlowState.AWAITING_REP_CHOICE.value,
+                      "candidates": options, "requested_name": asked,
+                      "role_collision": True},
+        )
+
+    # ── Names given, none of them resolved to a rep ─────────────────────────
+    # The multi-name counterpart of the rep_not_found branch above: the plugin
+    # returns 200 with an empty filter list rather than an error. Same
+    # treatment — they may all be customers.
+    if (data.get("scope") == "named_reps"
+            and requested_reps
+            and not (data.get("rep_filters") or [])):
+        logger.info(
+            f"order_stats | none of {requested_reps!r} resolved to a rep — "
+            f"trying the customer sense"
+        )
+        return _customer_report(
+            requested_reps, role, customer_id, conversation, user_context,
+            page, start_time, date_after, date_before, mode, _respond,
+        )
 
     # ── Several cs_reps match the name — let the admin choose ───────────────
     if data.get("ambiguous_rep"):
@@ -584,6 +934,23 @@ def handle_rep_choice_reply(
         if len(partial) == 1:
             picked = partial[0]
 
+    # 4. the kind word, for a rep/customer collision — both candidates share
+    #    the same name and email there, so steps 1-3 can never separate them
+    #    and the reply the admin actually sends is "sales rep" or "customer".
+    if not picked and reply:
+        _kinds = {"sales rep": "rep", "rep": "rep", "customer": "customer"}
+        _want = None
+        for _word, _kind in _kinds.items():
+            if _word in reply:
+                # Longest match wins: "sales rep" contains "rep", and a bare
+                # "rep" must not beat it to the answer.
+                if _want is None or len(_word) > _want[0]:
+                    _want = (len(_word), _kind)
+        if _want:
+            by_kind = [c for c in candidates if (c.get("kind") or "rep") == _want[1]]
+            if len(by_kind) == 1:
+                picked = by_kind[0]
+
     if not picked:
         options = [
             f"{c.get('label')} — {c.get('email')}" for c in candidates
@@ -615,10 +982,16 @@ def handle_rep_choice_reply(
     # "show orders by Jennifer" -> "2 reps match?" -> pick -> counts come
     # back instead of the order cards that were actually asked for.
     entities.mode = pending.get("mode") or "count"
+    # Which report to build. Defaults to "rep" so every candidate parked by an
+    # older build — none of which carry a kind — behaves exactly as before.
+    # Without this the customer choice would re-run as a rep query, rediscover
+    # the same ambiguity and ask again, which reads as the picker being broken.
+    entities.target_person_kind = picked.get("kind") or "rep"
 
     logger.info(
         f"rep_choice | resolved to {picked.get('email')} "
-        f"({picked.get('label')}) — re-running report"
+        f"({picked.get('label')}) as {entities.target_person_kind} — "
+        f"re-running report"
     )
 
     role = user_context.get("role") or user_context.get("user_role")

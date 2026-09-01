@@ -733,6 +733,7 @@ class WooEndpoints:
         include_orders: bool = False,
         page: int = 1,
         per_page: Optional[int] = None,
+        check_collision: bool = False,
         description: str = "",
         requires_resolution: Optional[List[str]] = None,
     ) -> WooAPICall:
@@ -783,6 +784,12 @@ class WooEndpoints:
             params["page"] = page
             if per_page:
                 params["per_page"] = per_page
+        if check_collision:
+            # Opt-in: ask the plugin to stop and hand back a `role_collision`
+            # payload when the ONE name given matches a rep AND some other
+            # account. Off by default so multi-rep reporting — which is
+            # live-tested — behaves exactly as before.
+            params["check_collision"] = "1"
 
         return WooAPICall(
             method="GET",
@@ -790,6 +797,132 @@ class WooEndpoints:
             params=params,
             surface="custom_plugin",
             description=description or "Order/sample counts by rep",
+            requires_resolution=requires_resolution or [],
+        )
+
+    def order_stats_by_team(
+        self,
+        requesting_customer_id,
+        date_after: Optional[str] = None,
+        date_before: Optional[str] = None,
+        member: Optional[Union[str, List[str]]] = None,
+        statuses: Optional[List[str]] = None,
+        include_orders: bool = False,
+        page: int = 1,
+        per_page: Optional[int] = None,
+        description: str = "",
+        requires_resolution: Optional[List[str]] = None,
+    ) -> WooAPICall:
+        """GET /order-stats-by-team — the rep report, scoped to the caller's team.
+
+        Same response shape as `order_stats_by_rep` (the plugin delegates to
+        it), plus `scope: "team"`, `manager_email`, `team` and `team_size`.
+        Members named who are not on the caller's team come back in
+        `unresolved_reps` with reason `not_on_your_team`.
+
+        `member` names people to narrow to; omit it for the whole team. It
+        rides as the `rep` param because the plugin forwards it to the rep
+        report after checking membership — the caller never sends a team.
+
+        The TEAM ITSELF IS NEVER SENT. It is derived in the plugin from the
+        requesting user's own WP account, so nothing here can widen the scope.
+        A caller who is not a manager in the org chart gets a 403, and an empty
+        `member` list means "my whole team", never "everyone".
+        """
+        params = {"customer_id": requesting_customer_id}
+        if date_after:
+            params["after"] = date_after
+        if date_before:
+            params["before"] = date_before
+        if member:
+            if isinstance(member, (list, tuple, set)):
+                _m = [str(m).strip() for m in member if str(m).strip()]
+            else:
+                _m = [str(member).strip()] if str(member).strip() else []
+            if _m:
+                params["rep"] = ",".join(_m)
+        if statuses:
+            params["status"] = ",".join(statuses)
+        if include_orders:
+            params["list"] = "1"
+            params["page"] = page
+            if per_page:
+                params["per_page"] = per_page
+
+        return WooAPICall(
+            method="GET",
+            endpoint="/order-stats-by-team",
+            params=params,
+            surface="custom_plugin",
+            description=description or "Order/sample counts for the caller's team",
+            requires_resolution=requires_resolution or [],
+        )
+
+    def order_stats_by_customer(
+        self,
+        requesting_customer_id,
+        customer: Optional[Union[str, List[str]]] = None,
+        date_after: Optional[str] = None,
+        date_before: Optional[str] = None,
+        statuses: Optional[List[str]] = None,
+        include_orders: bool = False,
+        page: int = 1,
+        per_page: Optional[int] = None,
+        description: str = "",
+        requires_resolution: Optional[List[str]] = None,
+    ) -> WooAPICall:
+        """GET /order-stats-by-customer — order counts for named CUSTOMERS.
+
+        The customer counterpart to order_stats_by_rep. A rep owns orders via
+        `_billing_project_rep`; a customer owns them in two different senses
+        that this endpoint reports SEPARATELY rather than merging:
+
+          placed  — they are the WooCommerce customer on the order
+          shipped — they are the recipient (`_shipping_email`, or the shipping
+                    first+last name)
+
+        Both are needed because bulk orders record the PLACER as customer_id
+        and the recipient only in the shipping block, so a colleague ordered
+        for by a rep owns none of those orders under the first sense.
+
+        `customer` accepts an email OR a display name, one or several (they
+        ride as one comma-separated param, same as `rep` above, so the merged
+        list can be paged and deduped honestly). The plugin returns an
+        `ambiguous_customer` payload rather than guessing between two
+        similarly-named accounts.
+
+        Admin-gated on the plugin side — this reads another person's order
+        history.
+
+        Response carries `truncated` and `counted_statuses`; surface both
+        rather than presenting the totals bare.
+        """
+        params = {"customer_id": requesting_customer_id}
+        if date_after:
+            params["after"] = date_after
+        if date_before:
+            params["before"] = date_before
+        if customer:
+            if isinstance(customer, (list, tuple, set)):
+                _names = [str(c).strip() for c in customer if str(c).strip()]
+            else:
+                _names = [str(customer).strip()] if str(customer).strip() else []
+            if _names:
+                params["customer"] = ",".join(_names)
+        if statuses:
+            params["status"] = ",".join(statuses)
+        if include_orders:
+            params["list"] = "1"
+            params["page"] = page
+            if per_page:
+                params["per_page"] = per_page
+
+        return WooAPICall(
+            method="GET",
+            endpoint="/order-stats-by-customer",
+            params=params,
+            surface="custom_plugin",
+            description=description or "Order counts by customer",
             requires_resolution=requires_resolution or [],
         )
 

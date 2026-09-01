@@ -212,6 +212,27 @@ class ExtractedEntities:
     # been dropped.
     target_rep_names: List[str] = field(default_factory=list)
 
+    # Which SENSE of a named person the report is about: "rep" (orders
+    # credited to them via _billing_project_rep) or "customer" (orders they
+    # placed, plus orders shipped to them). None means "not yet decided" and
+    # the handler tries rep first, then customer.
+    #
+    # Exists because one name can be both, and the two answer different
+    # questions over different order sets. When the admin resolves that with
+    # the picker, this field is what carries their choice through the re-run —
+    # without it the re-run would rediscover the same ambiguity and ask again.
+    target_person_kind: Optional[str] = None
+
+    # True when the question is about the caller's TEAM ("my team", "my
+    # reports"). Routes the report to /order-stats-by-team instead of
+    # /order-stats-by-rep, which scopes it to the caller's direct reports.
+    #
+    # Only meaningful for a role in MANAGER_ROLES; ignored otherwise, so an
+    # unscoped question from anyone else keeps its existing behaviour. Names in
+    # target_rep_names still travel alongside this — with it set they are read
+    # as team MEMBERS and checked for membership, not as arbitrary reps.
+    team_scope: bool = False
+
     # "count" (a number/summary answer) or "list" (actual order cards). Set by
     # OrderStatsEvaluator. "order list for Jennifer" is list; "how many did
     # Jennifer order" is count even when list-shaped words are also present —
