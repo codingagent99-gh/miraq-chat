@@ -79,6 +79,7 @@ query ($query: String!, $first: Int!, $after: String) {
             node {
               id title price availableForSale
               selectedOptions { name value }
+              image { url }
             }
           }
         }
@@ -104,6 +105,7 @@ query ($collectionId: ID!, $first: Int!, $after: String) {
               node {
                 id title price availableForSale
                 selectedOptions { name value }
+                image { url }
               }
             }
           }
@@ -187,6 +189,7 @@ def _normalize(node: dict) -> dict:
                 "price":            e["node"]["price"],
                 "availableForSale": e["node"]["availableForSale"],
                 "selectedOptions":  e["node"]["selectedOptions"],
+                "image":            (e["node"].get("image") or {}).get("url", ""),
             }
             for e in node.get("variants", {}).get("edges", [])
         ],
@@ -624,6 +627,11 @@ def _to_woo_shape(gql_product: dict) -> dict:
                 {"name": o["name"], "option": o["value"]}
                 for o in v.get("selectedOptions", [])
             ],
+            # Matches the object shape shopify_fetcher._normalise_product() and
+            # WooCommerce's own REST API use ({id, src, alt}) — formatters.py's
+            # variation_image_urls() reads raw["image"]["src"], and every other
+            # producer of a "Woo-shaped" variation already sends it this way.
+            "image":         {"src": v.get("image", "")} if v.get("image") else {},
             "_shopify_gid": v["id"],
         })
 

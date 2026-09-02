@@ -298,6 +298,50 @@ ORDER_REPORT_ADMIN_ROLES: frozenset = _load_admin_roles()
 # Which order statuses count toward reported totals. Cancelled/refunded/failed
 # are excluded so they can't inflate a rep's sample count; on-hold IS counted
 # it counted, so a number is never unexplained.
+# ── Team (manager) reporting ─────────────────────────────────────────────────
+# Roles that may run a TEAM-scoped order report — a manager seeing their own
+# direct reports and no one else.
+#
+# Deliberately its own constant rather than an addition to
+# ORDER_REPORT_ADMIN_ROLES: that set also unlocks the store-wide all-orders
+# list, CSV download of every order, and the admin page size. A manager gets
+# none of those — only the team report.
+#
+# Membership here is NECESSARY but not SUFFICIENT. The actual team comes from
+# the plugin's org chart, resolved from the caller's own WP account, so this
+# constant only decides what the chat offers; the plugin decides what it
+# serves. A manager who is not in the org chart is refused there.
+#
+# CAPABILITY DEPENDENCY — read before adding a role here. /order-stats-by-team
+# delegates to /order-stats-by-rep, which runs require_admin(). That passes for
+# shop_manager because the role holds `manage_woocommerce`. A role WITHOUT that
+# capability (cs_project_manager may well be one — it is a custom role) reaches
+# the team endpoint, passes the org-chart check, and then gets a 403 from the
+# delegated call. The symptom is a manager who is correctly recognised but
+# whose report comes back forbidden.
+def _load_manager_roles() -> frozenset:
+    raw = os.getenv("MANAGER_ROLES_JSON", "")
+    if raw:
+        try:
+            parsed = _json.loads(raw)
+            if isinstance(parsed, list):
+                return frozenset(parsed)
+        except Exception:
+            pass
+    return frozenset({"shop_manager", "cs_project_manager"})
+
+MANAGER_ROLES: frozenset = _load_manager_roles()
+
+
+def is_team_manager(role) -> bool:
+    """True when this role may run a team-scoped report.
+
+    Unlike is_order_report_admin(), this grants NO cross-team visibility on
+    its own — the plugin intersects the request with the caller's own team.
+    """
+    return bool(role) and role in MANAGER_ROLES
+
+
 def _load_counted_statuses() -> tuple:
     raw = os.getenv("ORDER_REPORT_STATUSES_JSON", "")
     if raw:
