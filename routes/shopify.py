@@ -3,11 +3,14 @@ routes/shopify.py — Shopify-specific endpoints for the widget frontend.
 Not admin-protected — called directly by the chat widget for logged-in customers.
 """
 
+import json
 import requests
 from flask import Blueprint, jsonify, request
 from chat_logger import get_logger
 from store_loader.config import SHOPIFY_STORE_DOMAIN
+from models import db
 from models.shopify_token import ShopifyToken
+from models.shopify_order_confirmation import ShopifyOrderConfirmation
 from ecommerce.shopify_endpoints import ShopifyEndpoints
 from ecommerce.shopify_proxy import resolve_shopify_customer_id, verify_events_hmac
 from app_config import SHOPIFY_CUSTOMER_AUTH, SHOPIFY_PROXY_MAX_AGE
@@ -171,6 +174,117 @@ def shopify_product_update_event():
     logger.info(
         f"shopify events: Product/update delivery accepted | "
         f"delivery_id={delivery_id!r} shop={shop_domain!r}"
+    )
+
+    return jsonify({"received": True}), 200
+
+
+def _extract_note_attribute(payload: dict, key: str) -> str | None:
+    """Pull a single note-attribute value out of an Order payload.
+
+    Payload shape for the unstable Events API's Order topic is NOT confirmed
+    against real Shopify deliveries yet (see the TOML comment for this
+    subscription) — REST webhooks use snake_case `note_attributes: [{name,
+    value}]`; the newer per-topic Events API tends to mirror the Admin
+    GraphQL schema, which would be camelCase `noteAttributes`. Both are
+    checked so this survives whichever it turns out to be. If neither is
+    present, the raw top-level keys are logged so the actual shape can be
+    confirmed from the first real delivery and this can be trimmed down.
+    """
+    for field_name in ("note_attributes", "noteAttributes"):
+        attrs = payload.get(field_name)
+        if not attrs:
+            continue
+        for attr in attrs:
+            if attr.get("name") == key:
+                return attr.get("value")
+    return None
+
+
+def _order_is_paid(payload: dict) -> bool:
+    """True if the payload's financial status indicates payment succeeded.
+
+    Same shape uncertainty as _extract_note_attribute above — checks both
+    the REST snake_case and GraphQL-style camelCase field/value casing.
+    """
+    status = payload.get("financial_status") or payload.get("displayFinancialStatus") or ""
+    return str(status).strip().lower() == "paid"
+
+
+@shopify_bp.route("/events/order-paid", methods=["POST"])
+def shopify_order_paid_event():
+    """Receiver for the Order/update Events subscription (filtered to paid
+    orders in-handler — see the TOML comment on this subscription for why
+    there's no dedicated "paid" action here).
+
+    Correlates the order back to the widget session via a `miraq_session_id`
+    note attribute, which the frontend sets as a cart attribute
+    (platform/shopify/useCheckout.ts: prefillAndRedirect) before handing off
+    to Shopify's hosted checkout — cart attributes carry through to the
+    resulting order's note attributes automatically.
+
+    Writes a ShopifyOrderConfirmation row for /chat/order-status to pick up
+    on the widget's next poll, rather than writing the chat Message directly
+    here — keeps "did we tell the shopper yet" as a single flag the polling
+    route owns, so a retried webhook delivery can't double-post the message.
+    """
+    raw_body = request.get_data()
+    header_hmac = request.headers.get("Shopify-Hmac-Sha256")
+
+    ok, reason = verify_events_hmac(raw_body, header_hmac, SHOPIFY_CLIENT_SECRET)
+    if not ok:
+        logger.warning(f"shopify events: rejected /events/order-paid delivery | reason={reason}")
+        return jsonify({"error": "unverified_request"}), 401
+
+    delivery_id = request.headers.get("Shopify-Webhook-Id", "")
+    shop_domain = request.headers.get("Shopify-Shop-Domain", "")
+
+    try:
+        payload = json.loads(raw_body)
+    except Exception as e:
+        logger.error(
+            f"shopify events: /events/order-paid — could not parse body | "
+            f"delivery_id={delivery_id!r} error={e}"
+        )
+        return jsonify({"error": "bad_payload"}), 400
+
+    if not _order_is_paid(payload):
+        # Order/update fires on every change, not just payment — silently
+        # accept and skip the ones we don't care about.
+        return jsonify({"received": True, "skipped": "not_paid"}), 200
+
+    session_id = _extract_note_attribute(payload, "miraq_session_id")
+    if not session_id:
+        logger.warning(
+            f"shopify events: /events/order-paid — no miraq_session_id note "
+            f"attribute | delivery_id={delivery_id!r} shop={shop_domain!r} "
+            f"payload_keys={sorted(payload.keys())}"
+        )
+        return jsonify({"received": True, "skipped": "no_session_id"}), 200
+
+    order_id = str(payload.get("id") or payload.get("admin_graphql_api_id") or "")
+    order_number = str(payload.get("name") or payload.get("order_number") or "") or None
+
+    try:
+        row = db.session.get(ShopifyOrderConfirmation, session_id)
+        if row is None:
+            row = ShopifyOrderConfirmation(session_id=session_id)
+            db.session.add(row)
+        row.order_id = order_id
+        row.order_number = order_number
+        # Deliberately NOT resetting delivered=False on an update — if this
+        # session already got its confirmation message, a retried/duplicate
+        # delivery for the same order shouldn't re-trigger it.
+        db.session.commit()
+    except Exception as e:
+        logger.error(f"shopify events: /events/order-paid — DB write failed: {e}")
+        db.session.rollback()
+        return jsonify({"error": "db_write_failed"}), 500
+
+    logger.info(
+        f"shopify events: Order/update (paid) delivery accepted | "
+        f"delivery_id={delivery_id!r} shop={shop_domain!r} "
+        f"session_id={session_id!r} order_id={order_id!r}"
     )
 
     return jsonify({"received": True}), 200

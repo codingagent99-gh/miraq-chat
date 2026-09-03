@@ -1546,6 +1546,61 @@ def handle_order_confirmed():
 
     return jsonify({"success": True, "bot_message": msg_text}), 200
 
+
+@chat_bp.route("/chat/order-status", methods=["GET"])
+def handle_order_status():
+    """
+    Polled by the Shopify widget after it returns from Shopify's hosted
+    checkout (ChatWidget.tsx), since — unlike WooCommerce's in-widget
+    checkout — the widget has no client-side way to know an order was
+    placed. The order-paid webhook (routes/shopify.py:
+    shopify_order_paid_event) writes the ShopifyOrderConfirmation row this
+    reads; that row may not exist yet if the webhook hasn't landed, so the
+    frontend is expected to retry a few times with backoff rather than
+    treating a single "not found" as final.
+
+    Mirrors handle_order_confirmed's message shape/format above so the chat
+    reads the same way regardless of which platform placed the order.
+    """
+    from models.shopify_order_confirmation import ShopifyOrderConfirmation
+
+    session_id_str = request.args.get("session_id", "").strip()
+    if not session_id_str:
+        return jsonify({"error": "session_id required"}), 400
+
+    row = db.session.get(ShopifyOrderConfirmation, session_id_str)
+    if row is None:
+        return jsonify({"confirmed": False}), 200
+
+    if row.delivered:
+        # Already shown to this session on an earlier poll/page load —
+        # don't hand back a bot_message a second time.
+        return jsonify({"confirmed": True, "bot_message": None}), 200
+
+    msg_text = f"✅ Order #{row.order_number or row.order_id} placed."
+
+    try:
+        conv = Conversation.query.get(uuid.UUID(session_id_str))
+        if not conv:
+            logger.warning(f"[order_status] No Conversation found for session_id={session_id_str}")
+        if conv:
+            db.session.add(Message(
+                conversation_id=conv.id,
+                role="bot",
+                content=msg_text,
+                intent="order_placed",
+                metadata_json={},
+            ))
+        row.delivered = True
+        db.session.commit()
+    except Exception as exc:
+        logger.warning(f"[order_status] DB write failed: {exc}")
+        db.session.rollback()
+        return jsonify({"error": "db_write_failed"}), 500
+
+    return jsonify({"confirmed": True, "bot_message": msg_text}), 200
+
+
 @chat_bp.route("/chat/cart-result", methods=["POST"])
 def handle_cart_result():
     data           = request.get_json() or {}
