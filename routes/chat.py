@@ -1548,7 +1548,7 @@ def handle_order_confirmed():
 
 
 @chat_bp.route("/chat/order-status", methods=["GET"])
-def handle_order_status():
+def handle_shopify_order_status():
     """
     Polled by the Shopify widget after it returns from Shopify's hosted
     checkout (ChatWidget.tsx), since — unlike WooCommerce's in-widget
