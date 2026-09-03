@@ -597,20 +597,15 @@ def _seed_resolved_from_entities(entities, variations: list, store_loader) -> di
     return seeded
 
 
-def _variation_images_for_resolved(variations: list, resolved: dict, store_loader) -> list:
+def _variations_matching_resolved(variations: list, resolved: dict, store_loader) -> list:
     """
-    Return the image(s) of the variation that explicitly matches every axis the
-    user has already resolved (e.g. {'Colors': 'Adams Graphite'}), so the product
-    card shows the colour they actually named instead of the generic parent shot.
+    Variations whose options match EVERY axis in `resolved`, in-stock ones first.
 
     Wildcard variations — axis present but blank — are deliberately skipped: a
-    blank axis means "any", not "this colour", and its image is the parent one.
+    blank axis means "any", not "this value".
 
-    Returns [] when nothing matches or the match has no image of its own, so the
-    caller simply keeps the existing parent images.
+    Returns [] when nothing matches, so callers keep whatever default they had.
     """
-    from formatters import variation_image_urls
-
     if not resolved or not variations:
         return []
 
@@ -634,15 +629,56 @@ def _variation_images_for_resolved(variations: list, resolved: dict, store_loade
         if all(opts_norm.get(axis) == val for axis, val in resolved_norm.items()):
             matches.append(var)
 
-    if not matches:
-        return []
-
-    in_stock_first = [
+    in_stock = [
         v for v in matches
         if v.get("stock_status") != "outofstock" and v.get("in_stock") is not False
-    ] or matches
+    ]
+    in_stock_ids = {id(v) for v in in_stock}
+    return in_stock + [v for v in matches if id(v) not in in_stock_ids]
 
-    for var in in_stock_first:
+
+def _fully_resolved_variation(
+    variations: list,
+    seeded: dict,
+    variant_options: dict,
+    store_loader,
+    product_name: str = "",
+):
+    """
+    The one variation the user has ALREADY fully specified, or None.
+
+    `variant_options` is the authority on whether anything is still open: a
+    non-empty dict means at least one axis has unanswered choices, so the user
+    must still be prompted. When it is empty and the seeded axes pin a real
+    variation, there is nothing left to ask and prompting is a dead end — that
+    was the "please specify your options" reply with `variant_options: {}`.
+    """
+    if variant_options or not seeded:
+        return None
+
+    matches = _variations_matching_resolved(variations, seeded, store_loader)
+    if not matches:
+        return None
+    if len(matches) > 1:
+        logger.warning(
+            f"{len(matches)} variations match the fully-specified combination "
+            f"{seeded} for '{product_name}' — taking the first in-stock one"
+        )
+    return matches[0]
+
+
+def _variation_images_for_resolved(variations: list, resolved: dict, store_loader) -> list:
+    """
+    Return the image(s) of the variation that explicitly matches every axis the
+    user has already resolved (e.g. {'Colors': 'Adams Graphite'}), so the product
+    card shows the colour they actually named instead of the generic parent shot.
+
+    Returns [] when nothing matches or the match has no image of its own, so the
+    caller simply keeps the existing parent images.
+    """
+    from formatters import variation_image_urls
+
+    for var in _variations_matching_resolved(variations, resolved, store_loader):
         imgs = variation_image_urls(var)
         if imgs:
             logger.info(
@@ -1465,7 +1501,6 @@ def handle_quantity_and_variant_check(
                         "flow_state": FlowState.AWAITING_QUANTITY.value,
                         "pagination": default_pagination(page),
                     }), 200
-            prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug, resolved_attr_values=resolved_attr_values)
             _variant_options = _compute_variant_options(_raw_for_prompt, getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug)
             _seeded = _seed_resolved_from_entities(entities, _variations_for_cache, _sl)
             if _seeded:
@@ -1477,6 +1512,64 @@ def handle_quantity_and_variant_check(
                 )
                 if _variant_images:
                     product["images"] = _variant_images
+
+            # The message already named every axis ("Ansel - ANSEL Charcoal /
+            # Matte / 12\"x12\"", e.g. a reorder chip). Only the quantity is
+            # unknown, so ask for that instead of prompting for a selection the
+            # user has already made. pending_variation_id must be set here: the
+            # quantity reply is handled by the flow-state machine, which reads it
+            # straight from context and never re-enters this step.
+            _exact_var = _fully_resolved_variation(
+                _variations_for_cache, _seeded, _variant_options, _sl, product.get("name", "")
+            )
+            if _exact_var:
+                elapsed = time.time() - start_time
+                if _exact_var.get("stock_status") == "outofstock" or _exact_var.get("in_stock") is False:
+                    return jsonify({
+                        "success": True,
+                        "bot_message": "I'm sorry, but that specific variant is currently out of stock! 😔",
+                        "intent": intent.value,
+                        "products": products_formatted[:1],
+                        "suggestions": ["Show similar products", "Browse categories"],
+                        "session_id": session_id,
+                        "metadata": {
+                            "flow_state": FlowState.IDLE.value,
+                            "response_time_ms": round(elapsed * 1000),
+                        },
+                        "flow_state": FlowState.IDLE.value,
+                        "pagination": default_pagination(page),
+                    }), 200
+
+                _var_label = " / ".join(_get_safe_options(_exact_var.get("attributes", []), _sl).values())
+                logger.info(
+                    f"Step 5.5: all variation axes resolved from user input → "
+                    f"variation_id={_exact_var.get('id')} ({_var_label}) — asking quantity"
+                )
+                return jsonify({
+                    "success": True,
+                    "bot_message": (
+                        f"Great choice! Here's what you selected:\n\n"
+                        f"**Product:** {product['name']}\n"
+                        f"**Variant:** {_var_label}\n\n"
+                        f"How many would you like to order? Type any number of quantities you need in the chat. 🛒"
+                    ),
+                    "intent": intent.value,
+                    "products": products_formatted[:1],
+                    "suggestions": ["Cancel"],
+                    "session_id": session_id,
+                    "metadata": {
+                        "flow_state": FlowState.AWAITING_QUANTITY.value,
+                        "pending_product_id": product.get("id"),
+                        "pending_product_name": product["name"],
+                        "pending_variation_id": _exact_var["id"],
+                        "resolved_attributes": _seeded,
+                        "response_time_ms": round(elapsed * 1000),
+                    },
+                    "flow_state": FlowState.AWAITING_QUANTITY.value,
+                    "pagination": default_pagination(page),
+                }), 200
+
+            prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug, resolved_attr_values=resolved_attr_values)
             elapsed = time.time() - start_time
             return jsonify({
                 "success": True,
@@ -1572,7 +1665,6 @@ def handle_quantity_and_variant_check(
                 f"{product.get('name')} — skipping variant prompt"
             )
             return None
-        prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug, resolved_attr_values=resolved_attr_values)
         _variant_options = _compute_variant_options(_raw_for_prompt, getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug)
         # Axes the user already stated (e.g. "Adams Beige" → Colors). Returned in
         # metadata so the caller persists them; this keeps the stated color from
@@ -1580,6 +1672,62 @@ def handle_quantity_and_variant_check(
         _seeded = _seed_resolved_from_entities(entities, _variations_for_cache, _sl)
         if _seeded:
             logger.info(f"Step 3.7 (quick): Seeded resolved axes from user input → {_seeded}")
+
+        # Every axis named AND a quantity given — go straight to the cart
+        # confirmation instead of prompting for an already-made selection.
+        _exact_var = _fully_resolved_variation(
+            _variations_for_cache, _seeded, _variant_options, _sl, product.get("name", "")
+        )
+        if _exact_var:
+            elapsed = time.time() - start_time
+            if _exact_var.get("stock_status") == "outofstock" or _exact_var.get("in_stock") is False:
+                return jsonify({
+                    "success": True,
+                    "bot_message": "I'm sorry, but that specific variant is currently out of stock! 😔",
+                    "intent": intent.value,
+                    "products": products_formatted[:1],
+                    "suggestions": ["Show similar products", "Browse categories"],
+                    "session_id": session_id,
+                    "metadata": {
+                        "flow_state": FlowState.IDLE.value,
+                        "response_time_ms": round(elapsed * 1000),
+                    },
+                    "flow_state": FlowState.IDLE.value,
+                    "pagination": default_pagination(page),
+                }), 200
+
+            _var_label = " / ".join(_get_safe_options(_exact_var.get("attributes", []), _sl).values())
+            _variant_suffix = f" ({_var_label})" if _var_label else ""
+            _variant_images = _variation_images_for_resolved(_variations_for_cache, _seeded, _sl)
+            if _variant_images:
+                product["images"] = _variant_images
+            logger.info(
+                f"Step 3.7 (quick): all variation axes resolved from user input → "
+                f"variation_id={_exact_var.get('id')} ({_var_label}) — confirming cart"
+            )
+            return jsonify({
+                "success": True,
+                "bot_message": (
+                    f"Got it — add **{product['name']}**{_variant_suffix} ×{entities.quantity} to your cart?"
+                ),
+                "intent": intent.value,
+                "products": products_formatted[:1],
+                "suggestions": ["Yes, add it", "No thanks"],
+                "session_id": session_id,
+                "metadata": {
+                    "flow_state":           FlowState.AWAITING_CART_CONFIRMATION.value,
+                    "pending_product_id":   product.get("id"),
+                    "pending_product_name": product["name"],
+                    "pending_quantity":     entities.quantity,
+                    "pending_variation_id": _exact_var["id"],
+                    "resolved_attributes":  _seeded,
+                    "response_time_ms":     round(elapsed * 1000),
+                },
+                "flow_state": FlowState.AWAITING_CART_CONFIRMATION.value,
+                "pagination": default_pagination(page),
+            }), 200
+
+        prompt_msg = build_variant_prompt(_raw_for_prompt, product["name"], getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug, resolved_attr_values=resolved_attr_values)
         elapsed = time.time() - start_time
         return jsonify({
             "success": True,
