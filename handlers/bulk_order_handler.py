@@ -35,6 +35,12 @@ from app_config import (
 from conversation_flow import FlowState
 from chat_logger import get_logger
 from handlers.chat_utils import default_pagination
+from utils.checkout_fields import (
+    get_required_fields,
+    validate_bulk_address,
+    has_errors,
+    format_missing_fields,
+)
 from parsers.bulk_order_parser import parse_bulk_order_utterance, BulkOrderLine
 import re
 import difflib
@@ -204,6 +210,7 @@ def handle_bulk_order_input(message, store_loader, conversation, user_context, p
             "quantity": l.quantity,
             "product_id": l.product_id,
             "variation_id": l.variation_id,
+            "variant_hint": l.variant_hint,
             "customer_id": l.customer_id,
             "customer_display_name": l.customer_display_name,
             "is_self_order": l.is_self_order,
@@ -471,6 +478,47 @@ def _ask_for_bulk_variant(
         for var in variations
     ]
 
+    # ── Axes already settled, so the card can pre-tick rather than re-ask ────
+    # Two independent sources, both derived from data already in hand — no new
+    # parser state, and each degrades to "ask normally" when it finds nothing.
+    #
+    #   1. Single-option axes. If every variation of this product carries the
+    #      same value on an axis, that axis is decided by the catalog. The card
+    #      would render exactly one chip for it, so making the user click that
+    #      chip is a question with one possible answer.
+    #
+    #   2. The user's own words. bulk_order_parser Step 3.5 tries to pin ONE
+    #      variation from variant_hint and gives up silently when the hint
+    #      narrows to several — which is precisely when this prompt appears.
+    #      The hint is still the strongest evidence of what they decided, so a
+    #      hint that matches an option on exactly ONE axis settles that axis.
+    #
+    # A hint only settles an axis when it picks out exactly ONE option on
+    # exactly ONE axis. Both halves matter and neither is redundant:
+    #   - several axes: "white" under both Colors and Finish is ambiguous
+    #     between axes
+    #   - several options on one axis: "london white" prefixes both
+    #     "LONDON White" and "LONDON Whitewash", so the axis is narrowed but
+    #     not decided
+    # Either way the user is the one who knows, so the prompt asks.
+    preselected: dict = {}
+
+    for _name, _opts in attr_axes.items():
+        if len(_opts) == 1:
+            preselected[_name] = next(iter(_opts))
+
+    _hint = (line.get("variant_hint") or "").strip().lower()
+    if _hint:
+        _hint_matches = {
+            _name: [_opt for _opt in _opts if _hint in _opt.lower()]
+            for _name, _opts in attr_axes.items()
+        }
+        _hit_axes = {n: opts for n, opts in _hint_matches.items() if opts}
+        if len(_hit_axes) == 1:
+            _axis, _opts = next(iter(_hit_axes.items()))
+            if len(_opts) == 1:
+                preselected[_axis] = _opts[0]
+
     conversation.flow_state = FlowState.AWAITING_BULK_VARIANT_SELECTION.value
 
     # ▼ CHANGED: wrap data inside "payload" key
@@ -484,6 +532,10 @@ def _ask_for_bulk_variant(
             "quantity": line.get("quantity", 0),
             "progress": {"current": pos + 1, "total": len(needs_variant_indices)},
             "attributes": attributes,
+            # Axes already settled — the card shows these as chosen rather than
+            # asking for them again. Every axis still stays on the prompt, so a
+            # pre-ticked value can be changed.
+            "preselected": preselected,
             "variations": variation_list,
         },
     }
@@ -1611,6 +1663,22 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
     resolved_lines = [l for l in lines if not l["unresolved"]]
     address_overrides = user_context.get("bulk_address_overrides", {})
 
+    # Resolved once per batch, not per line: it is one HTTP call and the answer
+    # is identical for every line in the same request.
+    #
+    # None means the store could not be asked, which is NOT the same as "the
+    # store requires nothing". Orders still go through — refusing to place a
+    # confirmed order because a plugin endpoint was briefly unreachable is a
+    # worse failure than the one this gate prevents, and the shopper cannot act
+    # on it — but it is logged at error level so an outage is visible rather
+    # than silently degrading into no validation at all.
+    required_fields = get_required_fields()
+    if required_fields is None:
+        logger.error(
+            "bulk_order | proceeding WITHOUT address validation — the required "
+            "field set could not be fetched from /checkout-fields"
+        )
+
     confirmed_count = sum(1 for l in resolved_lines if l.get("address_confirmed"))
     skipped   = [l for l in resolved_lines if l.get("address_skipped")]
 
@@ -1678,6 +1746,36 @@ def _create_all_confirmed_orders(user_context, conversation, page, start_time):
             payload["customer_note"] = order_notes
         billing  = {k: v for k, v in billing.items() if v}
         shipping = {k: v for k, v in shipping.items() if v}
+
+        # ── Blank-address gate ───────────────────────────────────────────────
+        # POST /wc/v3/orders runs none of the validation the storefront applies
+        # at checkout, so without this an incomplete address creates a real,
+        # payable order that nobody can ship.
+        #
+        # The two address_1 guards below made that worse rather than better: an
+        # address missing only address_1 caused the ENTIRE block to be dropped,
+        # so the order was created with NO address rather than a partial one —
+        # and the shopper saw the same success message either way.
+        #
+        # Checked against the field set THIS STORE marks required at its own
+        # checkout, fetched live. Nothing is hardcoded here: a store that
+        # requires nothing blocks nothing, which is correct, because its own
+        # checkout would not have blocked it either.
+        if required_fields is not None:
+            _addr_errors = validate_bulk_address(billing, shipping, required_fields)
+            if has_errors(_addr_errors):
+                _missing = format_missing_fields(_addr_errors)
+                failed_orders.append({
+                    "customer": line["customer_display_name"],
+                    "product": line["product_name"],
+                    "error": f"Incomplete address — missing {_missing}",
+                })
+                logger.warning(
+                    f"bulk_order | BLOCKED order for {line['customer_display_name']} "
+                    f"product='{line['product_name']}' | missing={_missing}"
+                )
+                continue
+
         if billing.get("address_1"):
             payload["billing"] = billing
         if shipping.get("address_1"):

@@ -36,6 +36,12 @@ class BulkOrderLine:
     quantity_explicitly_set: bool
     product_id: Optional[int]
     variation_id: Optional[int]
+    # The attribute value the user actually typed ("london white", "matte"),
+    # carried forward from _PreLine. Step 3.5 above uses it to try to pin a
+    # single variation; when it can't, the hint is still the best evidence of
+    # what they already decided, and the variant prompt pre-ticks the axis it
+    # matches rather than asking again. Empty when they named no variant.
+    variant_hint: str
     customer_id: Optional[str]
     customer_display_name: str
     is_self_order: bool
@@ -462,6 +468,7 @@ def parse_bulk_order_utterance(
             quantity_explicitly_set=pl.quantity_explicitly_set,
             product_id=pl.product_id,
             variation_id=pl.variation_id,
+            variant_hint=pl.variant_hint or "",
             customer_id=customer_id,
             customer_display_name=customer_display_name,
             is_self_order=is_self_order,

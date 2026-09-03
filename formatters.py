@@ -218,6 +218,36 @@ def format_custom_product(raw: dict) -> dict:
         "variations":    raw.get("variations", []),
     }
 
+def variation_image_urls(raw: dict) -> list:
+    """Extract image URLs from a single variation record.
+
+    Tolerates every shape a variation reaches us in:
+      - custom compact API : "images": ["https://..."]
+      - custom API (dicts) : "images": [{"src": "https://..."}]
+      - standard WC API    : "image": {"src": "https://..."}
+
+    Returns [] when the variation carries no image of its own, so callers can
+    decide whether to fall back to the parent product's images.
+    """
+    urls = []
+    images = raw.get("images", [])
+    if isinstance(images, list):
+        for img in images:
+            if isinstance(img, str) and img:
+                urls.append(img)
+            elif isinstance(img, dict) and img.get("src"):
+                urls.append(img["src"])
+    if urls:
+        return urls
+
+    wc_image = raw.get("image")
+    if isinstance(wc_image, dict) and wc_image.get("src"):
+        return [wc_image["src"]]
+    if isinstance(wc_image, str) and wc_image:
+        return [wc_image]
+    return []
+
+
 def format_variation(raw: dict, parent: dict = None) -> dict:
     """Convert a raw WooCommerce variation to clean response format."""
     price = _safe_float(raw.get("price", ""))
@@ -250,19 +280,7 @@ def format_variation(raw: dict, parent: dict = None) -> dict:
     parent_name = parent.get("name", "") if parent else ""
     name = f"{parent_name} — {attr_label}" if attr_label else parent_name
 
-    # WooCommerce full variation API: singular "image" dict with "src"
-    wc_image = raw.get("image", {})
-    wc_image_url = wc_image.get("src", "") if isinstance(wc_image, dict) else ""
-
-    # Custom compact API: "images" as a flat list of URLs (needs backend to populate)
-    custom_images = raw.get("images", [])
-    if isinstance(custom_images, list) and custom_images:
-        var_images = [img if isinstance(img, str) else img.get("src", "") for img in custom_images]
-        var_images = [i for i in var_images if i]
-    elif wc_image_url:
-        var_images = [wc_image_url]
-    else:
-        var_images = parent.get("images", []) if parent else []
+    var_images = variation_image_urls(raw) or (parent.get("images", []) if parent else [])
 
     return {
         "id":              raw.get("id"),

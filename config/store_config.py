@@ -347,3 +347,66 @@ GENERIC_WORD_SYNONYMS: dict = _load_generic_word_synonyms()
 KNOWN_QUERY_TYPO_CORRECTIONS = {
     "quick chip": "quick ship",
 }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Bulk order — required address fields (static floor)
+#
+# The bulk flow creates orders via POST /wc/v3/orders, which runs NONE of the
+# validation WC_Checkout::validate_posted_data() applies at the real checkout.
+# utils/checkout_fields.get_required_fields() returns the UNION of this floor
+# and the live /checkout-fields response — the live response may only ADD to
+# it, never remove, so a plugin whose conditional-display rule misfires in a
+# REST context cannot silently switch the gate off.
+#
+# This is a FLOOR, not a store's field list: the minimum any store must
+# collect for an order to be fulfillable. Per-store additions come from that
+# store's own live response.
+#
+# `company` is deliberately absent. It is required on B2B stores and pointless
+# on consumer ones, and a store that needs it flags it required at checkout,
+# which the live response then picks up. Putting it in the floor would block
+# every consumer-store order for a field that store never asks for.
+# ══════════════════════════════════════════════════════════════════════════
+
+_DEFAULT_BULK_ADDRESS_REQUIRED_FLOOR = {
+    "billing": [
+        "first_name", "last_name", "country",
+        "address_1", "city", "state", "postcode", "email",
+    ],
+    "shipping": [
+        "first_name", "last_name", "country",
+        "address_1", "city", "state", "postcode",
+    ],
+}
+
+
+def _load_bulk_address_required_floor() -> dict:
+    """
+    Env override: BULK_ADDRESS_REQUIRED_FLOOR_JSON, a JSON object with any of
+    the keys "billing" / "shipping" mapping to a list of field keys. Groups
+    absent from the override keep their default. A group set to an empty list
+    is honoured — that is how a deployment switches a group off deliberately.
+
+    Process-wide, not per-tenant, which is correct for a floor: it is the
+    minimum every store must meet. Anything a single store needs on top comes
+    from that store's own /checkout-fields response.
+    """
+    raw = os.getenv("BULK_ADDRESS_REQUIRED_FLOOR_JSON", "")
+    merged = {k: list(v) for k, v in _DEFAULT_BULK_ADDRESS_REQUIRED_FLOOR.items()}
+    if not raw:
+        return merged
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return merged
+    if not isinstance(parsed, dict):
+        return merged
+    for group in ("billing", "shipping"):
+        value = parsed.get(group)
+        if isinstance(value, list):
+            merged[group] = [str(k) for k in value]
+    return merged
+
+
+BULK_ADDRESS_REQUIRED_FLOOR: dict = _load_bulk_address_required_floor()

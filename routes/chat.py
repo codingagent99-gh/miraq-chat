@@ -1279,7 +1279,8 @@ def chat():
         conversation.context_data = user_context
 
     logger.info(
-        f'POST /chat | session={session_id} | message_length={len(message)} '
+        # f'POST /chat | session={session_id} | message_length={len(message)} '
+        f'POST /chat | session={session_id} | message={message} '
         f"| customer_id={customer_id} | flow_state={conversation.flow_state}"
     )
 

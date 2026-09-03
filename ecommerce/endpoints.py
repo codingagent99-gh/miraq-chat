@@ -42,6 +42,14 @@ class EcommerceEndpoints(Protocol):
         """Row 2.2 — Fetch all product attributes and their terms (custom-plugin surface)."""
         ...
 
+    def fetch_checkout_fields(
+        self,
+        description: str = "",
+        requires_resolution: Optional[List[str]] = None,
+    ) -> WooAPICall:
+        """Fetch WC checkout field definitions (custom-plugin surface)."""
+        ...
+
     def list_categories(
         self,
         page: int,

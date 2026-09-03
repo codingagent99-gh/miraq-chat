@@ -15,7 +15,7 @@ import logging
 from datetime import datetime, timezone
 from chat_logger import get_logger
 
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import cors_manager as _cors_manager
 
 from app_config import PORT, DEBUG, STORE_NAME, USE_RELOADER
@@ -171,18 +171,108 @@ def handle_global_exception(e):
 @app.route("/health", methods=["GET"])
 def health():
     """
-    Lightweight liveness check.
-    Returns 200 OK if the server is running, 503 if store is degraded.
+    Liveness check, and the signal the widget's down-overlay is driven from.
+
+    Three states:
+      down     — block the UI. This backend is up (it answered), but the store
+                 it depends on is not usable, so letting someone type an order
+                 only produces a failure later.
+      degraded — keep working, surface nothing or a soft notice. Salvaged
+                 response bodies land here: the data was correct, so blacking
+                 out the widget would be a worse outcome than the fault itself.
+      ok       — normal.
+
+    If the backend is unreachable the client never gets a reply at all — that
+    is the client's own "down" signal and needs no representation here.
+
+    TENANT RESOLUTION (multi-store): /health is in _EXEMPT_PATHS, so the
+    before_request hook leaves g.store_loader as None and get_store_loader()
+    returns None on EVERY call — which used to make this endpoint report
+    "degraded" unconditionally. Exempt is still the right default: /health must
+    answer even for an unknown or missing license, since proving the backend is
+    reachable is half its job. So the tenant is resolved HERE, optionally: with
+    a valid license header we report that tenant's store health, and without one
+    we report only what is knowable process-wide.
     """
+    from woo_client import upstream_health
+
     loader = get_store_loader()
-    degraded = loader._degraded if loader else True
-    status_code = 503 if degraded else 200
+    store_known = False
+
+    if loader is None:
+        loader, store_known = _health_loader_for_request()
+    else:
+        store_known = True
+
+    store_degraded = bool(loader._degraded) if loader is not None else False
+    store_reasons = list(getattr(loader, "_degraded_reasons", []) or []) if loader is not None else []
+
+    if store_known and loader is None:
+        # A license was supplied and named a tenant we could not load. That is
+        # a real fault for this caller, not an unknown, so it blocks.
+        store_degraded = True
+        store_reasons = ["store not initialised for this tenant"]
+
+    upstream = upstream_health()
+
+    if store_degraded or upstream["status"] == "down":
+        overall = "down"
+    elif upstream["status"] == "degraded":
+        overall = "degraded"
+    else:
+        overall = "ok"
+
+    reasons = list(store_reasons) if store_degraded else []
+    reasons += upstream["reasons"]
+
     return jsonify({
-        "status": "degraded" if degraded else "ok",
+        "status": overall,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "degraded": degraded,
-        "degraded_reasons": loader._degraded_reasons if loader else ["store not initialised"],
-    }), status_code
+        # `degraded` kept as-is for existing callers: it has always meant
+        # "the store loader is unhealthy" and other code reads it.
+        "degraded": store_degraded,
+        "degraded_reasons": reasons or store_reasons,
+        "blocking": overall == "down",
+        "components": {
+            "backend": "ok",   # reaching this line proves it
+            # "unknown", not "ok": with no license header there is no store to
+            # speak for, and claiming health we cannot observe is worse than
+            # admitting we cannot see it.
+            "store": ("degraded" if store_degraded else "ok") if store_known else "unknown",
+            "upstream": upstream["status"],
+        },
+        "upstream": upstream,
+        # Poll interval hint so the client does not have to hard-code one and
+        # does not hammer a struggling server while it recovers.
+        "retry_after_seconds": 5 if overall == "down" else 30,
+    }), (503 if overall == "down" else 200)
+
+
+def _health_loader_for_request():
+    """Best-effort tenant loader for /health only.
+
+    Returns (loader, store_known). store_known is False when the caller sent no
+    license header — there is simply no store to report on, which is different
+    from a store that is down. Never raises: /health answering at all is the
+    point, so any failure here degrades to (None, ...) rather than a 500.
+    """
+    license_id = request.headers.get("X-MiraQ-License-Id", "").strip()
+    if not license_id:
+        return None, False
+    try:
+        from models import Tenant
+        from store_registry import get_tenant_registry
+
+        tenant = Tenant.query.filter_by(license_id=license_id).first()
+        if tenant is None:
+            return None, True
+        registry = get_tenant_registry()
+        if registry is None:
+            return None, True
+        return registry.get_loader(tenant), True
+    except Exception as e:
+        logger.warning(f"/health: could not resolve tenant loader | {e}")
+        return None, True
 
 
 @app.route("/status", methods=["GET"])

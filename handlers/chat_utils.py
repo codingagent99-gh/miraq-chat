@@ -81,10 +81,15 @@ def _resolve_attribute_term_name(attr_name: str, raw_value, store_loader=None) -
 
 
 def _normalize_attribute_lookup_name(attr_name: str) -> str:
-    raw = str(attr_name or "").strip().lower().replace("_", " ")
+    # The taxonomy prefix is stripped BEFORE underscores are folded to spaces.
+    # Done the other way round, "pa_colors" is already "pa colors" by the time
+    # the startswith("pa_") test runs, so the test never fired and the prefix
+    # was never removed — meaning a taxonomy key could not match its own label.
+    raw = str(attr_name or "").strip().lower()
     if raw.startswith("pa_"):
         raw = raw[3:]
-    return re.sub(r"\s+", " ", raw.replace("-", " ")).strip()
+    raw = raw.replace("_", " ").replace("-", " ")
+    return re.sub(r"\s+", " ", raw).strip()
 
 
 def _resolve_display_to_slug_key(attr_name: str, display_to_slug: dict = None, store_loader=None) -> str:
@@ -182,17 +187,49 @@ def _variation_matches_resolved_neutral(
         if actual_slug is None:
             continue
 
+        # A resolved value may carry SEVERAL alternative slugs joined by commas
+        # — the attribute merge emits e.g. "12-x-24,12x24,12x24-3" so the API
+        # filter can match any spelling of the same term. Treated as one literal
+        # string it matches nothing, because no variation's option is ever the
+        # whole comma-joined list. The user's 12"x24" then failed to match the
+        # variation that was literally 12"x24", and every variation was rejected.
+        #
+        # OR semantics: the alternatives describe one value, so the axis is
+        # satisfied when ANY of them matches. Values without a comma go through
+        # this unchanged as a single-element list.
+        candidates = [c.strip() for c in str(res_val).split(",") if c.strip()]
+        if not candidates:
+            continue
+
+        _norm_actual = re.sub(r'[^a-z0-9]+', '', str(actual_slug).lower())
+        matched = False
+
         if display_to_slug:
             taxonomy = taxonomy or _resolve_display_to_slug_key(res_key, display_to_slug, loader)
             term_map = display_to_slug.get(taxonomy, {})
-            expected_slug = term_map.get(str(res_val).lower(), "")
-            if expected_slug:
-                if expected_slug != actual_slug:
-                    if re.sub(r'[^a-z0-9]+', '', expected_slug.lower()) != re.sub(r'[^a-z0-9]+', '', actual_slug.lower()):
-                        return False
-                continue
+            for cand in candidates:
+                expected_slug = term_map.get(cand.lower(), "")
+                if not expected_slug:
+                    continue
+                if expected_slug == actual_slug:
+                    matched = True
+                    break
+                if re.sub(r'[^a-z0-9]+', '', expected_slug.lower()) == _norm_actual:
+                    matched = True
+                    break
+            else:
+                # No candidate had a term-map entry at all — fall through to the
+                # direct comparison below rather than declaring a mismatch, which
+                # is what the single-value path did.
+                if any(term_map.get(c.lower()) for c in candidates):
+                    return False
+        if matched:
+            continue
 
-        if re.sub(r'[^a-z0-9]+', '', str(res_val).lower()) != re.sub(r'[^a-z0-9]+', '', str(actual_slug).lower()):
+        if not any(
+            re.sub(r'[^a-z0-9]+', '', cand.lower()) == _norm_actual
+            for cand in candidates
+        ):
             return False
 
     return True
@@ -438,7 +475,20 @@ def _compute_variant_options(
     log = logging.getLogger("miraq_chat")
 
     resolved = resolved_attributes or {}
-    resolved_keys_lower = {k.lower() for k in resolved.keys()}
+    # Normalised, not just lowercased. The two sides of this comparison arrive
+    # in different shapes: resolved keys come from the merged entity attributes
+    # in SLUG form ("sample-size"), while the axis names below are catalog
+    # LABELS ("Sample Size"). Lowercasing alone leaves "sample-size" != "sample
+    # size", so a multi-word axis is never recognised as already answered and
+    # gets asked a second time — the user says 12"x24" and is immediately asked
+    # for the size. Single-word axes (Colors, Finish) matched by luck, which is
+    # why this only ever showed up on multi-word attributes.
+    #
+    # _normalize_attribute_lookup_name strips the pa_ prefix and folds hyphens
+    # and underscores to spaces, so both shapes land on the same key.
+    resolved_keys_lower = {
+        _normalize_attribute_lookup_name(k) for k in resolved.keys()
+    }
     missing_attrs: dict = {}
     store_loader = _get_store_loader_safe()
 
@@ -451,7 +501,7 @@ def _compute_variant_options(
                 continue
             name = attr.get("name", "")
             nice_name = _attribute_display_name(name, store_loader)
-            if not nice_name or nice_name.lower() in resolved_keys_lower:
+            if not nice_name or _normalize_attribute_lookup_name(nice_name) in resolved_keys_lower:
                 continue
             opts = [
                 _resolve_attribute_term_name(name, o, store_loader).strip()
@@ -459,7 +509,7 @@ def _compute_variant_options(
                 if str(o).strip()
             ]
             if opts:
-                parent_defined_axes.add(nice_name.lower())
+                parent_defined_axes.add(_normalize_attribute_lookup_name(nice_name))
                 missing_attrs[nice_name] = set(opts)
 
     # ── STEP 2: Variation scan (wildcard axes only) ──
@@ -483,7 +533,8 @@ def _compute_variant_options(
                 if not val:
                     continue
                 nice_name = _attribute_display_name(k, store_loader)
-                if nice_name.lower() in resolved_keys_lower or nice_name.lower() in parent_defined_axes:
+                _norm = _normalize_attribute_lookup_name(nice_name)
+                if _norm in resolved_keys_lower or _norm in parent_defined_axes:
                     continue
                 display_value = _resolve_attribute_term_name(k, val, store_loader)
                 missing_attrs.setdefault(nice_name, set()).add(display_value)
@@ -495,7 +546,8 @@ def _compute_variant_options(
                 if not (name and val):
                     continue
                 nice_name = _attribute_display_name(name, store_loader)
-                if nice_name.lower() in resolved_keys_lower or nice_name.lower() in parent_defined_axes:
+                _norm = _normalize_attribute_lookup_name(nice_name)
+                if _norm in resolved_keys_lower or _norm in parent_defined_axes:
                     continue
                 display_value = _resolve_attribute_term_name(name, val, store_loader)
                 missing_attrs.setdefault(nice_name, set()).add(display_value)

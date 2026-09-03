@@ -1306,8 +1306,38 @@ def handle_quantity_and_variant_check(
 
     if entities.quantity and not order_data and (product.get("type") == "variable" or product.get("variations")):
 
-        if len(_variations_for_cache) == 1:
-            _resolved_var = _variations_for_cache[0]
+        # Narrow by what the user already said before deciding whether to ask.
+        # The short-circuit below used to test the whole CACHE for a single
+        # variation, which only fires on a product that has exactly one. So
+        # "Order 1 Ansel Charcoal, Polished, 12\"x24\"" — a complete spec
+        # naming one variation out of forty — still fell through to the prompt,
+        # and since every axis was answered the prompt had nothing left to ask
+        # and rendered empty ("please specify your options" with no options).
+        #
+        # Falls back to the full list when the resolved attributes match nothing
+        # or are absent, so an under-specified request still reaches the prompt
+        # exactly as before.
+        _resolved_for_match = getattr(entities, "attributes", {}) or {}
+        _narrowed = _variations_for_cache
+        if _resolved_for_match:
+            from handlers.chat_utils import _variation_matches_resolved_neutral
+            _match = [
+                v for v in _variations_for_cache
+                if isinstance(v, dict)
+                and _variation_matches_resolved_neutral(
+                    v, _resolved_for_match, display_to_slug, _sl
+                )
+            ]
+            if _match:
+                _narrowed = _match
+                logger.info(
+                    f"Step 3.7: resolved attributes narrowed "
+                    f"{len(_variations_for_cache)} variations to {len(_match)} "
+                    f"| resolved={list(_resolved_for_match.keys())}"
+                )
+
+        if len(_narrowed) == 1:
+            _resolved_var = _narrowed[0]
             if _resolved_var.get("stock_status") == "outofstock" or _resolved_var.get("in_stock") is False:
                 elapsed = time.time() - start_time
                 return jsonify({
