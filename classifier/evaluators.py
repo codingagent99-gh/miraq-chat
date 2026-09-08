@@ -707,14 +707,15 @@ class PopularityEvaluator(IntentEvaluator):
     same entities, just ranked by total_sales instead of the default order.
     """
     KEYWORDS = frozenset({
-        "best", "highest", "most", "popular", "sell", "sellers", "selling",
-        "sells", "sold", "top",
+        "best", "highest", "most", "popular", "products", "items",
+        "sell", "sellers", "selling", "sells", "sold", "top",
     })
 
     _POPULARITY_RE = re.compile(
         r"\b(most\s+popular|best[\s-]?sellers?|top[\s-]?sellers?|"
         r"top[\s-]?selling|best[\s-]?selling|most\s+sold|highest[\s-]?selling|"
-        r"sells?\s+(?:the\s+)?(?:most|best))\b"
+        r"sells?\s+(?:the\s+)?(?:most|best)|"
+        r"popular\s+(?:products?|items?))\b"
     )
 
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
