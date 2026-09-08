@@ -672,9 +672,9 @@ def generate_bot_message(
 
     elif intent == Intent.MOST_POPULAR:
         if search_context:
-            msg += f"Here are our **{count}** most popular products for {search_context}, ranked by sales! 🔥\n\n"
+            msg += f"Here are our **{count}** most popular products for {search_context}! \n\n"
         else:
-            msg += f"Here are our **{count}** most popular products, ranked by sales! 🔥\n\n"
+            msg += f"Here are our **{count}** most popular products! \n\n"
 
     elif intent == Intent.RELATED_PRODUCTS:
         p_name = entities.product_name or "this item"

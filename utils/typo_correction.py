@@ -33,7 +33,7 @@ Skipped tokens: protected words, tokens containing digits (dimensions like
 12x24, order numbers, quantities), tokens containing @ (emails), tokens
 shorter than 4 characters.
 """
-
+import os
 import re
 from collections import namedtuple
 from typing import Optional, Union
@@ -51,6 +51,33 @@ _HAS_DIGIT_RE = re.compile(r"\d")
 _TOKEN_SPLIT_RE = re.compile(r"(\W+)")  # keep separators so text reassembles exactly
 
 _MIN_CORRECTABLE_LEN = 4
+
+# ── Common-English guard ──────────────────────────────────────────────────
+# General form of CONTROL_PHRASE_WORDS below, which had been grown by hand one
+# incident at a time ("project", "each", "chip"…) — every entry was a real word
+# the corrector should never have touched.
+#
+# Frequency, not dictionary membership: a 160k-word dictionary marks "talc" and
+# "bullnose" as known, which would shield genuine typos. zipf is a log scale —
+# 3.0 sits above every misspelling (0.00) and below nothing we need to correct.
+#
+# Guard only, NOT a correction target: widening fuzzy_vocab_terms would pull
+# catalog typos toward English neighbours.
+try:
+    from wordfreq import zipf_frequency
+    _COMMON_WORD_ZIPF_FLOOR = float(os.getenv("TYPO_COMMON_WORD_ZIPF_FLOOR", "3.0"))
+
+    def _is_common_english(token: str) -> bool:
+        return zipf_frequency(token, "en") >= _COMMON_WORD_ZIPF_FLOOR
+
+except ImportError as _e:
+    logger.warning(
+        f"[TypoFix] wordfreq unavailable ({_e}) — falling back to "
+        "CONTROL_PHRASE_WORDS only; real English words may be rewritten"
+    )
+
+    def _is_common_english(token: str) -> bool:
+        return False
 
 # ── Control / chip vocabulary — NEVER corrected ────────────────────────────
 # These are the words that carry conversational control meaning: the exit
@@ -221,6 +248,7 @@ def find_mos_confusions(message: str, suppressed_tokens=None) -> list:
         if (
             "mos" not in token
             or _MOS_TARGET in token          # mosaic / mosaics / mosaic-anything
+            or _is_common_english(token)
             or token in MOS_CONFUSION_EXEMPT
             or token in _suppressed          # shopper already declined this one
             or token in seen                 # same word twice in one message
@@ -346,6 +374,7 @@ def correct_message(message: str, loader, suppressed_tokens=None) -> tuple[str, 
             or token in _suppressed          # shopper already declined this one
             or token in CONTROL_PHRASE_WORDS  # conversational control word
             or token in loader.fuzzy_protected_words
+            or _is_common_english(token)  # real word — the shopper meant it
             # Plural/singular of a protected word is NOT a typo — Phase 1's
             # matcher is already plural-tolerant; "tiles" must not become "tile".
             or (token.endswith("s") and token[:-1] in loader.fuzzy_protected_words)

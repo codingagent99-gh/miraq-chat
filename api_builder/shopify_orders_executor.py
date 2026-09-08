@@ -50,7 +50,7 @@ execute() return envelope:
 
 import time
 from typing import Optional
-
+from datetime import datetime, timedelta, timezone
 import requests as http_requests
 
 from chat_logger import get_logger
@@ -92,6 +92,38 @@ query CustomerAddress($customer_gid: ID!) {
   }
 }
 """
+
+# Shop-wide order scan for the windowed best-seller ranking. Not customer
+# scoped, unlike _CUSTOMER_ORDERS_GQL above.
+_TOP_SELLING_ORDERS_GQL = """
+query TopSellingOrders($first: Int!, $after: String, $query: String!) {
+  orders(first: $first, after: $after, query: $query, sortKey: PROCESSED_AT) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        name
+        processedAt
+        cancelledAt
+        test
+        lineItems(first: 100) {
+          pageInfo { hasNextPage }
+          edges {
+            node {
+              quantity
+              product { id }
+              discountedTotalSet { shopMoney { amount } }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+_TOP_SELLING_ORDER_PAGE_SIZE = 100
+_TOP_SELLING_MAX_PAGES = 20
 
 # List orders for a customer, optionally filtered by date range.
 # Variables: customer_gid (String!), first (Int!), after (String),
@@ -444,6 +476,8 @@ class ShopifyOrdersExecutor:
             result = self._fetch_single_order(body, token)
         elif op == "create_order":
             result = self._create_order(body, token)
+        elif op == "top_selling_products":
+            result = self._top_selling_products(body, token)
         else:
             result = self._list_customer_orders(body, token)
             
@@ -621,7 +655,234 @@ class ShopifyOrdersExecutor:
             f"requester={customer_gid!r} — returning empty"
         )
         return self._empty_result(body)
+    
+    def _top_selling_products(self, body: dict, token: str) -> dict:
+        """
+        Shop-wide "top selling products" over a date window, ranked by units.
 
+        Deliberate choices:
+          - Ranked by UNITS, matching what Woo's total_sales counts, so both
+            backends answer the same question. Revenue breaks ties only.
+          - Cancelled and test orders are skipped. A cancelled order is not a
+            sale, and test orders would let a staging run poison the ranking.
+          - Refunds are NOT subtracted. Partial refunds need per-line refund
+            data and a second query; gross units is the defensible v1.
+          - Products that sold but are gone from the catalog are dropped, not
+            rendered as a stub — an unclickable card is worse than a short list.
+          - The result is NEVER padded to top_n from the catalog. If two
+            products sold, two come back. Padding would present unsold products
+            as best-sellers: a wrong answer in the costume of a complete one.
+        """
+        top_n = max(1, int(body.get("top_n") or 5))
+        window_days = max(1, int(body.get("window_days") or 30))
+        date_after = body.get("date_after")
+        date_before = body.get("date_before")
+
+        if not date_after:
+            date_after = (
+                datetime.now(timezone.utc) - timedelta(days=window_days)
+            ).strftime("%Y-%m-%d")
+
+        # Shopify search syntax. Quoting the date keeps the ':' inside the term
+        # rather than being read as another field separator.
+        clauses = [f"processed_at:>='{date_after}'"]
+        if date_before:
+            clauses.append(f"processed_at:<='{date_before}'")
+        search = " AND ".join(clauses)
+
+        units: dict = {}
+        revenue: dict = {}
+        orders_seen = 0
+        skipped = 0
+        truncated_line_items = False
+
+        after = None
+        for _page_no in range(_TOP_SELLING_MAX_PAGES):
+            data = _gql(
+                _TOP_SELLING_ORDERS_GQL,
+                {"first": _TOP_SELLING_ORDER_PAGE_SIZE, "after": after, "query": search},
+                token,
+            )
+            conn = (data or {}).get("orders") or {}
+            edges = conn.get("edges") or []
+
+            for edge in edges:
+                node = edge.get("node") or {}
+                if node.get("cancelledAt") or node.get("test"):
+                    skipped += 1
+                    continue
+                orders_seen += 1
+
+                li = node.get("lineItems") or {}
+                if (li.get("pageInfo") or {}).get("hasNextPage"):
+                    # >100 lines on one order: the tail is not counted. Loud
+                    # rather than silent — an undercount looks exactly like a
+                    # genuine ranking.
+                    truncated_line_items = True
+                    logger.warning(
+                        "[ShopifyOrders] top_selling: order %s has >100 line "
+                        "items; tail not counted", node.get("name"),
+                    )
+
+                for l_edge in li.get("edges") or []:
+                    ln = l_edge.get("node") or {}
+                    gid = (ln.get("product") or {}).get("id")
+                    if not gid:
+                        # Product deleted from the store — Shopify keeps the
+                        # line item but drops the reference.
+                        continue
+                    qty = int(ln.get("quantity") or 0)
+                    if qty <= 0:
+                        continue
+                    units[gid] = units.get(gid, 0) + qty
+                    amount = (
+                        ((ln.get("discountedTotalSet") or {}).get("shopMoney") or {})
+                        .get("amount")
+                    )
+                    try:
+                        revenue[gid] = revenue.get(gid, 0.0) + float(amount or 0)
+                    except (TypeError, ValueError):
+                        pass
+
+            page_info = conn.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            after = page_info.get("endCursor")
+        else:
+            logger.warning(
+                "[ShopifyOrders] top_selling: hit the %d-page cap; ranking "
+                "covers only the most recent %d orders in the window",
+                _TOP_SELLING_MAX_PAGES,
+                _TOP_SELLING_MAX_PAGES * _TOP_SELLING_ORDER_PAGE_SIZE,
+            )
+
+        # units desc, revenue desc as tie-break, then GID so two equal products
+        # don't swap places between refreshes.
+        ranked_gids = sorted(
+            units.keys(),
+            key=lambda g: (-units[g], -revenue.get(g, 0.0), str(g)),
+        )
+
+        collection_slugs = body.get("collection_slugs") or []
+        products = self._resolve_ranked_products(ranked_gids, top_n, collection_slugs)
+
+        # Grouping runs off the SAME aggregate as the overall ranking, so the
+        # two can never disagree. Suppressed when a collection was named: the
+        # shopper asked about one collection, not all of them.
+        groups = []
+        if body.get("group_by_collection") and not collection_slugs:
+            groups = self._group_by_collection(
+                ranked_gids, units, top_n, int(body.get("max_groups") or 6)
+            )
+
+        logger.info(
+            "[ShopifyOrders] top_selling | window=%s..%s orders=%d skipped=%d "
+            "distinct_products=%d returned=%d",
+            date_after, date_before or "now", orders_seen, skipped,
+            len(units), len(products),
+        )
+        if groups:
+            logger.info(
+                "[ShopifyOrders] top_selling | %d collection group(s): %s",
+                len(groups),
+                ", ".join(f"{g['name']}={g['total_units']}" for g in groups),
+            )
+
+        return {
+            "products": products,
+            "page": 1,
+            "per_page": len(products),
+            "total": len(products),
+            "_meta": {
+                "ranked_by": "units_sold",
+                "date_after": date_after,
+                "date_before": date_before,
+                "orders_counted": orders_seen,
+                "distinct_products_sold": len(units),
+                "requested_top_n": top_n,
+                "line_items_truncated": truncated_line_items,
+                "collection_slugs": collection_slugs,
+                "groups": groups,
+            },
+        }
+
+    @staticmethod
+    def _resolve_ranked_products(ranked_gids: list, top_n: int,
+                                 collection_slugs=None) -> list:
+        from store_registry import get_store_loader
+        from store_loader.shopify_fetcher import _gid_numeric
+
+        loader = get_store_loader()
+        if not loader or not getattr(loader, "products", None):
+            logger.warning("[ShopifyOrders] top_selling: store loader unavailable")
+            return []
+
+        by_id = {p.get("id"): p for p in loader.products}
+        wanted = {s.lower() for s in (collection_slugs or [])}
+
+        out = []
+        for gid in ranked_gids:
+            if len(out) >= top_n:
+                break
+            prod = by_id.get(_gid_numeric(gid, 0))
+            if prod is None:
+                continue
+            # Filter BEFORE the top_n cut, never after. Truncating first and
+            # then filtering would take the store-wide top 5 and discard the
+            # ones outside the collection — a collection whose best seller
+            # ranks 8th store-wide would come back empty.
+            if wanted:
+                slugs = {(c.get("slug") or "").lower() for c in (prod.get("categories") or [])}
+                if not (slugs & wanted):
+                    continue
+            out.append(dict(prod))
+        return out
+    
+    @staticmethod
+    def _group_by_collection(ranked_gids: list, units: dict, top_n: int,
+                             max_groups: int) -> list:
+        """
+        Per-collection best sellers, derived from the same aggregate as the
+        overall ranking — no second scan and no second source of truth.
+
+        Only collections with at least one sale in the window appear. Listing
+        every collection would pad the answer with zeros, which is the same
+        mistake as padding the overall list to five.
+
+        A product in three collections counts in all three. That is deliberate:
+        "top sellers in Aurora" is a question about Aurora, not a partition.
+        """
+        from store_registry import get_store_loader
+        from store_loader.shopify_fetcher import _gid_numeric
+
+        loader = get_store_loader()
+        if not loader or not getattr(loader, "products", None):
+            return []
+
+        by_id = {p.get("id"): p for p in loader.products}
+
+        buckets: dict = {}
+        for gid in ranked_gids:            # already in overall rank order
+            prod = by_id.get(_gid_numeric(gid, 0))
+            if prod is None:
+                continue
+            for cat in (prod.get("categories") or []):
+                slug = cat.get("slug") or ""
+                if not slug:
+                    continue
+                b = buckets.setdefault(
+                    slug, {"slug": slug, "name": cat.get("name") or slug,
+                           "total_units": 0, "products": []}
+                )
+                b["total_units"] += units.get(gid, 0)
+                if len(b["products"]) < top_n:
+                    b["products"].append(dict(prod))
+
+        return sorted(
+            buckets.values(),
+            key=lambda b: (-b["total_units"], b["name"]),
+        )[:max_groups]
+    
     # ── private: helpers ─────────────────────────────────────
 
     def _get_token(self) -> str:

@@ -372,7 +372,10 @@ def is_order_report_admin(role) -> bool:
     """
     return bool(role) and role in ORDER_REPORT_ADMIN_ROLES
 
-
+# "Most popular" ranking window and size (Shopify orders-based path).
+MOST_POPULAR_TOP_N = int(os.getenv("MOST_POPULAR_TOP_N", "5"))
+MOST_POPULAR_WINDOW_DAYS = int(os.getenv("MOST_POPULAR_WINDOW_DAYS", "30"))
+MOST_POPULAR_MAX_GROUPS = int(os.getenv("MOST_POPULAR_MAX_GROUPS", "6"))
 
 LLM_API_BASE_URL: str = _resolve_llm_api_base_url()
 

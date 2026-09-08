@@ -92,6 +92,9 @@ class Intent(Enum):
     UPDATE_CART_QTY   = "update_cart_qty"
     CHECKOUT          = "checkout"
     BULK_ORDER        = "bulk_order"
+    
+    # Support
+    HUMAN_HANDOFF          = "human_handoff"
 
 # ══════════════════════════════════════════════════════════════
 # OR PAIR — typed replacement for List[dict]

@@ -6,6 +6,12 @@ Refactored: business logic extracted into parsers/ and handlers/.
 
 import time
 import uuid
+from handlers.handoff_handler import (
+    is_human_handoff_request,
+    handle_human_handoff,
+    is_resume_after_handoff,
+    handle_resume_after_handoff,
+)
 from api_builder.store_helpers import attr_slug_for_label
 from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify
@@ -28,6 +34,7 @@ from app_config import (
     BULK_ORDER_FULL_SCOPE_ROLES,
     ECOMMERCE_BACKEND,
     get_currency_symbol,
+    MOST_POPULAR_WINDOW_DAYS
 )
 from core.actions import build_open_checkout_panel, build_open_cart_panel
 from woo_client import woo_client
@@ -1438,9 +1445,43 @@ def _build_final_response(
     if _sr_rep_features and customer_id:
         _sr_actions.append({"type": "SHOW_BULK_ORDER_BUTTON", "payload": {}})
 
+    # Per-collection best sellers. The groups ride in _meta rather than in
+    # products[] because all_products_raw is flat and would render every
+    # group's cards inline, burying the overall top 5 above them.
+    if intent == Intent.MOST_POPULAR:
+        for _resp in api_responses:
+            if not _resp.get("success"):
+                continue
+            _data = _resp.get("data")
+            # Woo's products-advanced-new puts a LIST here; only the Shopify
+            # orders executor returns a dict with _meta. Guard on the shape
+            # rather than on ECOMMERCE_BACKEND — one envelope, two payloads,
+            # and the backend flag is a second source of truth that can drift.
+            if not isinstance(_data, dict):
+                continue
+            _groups = (_data.get("_meta") or {}).get("groups")
+            if not _groups:
+                continue
+            _sr_actions.append({
+                "type": "SHOW_TOP_SELLERS_BY_COLLECTION",
+                "payload": {
+                    "window_label": f"last {MOST_POPULAR_WINDOW_DAYS} days",
+                    "groups": [{
+                        "slug": g["slug"],
+                        "name": g["name"],
+                        "total_units": g["total_units"],
+                        # Formatted here, not in the executor: format_product is
+                        # the single place raw catalog dicts become response
+                        # products, and a second path would drift from it.
+                        "products": [format_product(p) for p in g["products"]],
+                    } for g in _groups],
+                },
+            })
+            break
+
     if _sr_actions:
         response["actions"] = _sr_actions
-
+    
     return _finalize_turn(conversation, jsonify(response))
 
 
@@ -2006,6 +2047,20 @@ def chat():
             resp = handle_cancel_bulk_order(user_context, conversation, page, start_time)
             return _finalize_turn(conversation, resp)  # no address proposal on a cancel
 
+        # ── Human handoff intercept ──
+        # Sits with the other intercepts, before the flow state machine, so
+        # "talk to a person" works from any state — including mid-bulk-order,
+        # which is exactly when someone gives up on the bot.
+        if is_human_handoff_request(message):
+            resp = handle_human_handoff(conversation, page, start_time)
+            return _finalize_turn(conversation, resp)
+        
+        # ── Resume after handoff ──
+        # Above the handoff check so the two never race, and above the flow
+        # state machine so it works from any state.
+        if is_resume_after_handoff(message):
+            return _finalize_turn(conversation, handle_resume_after_handoff(conversation, page, start_time))
+
         # ── Step 0.5: Suggestion retry (early exit) ──
         sr_resp = handle_suggestion_retry(body, message, str(conversation.id), customer_id, page, start_time)
         if sr_resp:
@@ -2233,6 +2288,13 @@ def chat():
                         return _ft(llm_outcome)
                 if isinstance(llm_outcome, tuple) and len(llm_outcome) == 4:
                     intent, entities, confidence, result = llm_outcome
+        # ── Human handoff (LLM-resolved) ──
+        # The regex intercept above catches the common phrasings before we ever
+        # spend a token. This catches the ones it missed, now that human_handoff
+        # is in the LLM's closed intent set. Same handler either way, so both
+        # paths produce an identical card.
+        if intent == Intent.HUMAN_HANDOFF:
+            return _ft(handle_human_handoff(conversation, page, start_time))
 
         # ── Step 4.5: Same-value attribute collision check ──────────────────
         # Any two (or more) attributes can independently end up holding the EXACT

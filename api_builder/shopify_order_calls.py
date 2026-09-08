@@ -154,3 +154,46 @@ def build_historical_search_call(
         description=description or "Shopify: historical order search",
         surface="shopify_orders",
     )
+    
+def build_top_selling_products_call(
+    top_n: int = 5,
+    window_days: int = 30,
+    date_after: str = None,
+    date_before: str = None,
+    collection_slugs=None,
+    group_by_collection: bool = False,
+    max_groups: int = 6,
+    description: str = "",
+) -> WooAPICall:
+    """
+    Shop-wide "top selling products" over a date window.
+
+    Unlike every other builder in this module this call is NOT customer-scoped:
+    it ranks the whole store's sales. No customer_gid is written, which also
+    keeps it clear of ShopifyOrdersExecutor's not-logged-in guard — that guard
+    matches on the placeholder appearing in customer_gid, and an absent key
+    never matches.
+    """
+    body = {
+        "_op":         "top_selling_products",
+        "top_n":       top_n,
+        "window_days": window_days,
+    }
+    if date_after:
+        body["date_after"] = date_after
+    if date_before:
+        body["date_before"] = date_before
+    if collection_slugs:
+        body["collection_slugs"] = list(collection_slugs)
+    if group_by_collection:
+        body["group_by_collection"] = True
+        body["max_groups"] = max_groups
+
+    return WooAPICall(
+        method="GET",
+        endpoint="orders",
+        params={},
+        body=body,
+        description=description or f"Shopify: top {top_n} products by units sold",
+        surface="shopify_orders",
+    )

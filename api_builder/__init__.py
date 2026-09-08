@@ -15,6 +15,9 @@ from app_config import (
     DEFAULT_PER_PAGE,
     DEFAULT_ORDER_PER_PAGE,
     is_order_report_admin,
+    MOST_POPULAR_TOP_N,
+    MOST_POPULAR_WINDOW_DAYS,
+    MOST_POPULAR_MAX_GROUPS,
 )
 from config.store_config import TAG_SLUG_QUICK_SHIP
 from chat_logger import get_logger
@@ -27,7 +30,6 @@ from api_builder.store_helpers import (
 from api_builder.filter_builder import build_advanced_filter_call
 from ecommerce import endpoints
 from app_config import ECOMMERCE_BACKEND
-
 logger = get_logger("miraq_chat")
 
 # ══════════════════════════════════════════════════════════════
@@ -845,6 +847,30 @@ def _build_most_popular(e, page) -> list:
     resolved an explicit in_stock signal — including asking for out-of-stock
     ones specifically.
     """
+    
+    if ECOMMERCE_BACKEND == "shopify":
+        from api_builder.shopify_order_calls import build_top_selling_products_call
+        
+        _cats = list(e.target_category_slugs or [])
+        if e.attributes or e.tag_slugs:
+            logger.warning(
+                "[MostPopular] Shopify path ignores attribute/tag filters "
+                "(attrs=%s tags=%s) — collections are honoured, these are not",
+                e.attributes, e.tag_slugs,
+            )
+        return [build_top_selling_products_call(
+            top_n=MOST_POPULAR_TOP_N,
+            window_days=MOST_POPULAR_WINDOW_DAYS,
+            date_after=e.date_after,
+            date_before=e.date_before,
+            collection_slugs=_cats,
+            # Breakdown only when no collection was named — asking for Aurora
+            # and getting every collection back is not an answer to the question.
+            group_by_collection=not _cats,
+            max_groups=MOST_POPULAR_MAX_GROUPS,
+            description="Shopify: top selling products by units in window",
+        )]
+        
     attr_filters = resolve_attr_filters(e.attributes)
 
     attr_value_tokens = set()

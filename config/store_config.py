@@ -450,3 +450,15 @@ def _load_bulk_address_required_floor() -> dict:
 
 
 BULK_ADDRESS_REQUIRED_FLOOR: dict = _load_bulk_address_required_floor()
+
+# ═══════════════════════════════════════════════════════════════
+# HUMAN HANDOFF — WhatsApp
+# Click-to-chat only: no Meta app, no token, no webhook. The number must be
+# international format, digits only (no '+', no leading zero) — build_whatsapp_link
+# strips it anyway, but keep it clean here so the value is obvious in .env.
+# Overrides: SUPPORT_WHATSAPP_PHONE, SUPPORT_WHATSAPP_PREFILL, SUPPORT_WHATSAPP_ENABLED
+# ═══════════════════════════════════════════════════════════════
+
+SUPPORT_WHATSAPP_PHONE = os.getenv("SUPPORT_WHATSAPP_PHONE", "917358251515").strip()
+SUPPORT_WHATSAPP_PREFILL = os.getenv("SUPPORT_WHATSAPP_PREFILL", "Send Subscribe to start")
+SUPPORT_WHATSAPP_ENABLED = os.getenv("SUPPORT_WHATSAPP_ENABLED", "true").strip().lower() not in ("0", "false", "no")
