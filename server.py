@@ -449,8 +449,10 @@ def initialize_store():
     if DEV_CACHE_ENABLED and loader._loaded_from_cache:
         _print_dev_banner()
 
-
 if __name__ == "__main__":
+    if not USE_RELOADER or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        initialize_store()
+
     print("=" * 60)
     print(f"  {STORE_NAME} — Chat API Server")
     print("=" * 60)
