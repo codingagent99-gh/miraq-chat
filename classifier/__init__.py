@@ -65,10 +65,16 @@ def classify(utterance: str) -> ClassifiedResult:
     tag_text = entity_text
 
     # ─── 2. Core entity extraction ───
-    extract_product_name(entity_text, entities)
-    extract_category(entity_text, entities)
-    extract_quantity(text, entities)
-    extract_order_item(text, entities)
+    # Sub-stage timings: "nlp_classify" measured ~0.72s uncontended and ~4.0s
+    # under 10 users, but the module-level code alone runs in <1ms without a
+    # store loader -- so the cost is loader-dependent catalog scanning, and
+    # these marks say which scan.
+    import timing_logger
+    with timing_logger.stage("cls_core_extract"):
+        extract_product_name(entity_text, entities)
+        extract_category(entity_text, entities)
+        extract_quantity(text, entities)
+        extract_order_item(text, entities)
 
     # ─── 2.5. Prepare masked text for attribute/tag extraction ───
     attr_text = entity_text
@@ -98,7 +104,8 @@ def classify(utterance: str) -> ClassifiedResult:
         attr_text = re.sub(rf'\b{re.escape(pt)}\b', ' ', attr_text).strip()
 
     # ─── 2.6. Question mask ───
-    attr_text = _apply_question_mask(text, attr_text, entities)
+    with timing_logger.stage("cls_question_mask"):
+        attr_text = _apply_question_mask(text, attr_text, entities)
 
     # ─── 2.7. Date-span mask ─────────────────────────────────────────────────
     # Mask "between DAY MONTH and DAY MONTH" and "between DAY and DAY MONTH"
@@ -122,36 +129,41 @@ def classify(utterance: str) -> ClassifiedResult:
     # ─────────────────────────────────────────────────────────────────────────
 
     # ─── 3. Positive constraints ───
-    extract_attributes(attr_text, entities)
-    extract_tag(tag_text, entities)
+    with timing_logger.stage("cls_attrs_tags"):
+        extract_attributes(attr_text, entities)
+        extract_tag(tag_text, entities)
 
     # ─── 4. Secondary extractions ───
-    extract_collection_year(text, entities)
-    extract_order_id(text, entities)
-    extract_email(text, entities)
-    logger.debug("ClassifierPipeline: Calling extract_time_range")
-    extract_time_range(text, entities)
+    with timing_logger.stage("cls_secondary"):
+        extract_collection_year(text, entities)
+        extract_order_id(text, entities)
+        extract_email(text, entities)
+        logger.debug("ClassifierPipeline: Calling extract_time_range")
+        extract_time_range(text, entities)
     # Scope must be read from the RAW message here, not inside an evaluator:
     # a message the local evaluators pass on still reaches ORDER_HISTORY via
     # the LLM fallback, which returns an intent but no entities.
-    extract_order_scope(text, entities)
-    logger.debug(f"ClassifierPipeline: After extract_time_range | entities={entities}")
-    extract_unresolved_descriptors(text, entities)
-    extract_price_range(text, entities)
-    extract_customer_updates(text, entities)
-    detect_tag_operator(text, entities)
-    extract_customer_fetch(text, entities)
-    extract_stock_status(text, entities)
+        extract_order_scope(text, entities)
+        logger.debug(f"ClassifierPipeline: After extract_time_range | entities={entities}")
+        extract_unresolved_descriptors(text, entities)
+        extract_price_range(text, entities)
+        extract_customer_updates(text, entities)
+        detect_tag_operator(text, entities)
+        extract_customer_fetch(text, entities)
+        extract_stock_status(text, entities)
 
     # ─── 4.5. Isolate leftovers for vector AI ───
-    isolate_unrecognized_terms(text, entities)
+    with timing_logger.stage("cls_isolate"):
+        isolate_unrecognized_terms(text, entities)
 
     # ─── 5. Intent pipeline ───
-    pipeline = get_default_pipeline()
-    intent, confidence = pipeline.evaluate(text, entities)
+    with timing_logger.stage("cls_pipeline"):
+        pipeline = get_default_pipeline()
+        intent, confidence = pipeline.evaluate(text, entities)
 
     # ─── 6–7. Post-classification consolidation ───
-    consolidate_entities(intent, entities, text)
+    with timing_logger.stage("cls_consolidate"):
+        consolidate_entities(intent, entities, text)
 
     return ClassifiedResult(intent=intent, entities=entities, confidence=confidence)
 

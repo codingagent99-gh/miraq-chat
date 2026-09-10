@@ -1973,10 +1973,16 @@ def chat():
             # Computed on the RAW message, before correction — the whole point
             # is to name the tokens the corrector must leave alone.
             _suppressed.extend(_person_scope_tokens(message))
-            _corrected, _typo_corrections, _typo_ambiguities = correct_message(
-                message, store_loader,
-                suppressed_tokens=_suppressed,
-            )
+            # Timed separately: this runs BEFORE parse_csv_message, so it was
+            # previously hidden in the "other" bucket rather than "classify".
+            # It is the rapidfuzz Damerau-Levenshtein pass over the catalog
+            # vocabulary -- CPU-bound, so a prime GIL-contention suspect.
+            import timing_logger
+            with timing_logger.stage("typo_correct"):
+                _corrected, _typo_corrections, _typo_ambiguities = correct_message(
+                    message, store_loader,
+                    suppressed_tokens=_suppressed,
+                )
             # Rep and customer names are protected from being REWRITTEN by the
             # typo corrector, not recovered afterwards. Two layers do it:
             #   * rep names — vocabulary-wide, via rep_name_tokens() unioned
@@ -2249,6 +2255,11 @@ def chat():
         if _skip_classification:
             result = bypass_result
         else:
+            # NOT wrapped in a single "classify" stage: parse_csv_message now
+            # reports its own per-phase stages (nlp_classify, phase1_catalog,
+            # phase2_nlp, phase3_leftovers, phase4_intent). A parent stage here
+            # would double-count against those and corrupt the "other" figure,
+            # which is computed as total minus the sum of all buckets.
             result = parse_csv_message(message, store_loader)
 
         # Merge phase-1 / phase-2 entity richness

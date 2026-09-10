@@ -12,6 +12,7 @@ Endpoint:
 
 import os
 import logging
+import threading
 from datetime import datetime, timezone
 from chat_logger import get_logger
 
@@ -66,6 +67,26 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     "pool_pre_ping": True,
     "pool_recycle": 280,
+
+    # Pool sizing. SQLAlchemy's defaults are pool_size=5 / max_overflow=10,
+    # i.e. 15 connections per process -- never enough for concurrent chat
+    # traffic. A 20-user load test (Sep 2026) hit the ceiling immediately and
+    # threw "QueuePool limit of size 5 overflow 10 reached, connection timed
+    # out, timeout 30.00", which surfaced to users as a 500 and dragged
+    # median latency to 30-45s (requests parked on the 30s pool_timeout).
+    #
+    # 20 + 30 = 50 connections max from this process. Sized for gunicorn
+    # later: N workers use up to N*50, so check Postgres's own
+    # max_connections (default 100) before raising worker count -- 2 workers
+    # already saturates a default Postgres.
+    "pool_size": 20,
+    "max_overflow": 30,
+
+    # Fail fast instead of parking a request for 30s. If the pool is
+    # genuinely exhausted, a quick error is more useful than a request that
+    # looks hung -- and it makes pool pressure visible in load tests rather
+    # than hiding it as latency.
+    "pool_timeout": 10,
 }
 
 def ensure_database_exists(db_uri):
@@ -123,6 +144,13 @@ app.register_blueprint(admin_bp)
 app.register_blueprint(products_bp)
 app.register_blueprint(shopify_bp)
 app.register_blueprint(sales_rep_bp)
+
+# ── Request timing instrumentation ───────────────────────────────────────────
+# Writes plain text to logs/<date>/timing.txt, separate from chat.txt and
+# api.txt. Two lines per request: START with the message, DONE with the
+# duration. Off unless TIMING_LOG_ENABLED=true.
+import timing_logger
+timing_logger.init_app(app, db)
 
 # ═══════════════════════════════════════════
 # GLOBAL ERROR HANDLER
@@ -449,16 +477,69 @@ def initialize_store():
     if DEV_CACHE_ENABLED and loader._loaded_from_cache:
         _print_dev_banner()
 
-if __name__ == "__main__":
-    if not USE_RELOADER or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
-        initialize_store()
 
+# ═══════════════════════════════════════════
+# STORE INITIALISATION (module level)
+# ═══════════════════════════════════════════
+# Runs on IMPORT, not just under __main__, because a WSGI server
+# (gunicorn/waitress) imports this module rather than executing it as a
+# script -- so anything inside `if __name__ == "__main__"` never runs and
+# every worker would serve an empty catalog.
+#
+# Guarded so it happens exactly once per process:
+#
+#   - _store_init_lock: gunicorn's gthread worker and Werkzeug's threaded
+#     mode can both import/serve concurrently; without the lock two threads
+#     could each build a StoreLoader and one would silently win.
+#   - _store_initialised: makes a second call a no-op rather than a second
+#     full catalogue fetch.
+#   - WERKZEUG_RUN_MAIN: with the Werkzeug reloader active the module is
+#     imported twice (parent + reloaded child). Skipping the parent avoids
+#     the duplicate live fetch that showed up in the load-test logs as two
+#     "Initialization Complete" blocks.
+#
+# Set MIRAQ_SKIP_STORE_INIT=true to import this module without loading the
+# catalogue (useful for migrations, shell scripts and tests).
+
+_store_init_lock = threading.Lock()
+_store_initialised = False
+
+
+def init_store_once():
+    """Idempotent, thread-safe wrapper around initialize_store()."""
+    global _store_initialised
+    if _store_initialised:
+        return
+    with _store_init_lock:
+        if _store_initialised:
+            return
+        initialize_store()
+        _store_initialised = True
+
+
+def _should_init_store() -> bool:
+    if os.getenv("MIRAQ_SKIP_STORE_INIT", "").strip().lower() in ("true", "1", "yes"):
+        return False
+    # Under the Werkzeug reloader the parent process only watches files; the
+    # child (WERKZEUG_RUN_MAIN=true) is the one that serves requests.
+    if USE_RELOADER and DEBUG and os.getenv("WERKZEUG_RUN_MAIN") != "true":
+        return False
+    return True
+
+
+if _should_init_store():
+    init_store_once()
+
+
+if __name__ == "__main__":
     print("=" * 60)
     print(f"  {STORE_NAME} — Chat API Server")
     print("=" * 60)
     print()
 
-    initialize_store()
+    # Already done at import time above unless explicitly skipped; this is a
+    # no-op in the normal case and a safety net if it was skipped.
+    init_store_once()
 
     print()
     print(f"🚀 Starting server on http://localhost:{PORT}")
@@ -469,9 +550,18 @@ if __name__ == "__main__":
     print(f"   GET  http://localhost:{PORT}/shopify-token-status")
     print()
 
+    # threaded=True: without this, Werkzeug's dev server handles exactly
+    # ONE request at a time regardless of concurrent connections. This is
+    # NOT implied by debug=True. Confirmed via load test Sep 2026 -- every
+    # query type showed near-identical 6-8s latency regardless of actual
+    # processing cost, and aggregate throughput stayed flat for the whole
+    # run -- both signatures of requests queued behind a single serial
+    # slot rather than genuine concurrency. This is still a dev server,
+    # not a production WSGI server -- gunicorn is the real next step.
     app.run(
         host="0.0.0.0",
         port=PORT,
         debug=DEBUG,
         use_reloader= USE_RELOADER,
+        threaded=True,
     )

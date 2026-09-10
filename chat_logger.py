@@ -11,6 +11,7 @@ Sets up Python logging with:
 import os
 import re
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -19,6 +20,16 @@ from pathlib import Path
 # server from — so if the CWD changed, logs silently went somewhere else.
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _LOG_BASE_DIR = _PROJECT_ROOT / "logs"
+
+# Guards handler creation for every get_*_logger() below. Each one does
+# check-then-add ("if logger.handlers: return; else attach handlers") which
+# is not atomic. Under real concurrency -- e.g. 20 load-test threads hitting
+# an endpoint for the first time at once -- several threads pass the empty
+# check before any of them attaches a handler, so the logger ends up with N
+# handlers and every line after that logs N times. One lock across all
+# loggers is fine: this only matters at first-call setup, never on the hot
+# path of an already-configured logger.
+_handler_setup_lock = threading.Lock()
 
 
 def sanitize_log_string(text: str) -> str:
@@ -102,33 +113,36 @@ def setup_logger(name: str = "miraq_chat", log_level: str = "INFO") -> logging.L
     # your records, making it look like logging has stopped.
     logger.propagate = False
 
-    # Guard: don't add handlers a second time (e.g. Flask debug reloader)
-    if logger.handlers:
+    # Guard: don't add handlers a second time (e.g. Flask debug reloader).
+    # Lock + re-check inside: the check above alone is not atomic under
+    # concurrent first calls -- see _handler_setup_lock's docstring.
+    with _handler_setup_lock:
+        if logger.handlers:
+            return logger
+
+        formatter = _MillisecondFormatter(
+            fmt="[%(asctime)s] [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
+        # ── File Handler (daily rotation, absolute path) ──────────────────
+        try:
+            file_handler = _DailyDirectoryHandler(_LOG_BASE_DIR, "chat.txt")
+            file_handler.setLevel(logging.DEBUG)   # capture everything in file
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+        except OSError as exc:
+            # Fall back gracefully — at least console logging will still work
+            print(f"[chat_logger] WARNING: Could not create log file: {exc}")
+
+        # ── Console Handler ────────────────────────────────────────────────
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+        logger.debug(f"Logger '{name}' initialised | level={log_level.upper()}")
         return logger
-
-    formatter = _MillisecondFormatter(
-        fmt="[%(asctime)s] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    # ── File Handler (daily rotation, absolute path) ──────────────────────
-    try:
-        file_handler = _DailyDirectoryHandler(_LOG_BASE_DIR, "chat.txt")
-        file_handler.setLevel(logging.DEBUG)   # capture everything in file
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-    except OSError as exc:
-        # Fall back gracefully — at least console logging will still work
-        print(f"[chat_logger] WARNING: Could not create log file: {exc}")
-
-    # ── Console Handler ───────────────────────────────────────────────────
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(level)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-
-    logger.debug(f"Logger '{name}' initialised | level={log_level.upper()}")
-    return logger
 
 
 def sanitize_url(url: str) -> str:
@@ -163,7 +177,7 @@ def get_logger(name: str = "miraq_chat") -> logging.Logger:
     logger = logging.getLogger(name)
     if not logger.handlers:
         log_level = os.getenv("LOG_LEVEL", "INFO")
-        setup_logger(name, log_level)
+        setup_logger(name, log_level)  # setup_logger takes the lock itself
     return logger
 
 
@@ -185,29 +199,37 @@ def get_api_logger() -> logging.Logger:
     if logger.handlers:
         return logger
 
-    logger.setLevel(logging.DEBUG)
-    logger.propagate = False
+    # Lock + re-check: the bare check above races under concurrent first
+    # calls. Everything that mutates the logger -- setLevel, propagate, AND
+    # every addHandler -- must stay inside the lock together; a handler
+    # added outside it is exactly the race this exists to close.
+    with _handler_setup_lock:
+        if logger.handlers:
+            return logger
 
-    formatter = _MillisecondFormatter(
-        fmt="[%(asctime)s] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
 
-    try:
-        file_handler = _DailyDirectoryHandler(_LOG_BASE_DIR, "api.txt")
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-    except OSError as exc:
-        print(f"[chat_logger] WARNING: Could not create api log file: {exc}")
+        formatter = _MillisecondFormatter(
+            fmt="[%(asctime)s] [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
 
-    # Console: only show at WARNING+ by default to keep stdout clean
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.WARNING)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+        try:
+            file_handler = _DailyDirectoryHandler(_LOG_BASE_DIR, "api.txt")
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+        except OSError as exc:
+            print(f"[chat_logger] WARNING: Could not create api log file: {exc}")
 
-    return logger
+        # Console: only show at WARNING+ by default to keep stdout clean
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.WARNING)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+        return logger
 
 
 def get_order_logger() -> logging.Logger:
@@ -232,25 +254,77 @@ def get_order_logger() -> logging.Logger:
     if logger.handlers:
         return logger
 
-    logger.setLevel(logging.DEBUG)
-    logger.propagate = False
+    # Lock + re-check: the bare check above races under concurrent first
+    # calls. Everything that mutates the logger stays inside the lock.
+    with _handler_setup_lock:
+        if logger.handlers:
+            return logger
 
-    formatter = _MillisecondFormatter(
-        fmt="[%(asctime)s] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
 
-    try:
-        file_handler = _DailyDirectoryHandler(_LOG_BASE_DIR, "orders.txt")
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-    except OSError as exc:
-        print(f"[chat_logger] WARNING: Could not create orders log file: {exc}")
+        formatter = _MillisecondFormatter(
+            fmt="[%(asctime)s] [%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
 
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.WARNING)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+        try:
+            file_handler = _DailyDirectoryHandler(_LOG_BASE_DIR, "orders.txt")
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+        except OSError as exc:
+            print(f"[chat_logger] WARNING: Could not create orders log file: {exc}")
 
-    return logger
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.WARNING)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+        return logger
+
+
+def get_timing_logger() -> logging.Logger:
+    """
+    Get a dedicated logger for request timing (start/completion), used for
+    load-test instrumentation.
+
+    Writes to logs/YYYY-MM-DD/timing.txt — separate from chat.txt, api.txt,
+    and orders.txt, so timing lines can be read on their own without being
+    interleaved with everything else a request logs.
+
+    No console handler at all (unlike get_api_logger/get_order_logger, which
+    show WARNING+ on console) -- this logger is for measuring latency, and a
+    console write is itself slow enough to distort the thing being measured.
+
+    Returns:
+        Logger instance named "miraq_timing"
+    """
+    name = "miraq_timing"
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger
+
+    # Lock + re-check: the bare check above races under concurrent first
+    # calls. Everything that mutates the logger stays inside the lock.
+    with _handler_setup_lock:
+        if logger.handlers:
+            return logger
+
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+
+        formatter = _MillisecondFormatter(
+            fmt="[%(asctime)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
+        try:
+            file_handler = _DailyDirectoryHandler(_LOG_BASE_DIR, "timing.txt")
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+        except OSError as exc:
+            print(f"[chat_logger] WARNING: Could not create timing log file: {exc}")
+
+        return logger

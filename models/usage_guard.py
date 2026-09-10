@@ -34,8 +34,15 @@ def enforce_daily_limit(f):
         if plan and plan.is_active_premium:
             return f(*args, **kwargs)
 
-        # Increment store's daily counter and check
-        new_count, exceeded = ChatUsage.increment_and_check(limit=DAILY_FREE_LIMIT)
+        # Increment store's daily counter and check.
+        # Timed: this is an INSERT ... ON CONFLICT against ONE shared row
+        # (today's date) followed by a commit, so every concurrent request
+        # takes a Postgres row lock on the SAME row and they serialize here.
+        # If usage_guard dominates the timing breakdown, that lock is the
+        # bottleneck (premium stores skip this path entirely).
+        import timing_logger
+        with timing_logger.stage("usage_guard"):
+            new_count, exceeded = ChatUsage.increment_and_check(limit=DAILY_FREE_LIMIT)
         if exceeded:
             reset_at = datetime.combine(
                 date.today() + timedelta(days=1),

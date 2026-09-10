@@ -6,6 +6,7 @@ and don't clutter the loading/building logic.
 """
 
 import re
+import logging
 import datetime as _dt
 import time as _time
 from typing import List, Dict, Optional
@@ -30,8 +31,32 @@ class StoreQueryMixin:
     Expects the host class to have all lookup dictionaries populated.
     """
     
+    # Declared for type checkers only -- these are populated on StoreLoader,
+    # which mixes this class in, so at runtime they always exist. Without the
+    # declarations a checker analysing the mixin in isolation reports
+    # "Cannot access attribute X for class StoreQueryMixin".
     attribute_by_key: "Dict[str, CatalogAttribute]"
+    attribute_by_id: "Dict[int, CatalogAttribute]"
     category_by_id: "Dict[int, dict]"
+    category_by_key: "Dict[str, dict]"
+    category_keywords: "Dict[str, int]"
+    category_slugs_by_name: "Dict[str, List[str]]"
+    product_by_name_lower: "Dict[str, Dict]"
+    product_variation_schema: "Dict"
+    products: "List[Dict]"
+    tag_by_key: "Dict[str, dict]"
+    tag_by_name_lower: "Dict[str, dict]"
+    variation_detail_cache: "Dict"
+    _store_generic_terms: "set"
+    attributes: "List"
+    categories: "List"
+    tags: "List"
+    _degraded: bool
+    _degraded_reasons: "List[str]"
+    _expected_product_count: "Optional[int]"
+    _last_loaded: "Optional[float]"
+    _loaded_from_cache: bool
+    _retry_interval: "int"
 
     # ─── Category queries ───
 
@@ -111,13 +136,22 @@ class StoreQueryMixin:
         text_lower = text.lower()
         candidates = []
         
-        logger.debug(f"get_product_for_text: size={len(self.product_by_name_lower)} sample={list(self.product_by_name_lower.keys())[:5]}")  # ← ADD THIS
+        # Lazy %-style args, not f-strings: an f-string is built BEFORE
+        # logger.debug decides to discard it, so the old version materialised
+        # all product keys on every call even with DEBUG off.
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "get_product_for_text: size=%d sample=%s",
+                len(self.product_by_name_lower),
+                list(self.product_by_name_lower.keys())[:5],
+            )
 
         for name_lower, entry in self.product_by_name_lower.items():
             if re.search(rf'\b{re.escape(name_lower)}\b', text_lower):
                 candidates.append(entry)
-                
-        logger.debug(f"get_product_for_text: candidates={candidates}")
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("get_product_for_text: candidates=%s", candidates)
 
         stop_words = self._store_generic_terms.copy()
         stop_words.update({"sample", "samples", "product", "item", "size", "sizes"})
@@ -369,7 +403,6 @@ class StoreQueryMixin:
                 "category_keywords": len(self.category_keywords),
                 "attribute_terms": sum(len(a.terms) for a in self.attribute_by_key.values()),
                 "variation_cache_size": len(self.variation_detail_cache),
-                "semantic_vectors": len(self.semantic_keys) if self.semantic_keys else 0,
             },
         }
 

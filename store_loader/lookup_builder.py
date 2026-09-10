@@ -1,7 +1,7 @@
 """
 store_loader/lookup_builder.py — Builds all in-memory lookup indexes
 from raw WooCommerce data: category keywords, tag/attribute indexes,
-product search index, longest-match catalog, and semantic vectors.
+product search index, and longest-match catalog.
 """
 
 import os
@@ -19,7 +19,6 @@ from models.catalog import (
     CatalogTag,
 )
 from store_loader.config import ECOMMERCE_BACKEND
-from config.store_config import ATTRIBUTE_VALUE_PHRASES
 logger = get_logger("miraq_chat")
 
 
@@ -418,105 +417,3 @@ def build_fuzzy_vocab(loader):
         f"lookup_builder: fuzzy vocab built | catalog_terms={len(vocab_types)} | "
         f"total_search_space={len(loader.fuzzy_vocab_terms)}"
     )
-
-# ══════════════════════════════════════════════════════════════
-# SEMANTIC VECTOR BUILDER
-# ═══════════════════════════════��══════════════════════════════
-
-import os
-import time
-import torch
-from chat_logger import get_logger
-from store_loader.config import DEV_CACHE_ENABLED, UPDATE_DEV_CACHE_ENABLED, VECTOR_CACHE_FILE
-
-logger = get_logger("miraq_chat")
-
-def build_semantic_vectors(loader):
-    """Translates WooCommerce Tags and Attributes into Semantic Coordinates, with disk caching."""
-    logger.info("Building Semantic Vectors for Store Tags & Attributes...")
-    start_time = time.time()
-    
-    # 1. Read from cache ONLY if DEV_CACHE is true
-    if DEV_CACHE_ENABLED and os.path.exists(VECTOR_CACHE_FILE):
-        try:
-            cached_data = torch.load(VECTOR_CACHE_FILE, weights_only=False)
-            loader.semantic_tensors = cached_data["tensors"]
-            loader.semantic_keys = cached_data["keys"]
-            loader.semantic_dictionary = cached_data["dictionary"]
-            logger.info(f"⚡ Loaded {len(loader.semantic_keys)} cached semantic vectors in {round(time.time() - start_time, 2)}s")
-            return
-        except Exception as e:
-            logger.warning(f"Failed to load cached vectors, rebuilding from scratch: {e}")
-    
-    # 2. Build Corpus from scratch (if cache miss or live mode)
-    corpus_texts = []
-    loader.semantic_keys = []
-    loader.semantic_dictionary = {}
-    
-    # Tags
-    for name_lower, tag in loader.tag_by_name_lower.items():
-        if tag.get("count", 0) > 0:
-            clean_name = name_lower.replace("-", " ")
-            corpus_texts.append(clean_name)
-            loader.semantic_keys.append(tag["slug"])
-            loader.semantic_dictionary[tag["slug"]] = {
-                "suggested_name": tag["name"],
-                "type": "tag",
-                "slug": tag["slug"]
-            }
-
-    # Attributes
-    for attr in loader.all_attributes_raw:
-        taxonomy = attr.get("attribute_name", "") or attr.get("taxonomy", "")
-        for term in attr.get("terms", []):
-            term_slug = term.get("slug", "")
-            term_name = term.get("name", "")
-            # Some attribute term values are too generic on their own to be a
-            # meaningful semantic anchor (e.g. pa_quick-ship's "Yes"/"No").
-            # ATTRIBUTE_VALUE_PHRASES already maps {attr_key: {term_value:
-            # natural_phrase}} for exactly this case in the deterministic
-            # extractor — reuse it here so the vector index has an actual
-            # findable phrase ("quick ship") instead of the bare word "yes",
-            # letting fuzzy/typo'd input reach it too.
-            phrase_override = ATTRIBUTE_VALUE_PHRASES.get(taxonomy, {}).get(term_name.lower())
-            clean_name = phrase_override.lower() if phrase_override else term_name.replace("-", " ").lower()
-
-            corpus_texts.append(clean_name)
-            loader.semantic_keys.append(term_slug)
-            loader.semantic_dictionary[term_slug] = {
-                "suggested_name": term_name,
-                "type": "attribute",
-                "taxonomy": taxonomy,
-                "slug": term_slug
-            }
-    logger.info(f"[DEBUG quick-ship] corpus entry for 'yes'/pa_quick-ship: {[t for t, k in zip(corpus_texts, loader.semantic_keys) if k == 'yes']}")        
-    # Categories
-    for name_lower, cat in loader.category_by_name_lower.items():
-        if cat.get("count", 0) > 0 and cat.get("slug") != "uncategorized":
-            clean_name = name_lower.replace("-", " ")
-            corpus_texts.append(clean_name)
-            loader.semantic_keys.append(cat["slug"])
-            loader.semantic_dictionary[cat["slug"]] = {
-                "suggested_name": cat["name"],
-                "type": "category",
-                "slug": cat["slug"]
-            }
-
-    # 3. Generate and Save the Tensors
-    if corpus_texts and loader.vector_model:
-        loader.semantic_tensors = loader.vector_model.encode(corpus_texts, convert_to_tensor=True)
-        
-        # Save to disk ONLY if UPDATE_DEV_CACHE is true
-        if UPDATE_DEV_CACHE_ENABLED:
-            try:
-                os.makedirs(os.path.dirname(VECTOR_CACHE_FILE), exist_ok=True)
-                torch.save({
-                    "tensors": loader.semantic_tensors,
-                    "keys": loader.semantic_keys,
-                    "dictionary": loader.semantic_dictionary
-                }, VECTOR_CACHE_FILE)
-                logger.info("💾 Saved newly generated semantic vectors to local cache.")
-            except Exception as e:
-                logger.error(f"Failed to save semantic vector cache: {e}")
-
-    logger.info(f"Generated {len(corpus_texts)} vectors in {round(time.time() - start_time, 2)}s")

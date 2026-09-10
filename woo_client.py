@@ -285,24 +285,28 @@ class WooClient:
         resp = None
 
         try:
-            if api_call.method == "GET":
-                resp = self.session.get(
-                    endpoint,
-                    auth=auth,
-                    headers=headers,
-                    params=params,
-                    timeout=45,
-                )
-            else:
-                resp = self.session.request(
-                    method=api_call.method,
-                    url=endpoint,
-                    auth=auth,
-                    headers=headers,
-                    params=params,
-                    json=api_call.body,
-                    timeout=45,
-                )
+            # Timed into the "woo_api" bucket so the timing log can separate
+            # time waiting on WooCommerce from time spent in our own code.
+            import timing_logger
+            with timing_logger.stage("woo_api"):
+                if api_call.method == "GET":
+                    resp = self.session.get(
+                        endpoint,
+                        auth=auth,
+                        headers=headers,
+                        params=params,
+                        timeout=45,
+                    )
+                else:
+                    resp = self.session.request(
+                        method=api_call.method,
+                        url=endpoint,
+                        auth=auth,
+                        headers=headers,
+                        params=params,
+                        json=api_call.body,
+                        timeout=45,
+                    )
 
             resp.raise_for_status()
             _elapsed_ms = round((_time.time() - _req_start) * 1000)

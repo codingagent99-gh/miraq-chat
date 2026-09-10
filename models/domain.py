@@ -298,8 +298,12 @@ class ExtractedEntities:
     logical_chunks: List[dict] = field(default_factory=list, metadata={"llm_exclude": "internal"})  # NLP-internal, no user-facing meaning
 
 
-    # ──── Semantic Resolution ────
-    semantic_matches: List = field(default_factory=list, metadata={"llm_exclude": "internal"})  # embedding-internal, no user-facing meaning
+    # ──── Ambiguous-match Resolution ────
+    # Candidate groups needing user clarification. Populated by the same-value
+    # attribute collision check in routes/chat.py Step 4.5 (score 1.0), and
+    # consumed by handlers/semantic_clarification_handler.py. Formerly also
+    # populated by embedding search in catalog_parser Phase 3, which was removed.
+    semantic_matches: List = field(default_factory=list, metadata={"llm_exclude": "internal"})  # internal, no user-facing meaning
 
     # ──── Search hints (unresolvable descriptors like "premium", "rustic") ────
     search_hints: List[str] = field(default_factory=list)
@@ -310,13 +314,13 @@ class ExtractedEntities:
     # Each item: {product_id, variation_id, qty, name}
     
     # ──── Semantic auto-materialize marker ────
-    # Set to True only by _auto_materialize() (catalog_parser.py) when a
-    # semantic-match candidate scored >= AUTO_APPLY_THRESHOLD and was
-    # written directly into attributes/tags/categories THIS turn. Used by
-    # _merge_phase_entities (chat.py) to safely upgrade an UNKNOWN intent
-    # without risking a false positive from carryover state — this field
-    # is never set by any carryover-restoration path, only by a fresh
-    # same-turn semantic resolution.
+    # DORMANT: previously set by _auto_materialize() (catalog_parser.py) when
+    # an embedding-search candidate scored >= AUTO_APPLY_THRESHOLD and was
+    # written straight into attributes/tags/categories that turn. Phase 3
+    # embedding search has been removed, so nothing sets this to True any
+    # more and the reader in _merge_phase_entities (chat.py, UNKNOWN-intent
+    # upgrade) is now a no-op. Kept as a default-False field so that reader
+    # stays safe; remove both together if the flag is not revived.
     semantic_auto_applied: bool = field(default=False, metadata={"llm_exclude": "internal"})
 
     # ──── Helper methods ────

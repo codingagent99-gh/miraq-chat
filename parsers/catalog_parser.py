@@ -1,6 +1,6 @@
 """
 parsers/catalog_parser.py — Hybrid parser combining catalog matching, NLP fallback,
-semantic vector search, and intent resolution.
+leftover-text resolution, and intent resolution.
 
 Replaces the old monolithic parse_csv_message() in chat.py.
 """
@@ -8,15 +8,12 @@ Replaces the old monolithic parse_csv_message() in chat.py.
 import re
 from models import ExtractedEntities, ClassifiedResult, Intent
 from classifier import classify
-from store_registry import get_store_loader
 from chat_logger import get_logger
 from utils.entity_helpers import (
     append_category_name, merge_attribute, merge_tags, merge_entities,
     clean_leftovers, STOP_WORDS,
 )
 from classifier.extractors import ALL_PRICE_PATTERNS
-from config.store_config import KNOWN_QUERY_TYPO_CORRECTIONS
-from classifier.consolidation import _resolve_tag_attribute_overlap
 from typing import Optional
 logger = get_logger("miraq_chat")
 from classifier.utils import create_flexible_pattern
@@ -355,7 +352,7 @@ def phase2_nlp_merge(
     return nlp_entities  # caller needs search_term from this
 
 # ══════════════════════════════════════════════════════════════
-# PHASE 3: Semantic Vector Search
+# PHASE 3: Leftover Text Resolution
 # ══════════════════════════════════════════════════════════════
 
 def _mask_resolved_entities(text: str, entities: ExtractedEntities) -> str:
@@ -425,198 +422,51 @@ def _mask_resolved_entities(text: str, entities: ExtractedEntities) -> str:
 
     return re.sub(r'\s+', ' ', ' '.join(out_words)).strip()
 
-def phase3_semantic_search(
+def phase3_resolve_leftovers(
     unmatched_text: str,
     nlp_entities,
     entities: ExtractedEntities,
-    loader,
 ) -> None:
     """
-    Run semantic vector matching on leftover text.
-    Mutates `entities` in place (semantic_matches, search_term).
+    Resolve leftover text into search_term / excluded_search_term.
+
+    Terms already resolved in `entities` as exact matches are masked out
+    first (see _mask_resolved_entities) — unmatched_text can still contain
+    words the FINAL entities object already settled, and echoing those back
+    as free-text search re-litigates a settled match.
+
+    NOTE: this phase previously also ran sentence-transformer vector search
+    over the catalog taxonomy (tags/attributes/categories) on the leftover
+    text. That was removed: utils/typo_correction.py already does
+    Damerau-Levenshtein fuzzy correction against the same catalog vocabulary
+    BEFORE Phase 1 runs, so the two overlapped, and the embedding path was
+    the only CPU-bound model inference on the request path — it serialized
+    concurrent requests under the GIL and forced all-MiniLM-L6-v2 to be
+    loaded into every worker process. `entities.semantic_matches` is still
+    populated (and still drives the clarification flow) by the same-value
+    attribute collision check in routes/chat.py Step 4.5.
     """
     strict_search_term = getattr(nlp_entities, 'search_term', None)
-    raw_pos_for_vectors = unmatched_text if unmatched_text else strict_search_term
+    raw_pos = unmatched_text if unmatched_text else strict_search_term
 
-    # unmatched_text can still contain terms `entities` already resolved as
-    # exact matches (see _mask_resolved_entities docstring) — strip those
-    # before running vector search, or it re-litigates a settled match.
-    if raw_pos_for_vectors:
-        raw_pos_for_vectors = _mask_resolved_entities(raw_pos_for_vectors, entities)
+    if raw_pos:
+        raw_pos = _mask_resolved_entities(raw_pos, entities)
 
     raw_neg = getattr(nlp_entities, 'excluded_search_term', None)
 
-    cleaned_pos_text = clean_leftovers(raw_pos_for_vectors)
+    cleaned_pos_text = clean_leftovers(raw_pos)
     cleaned_neg_text = clean_leftovers(raw_neg)
 
-    still_unmatched_pos = []
-    still_unmatched_neg = []
-
-    if (cleaned_pos_text or cleaned_neg_text) and loader:
-        import torch
-        from sentence_transformers import util
-        SEMANTIC_THRESHOLD = 0.7
-
-        if not hasattr(loader, 'semantic_tensors') or loader.semantic_tensors is None:
-            if cleaned_pos_text:
-                still_unmatched_pos.append(cleaned_pos_text)
-            if cleaned_neg_text:
-                still_unmatched_neg.append(cleaned_neg_text)
-        else:
-            def _process_vectors(term_string, is_negative=False):
-                unmatched = []
-                phrase = term_string.strip()
-                if not phrase:
-                    return unmatched
-                
-                # Known-typo correction — see KNOWN_QUERY_TYPO_CORRECTIONS docstring.
-                # Substring match (not exact-equals) so this still fires when the
-                # leftover phrase has extra words around it, not just a bare 2-word match.
-                _phrase_lower = phrase.lower()
-                for typo, correction in KNOWN_QUERY_TYPO_CORRECTIONS.items():
-                    if typo in _phrase_lower:
-                        corrected = _phrase_lower.replace(typo, correction)
-                        logger.info(f"[SemanticSearch] typo correction applied: {phrase!r} → {corrected!r}")
-                        phrase = corrected
-                        break
-
-                user_vector = loader.vector_model.encode(phrase, convert_to_tensor=True)
-                cosine_scores = util.cos_sim(user_vector, loader.semantic_tensors)[0]
-                top_results = torch.topk(cosine_scores, k=3)
-
-                # Log the full top-3 BEFORE threshold filtering — this is the only
-                # point in the pipeline where sub-threshold near-misses are visible;
-                # once filtered into `candidates` below, anything under
-                # SEMANTIC_THRESHOLD is discarded with no trace.
-                _top3_debug = [
-                    (loader.semantic_keys[idx], round(score.item(), 4))
-                    for score, idx in zip(top_results[0], top_results[1])
-                ]
-                logger.info(
-                    f"[SemanticSearch] phrase={phrase!r} | is_negative={is_negative} | "
-                    f"threshold={SEMANTIC_THRESHOLD} | top3={_top3_debug}"
-                )
-
-                candidates = []
-                for score, idx in zip(top_results[0], top_results[1]):
-                    if score.item() >= SEMANTIC_THRESHOLD:
-                        matched_slug = loader.semantic_keys[idx]
-                        candidate_data = loader.semantic_dictionary[matched_slug].copy()
-                        candidate_data["user_text"] = phrase
-                        candidate_data["score"] = score.item()
-                        candidate_data["is_negative"] = is_negative
-                        candidates.append(candidate_data)
-
-                if candidates:
-                    if not hasattr(entities, 'semantic_matches'):
-                        entities.semantic_matches = []
-                    entities.semantic_matches.append(candidates)
-                else:
-                    words = phrase.split()
-                    if len(words) > 1:
-                        for word in words:
-                            w_vector = loader.vector_model.encode(word, convert_to_tensor=True)
-                            w_scores = util.cos_sim(w_vector, loader.semantic_tensors)[0]
-                            w_top = torch.topk(w_scores, k=3)
-
-                            _w_top3_debug = [
-                                (loader.semantic_keys[idx], round(score.item(), 4))
-                                for score, idx in zip(w_top[0], w_top[1])
-                            ]
-                            logger.info(
-                                f"[SemanticSearch] word={word!r} (fallback) | "
-                                f"threshold={SEMANTIC_THRESHOLD} | top3={_w_top3_debug}"
-                            )
-
-                            w_candidates = []
-                            for w_score, w_idx in zip(w_top[0], w_top[1]):
-                                if w_score.item() >= SEMANTIC_THRESHOLD:
-                                    matched_slug = loader.semantic_keys[w_idx]
-                                    candidate_data = loader.semantic_dictionary[matched_slug].copy()
-                                    candidate_data["user_text"] = word
-                                    candidate_data["score"] = w_score.item()
-                                    candidate_data["is_negative"] = is_negative
-                                    w_candidates.append(candidate_data)
-
-                            if w_candidates:
-                                if not hasattr(entities, 'semantic_matches'):
-                                    entities.semantic_matches = []
-                                entities.semantic_matches.append(w_candidates)
-                            else:
-                                unmatched.append(word)
-                    else:
-                        unmatched.append(phrase)
-
-                return unmatched
-
-            if cleaned_pos_text:
-                still_unmatched_pos.extend(_process_vectors(cleaned_pos_text, is_negative=False))
-            if cleaned_neg_text:
-                still_unmatched_neg.extend(_process_vectors(cleaned_neg_text, is_negative=True))
-    else:
-        if cleaned_pos_text:
-            still_unmatched_pos.append(cleaned_pos_text)
-        if cleaned_neg_text:
-            still_unmatched_neg.append(cleaned_neg_text)
-
     # Assign search_term from survivors
-    if still_unmatched_pos:
-        entities.search_term = " ".join(still_unmatched_pos)
+    if cleaned_pos_text:
+        entities.search_term = cleaned_pos_text
     else:
         fallback = clean_leftovers(strict_search_term)
         entities.search_term = fallback if fallback else None
 
-    entities.excluded_search_term = " ".join(still_unmatched_neg) if still_unmatched_neg else None
-
-    # Auto-materialize high-confidence matches
-    _auto_materialize(entities)
+    entities.excluded_search_term = cleaned_neg_text if cleaned_neg_text else None
 
 
-def _auto_materialize(entities: ExtractedEntities):
-    """Promote high-confidence semantic matches into concrete filters."""
-    if not (hasattr(entities, 'semantic_matches') and entities.semantic_matches):
-        return
-
-    AUTO_APPLY_THRESHOLD = 0.85
-    surviving_matches = []
-
-    for candidates in entities.semantic_matches:
-        if not candidates:
-            continue
-        best = max(candidates, key=lambda c: c.get("score", 0))
-
-        if best.get("score", 0) >= AUTO_APPLY_THRESHOLD:
-            match_type = best.get("type")
-            slug = best.get("slug")
-
-            if match_type == "category" and slug and not entities.target_category_slugs:
-                entities.add_category_group([slug])
-                entities.category_name = best.get("suggested_name", slug)
-            elif match_type == "tag" and slug and slug not in entities.tag_slugs:
-                entities.tag_slugs.append(slug)
-                l = get_store_loader()
-                if l:
-                    tag_obj = l.resolve_tag(slug)
-                    if tag_obj:
-                        entities.tag_ids.append(tag_obj.backend_ref.get("id"))
-            elif match_type == "attribute" and slug:
-                taxonomy = best.get("taxonomy", "")
-                if taxonomy and taxonomy not in entities.attributes:
-                    entities.attributes[taxonomy] = slug
-
-            entities.search_term = None
-            entities.semantic_auto_applied = True
-        else:
-            surviving_matches.append(candidates)
-
-    entities.semantic_matches = surviving_matches
-
-    # re-run tag/attribute overlap detection now that a semantic
-    # auto-applied tag (e.g. "Quick Ship") may exist alongside an attribute
-    # extracted earlier in the pipeline that was already independently set.
-    _resolve_tag_attribute_overlap(entities)
-
-# ══════════════════════════════════════════════════════════════
 # PHASE 4: Intent Resolution
 # ══════════════════════════════════════════════════════════════
 
@@ -671,7 +521,14 @@ def resolve_final_intent(
 
 def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
     """Hybrid Parser: Uses Longest-String Substring Matching on natural language."""
-    original_nlp_result = classify(msg)
+    # Stage timings feed the timing log's per-request breakdown; see
+    # timing_logger.stage(). Split fine-grained here because "classify" as a
+    # whole was measured at ~58% of all request time under load, and that
+    # number alone doesn't say WHICH phase is expensive.
+    import timing_logger
+
+    with timing_logger.stage("nlp_classify"):
+        original_nlp_result = classify(msg)
 
     if not loader:
         return original_nlp_result
@@ -685,7 +542,8 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
     clean_msg = re.sub(r'\s+', ' ', clean_msg).strip()
 
     # Phase 1: Catalog match
-    entities, unmatched_text = phase1_catalog_match(clean_msg, loader)
+    with timing_logger.stage("phase1_catalog"):
+        entities, unmatched_text = phase1_catalog_match(clean_msg, loader)
     logger.debug(
         f"[PHASE1_TRACE] attr_tag_or_pairs={entities.attr_tag_or_pairs} | "
         f"attributes={entities.attributes} | "
@@ -693,15 +551,18 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
     )
     # Phase 2: NLP fallback merge
     # Pass original_msg so phase2 can skip re-classify when Phase 1 matched nothing
-    nlp_entities = phase2_nlp_merge(unmatched_text, entities, original_nlp_result, loader, original_msg=clean_msg)
+    with timing_logger.stage("phase2_nlp"):
+        nlp_entities = phase2_nlp_merge(unmatched_text, entities, original_nlp_result, loader, original_msg=clean_msg)
 
-    # Phase 3: Semantic vector search
-    phase3_semantic_search(unmatched_text, nlp_entities, entities, loader)
+    # Phase 3: Resolve leftover text into search_term / excluded_search_term
+    with timing_logger.stage("phase3_leftovers"):
+        phase3_resolve_leftovers(unmatched_text, nlp_entities, entities)
 
     # Phase 4: Intent resolution
-    resolved_intent, final_confidence = resolve_final_intent(
-        entities, original_nlp_result.intent, original_nlp_result.confidence
-    )
+    with timing_logger.stage("phase4_intent"):
+        resolved_intent, final_confidence = resolve_final_intent(
+            entities, original_nlp_result.intent, original_nlp_result.confidence
+        )
     
     result = ClassifiedResult(intent=resolved_intent, entities=entities, confidence=final_confidence)
     result.phase1_entities   = original_nlp_result.entities    # ExtractedEntities
