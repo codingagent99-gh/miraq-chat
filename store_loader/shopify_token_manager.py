@@ -20,6 +20,7 @@ Usage (called from store_loader/__init__.py):
 
 import threading
 import time
+import zlib
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -113,6 +114,27 @@ class ShopifyTokenManager:
             "Check SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET and server logs."
         )
 
+    def invalidate(self, bad_token: str):
+        """
+        Called by the fetcher immediately after Shopify itself rejects
+        `bad_token` with a 401 — i.e. Shopify has already told us this
+        token is dead, regardless of what our own expiry bookkeeping says.
+
+        Drops it from memory and forces a synchronous refresh, so the next
+        get_token() call returns something usable right away instead of
+        the same dead token being handed out again until the next
+        scheduled health check (up to 30 minutes later).
+
+        If `bad_token` no longer matches what's cached — another thread
+        already replaced it, via its own invalidate() call or the routine
+        health check — this is a no-op.
+        """
+        with self._lock:
+            if self._current_token != bad_token:
+                return
+            self._current_token = None
+        self._do_refresh(known_bad_token=bad_token)
+
     # ──────────────────────────────────────────────
     # Internal: token lifecycle
     # ──────────────────────────────────────────────
@@ -147,40 +169,108 @@ class ShopifyTokenManager:
             logger.info(f"ShopifyTokenManager: token {reason} — fetching fresh token…")
             self._do_refresh()
 
-    def _do_refresh(self):
+    def _do_refresh(self, known_bad_token: Optional[str] = None):
         """
         Hit the Shopify client_credentials endpoint, persist the result to
         Postgres, and update the in-memory cache.
+
+        Guarded by a Postgres transaction-scoped advisory lock keyed on the
+        store domain. Shopify's client_credentials grant invalidates the
+        previously issued token every time a new one is requested for the
+        same client -- so with multiple gunicorn workers each running their
+        own ShopifyTokenManager, two workers refreshing at the same moment
+        used to silently knock each other's token offline (the loser kept a
+        token that Shopify had already killed, and had no way to notice).
+        The lock serialises refreshes across workers; the re-check
+        immediately after acquiring it lets a worker that lost the race
+        just adopt the token the winner already wrote, instead of fetching
+        -- and thereby invalidating -- a second one.
+
+        `known_bad_token`, set by invalidate(), means this call was
+        triggered by an actual 401 rather than routine expiry bookkeeping.
+        In that case a DB row is only trusted if it holds a *different*
+        token than the one that just got rejected -- our own timestamps
+        saying a row is "healthy" don't mean much when Shopify has already
+        told us, empirically, that its token doesn't work.
+
+        The lock is held for the lifetime of this transaction, which spans
+        the outbound HTTP call to Shopify. That's deliberate: an
+        xact-scoped lock can't be released early and can't leak on a pooled
+        connection, and refreshes are rare (roughly once per token
+        lifetime), so tying up one connection for the duration is cheap.
         """
-        url = f"https://{self._domain}/admin/oauth/access_token"
-        params = {
-            "grant_type":    "client_credentials",
-            "client_id":     SHOPIFY_CLIENT_ID,
-            "client_secret": SHOPIFY_CLIENT_SECRET,
-        }
+        from models import db
+        from models.shopify_token import ShopifyToken
+        from sqlalchemy import text
+
+        lock_key = zlib.crc32(self._domain.encode("utf-8"))
 
         try:
-            resp = requests.post(url, params=params, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
+            with self._db_context():
+                db.session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": lock_key})
 
-            access_token = data["access_token"]
-            scope        = data.get("scope", "")
-            expires_in   = int(data.get("expires_in", 86400))   # default 24 h
+                # Re-check now that we hold the lock — another worker may
+                # have refreshed while we were waiting for it.
+                row = ShopifyToken.query.get(self._domain)
+                row_is_usable = (
+                    row and not row.needs_refresh
+                    and (known_bad_token is None or row.access_token != known_bad_token)
+                )
+                if row_is_usable:
+                    with self._lock:
+                        self._current_token = row.access_token
+                    logger.info(
+                        "ShopifyTokenManager: ✅ another worker already refreshed "
+                        "the token while we waited for the lock — adopting it "
+                        f"(expires in {row.seconds_until_expiry / 3600:.1f}h)"
+                    )
+                    db.session.commit()  # release the advisory lock
+                    return
 
-            now        = datetime.now(timezone.utc)
-            expires_at = now + timedelta(seconds=expires_in)
+                url = f"https://{self._domain}/admin/oauth/access_token"
+                params = {
+                    "grant_type":    "client_credentials",
+                    "client_id":     SHOPIFY_CLIENT_ID,
+                    "client_secret": SHOPIFY_CLIENT_SECRET,
+                }
+                resp = requests.post(url, params=params, timeout=15)
+                resp.raise_for_status()
+                data = resp.json()
 
-            self._save_to_db(access_token, scope, now, expires_at)
+                access_token = data["access_token"]
+                scope        = data.get("scope", "")
+                expires_in   = int(data.get("expires_in", 86400))   # default 24 h
 
-            with self._lock:
-                self._current_token = access_token
+                now        = datetime.now(timezone.utc)
+                expires_at = now + timedelta(seconds=expires_in)
 
-            logger.info(
-                f"ShopifyTokenManager: ✅ token refreshed — "
-                f"expires at {expires_at.isoformat()} "
-                f"(in {expires_in / 3600:.1f}h)"
-            )
+                if row:
+                    row.access_token  = access_token
+                    row.scope         = scope
+                    row.fetched_at    = now
+                    row.expires_at    = expires_at
+                    row.refresh_count = (row.refresh_count or 0) + 1
+                    row.last_error    = None
+                else:
+                    row = ShopifyToken(
+                        store_domain  = self._domain,
+                        access_token  = access_token,
+                        scope         = scope,
+                        fetched_at    = now,
+                        expires_at    = expires_at,
+                        refresh_count = 1,
+                    )
+                    db.session.add(row)
+                db.session.commit()  # persists the token and releases the lock
+
+                with self._lock:
+                    self._current_token = access_token
+
+                logger.info(
+                    f"ShopifyTokenManager: ✅ token refreshed — "
+                    f"expires at {expires_at.isoformat()} "
+                    f"(in {expires_in / 3600:.1f}h)"
+                )
 
         except Exception as e:
             logger.error(
@@ -215,40 +305,6 @@ class ShopifyTokenManager:
         except Exception as e:
             logger.error(f"ShopifyTokenManager: DB read failed — {e}", exc_info=True)
             return None
-
-    def _save_to_db(self, access_token: str, scope: str,
-                    fetched_at: datetime, expires_at: datetime):
-        """Upsert the token row in Postgres."""
-        from models.shopify_token import ShopifyToken
-        from models import db
-        try:
-            with self._db_context():
-                row = ShopifyToken.query.get(self._domain)
-                if row:
-                    row.access_token  = access_token
-                    row.scope         = scope
-                    row.fetched_at    = fetched_at
-                    row.expires_at    = expires_at
-                    row.refresh_count = (row.refresh_count or 0) + 1
-                    row.last_error    = None
-                else:
-                    row = ShopifyToken(
-                        store_domain  = self._domain,
-                        access_token  = access_token,
-                        scope         = scope,
-                        fetched_at    = fetched_at,
-                        expires_at    = expires_at,
-                        refresh_count = 1,
-                    )
-                    db.session.add(row)
-                db.session.commit()
-        except Exception as e:
-            logger.error(f"ShopifyTokenManager: DB write failed — {e}", exc_info=True)
-            try:
-                from models import db
-                db.session.rollback()
-            except Exception:
-                pass
 
     def _save_error_to_db(self, error_msg: str):
         """Record the last refresh error in the token row (if one exists)."""
@@ -289,10 +345,26 @@ class ShopifyTokenManager:
                         logger.info(f"ShopifyTokenManager: 🔄 background refresh triggered ({label})")
                         self._do_refresh()
                     else:
-                        logger.debug(
-                            f"ShopifyTokenManager: token healthy "
-                            f"({row.seconds_until_expiry / 3600:.1f}h remaining)"
-                        )
+                        # The DB row looks healthy, but our in-memory copy may
+                        # not match it -- e.g. another worker refreshed the
+                        # token (which invalidates whatever we're holding)
+                        # since our last check. Re-sync unconditionally so a
+                        # worker that lost that race recovers here instead of
+                        # failing every request until it's restarted.
+                        with self._lock:
+                            was_stale = self._current_token != row.access_token
+                            self._current_token = row.access_token
+                        if was_stale:
+                            logger.info(
+                                "ShopifyTokenManager: 🔁 in-memory token was stale "
+                                "(refreshed by another worker) — synced from DB "
+                                f"({row.seconds_until_expiry / 3600:.1f}h remaining)"
+                            )
+                        else:
+                            logger.debug(
+                                f"ShopifyTokenManager: token healthy "
+                                f"({row.seconds_until_expiry / 3600:.1f}h remaining)"
+                            )
                 except Exception as e:
                     logger.error(
                         f"ShopifyTokenManager: background loop error — {e}", exc_info=True

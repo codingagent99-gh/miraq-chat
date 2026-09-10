@@ -39,16 +39,29 @@ MAX_RETRIES = 3
 # ══════════════════════════════════════════════════════════════
 
 def _gql(session, store_domain: str, admin_token: str, query: str,
-         variables: Optional[dict] = None) -> dict:
-    """Execute a GraphQL query against the Shopify Admin API with retries."""
+         variables: Optional[dict] = None, token_manager=None) -> dict:
+    """Execute a GraphQL query against the Shopify Admin API with retries.
+
+    A 401 is not a transient fault -- retrying with the same token Shopify
+    just rejected only ever reproduces the same 401, MAX_RETRIES times
+    over, which is exactly the "keeps calling and getting 401" loop this
+    guards against. When a token_manager is available, each attempt reads
+    the token fresh from it (so it automatically picks up a refresh done
+    by us or by another worker), and a 401 triggers an immediate,
+    synchronous invalidate() rather than a backoff sleep. Without a
+    token_manager (the static SHOPIFY_ADMIN_TOKEN dev/legacy path, where
+    there's nothing to refresh), behaviour is unchanged from before.
+    """
     url = f"https://{store_domain}/admin/api/{API_VERSION}/graphql.json"
-    headers = {
-        "X-Shopify-Access-Token": admin_token,
-        "Content-Type": "application/json",
-    }
     payload = {"query": query, "variables": variables or {}}
 
     for attempt in range(MAX_RETRIES):
+        is_last_attempt = attempt == MAX_RETRIES - 1
+        token = token_manager.get_token() if token_manager is not None else admin_token
+        headers = {
+            "X-Shopify-Access-Token": token,
+            "Content-Type": "application/json",
+        }
         try:
             resp = session.post(url, json=payload, headers=headers, timeout=TIMEOUT)
             resp.raise_for_status()
@@ -62,17 +75,35 @@ def _gql(session, store_domain: str, admin_token: str, query: str,
                 time.sleep(0.5)
             return data["data"]
         except Exception as e:
-            if attempt < MAX_RETRIES - 1:
-                logger.warning(f"ShopifyFetcher: retrying GraphQL ({e})")
-                time.sleep(2 ** attempt)
-            else:
+            if is_last_attempt:
                 logger.error(f"ShopifyFetcher: GraphQL failed after retries: {e}")
                 raise
+
+            is_unauthorized = (
+                isinstance(e, requests.exceptions.HTTPError)
+                and e.response is not None
+                and e.response.status_code == 401
+            )
+            if is_unauthorized and token_manager is not None:
+                logger.warning(
+                    "ShopifyFetcher: 401 — token rejected, forcing a refresh "
+                    "instead of retrying with the same token"
+                )
+                try:
+                    token_manager.invalidate(token)
+                except Exception as refresh_err:
+                    logger.error(f"ShopifyFetcher: token refresh after 401 failed: {refresh_err}")
+                # Loop straight back around and re-read get_token() -- no
+                # backoff sleep, since this isn't a transient network fault.
+            else:
+                logger.warning(f"ShopifyFetcher: retrying GraphQL ({e})")
+                time.sleep(2 ** attempt)
 
 
 def _drain_connection(session, store_domain: str, admin_token: str,
                       query_template: str, root_field: str,
-                      extra_variables: Optional[dict] = None) -> List[dict]:
+                      extra_variables: Optional[dict] = None,
+                      token_manager=None) -> List[dict]:
     """Walk a Relay connection until ``hasNextPage`` is false; return all nodes."""
     nodes = []
     cursor = None
@@ -80,7 +111,8 @@ def _drain_connection(session, store_domain: str, admin_token: str,
 
     while True:
         variables = {"first": PAGE_SIZE, "after": cursor, **extra}
-        data = _gql(session, store_domain, admin_token, query_template, variables)
+        data = _gql(session, store_domain, admin_token, query_template, variables,
+                    token_manager=token_manager)
         connection = data[root_field]
         for edge in connection.get("edges", []):
             nodes.append(edge["node"])
@@ -555,7 +587,7 @@ query Product($id: ID!) {
 
 
 def fetch_single_product(
-    store_domain: str, admin_token: str, product_gid: str
+    store_domain: str, admin_token: str, product_gid: str, token_manager=None
 ) -> Optional[dict]:
     """
     Fetch one Shopify product by GID and return it in the same Woo-shaped dict
@@ -574,6 +606,7 @@ def fetch_single_product(
             session, store_domain, admin_token,
             _SINGLE_PRODUCT_QUERY,
             variables={"id": product_gid},
+            token_manager=token_manager,
         )
         raw = data.get("product")
         if not raw:
@@ -600,11 +633,15 @@ def fetch_single_product(
 # PUBLIC ENTRY POINT
 # ══════════════════════════════════════════════════════════════
 
-def load_from_shopify(store_domain: str, admin_token: str) -> dict:
+def load_from_shopify(store_domain: str, admin_token: str, token_manager=None) -> dict:
     """
     Fetch the entire Shopify catalog and return it in the same dict shape
     that `fetcher.load_from_live_api()` returns, so `lookup_builder.py`
     can build the neutral indexes without backend awareness.
+
+    `token_manager`, when passed, lets every GraphQL call in this fetch
+    recover from a 401 by forcing a refresh instead of exhausting retries
+    against a token Shopify has already rejected -- see `_gql()`.
 
     Returns:
         {
@@ -622,7 +659,7 @@ def load_from_shopify(store_domain: str, admin_token: str) -> dict:
     session = requests.Session()
 
     # 1. Shop / currency
-    shop_data = _gql(session, store_domain, admin_token, _SHOP_QUERY)
+    shop_data = _gql(session, store_domain, admin_token, _SHOP_QUERY, token_manager=token_manager)
     currency_code = (shop_data.get("shop") or {}).get("currencyCode", "USD")
     currency_symbol = {
         "USD": "$", "EUR": "€", "GBP": "£", "INR": "₹",
@@ -632,14 +669,16 @@ def load_from_shopify(store_domain: str, admin_token: str) -> dict:
     # 2. Collections
     logger.info("ShopifyFetcher: fetching collections…")
     raw_collections = _drain_connection(
-        session, store_domain, admin_token, _COLLECTIONS_QUERY, "collections"
+        session, store_domain, admin_token, _COLLECTIONS_QUERY, "collections",
+        token_manager=token_manager,
     )
     categories = [_normalise_collection(c, i) for i, c in enumerate(raw_collections)]
 
     # 3. Products (with embedded variants, options, tags, collections)
     logger.info("ShopifyFetcher: fetching products…")
     raw_products = _drain_connection(
-        session, store_domain, admin_token, _PRODUCTS_QUERY, "products"
+        session, store_domain, admin_token, _PRODUCTS_QUERY, "products",
+        token_manager=token_manager,
     )
     products = [_normalise_product(p, i, store_domain=store_domain) for i, p in enumerate(raw_products)]
 

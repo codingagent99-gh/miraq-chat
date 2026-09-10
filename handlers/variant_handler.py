@@ -181,6 +181,7 @@ def handle_variant_selection(
                         store_domain=_sl.shopify_domain,
                         admin_token=_sl._get_shopify_token(),
                         product_gid=_var_product_id,
+                        token_manager=_sl._token_manager,
                     )
             except Exception as _live_err:
                 logger.error(

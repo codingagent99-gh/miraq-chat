@@ -31,10 +31,7 @@ from store_loader.fetcher import (
     save_to_local_files,
     dump_lookups_for_debugging,
 )
-from store_loader.lookup_builder import (
-    build_all_lookups,
-    build_semantic_vectors,
-)
+from store_loader.lookup_builder import build_all_lookups
 from store_loader.queries import StoreQueryMixin
 
 logger = get_logger("miraq_chat")
@@ -83,43 +80,11 @@ class StoreLoader(StoreQueryMixin):
         self.session = requests.Session()
         self.session.headers.update(BROWSER_HEADERS)
 
-        # Semantic vector model
-        logger.info("Loading Semantic Vector Model (all-MiniLM-L6-v2)...")
-        try:
-            from sentence_transformers import SentenceTransformer
-            if DEV_CACHE_ENABLED:
-                self.vector_model = SentenceTransformer('all-MiniLM-L6-v2', local_files_only=True)
-                logger.info("Loaded vector model from local HuggingFace cache (dev mode, offline).")
-            else:
-                self.vector_model = SentenceTransformer('all-MiniLM-L6-v2')
-                logger.info("Loaded vector model (online).")
-        except Exception as e:
-            if not DEV_CACHE_ENABLED:
-                logger.warning(
-                    f"Could not reach HuggingFace Hub ({type(e).__name__}: {e}). "
-                    "Retrying with local disk cache only..."
-                )
-                try:
-                    from sentence_transformers import SentenceTransformer
-                    self.vector_model = SentenceTransformer('all-MiniLM-L6-v2', local_files_only=True)
-                    logger.info("Loaded vector model from local HuggingFace cache (offline fallback).")
-                except Exception as e2:
-                    logger.error(
-                        f"Failed to load vector model — not found in local cache either. "
-                        f"Semantic fallback will not be available. ({type(e2).__name__}: {e2})"
-                    )
-                    self.vector_model = None
-            else:
-                logger.error(
-                    f"Failed to load vector model from local cache. "
-                    f"Has the model been downloaded yet? Run once with DEV_CACHE=false to fetch it. "
-                    f"({type(e).__name__}: {e})"
-                )
-                self.vector_model = None
-
-        self.semantic_dictionary: Dict = {}
-        self.semantic_tensors = None
-        self.semantic_keys: List = []
+        # NOTE: the all-MiniLM-L6-v2 semantic vector model and its
+        # tag/attribute/category tensors were removed — utils/typo_correction.py
+        # already fuzzy-matches the same catalog vocabulary before Phase 1, and
+        # this model was the only CPU-bound inference on the request path
+        # (GIL-serializing) plus a large per-worker memory cost.
 
         # Raw data
         self.categories: List[Dict] = []
@@ -192,6 +157,7 @@ class StoreLoader(StoreQueryMixin):
                 data = load_from_shopify(
                     store_domain=self.shopify_domain,
                     admin_token=self._get_shopify_token(),
+                    token_manager=self._token_manager,
                 )
                 self._loaded_from_cache = False
 
@@ -246,9 +212,6 @@ class StoreLoader(StoreQueryMixin):
             build_all_lookups(self)
             self._validate_load()
             self._last_loaded = time.time()
-
-            if self.vector_model:
-                build_semantic_vectors(self)
 
             if DEV_CACHE_ENABLED:
                 dump_lookups_for_debugging(self)
@@ -370,7 +333,6 @@ class StoreLoader(StoreQueryMixin):
 
         status     = "⚠️ DEGRADED" if self._degraded else "✅ HEALTHY"
         attr_count = sum(len(a.terms) for a in self.attribute_by_key.values())
-        vector_count = len(self.semantic_keys) if self.semantic_keys else 0
 
         summary = [
             f"StoreLoader: Initialization Complete [{status}]",
@@ -380,8 +342,7 @@ class StoreLoader(StoreQueryMixin):
             f"  ├─ Categories: {len(self.categories)}",
             f"  ├─ Tags:       {len(self.tags)}",
             f"  ├─ Attributes: {len(self.attribute_by_key)} (with {attr_count} terms)",
-            f"  ├─ Keywords:   {len(self.category_keywords)} (generated for search index)",
-            f"  └─ Vectors:    {vector_count} (for semantic fallback)",
+            f"  └─ Keywords:   {len(self.category_keywords)} (generated for search index)",
         ]
         if self._degraded:
             summary.append("  ❌ Degraded Reasons:")
