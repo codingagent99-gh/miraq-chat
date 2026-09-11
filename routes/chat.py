@@ -1264,7 +1264,7 @@ def _compute_matched_against(raw_product: dict, formatted_product: dict, entitie
             if label:
                 labels.append(label)
                 
-    logger.warning(f"MATCHED_AGAINST_DEBUG | product_id={raw_product.get('id')} | labels={labels}")
+    logger.debug(f"MATCHED_AGAINST_DEBUG | product_id={raw_product.get('id')} | labels={labels}")
     return list(dict.fromkeys(labels))  # de-dupe, preserve order
 
 

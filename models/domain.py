@@ -18,6 +18,24 @@ from chat_logger import get_logger
 logger = get_logger("miraq_chat")
 
 
+# OrPair.attr_taxonomy is used by a lot of call sites that build plain dicts,
+# so the deprecation used to fire several times per request and dominated the
+# stdout log during load tests. The message is worth keeping -- the volume is
+# not -- so say it once per process.
+_ATTR_TAXONOMY_WARNED = False
+
+
+def _warn_attr_taxonomy_deprecated() -> None:
+    global _ATTR_TAXONOMY_WARNED
+    if _ATTR_TAXONOMY_WARNED:
+        return
+    _ATTR_TAXONOMY_WARNED = True
+    logger.warning(
+        "OrPair.attr_taxonomy is deprecated; use attr_key "
+        "(further occurrences suppressed)"
+    )
+
+
 # ══════════════════════════════════════════════════════════════
 # BACKWARD-COMPAT RE-EXPORTS (from db_models.py)
 # ══════════════════════════════════════════════════════════════
@@ -119,7 +137,7 @@ class OrPair:
     def __post_init__(self):
         if self.attr_taxonomy and not self.attr_key:
             self.attr_key = self.attr_taxonomy.removeprefix("pa_")
-            logger.warning("OrPair.attr_taxonomy is deprecated; use attr_key")
+            _warn_attr_taxonomy_deprecated()
 
     @property
     def branches(self) -> int:

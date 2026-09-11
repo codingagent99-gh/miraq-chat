@@ -42,17 +42,21 @@ def _detect_explicit_taxonomy_signal(msg: str, l) -> Optional[str]:
 # PHASE 1: Longest-String Catalog Match
 # ══════════════════════════════════════════════════════════════
 
-def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
-    """
-    Run longest-string substring matching against the store catalog.
-    Returns (entities, unmatched_text).
-    """
-    msg_lower = msg.lower()
-    entities = ExtractedEntities()
-    if not hasattr(entities, 'target_category_slugs'):
-        entities.target_category_slugs = set()
+def _build_phase1_index(catalog_items):
+    """Precompute the grouped catalog and one compiled regex per group.
 
-    catalog_items = getattr(loader, 'longest_match_catalog', [])
+    Depends only on the catalog, never on the message, so it can be built
+    once per catalog instead of once per request. Rebuilding it per request
+    dominated CPU time (Sep 2026 load test: phase1_catalog was 50-70% of all
+    per-request CPU) and, past ~512 distinct patterns, also thrashed the re
+    module's internal compile cache so nothing stayed compiled.
+
+    Returns (name, matches, compiled_pattern) tuples in the same order the
+    grouping dict produced. Order is load-bearing: Phase 1 consumes matched
+    text as it goes, so length-sorted order is what makes the longest term
+    win.
+    """
+    index = []
 
     # Group by identical string (preserves length-sorted order)
     grouped_catalog = {}
@@ -82,8 +86,6 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
         if group_key not in grouped_catalog:
             grouped_catalog[group_key] = []
         grouped_catalog[group_key].append((match_type, data))
-
-    unmatched_text = msg_lower
 
     for name, matches in grouped_catalog.items():
         if len(name) < 3:
@@ -119,9 +121,60 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
             flexible_name = r'[\s\-]*'.join(parts)
         
         
-        pattern = r'(?<![\w-])(' + flexible_name + r')(?![\w-])'
+        index.append((
+            name,
+            matches,
+            re.compile(r'(?<![\w-])(' + flexible_name + r')(?![\w-])'),
+        ))
 
-        if not re.search(pattern, unmatched_text):
+    return index
+
+
+def _get_phase1_index(loader, catalog_items):
+    """Identity-cached accessor for the Phase 1 index.
+
+    Keyed on the catalog list OBJECT, not its contents. lookup_builder
+    reassigns loader.longest_match_catalog to a freshly built list on every
+    reload, so a changed catalog is always a different object and the cache
+    invalidates itself -- no hook needed in the refresh path, and no way for
+    a refresh to leave a stale index behind.
+
+    Deliberately unlocked. Two threads racing here each build a correct
+    index and one assignment wins; a lock would serialise every request on
+    the common path to avoid a duplicate build that costs one request.
+    """
+    cached = getattr(loader, "_phase1_index_cache", None)
+    if cached is not None and cached[0] is catalog_items:
+        return cached[1]
+
+    index = _build_phase1_index(catalog_items)
+    try:
+        loader._phase1_index_cache = (catalog_items, index)
+    except Exception:
+        # A loader that refuses attribute assignment still gets correct
+        # results, just at the old per-request cost.
+        logger.debug("phase1: could not cache index on loader; rebuilding per request")
+    return index
+
+
+def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
+    """
+    Run longest-string substring matching against the store catalog.
+    Returns (entities, unmatched_text).
+    """
+    msg_lower = msg.lower()
+    entities = ExtractedEntities()
+    if not hasattr(entities, 'target_category_slugs'):
+        entities.target_category_slugs = set()
+
+    catalog_items = getattr(loader, 'longest_match_catalog', [])
+    phase1_index = _get_phase1_index(loader, catalog_items)
+
+    unmatched_text = msg_lower
+
+    for name, matches, pattern in phase1_index:
+
+        if not pattern.search(unmatched_text):
             # if _DIM_RE.match(name.strip()):
             #     logger.debug(f"[DIM_PATTERN_TRACE] NO MATCH for {name!r} against text={unmatched_text!r}")
             continue
@@ -215,7 +268,7 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
                 logger.debug(f"[ATTR_MERGE_TRACE] merging attr_name={attr_name!r} slugs={unique_slugs!r}")
                 merge_attribute(entities.attributes, attr_name, combined)
 
-        unmatched_text = re.sub(pattern, " ", unmatched_text)
+        unmatched_text = pattern.sub(" ", unmatched_text)
 
     return entities, unmatched_text
 
