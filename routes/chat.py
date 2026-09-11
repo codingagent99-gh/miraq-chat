@@ -1322,13 +1322,15 @@ def _build_final_response(
         bot_message      = "Here are our top categories to help you get started!"
         suggestions_list = ["Cancel"]
     else:
-        bot_message      = generate_bot_message(
-            intent, entities, products, confidence, order_data,
-            total_items=pagination.get("total_items"), page=page,
-            customer_id=customer_id,
-            or_pair_breakdown=or_pair_breakdown,
-        )
-        suggestions_list = generate_suggestions(intent, entities, products)
+        import timing_logger
+        with timing_logger.stage("render"):
+            bot_message      = generate_bot_message(
+                intent, entities, products, confidence, order_data,
+                total_items=pagination.get("total_items"), page=page,
+                customer_id=customer_id,
+                or_pair_breakdown=or_pair_breakdown,
+            )
+            suggestions_list = generate_suggestions(intent, entities, products)
 
     # ── Refinement prefix + New Search affordance ──
     # On a refined search, show the accumulated filter set so the shopper always
@@ -2284,12 +2286,14 @@ def chat():
                 f"target_category_slugs={getattr(entities, 'target_category_slugs', None)} | "
                 f"attr_tag_or_pairs={entities.attr_tag_or_pairs}"
             )
-            llm_outcome = run_llm_fallback(
-                message=message, intent=intent, entities=entities, confidence=confidence,
-                session_id=str(conversation.id), session_history=session_history,
-                store_loader=store_loader, page=page, start_time=start_time,
-                order_create_intents=ORDER_CREATE_INTENTS, user_context=user_context,
-            )
+            import timing_logger
+            with timing_logger.stage("llm_fallback"):
+                llm_outcome = run_llm_fallback(
+                    message=message, intent=intent, entities=entities, confidence=confidence,
+                    session_id=str(conversation.id), session_history=session_history,
+                    store_loader=store_loader, page=page, start_time=start_time,
+                    order_create_intents=ORDER_CREATE_INTENTS, user_context=user_context,
+                )
 
             if llm_outcome is not None:
                 if not isinstance(llm_outcome, tuple) or not isinstance(llm_outcome[0], tuple):

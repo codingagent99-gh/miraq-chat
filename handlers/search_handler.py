@@ -161,13 +161,15 @@ def handle_empty_results(
         **entities.attributes,
     }
 
-    llm_retry_result = llm_retry_search(
-        user_message=message,
-        original_intent=intent.value,
-        entities=entities_dict,
-        session_id=session_id,
-        store_loader=store_loader,
-    )
+    import timing_logger
+    with timing_logger.stage("llm_retry"):
+        llm_retry_result = llm_retry_search(
+            user_message=message,
+            original_intent=intent.value,
+            entities=entities_dict,
+            session_id=session_id,
+            store_loader=store_loader,
+        )
 
     if not llm_retry_result.get("success"):
         return all_products_raw, None
