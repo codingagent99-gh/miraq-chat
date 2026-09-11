@@ -41,6 +41,13 @@ order_logger = get_order_logger()
 # ══════════════════════════════════════════════════════════════════════
 _UPSTREAM_LOCK = _threading.Lock()
 _UNHEALTHY_AFTER = 3        # consecutive hard failures before "down"
+
+# Upper bound on concurrent outbound WooCommerce calls per request. Four is
+# comfortably under requests' default HTTPAdapter pool_maxsize of 10, which
+# the WooClient singleton shares across every gunicorn thread -- going wider
+# would start discarding connections and paying a fresh TCP+TLS handshake on
+# calls that could have reused one.
+_MAX_PARALLEL_WOO_CALLS = 4
 _SALVAGE_WINDOW_S = 300     # a salvage older than this stops mattering
 
 _UPSTREAM = {
@@ -442,10 +449,52 @@ class WooClient:
             return _err
 
     def execute_all(self, api_calls: List[WooAPICall]) -> List[dict]:
-        results = []
-        for call in api_calls:
-            results.append(self.execute(call))
-        return results
+        """Run every call, in parallel when there is more than one.
+
+        Each WooCommerce call costs 2.5-3s of pure waiting (measured Sep 2026;
+        flat whether the server is idle or saturated, so it is upstream
+        latency, not contention). Run serially, a three-call request waits
+        ~8s for work that could finish in ~3s. The wait releases the GIL, so
+        threads genuinely overlap here.
+
+        Results stay in the order of api_calls -- callers downstream pair
+        each response with its .call by position.
+
+        TIMING: execute() records into the "woo_api" bucket, but
+        timing_logger.accumulate() no-ops outside a request context, and
+        worker threads have none. So the batch is wrapped here instead, which
+        also gives the more useful number: wall-clock waiting on WooCommerce,
+        not the sum of overlapping calls. The single-call path is left inline
+        so execute() keeps recording it -- wrapping there too would
+        double-count.
+        """
+        if not api_calls:
+            return []
+
+        if len(api_calls) == 1:
+            return [self.execute(api_calls[0])]
+
+        import timing_logger
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Bounded: with N gunicorn threads each fanning out, an unbounded
+        # pool would multiply into far more sockets than WooCommerce (or the
+        # session's connection pool) wants to see at once.
+        max_workers = min(len(api_calls), _MAX_PARALLEL_WOO_CALLS)
+
+        def _run(call):
+            # execute() already converts failures into an error dict; this is
+            # a backstop so one unexpected raise cannot lose the whole batch.
+            try:
+                return self.execute(call)
+            except Exception as exc:
+                logger.error(f"execute_all: call failed | error={exc}", exc_info=True)
+                return {"success": False, "error": str(exc), "call": call}
+
+        with timing_logger.stage("woo_api"):
+            with ThreadPoolExecutor(max_workers=max_workers,
+                                    thread_name_prefix="woo") as pool:
+                return list(pool.map(_run, api_calls))
 
 
 # Global WooClient instance

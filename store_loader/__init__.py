@@ -30,6 +30,7 @@ from store_loader.fetcher import (
     load_from_live_api,
     save_to_local_files,
     dump_lookups_for_debugging,
+    fetch_catalog_version,
 )
 from store_loader.lookup_builder import build_all_lookups
 from store_loader.queries import StoreQueryMixin
@@ -116,14 +117,19 @@ class StoreLoader(StoreQueryMixin):
         # State
         self._lock = threading.Lock()
         self._last_loaded: Optional[float] = None
+        # Ceiling, not cadence. The catalog-version probe below is what
+        # normally triggers a reload; this is the backstop that still fires if
+        # the probe is unavailable, or if the catalog changed in some way the
+        # fingerprint does not cover.
         self._refresh_interval: int = 6 * 3600
+        self._poll_interval: int = int(os.getenv("CATALOG_POLL_INTERVAL", "60"))
         self._retry_interval: int = 2 * 60
+        self._catalog_version: Optional[str] = None
         self._refresh_thread: Optional[threading.Thread] = None
         self._degraded: bool = False
         self._degraded_reasons: list = []
         self._expected_product_count: Optional[int] = None
         self._loaded_from_cache: bool = False
-        self.conflicts: List[Dict] = []
 
     # ─── Token helper ───
 
@@ -200,16 +206,20 @@ class StoreLoader(StoreQueryMixin):
                             "Existing cache files preserved."
                         )
 
-            # ── Apply fetched data ────────────────────────────────────
-            self.categories         = data["categories"]
-            self.tags               = data["tags"]
-            self.products           = data["products"]
-            self.all_attributes_raw = data["all_attributes_raw"]
-            self.currency_symbol    = data["currency_symbol"]
-            self._expected_product_count = data.get("expected_product_count")
-
-            # ── Build indexes ─────────────────────────────────────────
-            build_all_lookups(self)
+            # ── Build indexes, then publish raw data + indexes together ──
+            # Request threads never take self._lock, so anything assigned to
+            # self here is visible to in-flight requests immediately. The raw
+            # lists and the indexes derived from them are staged and swapped in
+            # one update, so a reader sees the old catalog or the new one and
+            # never a mix of the two.
+            build_all_lookups(self, raw={
+                "categories":              data["categories"],
+                "tags":                    data["tags"],
+                "products":                data["products"],
+                "all_attributes_raw":      data["all_attributes_raw"],
+                "currency_symbol":         data["currency_symbol"],
+                "_expected_product_count": data.get("expected_product_count"),
+            })
             self._validate_load()
             self._last_loaded = time.time()
 
@@ -225,9 +235,6 @@ class StoreLoader(StoreQueryMixin):
 
         finally:
             self._lock.release()
-
-        # Run scanner outside the lock
-        threading.Thread(target=self._run_scanner_async, daemon=True).start()
 
     def sync_from_webhook(self):
         """Background function triggered by WordPress Action Webhooks."""
@@ -267,9 +274,14 @@ class StoreLoader(StoreQueryMixin):
 
         def _refresh_loop():
             while True:
-                interval = self._retry_interval if self._degraded else self._refresh_interval
-                time.sleep(interval)
-                label = "🔁 Degraded load retry" if self._degraded else "🔄 Background refresh"
+                if self._degraded:
+                    time.sleep(self._retry_interval)
+                    label = "🔁 Degraded load retry"
+                else:
+                    time.sleep(self._poll_interval)
+                    label = self._reason_to_reload()
+                    if not label:
+                        continue
                 logger.info(f"StoreLoader: {label} — reloading store data...")
                 try:
                     self.load_all()
@@ -278,7 +290,49 @@ class StoreLoader(StoreQueryMixin):
 
         self._refresh_thread = threading.Thread(target=_refresh_loop, daemon=True)
         self._refresh_thread.start()
-        logger.info(f"StoreLoader: Catalog refresh scheduled every {self._refresh_interval // 3600}h")
+        logger.info(
+            f"StoreLoader: Catalog version polled every {self._poll_interval}s "
+            f"| full reload forced every {self._refresh_interval // 3600}h"
+        )
+
+    def _reason_to_reload(self) -> Optional[str]:
+        """Decide whether the background loop should reload. None = stay put.
+
+        Order matters. The version probe is consulted first and its result is
+        recorded BEFORE load_all() runs, not after: an edit landing mid-reload
+        then leaves self._catalog_version pointing at the token we observed, so
+        the next poll sees a different one and reloads again. Stamping it after
+        a successful load would swallow that edit until the 6h backstop.
+
+        A probe that returns None is explicitly NOT treated as "unchanged" —
+        see fetch_catalog_version. The interval check below still runs, so an
+        unreachable or missing endpoint gives back the old 6h behaviour rather
+        than freezing the catalog.
+        """
+        elapsed = time.time() - (self._last_loaded or 0)
+
+        # Shopify has no equivalent endpoint (the probe lives in the
+        # WooCommerce plugin), so that backend stays on the plain timer.
+        if ECOMMERCE_BACKEND != "shopify":
+            version = fetch_catalog_version(
+                self.session, self.custom_api_base,
+                self.consumer_key, self.consumer_secret,
+            )
+            if version and version != self._catalog_version:
+                previous = self._catalog_version
+                self._catalog_version = version
+                if previous is None:
+                    # First successful probe since boot. Nothing is known to
+                    # have changed; just record the baseline and let the
+                    # interval check below decide.
+                    logger.info(f"StoreLoader: catalog version baseline = {version[:12]}")
+                else:
+                    return f"📥 Catalog changed ({previous[:12]} → {version[:12]})"
+
+        if elapsed >= self._refresh_interval:
+            return f"🔄 Interval backstop ({int(elapsed // 3600)}h since last load)"
+
+        return None
 
     # ─── Private helpers ───
 
@@ -296,13 +350,6 @@ class StoreLoader(StoreQueryMixin):
     @staticmethod
     def _currency_code_to_symbol(code: str) -> str:
         return CURRENCY_MAP.get(code.upper(), code)
-
-    def _run_scanner_async(self):
-        try:
-            from conflict_scanner import run_conflict_simulation
-            self.conflicts = run_conflict_simulation(self)
-        except Exception as e:
-            logger.error(f"StoreLoader: Conflict scanner failed: {e}", exc_info=True)
 
     def _validate_load(self):
         reasons = []

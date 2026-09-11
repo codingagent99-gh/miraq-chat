@@ -261,6 +261,46 @@ def fetch_currency_symbol(session, base_url: str, consumer_key: str,
         return "$"
 
 
+def fetch_catalog_version(session, custom_api_base: str,
+                         consumer_key: str, consumer_secret: str,
+                         timeout: int = 10) -> Optional[str]:
+    """Fetch the store's catalog fingerprint from custom-api/v1/catalog-version.
+
+    Returns the token, or None if the probe could not be completed for ANY
+    reason -- endpoint missing (older plugin), auth rejected, network error,
+    malformed body. None means "don't know", never "unchanged": the caller
+    falls back to the plain interval timer on None, so a broken or absent probe
+    degrades to exactly the old 6h behaviour instead of either hammering the
+    store or pinning the catalog forever.
+
+    Short timeout on purpose. This runs on the refresh thread every minute; a
+    probe that hangs for the full 30s catalog timeout would stall the poll loop
+    far longer than the thing it is trying to save.
+    """
+    url = f"{custom_api_base}/catalog-version"
+    try:
+        resp = session.get(
+            url,
+            headers=_custom_api_headers(consumer_key, consumer_secret),
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        version = (resp.json() or {}).get("version")
+        if not isinstance(version, str) or not version:
+            logger.warning(
+                f"StoreLoader: catalog-version returned no usable token "
+                f"(body={resp.text[:120]!r}) — falling back to interval refresh"
+            )
+            return None
+        return version
+    except Exception as e:
+        logger.warning(
+            f"StoreLoader: catalog-version probe failed ({e}) — "
+            "falling back to interval refresh"
+        )
+        return None
+
+
 def load_from_live_api(session, base_url: str, custom_api_base: str,
                        consumer_key: str, consumer_secret: str,
                        timeout: int = 30) -> dict:

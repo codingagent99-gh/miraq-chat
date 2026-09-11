@@ -158,7 +158,58 @@ def build_longest_match_catalog(
 # MASTER LOOKUP BUILDER
 # ══════════════════════════════════════════════════════════════
 
-def build_all_lookups(loader):
+class _LookupStaging:
+    """Write-through staging view over a StoreLoader.
+
+    Reads fall through to the real loader; writes are captured locally.
+    ``publish()`` copies every captured attribute onto the loader in a single
+    ``__dict__.update()``.
+
+    Why this exists: build_all_lookups used to reset ``category_by_name_lower``,
+    ``product_by_name_lower`` and friends to ``{}`` on the LIVE loader and then
+    repopulate them in place. ``StoreLoader._lock`` is only held against a second
+    ``load_all()`` -- no request thread ever takes it -- and gunicorn runs
+    gthread with 4 threads per worker. So any request that landed mid-rebuild
+    read a half-built or empty index and silently failed to resolve a category
+    the store definitely has. That is a wrong answer, not an error, which is why
+    it never showed up as one. Staging closes the window.
+    """
+
+    __slots__ = ("_loader", "_staged")
+
+    def __init__(self, loader, raw=None):
+        object.__setattr__(self, "_loader", loader)
+        object.__setattr__(self, "_staged", dict(raw or {}))
+
+    def __getattr__(self, name):
+        staged = object.__getattribute__(self, "_staged")
+        if name in staged:
+            return staged[name]
+        return getattr(object.__getattribute__(self, "_loader"), name)
+
+    def __setattr__(self, name, value):
+        object.__getattribute__(self, "_staged")[name] = value
+
+    def publish(self):
+        # dict.update is a single C-level call, so under the GIL a reader sees
+        # either the whole old set or the whole new set.
+        loader = object.__getattribute__(self, "_loader")
+        loader.__dict__.update(object.__getattribute__(self, "_staged"))
+
+
+def build_all_lookups(loader, raw=None):
+    """Rebuild every lookup index and swap it in atomically.
+
+    ``raw`` is the freshly fetched payload (categories/tags/products/...).
+    Passing it here rather than assigning it on the loader first means the raw
+    data and the indexes derived from it become visible in the same instant.
+    """
+    staging = _LookupStaging(loader, raw)
+    _build_lookups_into(staging)
+    staging.publish()
+
+
+def _build_lookups_into(loader):
     """
     Build all in-memory lookup dictionaries from raw data.
     Mutates the loader instance in-place.
@@ -315,6 +366,21 @@ def build_all_lookups(loader):
         loader.all_attributes_raw,
         loader.tag_by_name_lower,
     )
+
+    # Build the Phase 1 regex index here rather than letting the first
+    # request trigger it. The cache in catalog_parser is unlocked on purpose,
+    # so a lazy build costs not one request but every request that arrives
+    # while it runs -- on the Sep 2026 cold start that was the first SIX,
+    # at ~1.6s each. Building it as part of the catalog means no request ever
+    # pays, including after a webhook-triggered reload.
+    try:
+        from parsers.catalog_parser import _get_phase1_index
+        _get_phase1_index(loader, loader.longest_match_catalog)
+        logger.info("lookup_builder: Phase 1 index prewarmed")
+    except Exception as exc:
+        # Never fail a catalog load over a warm-up: the first request will
+        # just build it lazily, exactly as before.
+        logger.warning(f"lookup_builder: Phase 1 index prewarm skipped — {exc}")
     
     # Fuzzy typo-correction vocabulary (utils/typo_correction.py)
     build_fuzzy_vocab(loader)
