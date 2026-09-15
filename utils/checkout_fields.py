@@ -455,6 +455,14 @@ def _fetch_live_fields() -> Optional[dict]:
     failure — a plugin outage must neither break bulk ordering nor disable the
     gate, so callers fall back to the floor.
     """
+    # /checkout-fields is served by THWCFE, a WooCommerce plugin. There is no
+    # equivalent Shopify endpoint, and ShopifyEndpoints intentionally omits
+    # fetch_checkout_fields. Bail early so callers use the static floor
+    # without logging a spurious warning.
+    from app_config import ECOMMERCE_BACKEND
+    if ECOMMERCE_BACKEND != "woocommerce":
+        return None
+
     try:
         # Imported lazily: this module is imported from handlers that are
         # themselves imported at request time, and woo_client pulls in app

@@ -377,6 +377,61 @@ def extract_attributes(text: str, entities: ExtractedEntities) -> str:
                 break
             except re.error:
                 pass
+        else:
+            # ── Compound-term tail-match second pass ─────────────────────
+            # The full-term main loop above found nothing for this taxonomy.
+            # Try matching the trailing word(s) of each compound term so that
+            # e.g. "gray" resolves against "FOLATA Gray" / "FOLATA Dark Gray".
+            # Dimensional attributes are skipped — their matching is already
+            # tightly controlled by normalize_dimension.
+            if not is_dimensional:
+                attr_key = _resolve_attr_key_with_fallback(loader, taxonomy, label)
+                if attr_key not in entities.attributes:
+                    tail_cands = _compound_tail_candidates(
+                        masked_text, masked_text_lower, terms, product_name_lower
+                    )
+                    if tail_cands:
+                        max_len = max(c[0] for c in tail_cands)
+                        best = [c for c in tail_cands if c[0] == max_len]
+                        if len(best) == 1:
+                            _, matched_term, tail = best[0]
+                            _resolve_attribute_or_tag(
+                                entities, loader, text, taxonomy, label,
+                                matched_term,
+                                matched_term.get("name", "").lower().strip(),
+                                False,
+                                rf"(?<![\w-]){re.escape(tail)}(?![\w-])",
+                            )
+                            logger.debug(
+                                f"[CompoundTailMatch] taxonomy={taxonomy!r} "
+                                f"| term={matched_term.get('name')!r} "
+                                f"| tail={tail!r} (unambiguous auto-applied)"
+                            )
+                        else:
+                            # Multiple terms with same-length tail → disambiguation.
+                            _, _, tail = best[0]  # all share the same tail
+                            sem_candidates = []
+                            for _, matched_term, _ in best:
+                                term_key = _resolve_attr_term_key_with_fallback(
+                                    loader, taxonomy,
+                                    matched_term.get("name", matched_term.get("slug", "")),
+                                    matched_term.get("slug", matched_term.get("name", "")),
+                                )
+                                sem_candidates.append({
+                                    "type": "attribute",
+                                    "taxonomy": attr_key,
+                                    "slug": term_key,
+                                    "suggested_name": matched_term.get("name", ""),
+                                    "user_text": tail,
+                                    "is_negative": False,
+                                    "score": 0.80,
+                                })
+                            entities.semantic_matches.append(sem_candidates)
+                            logger.debug(
+                                f"[CompoundTailMatch] taxonomy={taxonomy!r} "
+                                f"| tail={tail!r} | ambiguous: "
+                                f"{[c['suggested_name'] for c in sem_candidates]}"
+                            )
 
     return masked_text
 
@@ -448,6 +503,57 @@ def _match_term_in_text(text: str, term_lower: str, is_dimensional: bool,
     if len(term_lower) > 4 and re.search(rf"(?<![\w-]){re.escape(term_lower[:-1])}(?![\w-])", text):
         return rf"(?<![\w-]){re.escape(term_lower[:-1])}(?![\w-])"
     return None
+
+
+
+def _compound_tail_candidates(
+    masked_text: str,
+    masked_text_lower: str,
+    terms: list,
+    product_name_lower: str,
+) -> list:
+    """
+    Second-pass matcher for compound catalog terms whose FULL name wasn't found
+    in the user's text, but whose trailing word(s) were.
+
+    Example: catalog term "FOLATA Gray"      → tries "gray" (1-word tail).
+             catalog term "FOLATA Dark Gray"  → tries "dark gray" (2-word tail),
+                                                 then "gray" (1-word tail).
+
+    Returns a list of (tail_word_count, term_dict, matched_tail_str), one entry
+    per term that matched, using the LONGEST matching tail for each.  The caller
+    picks candidates with the highest tail_word_count:
+
+      - exactly one best candidate  → safe to auto-apply via _resolve_attribute_or_tag
+      - multiple best candidates    → ambiguous; caller adds to semantic_matches
+
+    Only called when the full-term main pass found nothing for a taxonomy, and
+    only for non-dimensional attributes.
+    """
+    candidates = []
+    for term in terms:
+        term_name_lower = term.get("name", "").lower().strip()
+        if not term_name_lower:
+            continue
+        if product_name_lower and term_name_lower in product_name_lower:
+            continue
+        words = term_name_lower.split()
+        if len(words) < 2:
+            continue  # single-word terms already handled by the main pass
+
+        for tail_start in range(1, len(words)):
+            tail = " ".join(words[tail_start:])
+            if len(tail) < 3:
+                continue
+            # Fast reject: the tail (minus its last char) must be a literal substring.
+            if tail[:-1] not in masked_text_lower:
+                continue
+            pattern = rf"(?<![\w-]){re.escape(tail)}(?![\w-])"
+            if re.search(pattern, masked_text, re.IGNORECASE):
+                candidates.append((len(words) - tail_start, term, tail))
+                break  # longest matching tail found for this term; move on
+
+    return candidates
 
 
 def _resolve_attribute_or_tag(

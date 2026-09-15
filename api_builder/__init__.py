@@ -614,8 +614,17 @@ def _build_product_search(e, page, user_message: str = "") -> list:
     attr_filters = resolve_attr_filters(e.attributes)
     active_or_pairs = list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else []
 
-    actual_search = e.product_name or e.search_term
-    if not actual_search and not e.tag_slugs and not e.target_category_slugs and not attr_filters and not e.product_id and not active_or_pairs:
+    # When taxonomy signals already exist, e.search_term is a catch-all
+    # extraction fallback — passing it alongside attr/tag/cat filters causes
+    # Layer2 to AND text-search with taxonomy filters, producing 0 results
+    # for unrecognised attribute values (e.g. "gray" when the catalog stores
+    # "FOLATA Gray"). Same suppression logic as _build_filter_by_attribute.
+    _has_taxonomy = bool(
+        attr_filters or active_or_pairs
+        or e.tag_slugs or e.target_category_slugs or e.product_id
+    )
+    actual_search = e.product_name or (e.search_term if not _has_taxonomy else None)
+    if not actual_search and not _has_taxonomy:
         actual_search = user_message
 
     # ── Text-only search guard ──────────────────────────────────────────────
@@ -816,8 +825,20 @@ def _build_filter_by_attribute(e, page, user_message: str = "") -> list:
     attr_label = next(iter(e.attributes.keys()), "attribute")
     attr_value = next(iter(e.attributes.values()), "")
 
-    actual_search = e.product_name or e.search_term
-    if not actual_search and not deduped_tag_slugs and not e.target_category_slugs and not attr_filters and not e.product_id and not e.attr_tag_or_pairs:
+    # When taxonomy signals already exist (attrs/tags/categories/or-pairs resolved
+    # from the current turn or carried forward by merge_into_active_search),
+    # e.search_term is a catch-all extraction fallback — not a product name.
+    # Passing it as search_term alongside attr_filters causes Layer2 to AND both
+    # constraints, producing 0 results for any unrecognized attribute value
+    # (e.g. "gray" when the catalog stores "FOLATA Gray", "FOLATA Dark Gray").
+    # Only promote search_term to actual_search when there are NO taxonomy signals
+    # at all and it must act as a last-resort text search.
+    _has_taxonomy = bool(
+        attr_filters or deduped_tag_slugs
+        or e.target_category_slugs or e.attr_tag_or_pairs or e.product_id
+    )
+    actual_search = e.product_name or (e.search_term if not _has_taxonomy else None)
+    if not actual_search and not _has_taxonomy:
         actual_search = user_message
 
     return [build_advanced_filter_call(

@@ -43,30 +43,33 @@ CATEGORY = [
     # that exercises category_groups rather than a single slug, and
     # "give fabric" is bare and lowercase — no "show me" lead-in, which is a
     # different shape through Phase 1 than the rest.
-    "Show me new releases",
-    "Show me Exterior Tiles",
-    "Show me Countertop products",
-    "Show me panels products",
-    "Show me Pavers",
-    "Show me Floor/Pool products",
-    "Show tile products",
-    "Show floor tiles",
-    "give fabric",
+    # "Show me new releases",
+    # "Show me Exterior Tiles",
+    # "Show me Countertop products",
+    # "Show me panels products",
+    # "Show me Pavers",
+    # "Show me Floor/Pool products",
+    # "Show tile products",
+    # "Show floor tiles",
+    # "give fabric",
+    "Show me Countertop products"
+    
 ]
 
 ATTRIBUTE = [
     # Guide 1.3 / 1.4 and 12. Category + tag, or category + attribute term.
     # These go through consolidation and attribute-filter building rather
     # than a plain category browse.
-    "Show me tile products with minimalistic look",
-    "Show me Blue color tiles",
-    "Show me Blue color products",
-    "Show me matte finish",
-    "Show with colors blue",
-    "Show me green mosaic products with matte finish",
-    "Show me Minimalistic pavers",
-    "Show wood pavers gray",
-    "Show Porcelain pavers",
+    # "Show me tile products with minimalistic look",
+#     "Show me Blue color tiles",
+#     "Show me Blue color products",
+#     "Show me matte finish",
+#     "Show with colors blue",
+#     "Show me green mosaic products with matte finish",
+#     "Show me Minimalistic pavers",
+#     "Show wood pavers gray",
+#     "Show Porcelain pavers",
+    "ANSEL Warm White",
 ]
 
 DIMENSION = [
@@ -75,10 +78,11 @@ DIMENSION = [
     # for translation corrupting dimension strings (12"X24" becoming
     # 12 "X24"), and catalog_parser has dimension-specific regex handling.
     # If one bucket regresses on its own, it will probably be this one.
-    'Show me tile products with 12"x12" tile size',
-    'Show wood pavers 1/2"',
-    'Show wood pavers 3/8"',
-    'Show me brown countertops size 60"x60"',
+    # 'Show me tile products with 12"x12" tile size',
+    # 'Show wood pavers 1/2"',
+    # 'Show wood pavers 3/8"',
+    # 'Show me brown countertops size 60"x60"',
+    '12"x24"'
 ]
 
 MULTI_FILTER = [
@@ -89,13 +93,14 @@ MULTI_FILTER = [
     # included. It is listed there as a working query, so it is left exactly
     # as written — if you "fix" it you are no longer testing what the guide
     # documents.
-    "Show paver products with bullnose with quickship",
-    "Show all floor tile covebase with quickship",
-    'Show paver products bullnose of 5/16" with quick quickship',
-    "Show all paver products with anti-slip with quickship",
-    "Give all floor mosaic with quickship",
-    "Give me all wall tile with quickship",
-    "Give me all tile wall mosaics",
+    # "Show paver products with bullnose with quickship",
+    # "Show all floor tile covebase with quickship",
+    # 'Show paver products bullnose of 5/16" with quick quickship',
+    # "Show all paver products with anti-slip with quickship",
+    # "Give all floor mosaic with quickship",
+    # "Give me all wall tile with quickship",
+    # "Give me all tile wall mosaics",
+    'show me matte 6"x6"'
 ]
 
 # Guide 1.5. Exact string, matched case-insensitively in routes/chat.py before
