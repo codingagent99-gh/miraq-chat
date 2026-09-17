@@ -48,12 +48,11 @@ from flask import Blueprint, jsonify, request
 
 from chat_logger import get_logger
 from models.shopify_token import ShopifyToken
-from store_loader.config import SHOPIFY_STORE_DOMAIN
+from store_registry import get_store_loader
 
 logger = get_logger("miraq_chat")
 shopify_products_bp = Blueprint("shopify_products", __name__)
 
-_ADMIN_GQL_URL = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-10/graphql.json"
 _MAX_FETCH     = 250   # max products pulled per request (covers most catalogs)
 _BATCH_SIZE    = 50    # products per GraphQL page (Shopify limit is 250 but 50 is safer)
 
@@ -302,13 +301,13 @@ def _evaluate(node, product, variant):
 # Shopify API helpers
 # ─────────────────────────────────────────────────────────────
 
-def _gql(query, variables, token):
+def _gql(query, variables, token, domain):
     """
     Execute a single GraphQL request against the Shopify Admin API.
     Raises on HTTP errors or GraphQL-level errors.
     """
     resp = http_requests.post(
-        _ADMIN_GQL_URL,
+        f"https://{domain}/admin/api/2024-10/graphql.json",
         json={"query": query, "variables": variables},
         headers={
             "Content-Type":             "application/json",
@@ -348,7 +347,7 @@ def _normalize(node):
     }
 
 
-def _fetch_products(tag_query, token, max_fetch=_MAX_FETCH):
+def _fetch_products(tag_query, token, domain, max_fetch=_MAX_FETCH):
     """
     Cursor-paginate through the top-level products query.
     tag_query is passed directly as the Shopify query string.
@@ -361,6 +360,7 @@ def _fetch_products(tag_query, token, max_fetch=_MAX_FETCH):
             _PRODUCTS_GQL,
             {"query": tag_query, "first": batch, "after": cursor},
             token,
+            domain,
         )
         pdata = data["data"]["products"]
         edges = pdata.get("edges", [])
@@ -376,7 +376,7 @@ def _fetch_products(tag_query, token, max_fetch=_MAX_FETCH):
     return products
 
 
-def _fetch_from_collection(collection_id, tag_query, token, max_fetch=_MAX_FETCH):
+def _fetch_from_collection(collection_id, tag_query, token, domain, max_fetch=_MAX_FETCH):
     """
     Cursor-paginate through a single collection's products.
     tag_query further narrows results within the collection.
@@ -390,6 +390,7 @@ def _fetch_from_collection(collection_id, tag_query, token, max_fetch=_MAX_FETCH
             _COLLECTION_GQL,
             {"collectionId": gid, "query": tag_query, "first": batch, "after": cursor},
             token,
+            domain,
         )
         cdata = (data.get("data") or {}).get("collection")
         if not cdata:
@@ -450,10 +451,17 @@ def search_shopify_products():
     page     = max(1, int(body.get("page", 1)))
     per_page = max(1, min(100, int(body.get("per_page", 20))))
 
+    # ── Resolve tenant ─────────────────────────────────────────────────────
+    loader = get_store_loader()
+    if not loader:
+        logger.error("shopify/products: no tenant loader resolved")
+        return jsonify({"success": False, "error": "tenant not resolved"}), 400
+    domain = loader.shopify_domain
+
     # ── Auth ────────────────────────────────────────────────────────────────
-    token_row = ShopifyToken.query.get(SHOPIFY_STORE_DOMAIN)
+    token_row = ShopifyToken.query.get(domain)
     if not token_row or token_row.is_expired:
-        logger.error("shopify/products: Admin token missing or expired")
+        logger.error(f"shopify/products: Admin token missing or expired | domain={domain}")
         return jsonify({"success": False, "error": "Shopify token unavailable"}), 503
 
     token = token_row.access_token
@@ -474,23 +482,28 @@ def search_shopify_products():
         # ── Fetch from Shopify ───────────────────────────────────────────────
         if not collections:
             # No collection filter — query the full catalog
-            raw_products = _fetch_products(tag_query, token)
+            raw_products = _fetch_products(tag_query, token, domain)
 
         elif len(collections) == 1:
             # Single collection
-            raw_products = _fetch_from_collection(collections[0], tag_query, token)
+            raw_products = _fetch_from_collection(collections[0], tag_query, token, domain)
 
         else:
             # Multiple collections
             col_rel = _collection_relation(filters) or "AND"
 
             if col_rel == "OR":
-                # Each collection is an independent source → fetch in parallel and merge
+                # Each collection is an independent source → fetch in parallel
+                # and merge. domain and token are resolved ONCE above, in this
+                # request's own thread, and passed explicitly into every
+                # worker — a worker calling get_store_loader() itself would
+                # see no request context and get None; the wrong-tenant-data
+                # risk from resolving it some other way is worse than that.
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=min(len(collections), 5)
                 ) as pool:
                     futures = [
-                        pool.submit(_fetch_from_collection, col, tag_query, token)
+                        pool.submit(_fetch_from_collection, col, tag_query, token, domain)
                         for col in collections
                     ]
                     results = [f.result() for f in concurrent.futures.as_completed(futures)]
@@ -502,7 +515,7 @@ def search_shopify_products():
                 # (a product must be in all collections, but that's rare in practice;
                 # for strict AND enforcement across collections, remove this note and
                 # add a collection-membership check in _evaluate if needed).
-                raw_products = _fetch_from_collection(collections[0], tag_query, token)
+                raw_products = _fetch_from_collection(collections[0], tag_query, token, domain)
 
         # ── Layer 2: post-filter products & variants ─────────────────────────
         # _evaluate is the authoritative filter — it re-checks tags too,

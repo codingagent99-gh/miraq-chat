@@ -1,9 +1,10 @@
 # models/usage_guard.py
 
 from functools import wraps
-from flask import request, jsonify
+from flask import request, jsonify, g
 from datetime import date, datetime, timedelta, timezone
-from models.chat_usage import ChatUsage, CustomerPlan
+from models.chat_usage import ChatUsage
+from store_registry import get_tenant_features
 
 DAILY_FREE_LIMIT = 25
 
@@ -29,9 +30,25 @@ def enforce_daily_limit(f):
         if flow_state in _BOT_PROMPTED_STATES:
             return f(*args, **kwargs)
 
-        # Premium bypass — store-level
-        plan = CustomerPlan.get()
-        if plan and plan.is_active_premium:
+        # Premium bypass — per-tenant.
+        #
+        # Replaces the old CustomerPlan singleton (one id=1 row for the whole
+        # deployment), which cannot express a per-store plan once more than one
+        # store shares the process. The tier now lives on the tenant row and is
+        # bound to g by register_before_request, so this reads whichever store
+        # the current request resolved to.
+        #
+        # register_before_request has already applied the expiry downgrade
+        # (an expired tenant is set to plan="free" before reaching any route),
+        # so checking plan alone is sufficient — no separate expiry test is
+        # needed here, unlike CustomerPlan.is_active_premium which bundled both.
+        tenant = getattr(g, "tenant", None)
+        if tenant is not None and tenant.plan != "free":
+            return f(*args, **kwargs)
+
+        # Feature-flag override, for a tenant granted unlimited chat without a
+        # paid plan (trials, internal stores).
+        if get_tenant_features().get("unlimited_chat"):
             return f(*args, **kwargs)
 
         # Increment store's daily counter and check.

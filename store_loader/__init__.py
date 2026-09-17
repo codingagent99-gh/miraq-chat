@@ -16,14 +16,11 @@ from typing import List, Dict, Optional
 from chat_logger import get_logger
 from models.catalog import CatalogAttribute, CatalogCategory, CatalogTag
 from store_loader.config import (
-    WOO_BASE_URL, CUSTOM_API_BASE_URL,
-    WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET,
     REQUEST_TIMEOUT, BROWSER_HEADERS,
     DEV_CACHE_ENABLED, UPDATE_DEV_CACHE_ENABLED,
     CURRENCY_MAP,
-    ECOMMERCE_BACKEND, SHOPIFY_STORE_DOMAIN,
-    SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET, SHOPIFY_ADMIN_TOKEN,
 )
+from tenant_config import TenantConfig
 from store_loader.cache import BoundedVariationCache
 from store_loader.fetcher import (
     load_from_local_files,
@@ -43,39 +40,58 @@ class StoreLoader(StoreQueryMixin):
 
     _CURRENCY_MAP = CURRENCY_MAP
 
-    def __init__(self, app=None):
+    def __init__(self, config: TenantConfig, app=None):
         """
         Args:
-            app: Flask app instance, forwarded to ShopifyTokenManager so it
-                 can open app contexts for DB access in background threads.
+            config: Per-tenant credentials and URLs, built per-request by
+                    tenant_registry.py's _rehydrate() from the tenants table.
+            app:    Flask app instance, forwarded to ShopifyTokenManager so
+                    it can open app contexts for DB access in background
+                    threads.
         """
-        self._flask_app = app
-
-        self.base             = WOO_BASE_URL
-        self.custom_api_base  = CUSTOM_API_BASE_URL
-        self.consumer_key     = WOO_CONSUMER_KEY
-        self.consumer_secret  = WOO_CONSUMER_SECRET
+        self._config          = config
+        self._flask_app       = app
+        self.license_id       = config.license_id
+        self.tenant_id        = config.tenant_id
+        self.ecommerce_backend = config.ecommerce_backend
+        self.wp_base_url      = config.wp_base_url
+        self.base             = config.woo_base_url
+        self.custom_api_base  = config.custom_api_base_url
+        self.consumer_key     = config.woo_key
+        self.consumer_secret  = config.woo_secret
         self.timeout          = REQUEST_TIMEOUT
-        self.shopify_domain   = SHOPIFY_STORE_DOMAIN
+        self.shopify_domain   = config.shopify_domain
 
         # ── Shopify token manager ─────────────────────────────────────────────
-        # If we have OAuth credentials, use the token manager (auto-refresh).
-        # Fall back to the hardcoded SHOPIFY_ADMIN_TOKEN for local dev.
+        # The app's client credentials are process-wide (app_config), not
+        # per-tenant, so the gate is: are they configured at all, and does
+        # this tenant have a domain to hold a token for. Falls back to
+        # config.shopify_admin_token for local dev.
         self._token_manager = None
-        if ECOMMERCE_BACKEND == "shopify":
-            if SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET:
+        if config.ecommerce_backend == "shopify":
+            from app_config import SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET
+            if SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET and config.shopify_domain:
                 from store_loader.shopify_token_manager import ShopifyTokenManager
-                self._token_manager = ShopifyTokenManager(app=app)
-                logger.info("StoreLoader: Shopify token manager initialised (auto-refresh enabled)")
-            elif SHOPIFY_ADMIN_TOKEN:
+                self._token_manager = ShopifyTokenManager(config=config, app=app)
+                logger.info(
+                    "StoreLoader: Shopify token manager initialised "
+                    f"(auto-refresh enabled) | domain={config.shopify_domain}"
+                )
+            elif config.shopify_admin_token:
                 logger.warning(
-                    "StoreLoader: SHOPIFY_CLIENT_ID/SECRET not set — "
-                    "falling back to hardcoded SHOPIFY_ADMIN_TOKEN (expires daily!)"
+                    "StoreLoader: app credentials or shopify_domain missing — "
+                    "falling back to hardcoded shopify_admin_token (expires daily!)"
+                )
+            elif not config.shopify_domain:
+                logger.error(
+                    "StoreLoader: Shopify tenant has no shopify_domain. The OAuth "
+                    "callback should have set it at install time."
                 )
             else:
                 logger.error(
-                    "StoreLoader: Shopify backend selected but no credentials found. "
-                    "Set SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET in .env"
+                    "StoreLoader: Shopify backend selected but the app's credentials "
+                    "are not configured. Set SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET "
+                    "in .env — these are app-wide, not per tenant."
                 )
 
         self.session = requests.Session()
@@ -122,10 +138,8 @@ class StoreLoader(StoreQueryMixin):
         # the probe is unavailable, or if the catalog changed in some way the
         # fingerprint does not cover.
         self._refresh_interval: int = 6 * 3600
-        self._poll_interval: int = int(os.getenv("CATALOG_POLL_INTERVAL", "60"))
         self._retry_interval: int = 2 * 60
         self._catalog_version: Optional[str] = None
-        self._refresh_thread: Optional[threading.Thread] = None
         self._degraded: bool = False
         self._degraded_reasons: list = []
         self._expected_product_count: Optional[int] = None
@@ -141,14 +155,14 @@ class StoreLoader(StoreQueryMixin):
         """
         if self._token_manager:
             return self._token_manager.get_token()
-        return SHOPIFY_ADMIN_TOKEN
+        return self._config.shopify_admin_token
 
     # ─── Loading orchestration ───
 
     def load_all(self):
         """Load store data from the configured backend.
 
-        Backend selection (ECOMMERCE_BACKEND env var):
+        Backend selection (self.ecommerce_backend, from TenantConfig):
           - "shopify"     → live Shopify GraphQL API (always, no dev cache)
           - "woocommerce" → local JSON files when DEV_CACHE=true, else live API
         """
@@ -158,7 +172,7 @@ class StoreLoader(StoreQueryMixin):
 
         try:
             # ── Fetch raw data ────────────────────────────────────────
-            if ECOMMERCE_BACKEND == "shopify":
+            if self.ecommerce_backend == "shopify":
                 from store_loader.shopify_fetcher import load_from_shopify
                 data = load_from_shopify(
                     store_domain=self.shopify_domain,
@@ -246,16 +260,31 @@ class StoreLoader(StoreQueryMixin):
 
     def start_background_refresh(self):
         """
-        Start the background thread that periodically reloads store data.
-        Also boots the Shopify token manager's refresh loop (if active).
+        Do this loader's one-time startup work: the initial Shopify token
+        fetch, if this is a Shopify tenant. Despite the name, nothing here
+        starts a background THREAD anymore for either concern:
+
+        Catalog refresh is NO LONGER per-loader: a single shared scheduler
+        (refresh_scheduler.py) walks resident loaders each tick and calls
+        load_all() on whichever ones _reason_to_reload() says are due.
+
+        Shopify token refresh is the same story — ShopifyTokenManager.start()
+        does the initial fetch only; the same shared scheduler calls
+        check_and_refresh_if_needed() per tick instead of the token manager
+        running its own loop.
+
+        Both used to be a per-loader/per-manager daemon thread holding a
+        strong reference to itself for the life of the process —
+        TenantRegistry's LRU eviction popped the loader from its dict, but
+        the thread kept everything it touched alive and polling forever, one
+        leaked thread per evicted tenant. Removed deliberately; see
+        tenant_registry.py's module docstring for the fuller history.
         """
-        # Start Shopify token auto-refresh.
+        # Do the initial Shopify token fetch (if this is a Shopify tenant).
         #
-        # Guarded on purpose: the token manager now boots degraded on a failed
-        # fetch, but this call runs BEFORE the catalog refresh thread is set up
-        # below, so anything escaping here costs us both the token loop AND the
-        # catalog loop — and on a Shopify deployment that meant the server never
-        # started at all. A token problem must stay a token problem.
+        # Guarded on purpose: the token manager must not be able to take the
+        # rest of startup down with it. A token problem must stay a token
+        # problem.
         if self._token_manager:
             try:
                 self._token_manager.start()
@@ -267,53 +296,44 @@ class StoreLoader(StoreQueryMixin):
 
         if DEV_CACHE_ENABLED:
             logger.info("StoreLoader: 🛑 Catalog background refresh DISABLED in dev mode")
-            return
-
-        if self._refresh_thread and self._refresh_thread.is_alive():
-            return
-
-        def _refresh_loop():
-            while True:
-                if self._degraded:
-                    time.sleep(self._retry_interval)
-                    label = "🔁 Degraded load retry"
-                else:
-                    time.sleep(self._poll_interval)
-                    label = self._reason_to_reload()
-                    if not label:
-                        continue
-                logger.info(f"StoreLoader: {label} — reloading store data...")
-                try:
-                    self.load_all()
-                except Exception as e:
-                    logger.error(f"StoreLoader: {label} failed | error={e}", exc_info=True)
-
-        self._refresh_thread = threading.Thread(target=_refresh_loop, daemon=True)
-        self._refresh_thread.start()
-        logger.info(
-            f"StoreLoader: Catalog version polled every {self._poll_interval}s "
-            f"| full reload forced every {self._refresh_interval // 3600}h"
-        )
 
     def _reason_to_reload(self) -> Optional[str]:
-        """Decide whether the background loop should reload. None = stay put.
+        """Decide whether this loader should reload right now. None = stay put.
 
-        Order matters. The version probe is consulted first and its result is
-        recorded BEFORE load_all() runs, not after: an edit landing mid-reload
-        then leaves self._catalog_version pointing at the token we observed, so
-        the next poll sees a different one and reloads again. Stamping it after
-        a successful load would swallow that edit until the 6h backstop.
+        Called once per tick by the shared RefreshScheduler for every
+        resident loader — replaces what used to be embedded in this
+        loader's own per-thread sleep loop (see start_background_refresh's
+        docstring for why that thread is gone). The cadence logic is
+        unchanged from that loop, just relocated here as a single callable:
+
+          - degraded  → retry on the flat _retry_interval cadence,
+            unconditionally. A broken loader wants to just try again, not
+            wait on a catalog-version probe it may never see change while
+            the underlying fetch itself is failing.
+          - healthy   → the catalog-version probe below. Order matters
+            there: the probe is consulted and its result recorded BEFORE
+            load_all() runs, not after — an edit landing mid-reload then
+            leaves self._catalog_version pointing at the token observed
+            before the reload, so the next tick sees a different one and
+            reloads again. Recording it after a successful load would
+            swallow that edit until the interval backstop.
 
         A probe that returns None is explicitly NOT treated as "unchanged" —
-        see fetch_catalog_version. The interval check below still runs, so an
-        unreachable or missing endpoint gives back the old 6h behaviour rather
-        than freezing the catalog.
+        see fetch_catalog_version. The interval check still runs, so an
+        unreachable or missing endpoint gives back the old interval-only
+        behaviour rather than freezing the catalog.
         """
+        if self._degraded:
+            elapsed = time.time() - (self._last_loaded or 0)
+            if elapsed >= self._retry_interval:
+                return "🔁 Degraded load retry"
+            return None
+
         elapsed = time.time() - (self._last_loaded or 0)
 
         # Shopify has no equivalent endpoint (the probe lives in the
         # WooCommerce plugin), so that backend stays on the plain timer.
-        if ECOMMERCE_BACKEND != "shopify":
+        if self.ecommerce_backend != "shopify":
             version = fetch_catalog_version(
                 self.session, self.custom_api_base,
                 self.consumer_key, self.consumer_secret,
@@ -371,7 +391,7 @@ class StoreLoader(StoreQueryMixin):
         self._degraded_reasons = reasons
 
     def _log_load_summary(self):
-        if ECOMMERCE_BACKEND == "shopify":
+        if self.ecommerce_backend == "shopify":
             mode = "Live Shopify GraphQL API"
         elif DEV_CACHE_ENABLED:
             mode = "Local Dev Cache"

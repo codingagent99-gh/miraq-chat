@@ -17,18 +17,19 @@ from datetime import datetime, timezone
 from chat_logger import get_logger
 
 from flask import Flask, jsonify, request
-from flask_cors import CORS
+import cors_manager as _cors_manager
 from werkzeug.exceptions import HTTPException
 
 from app_config import PORT, DEBUG, STORE_NAME, USE_RELOADER
-from store_registry import set_store_loader, get_store_loader
-from store_loader import StoreLoader, DEV_CACHE_ENABLED
+from store_registry import get_store_loader, register_before_request
 from models import db, Conversation
 
 from routes.chat import chat_bp
 from routes.admin import admin_bp
 from routes.products import products_bp
 from routes.shopify import shopify_bp
+from routes.provisioning import provisioning_bp
+from routes.deactivation import deactivation_bp
 import urllib.parse
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
@@ -38,18 +39,29 @@ from routes.sales_rep import sales_rep_bp
 # ═══════════════════════════════════════════
 
 app = Flask(__name__)
-CORS(app,
-    origins=[
-        "https://wgc.net.in",
-        "https://silfradigital.com",
-        "https://silfratech.in",
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "https://staging-91e4-ecom-solutions9857d536fc-ugaqb.wpcomstaging.com",
-        "https://silfra-store-4680.myshopify.com"
-    ],
-    supports_credentials=True
-)
+
+
+@app.after_request
+def _apply_cors(response):
+    origin = request.headers.get("Origin", "")
+    if origin and _cors_manager.is_allowed(origin):
+        _cors_manager.apply_cors(response, origin)
+    return response
+
+
+@app.before_request
+def _handle_options_preflight():
+    # Registered BEFORE register_before_request(app) below, so an OPTIONS
+    # preflight is answered here and never reaches tenant resolution at all
+    # — it carries no X-MiraQ-License-Id and shouldn't need one.
+    if request.method == "OPTIONS":
+        origin = request.headers.get("Origin", "")
+        resp = jsonify({})
+        if origin and _cors_manager.is_allowed(origin):
+            _cors_manager.apply_cors(resp, origin)
+        return resp, 200
+
+
 from flask_migrate import Migrate
 migrate = Migrate(app, db)
 
@@ -132,11 +144,17 @@ ensure_database_exists(database_uri)
 # Bind Database to App
 db.init_app(app)
 
+# Tenant resolution — binds g.tenant / g.store_loader / g.db_engine per
+# request from X-MiraQ-License-Id. Registered here so it applies to every
+# route below, including ones registered later in this file.
+register_before_request(app)
+
 # Create Tables on Startup
 with app.app_context():
     # Import ShopifyToken here so SQLAlchemy registers it before create_all()
     from models.shopify_token import ShopifyToken  # noqa: F401
     db.create_all()
+    _cors_manager.refresh_from_db()   # seed dynamic origins from existing tenants
 
 # Register blueprints
 app.register_blueprint(chat_bp)
@@ -144,6 +162,8 @@ app.register_blueprint(admin_bp)
 app.register_blueprint(products_bp)
 app.register_blueprint(shopify_bp)
 app.register_blueprint(sales_rep_bp)
+app.register_blueprint(provisioning_bp)
+app.register_blueprint(deactivation_bp)
 
 # ── Request timing instrumentation ───────────────────────────────────────────
 # Writes plain text to logs/<date>/timing.txt, separate from chat.txt and
@@ -373,16 +393,20 @@ def get_session(session_id):
 @app.route("/widget-config", methods=["GET"])
 def widget_config():
     import requests as req
-    from app_config import WOO_CONSUMER_KEY, _WP_BASE, WOO_CONSUMER_SECRET, BROWSER_HEADERS
+    from store_loader.config import BROWSER_HEADERS
 
     logger = get_logger("miraq_chat")
-    target_url = f"{_WP_BASE}/wp-json/wdget-logo-uploader/v1/data"
+    loader = get_store_loader()
+    if not loader:
+        return jsonify({"image_url": "", "text": ""}), 200
+
+    target_url = f"{loader.wp_base_url}/wp-json/wdget-logo-uploader/v1/data"
 
     try:
         headers = {
             **BROWSER_HEADERS,
-            "X-Consumer-Key":    WOO_CONSUMER_KEY,
-            "X-Consumer-Secret": WOO_CONSUMER_SECRET,
+            "X-Consumer-Key":    loader.consumer_key,
+            "X-Consumer-Secret": loader.consumer_secret,
         }
         resp = req.get(target_url, headers=headers, timeout=10)
         resp.raise_for_status()
@@ -397,25 +421,23 @@ def widget_config():
 
 @app.route("/debug-plan")
 def debug_plan():
-    from models.chat_usage import CustomerPlan
+    from flask import g
     from models import db
-    try:
-        raw = db.session.execute(db.text("SELECT * FROM customer_plans WHERE id = 1")).fetchone()
-        raw_result = str(raw)
-    except Exception as e:
-        raw_result = str(e)
     try:
         db_name = db.session.execute(db.text("SELECT current_database()")).scalar()
     except Exception as e:
         db_name = str(e)
-    plan = CustomerPlan.query.filter_by(id=1).first()
+    tenant = g.__dict__.get("tenant")
     return {
         "connected_database": db_name,
         "database_url_from_config": app.config.get("SQLALCHEMY_DATABASE_URI", "not set"),
-        "raw_sql_result": raw_result,
-        "plan_exists": plan is not None,
-        "is_premium": getattr(plan, "is_premium", None),
-        "is_active_premium": getattr(plan, "is_active_premium", None),
+        "tenant_id": str(tenant.tenant_id) if tenant else None,
+        "plan": tenant.plan if tenant else None,
+        "features": dict(tenant.features or {}) if tenant else {},
+        "license_expires_at": (
+            tenant.license_expires_at.isoformat()
+            if tenant and tenant.license_expires_at else None
+        ),
     }
    
 # ═══════════════════════════════════════════
@@ -423,6 +445,10 @@ def debug_plan():
 # ═══════════════════════════════════════════
 
 def _print_dev_banner():
+    # Currently uncalled: it fired from initialize_store()'s old eager
+    # single-tenant boot (loader._loaded_from_cache), which no longer exists
+    # now that loaders build lazily per-tenant. Left defined in case Phase 4/5
+    # wants to reattach it to a per-tenant dev-cache-loaded signal.
     YELLOW = "\033[93m"
     RED = "\033[91m"
     BOLD = "\033[1m"
@@ -453,29 +479,27 @@ def _print_dev_banner():
 
 def initialize_store():
     """
-    Load store data from WooCommerce/Shopify at startup,
-    then start background refresh (and Shopify token manager if applicable).
-
-    The Flask app instance is passed into StoreLoader so the token manager
-    can open app contexts from its background thread.
+    Start the tenant/engine registries and the shared refresh scheduler. No
+    default tenant is loaded — every request must carry X-MiraQ-License-Id
+    (register_before_request handles resolution). A tenant's StoreLoader is
+    built lazily, on that tenant's first request, by TenantRegistry.get_loader().
     """
-    loader = StoreLoader(app=app)   # ← pass app so token manager can use DB from threads
-    try:
-        loader.load_all()
-    except Exception as e:
-        logging.getLogger("miraq_chat").error(
-            f"Store loader error at startup: {e}", exc_info=True
-        )
-        logging.getLogger("miraq_chat").warning(
-            "Server will respond with limited functionality until store data loads."
-        )
+    from tenant_registry import TenantRegistry
+    from models.db_engine_registry import DBEngineRegistry
+    from refresh_scheduler import RefreshScheduler
+    from store_registry import init_registries
 
-    # Always register and always start background refresh
-    set_store_loader(loader)
-    loader.start_background_refresh()
+    tenant_registry = TenantRegistry(app=app)
+    engine_registry = DBEngineRegistry(base_dsn=database_uri)
+    init_registries(tenant_registry, engine_registry)
 
-    if DEV_CACHE_ENABLED and loader._loaded_from_cache:
-        _print_dev_banner()
+    scheduler = RefreshScheduler(registry=tenant_registry, app=app)
+    scheduler.start()
+
+    logging.getLogger("miraq_chat").info(
+        "initialize_store: registries ready — tenants served from DB, "
+        "loaders built lazily per-request"
+    )
 
 
 # ═══════════════════════════════════════════

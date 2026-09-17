@@ -46,11 +46,35 @@ from typing import Optional
 
 from chat_logger import get_logger
 from config.store_config import BULK_ADDRESS_REQUIRED_FLOOR
+from store_registry import get_store_loader
 
 logger = get_logger("miraq_chat")
 
 # Cache TTL for the live /checkout-fields response.
 _CACHE_TTL_SECONDS = 900  # 15 minutes
+
+
+def _resolve_loader(loader):
+    """
+    Every public function below takes an optional `loader` param rather than
+    always calling get_store_loader() itself. Most callers are request-time
+    code and can rely on the default; but build_fuzzy_vocab() (see
+    store_loader/lookup_builder.py) calls rep_name_tokens() from INSIDE
+    TenantRegistry._rehydrate() — while a tenant's loader is still being
+    built, before it's assigned to g.store_loader — so get_store_loader()
+    would return None there even though a perfectly good loader exists,
+    right there, as a local variable in the caller. That caller passes it
+    explicitly; everyone else leaves this as None and gets the request's
+    bound tenant.
+    """
+    if loader is None:
+        loader = get_store_loader()
+    if not loader:
+        raise RuntimeError(
+            "utils.checkout_fields: no tenant loader resolved — "
+            "is X-MiraQ-License-Id missing from the request?"
+        )
+    return loader
 
 # ── Key normalisation (mirrors hooks/useCheckoutFields.ts) ────────────────────
 
@@ -98,7 +122,7 @@ _DEFAULT_LABELS = {
     "order_notes": "Order notes",
 }
 
-_live_labels: dict = {}
+_live_labels_by_tenant: dict = {}
 
 # Option VALUES (emails) registered on the project_rep select, harvested from
 # the same /checkout-fields response the required-field union is built from.
@@ -111,12 +135,17 @@ _live_labels: dict = {}
 #
 # Empty means "not known yet / fetch failed", never "nobody is a rep" —
 # callers must fail open rather than block ordering on a plugin outage.
-_rep_option_values: set = set()
+#
+# Keyed by tenant_id (not a single flat set) — see module docstring's note
+# on why: without this, one tenant's rep directory could leak into another's
+# find_reps_in_text()/rep_name_tokens()/is_known_rep() mid-flight, since a
+# flat set is shared, mutable, process-wide state with no tenant boundary.
+_rep_option_values_by_tenant: dict = {}
 
 # email → display label, harvested from the SAME options dict as
-# _rep_option_values above. WooCommerce serialises the select as value→label,
-# so the emails are the keys and the human names are the values — and the
-# values were previously read and thrown away.
+# _rep_option_values_by_tenant above. WooCommerce serialises the select as
+# value→label, so the emails are the keys and the human names are the
+# values — and the values were previously read and thrown away.
 #
 # The names are what a user actually types ("how many did Ram order"), so
 # without them rep extraction had to infer a person from sentence grammar
@@ -124,19 +153,32 @@ _rep_option_values: set = set()
 # ordered") silently produced a store-wide report. Products never had this
 # problem because they have a loaded vocabulary; this gives reps one too.
 #
-# Kept SEPARATE from _rep_option_values rather than replacing it: that set
-# backs is_known_rep()'s auto-fill gate and its fail-open contract, which must
-# not change. Empty here means the same thing it means there — "not fetched
-# yet", never "there are no reps" — so every reader below must fall back to
-# its existing behaviour rather than concluding a name is not a rep.
-_rep_labels_by_email: dict = {}
+# Kept SEPARATE from _rep_option_values_by_tenant rather than replacing it:
+# that set backs is_known_rep()'s auto-fill gate and its fail-open contract,
+# which must not change. Empty here means the same thing it means there —
+# "not fetched yet", never "there are no reps" — so every reader below must
+# fall back to its existing behaviour rather than concluding a name is not a
+# rep. Keyed by tenant_id, same reasoning as above.
+_rep_labels_by_email_by_tenant: dict = {}
 
-# Cache is keyed by the custom-api base URL, which is this deployment's store
-# identity. On a multi-tenant build where that URL is resolved per tenant rather
-# than being a module constant, this key stays correct; if it ever becomes
-# ambiguous, drop the cache rather than risk serving one store's field config to
-# another. One extra HTTP call per bulk order is a cheap price.
+# Cache is keyed by the custom-api base URL, which is this tenant's store
+# identity (resolved per-request via the tenant loader, not a module
+# constant). If it ever becomes ambiguous, drop the cache rather than risk
+# serving one store's field config to another. One extra HTTP call per bulk
+# order is a cheap price.
 _cache: dict = {"key": None, "value": None, "expires_at": 0.0}
+
+
+def _live_labels_for(loader) -> dict:
+    return _live_labels_by_tenant.setdefault(loader.tenant_id, {})
+
+
+def _rep_option_values_for(loader) -> set:
+    return _rep_option_values_by_tenant.setdefault(loader.tenant_id, set())
+
+
+def _rep_labels_by_email_for(loader) -> dict:
+    return _rep_labels_by_email_by_tenant.setdefault(loader.tenant_id, {})
 
 
 def _form_key(wc_key: str, group: str) -> str:
@@ -152,9 +194,11 @@ def _form_key(wc_key: str, group: str) -> str:
     return "company" if stripped == "company_name" else stripped
 
 
-def label_for(key: str) -> str:
+def label_for(key: str, loader=None) -> str:
     """Display label for a field key."""
-    return _live_labels.get(key) or _DEFAULT_LABELS.get(key) or key.replace("_", " ").title()
+    loader = _resolve_loader(loader)
+    live = _live_labels_for(loader)
+    return live.get(key) or _DEFAULT_LABELS.get(key) or key.replace("_", " ").title()
 
 
 def _blank_floor() -> dict:
@@ -166,13 +210,13 @@ def _blank_floor() -> dict:
     }
 
 
-def _absorb_live_labels(short_key: str, cfg: dict) -> None:
+def _absorb_live_labels(short_key: str, cfg: dict, loader) -> None:
     label = (cfg or {}).get("label")
     if isinstance(label, str) and label.strip():
-        _live_labels[short_key] = label.strip()
+        _live_labels_for(loader)[short_key] = label.strip()
 
 
-def _absorb_rep_options(short_key: str, cfg: dict) -> None:
+def _absorb_rep_options(short_key: str, cfg: dict, loader) -> None:
     """Harvest project_rep's option values. WC serialises them value → label."""
     if short_key != "project_rep":
         return
@@ -196,17 +240,19 @@ def _absorb_rep_options(short_key: str, cfg: dict) -> None:
             continue
         labels[email] = name
 
+    rep_values = _rep_option_values_for(loader)
+    rep_labels = _rep_labels_by_email_for(loader)
     if values:
-        _rep_option_values.clear()
-        _rep_option_values.update(values)
+        rep_values.clear()
+        rep_values.update(values)
     # Guarded independently of `values`: a fetch that returned options but no
     # usable labels must not wipe a directory a previous fetch populated.
     if labels:
-        _rep_labels_by_email.clear()
-        _rep_labels_by_email.update(labels)
+        rep_labels.clear()
+        rep_labels.update(labels)
 
 
-def rep_directory() -> dict:
+def rep_directory(loader=None) -> dict:
     """
     email → display name for every rep on the project_rep select.
 
@@ -214,11 +260,12 @@ def rep_directory() -> dict:
     Callers must treat empty as "I don't know" and fall back to whatever they
     did before, exactly as is_known_rep() fails open.
     """
-    get_required_fields()          # cached; populates on first use
-    return dict(_rep_labels_by_email)
+    loader = _resolve_loader(loader)
+    get_required_fields(loader=loader)          # cached; populates on first use
+    return dict(_rep_labels_by_email_for(loader))
 
 
-def rep_name_tokens() -> set:
+def rep_name_tokens(loader=None) -> set:
     """
     Lowercase word tokens from every rep display name, >= 3 chars.
 
@@ -229,14 +276,14 @@ def rep_name_tokens() -> set:
     store has both an "Adams" product and Adams-like surnames) is unaffected.
     """
     tokens = set()
-    for name in rep_directory().values():
+    for name in rep_directory(loader=loader).values():
         for tok in re.split(r"[^a-z0-9]+", name.lower()):
             if len(tok) >= 3:
                 tokens.add(tok)
     return tokens
 
 
-def find_reps_in_text(text: str, catalog_words: Optional[set] = None) -> list:
+def find_reps_in_text(text: str, catalog_words: Optional[set] = None, loader=None) -> list:
     """
     Find rep display names occurring in `text`. Returns [(name, email), ...],
     longest name first so "Ram R" wins over a bare "Ram".
@@ -261,7 +308,7 @@ def find_reps_in_text(text: str, catalog_words: Optional[set] = None) -> list:
     catalog_words = {w.lower() for w in (catalog_words or set())}
 
     hits = []
-    for email, name in rep_directory().items():
+    for email, name in rep_directory(loader=loader).items():
         norm = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
         if not norm:
             continue
@@ -295,7 +342,7 @@ def find_reps_in_text(text: str, catalog_words: Optional[set] = None) -> list:
 _ORDER_TYPE_CACHE = {"value": None, "key": None, "expires_at": 0.0}
 
 
-def _fetch_order_types() -> Optional[list]:
+def _fetch_order_types(loader=None) -> Optional[list]:
     """GET /order-types. None on any failure — callers must fail OPEN."""
     try:
         from woo_client import woo_client
@@ -304,7 +351,8 @@ def _fetch_order_types() -> Optional[list]:
         result = woo_client.execute(
             endpoints.fetch_order_types(
                 description="Fetch order type options for bulk order parsing",
-            )
+            ),
+            loader=loader,
         )
     except Exception as exc:
         logger.warning(f"[OrderTypes] fetch raised | error={exc}")
@@ -317,24 +365,25 @@ def _fetch_order_types() -> Optional[list]:
     return data
 
 
-def order_type_options() -> list:
+def order_type_options(loader=None) -> list:
     """
     [{"value": "new_deal", "label": "New Deal"}, ...] for billing_field_type.
 
     Empty means "not fetched / fetch failed", NEVER "this field has no valid
     values" — same fail-open contract as is_known_rep().
     """
-    from app_config import CUSTOM_API_BASE_URL
+    loader = _resolve_loader(loader)
+    cache_key = loader.custom_api_base
 
     now = time.time()
     if (
         _ORDER_TYPE_CACHE["value"] is not None
-        and _ORDER_TYPE_CACHE["key"] == CUSTOM_API_BASE_URL
+        and _ORDER_TYPE_CACHE["key"] == cache_key
         and _ORDER_TYPE_CACHE["expires_at"] > now
     ):
         return list(_ORDER_TYPE_CACHE["value"])
 
-    raw = _fetch_order_types()
+    raw = _fetch_order_types(loader=loader)
     if raw is None:
         # Cache nothing on failure so the next turn retries, and return empty
         # so the caller falls open rather than rejecting every value.
@@ -350,7 +399,7 @@ def order_type_options() -> list:
             opts.append({"value": value, "label": label})
 
     _ORDER_TYPE_CACHE["value"] = list(opts)
-    _ORDER_TYPE_CACHE["key"] = CUSTOM_API_BASE_URL
+    _ORDER_TYPE_CACHE["key"] = cache_key
     _ORDER_TYPE_CACHE["expires_at"] = now + _CACHE_TTL_SECONDS
     logger.info(f"[OrderTypes] cached {len(opts)} option(s): {[o['label'] for o in opts]}")
     return list(opts)
@@ -366,7 +415,7 @@ def _norm_option(s: str) -> str:
     return re.sub(r"[\s_\-/]+", " ", str(s or "").strip().lower()).strip()
 
 
-def match_order_type(text: str) -> dict:
+def match_order_type(text: str, loader=None) -> dict:
     """
     Resolve typed text to a billing_field_type VALUE.
 
@@ -392,7 +441,7 @@ def match_order_type(text: str) -> dict:
     if not needle:
         return {"status": "unknown", "value": "", "label": "", "candidates": []}
 
-    opts = order_type_options()
+    opts = order_type_options(loader=loader)
     if not opts:
         logger.warning(
             f"[OrderTypes] options unavailable — accepting {text!r} unvalidated"
@@ -428,7 +477,7 @@ def match_order_type(text: str) -> dict:
     return {"status": "unknown", "value": "", "label": "", "candidates": all_labels}
 
 
-def is_known_rep(email: str) -> bool:
+def is_known_rep(email: str, loader=None) -> bool:
     """
     True when `email` appears in the project_rep option list.
 
@@ -440,29 +489,23 @@ def is_known_rep(email: str) -> bool:
     email = str(email or "").strip().lower()
     if not email:
         return False
+    loader = _resolve_loader(loader)
     # Cheap on the hot path — cached for _CACHE_TTL_SECONDS. Called here so the
     # option list is populated even if this is the first lookup of the process,
     # before any validation pass has run.
-    get_required_fields()
-    if not _rep_option_values:
+    get_required_fields(loader=loader)
+    rep_values = _rep_option_values_for(loader)
+    if not rep_values:
         return True
-    return email in _rep_option_values
+    return email in rep_values
 
 
-def _fetch_live_fields() -> Optional[dict]:
+def _fetch_live_fields(loader=None) -> Optional[dict]:
     """
     Fetch /checkout-fields. Returns the raw grouped dict, or None on any
     failure — a plugin outage must neither break bulk ordering nor disable the
     gate, so callers fall back to the floor.
     """
-    # /checkout-fields is served by THWCFE, a WooCommerce plugin. There is no
-    # equivalent Shopify endpoint, and ShopifyEndpoints intentionally omits
-    # fetch_checkout_fields. Bail early so callers use the static floor
-    # without logging a spurious warning.
-    from app_config import ECOMMERCE_BACKEND
-    if ECOMMERCE_BACKEND != "woocommerce":
-        return None
-
     try:
         # Imported lazily: this module is imported from handlers that are
         # themselves imported at request time, and woo_client pulls in app
@@ -473,7 +516,8 @@ def _fetch_live_fields() -> Optional[dict]:
         result = woo_client.execute(
             endpoints.fetch_checkout_fields(
                 description="Fetch checkout fields for bulk address validation",
-            )
+            ),
+            loader=loader,
         )
     except Exception as exc:
         logger.warning(f"[CheckoutFields] live fetch raised — using floor only | error={exc}")
@@ -489,17 +533,17 @@ def _fetch_live_fields() -> Optional[dict]:
     return result["data"]
 
 
-def get_required_fields(force_refresh: bool = False) -> dict:
+def get_required_fields(force_refresh: bool = False, loader=None) -> dict:
     """
     Return {"billing": [...], "shipping": [...], "meta": [...]} — the union of
     the static floor and the live /checkout-fields required flags.
 
     Never returns fewer fields than the floor. Never raises.
     """
-    from app_config import CUSTOM_API_BASE_URL
+    loader = _resolve_loader(loader)
+    cache_key = loader.custom_api_base
 
     now = time.time()
-    cache_key = CUSTOM_API_BASE_URL
     if (
         not force_refresh
         and _cache["value"] is not None
@@ -510,7 +554,7 @@ def get_required_fields(force_refresh: bool = False) -> dict:
         return {k: list(v) for k, v in _cache["value"].items()}
 
     required = _blank_floor()
-    live = _fetch_live_fields()
+    live = _fetch_live_fields(loader=loader)
 
     if live:
         added = []
@@ -522,8 +566,8 @@ def get_required_fields(force_refresh: bool = False) -> dict:
                 if not isinstance(cfg, dict):
                     continue
                 short = _form_key(wc_key, group)
-                _absorb_live_labels(short, cfg)
-                _absorb_rep_options(short, cfg)
+                _absorb_live_labels(short, cfg, loader)
+                _absorb_rep_options(short, cfg, loader)
                 if not cfg.get("required"):
                     continue
                 # Route the CS custom fields to "meta" regardless of the address

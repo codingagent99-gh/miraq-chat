@@ -7,15 +7,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── WooCommerce ───────────────────────────────────────────────────────────────
-
-_WP_BASE = os.getenv("WP_BASE_URL", "https://wgc.net.in/hn")
-
-WOO_BASE_URL        = os.getenv("WOO_BASE_URL",        f"{_WP_BASE}/wp-json/wc/v3")
-CUSTOM_API_BASE_URL = os.getenv("CUSTOM_API_BASE_URL", f"{_WP_BASE}/wp-json/custom-api/v1")
-
-WOO_CONSUMER_KEY    = os.getenv("WOO_CONSUMER_KEY", "")
-WOO_CONSUMER_SECRET = os.getenv("WOO_CONSUMER_SECRET", "")
 REQUEST_TIMEOUT     = 30
 
 # ── Dev cache ─────────────────────────────────────────────────────────────────
@@ -79,16 +70,12 @@ CURRENCY_MAP = {
 # second independent os.getenv -- see that module's docstring for why.
 from platform_config import ECOMMERCE_BACKEND  # noqa: F401  (re-export)
 
-SHOPIFY_STORE_DOMAIN = os.getenv("SHOPIFY_STORE_DOMAIN", "")
-
-# ── Shopify OAuth (client credentials flow) ───────────────────────────────────
-# These never change — store them in .env and leave them there.
-# The access token is managed automatically; do NOT set SHOPIFY_ADMIN_TOKEN manually.
-
-SHOPIFY_CLIENT_ID     = os.getenv("SHOPIFY_CLIENT_ID",     "")
-SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET", "")
-
-# SHOPIFY_ADMIN_TOKEN is kept for local dev / one-off overrides only.
-# When SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET are present, the token
-# manager takes over and this value is ignored at runtime.
-SHOPIFY_ADMIN_TOKEN  = os.getenv("SHOPIFY_ADMIN_TOKEN",  "")
+# SHOPIFY_STORE_DOMAIN / SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET /
+# SHOPIFY_ADMIN_TOKEN used to live here as single-store globals. Every
+# consumer now resolves these per-tenant instead, off TenantConfig /
+# StoreLoader (self.shopify_domain) or from app_config for the app-level
+# client credentials, which are shared by every tenant —
+# see store_loader/shopify_token_manager.py, api_builder/shopify_graphql_executor.py,
+# api_builder/shopify_orders_executor.py, routes/shopify.py, and
+# routes/shopify_products.py. server.py's /shopify-token-status now takes an
+# explicit ?domain= query param instead of a single implicit store.

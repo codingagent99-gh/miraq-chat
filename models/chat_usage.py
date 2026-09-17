@@ -1,13 +1,15 @@
 # models/chat_usage.py
 
-from datetime import datetime, date, timezone
+from datetime import date
 from models.db_models import db
 
 
 class ChatUsage(db.Model):
     """
     Tracks the store's total daily question count.
-    One row per day — no tenant keys needed (one backend = one store).
+    One row per day — no tenant key needed here: this table lives in the
+    per-tenant database (routed via _TenantRoutingSession/g.db_engine), so
+    "one row per day" is already scoped per-tenant by which database it's in.
     """
     __tablename__ = "chat_usage"
 
@@ -43,38 +45,3 @@ class ChatUsage(db.Model):
     def get_count_today(cls) -> int:
         row = cls.query.filter_by(usage_date=date.today()).first()
         return row.question_count if row else 0
-
-
-class CustomerPlan(db.Model):
-    """
-    Stores this store's premium plan status.
-    There is exactly one row in this table (id=1).
-    Manually inserted/updated — no billing flow yet.
-    premium_until=NULL means lifetime.
-    """
-    __tablename__ = "customer_plans"
-
-    id            = db.Column(db.Integer, primary_key=True, default=1)
-    is_premium    = db.Column(db.Boolean, nullable=False, default=False)
-    premium_since = db.Column(db.DateTime(timezone=True), nullable=True)
-    premium_until = db.Column(db.DateTime(timezone=True), nullable=True)  # NULL = lifetime
-    plan_ref      = db.Column(db.String(255), nullable=True)  # e.g. order ID, invoice ref
-
-    updated_at = db.Column(
-        db.DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-        onupdate=lambda: datetime.now(timezone.utc),
-    )
-
-    @classmethod
-    def get(cls) -> "CustomerPlan | None":
-        """Always fetch the single store plan row."""
-        return cls.query.filter_by(id=1).first()
-
-    @property
-    def is_active_premium(self) -> bool:
-        if not self.is_premium:
-            return False
-        if self.premium_until is None:
-            return True  # lifetime
-        return datetime.now(timezone.utc) < self.premium_until

@@ -25,13 +25,23 @@ def force_refresh_cache():
 
     Does not touch _catalog_version. The next poll compares against whatever it
     last observed, so a forced reload here cannot mask a later edit.
+
+    Refreshes whichever tenant made this request — get_store_loader() resolves
+    to the caller's own bound loader (register_before_request already requires
+    X-MiraQ-License-Id for this route; it was never in store_registry's
+    _EXEMPT_PATHS). Logged explicitly so a refresh in the logs is attributable
+    to a tenant, not just "the store."
     """
     loader = get_store_loader()
     if not loader:
         return jsonify({"success": False, "error": "Store loader not active."}), 500
     try:
+        logger.info(f"force_refresh_cache: manual refresh requested | tenant={loader.license_id!r}")
         loader.load_all()
         return jsonify({"success": True, "message": "Memory refreshed."}), 200
     except Exception as e:
-        logger.error(f"Forced cache refresh failed: {e}", exc_info=True)
+        logger.error(
+            f"Forced cache refresh failed | tenant={loader.license_id!r} | error={e}",
+            exc_info=True,
+        )
         return jsonify({"success": False, "error": str(e)}), 500

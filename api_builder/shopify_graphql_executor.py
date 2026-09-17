@@ -53,7 +53,6 @@ import requests as http_requests
 
 from chat_logger import get_logger
 from models.shopify_token import ShopifyToken
-from store_loader.config import SHOPIFY_STORE_DOMAIN
 
 logger = get_logger("miraq_chat")
 
@@ -149,9 +148,9 @@ def _slugify(s: str) -> str:
     )
 
 
-def _gql(query, variables, token):
+def _gql(query, variables, token, domain):
     resp = http_requests.post(
-        f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/2024-10/graphql.json",
+        f"https://{domain}/admin/api/2024-10/graphql.json",
         json={"query": query, "variables": variables},
         headers={
             "Content-Type":           "application/json",
@@ -201,11 +200,11 @@ def _to_gid(collection_id: str) -> str:
     return s if s.startswith("gid://") else f"gid://shopify/Collection/{s}"
 
 
-def _fetch_products(tag_query: str, token: str, max_fetch: int = _MAX_FETCH) -> list:
+def _fetch_products(tag_query: str, token: str, domain: str, max_fetch: int = _MAX_FETCH) -> list:
     products, cursor = [], None
     while len(products) < max_fetch:
         batch = min(_BATCH_SIZE, max_fetch - len(products))
-        data  = _gql(_PRODUCTS_GQL, {"query": tag_query, "first": batch, "after": cursor}, token)
+        data  = _gql(_PRODUCTS_GQL, {"query": tag_query, "first": batch, "after": cursor}, token, domain)
         pdata = data["data"]["products"]
         for edge in pdata.get("edges", []):
             products.append(_normalize(edge["node"]))
@@ -215,7 +214,7 @@ def _fetch_products(tag_query: str, token: str, max_fetch: int = _MAX_FETCH) -> 
         cursor = pi["endCursor"]
     return products
 
-def _fetch_from_collection(collection_id: str, tag_query: str, token: str,
+def _fetch_from_collection(collection_id: str, tag_query: str, token: str, domain: str,
                             max_fetch: int = _MAX_FETCH) -> list:
     products, cursor = [], None
     gid = _to_gid(collection_id)
@@ -223,7 +222,7 @@ def _fetch_from_collection(collection_id: str, tag_query: str, token: str,
         batch = min(_BATCH_SIZE, max_fetch - len(products))
         data  = _gql(_COLLECTION_GQL,
                      {"collectionId": gid, "first": batch, "after": cursor},
-                     token)
+                     token, domain)
         cdata = (data.get("data") or {}).get("collection")
         if not cdata:
             logger.warning(f"ShopifyGraphQLExecutor: collection {gid} not found or empty")
@@ -603,7 +602,7 @@ def _post_filter(raw_products: list, filter_tree: dict,
 # Result normalisation  (GraphQL → Woo-shaped dicts chat.py expects)
 # ══════════════════════════════════════════════════════════════
 
-def _to_woo_shape(gql_product: dict) -> dict:
+def _to_woo_shape(gql_product: dict, domain: str) -> dict:
     """
     Convert a _normalize()-shaped GraphQL product into the Woo-shaped dict
     that format_product() / format_variation() in formatters.py expects.
@@ -653,7 +652,7 @@ def _to_woo_shape(gql_product: dict) -> dict:
         "sale_price":    "",
         "in_stock":      any_in_stock,
         "stock_status":  "instock" if any_in_stock else "outofstock",
-        "permalink":     f"https://{SHOPIFY_STORE_DOMAIN}/products/{gql_product['handle']}",
+        "permalink":     f"https://{domain}/products/{gql_product['handle']}",
         "categories": [
             {"id": i + 1, "name": c["title"], "slug": c["handle"]}
             for i, c in enumerate(gql_product.get("collections", []))
@@ -716,12 +715,13 @@ class ShopifyGraphQLExecutor:
         )
 
         token = self._get_token()
+        domain = self._loader.shopify_domain
 
         # ── product_id fast-path ─────────────────────────────
         ids = body.get("ids")
         if ids:
             logger.info(f"[ShopifyGQL] fast-path: fetching by ids={ids}")
-            result = self._fetch_by_ids(ids, page, per_page, token)
+            result = self._fetch_by_ids(ids, page, per_page, token, domain)
             logger.info(
                 f"[ShopifyGQL] fast-path done | found={result['total']} "
                 f"elapsed={round(time.time()-t0,2)}s"
@@ -770,12 +770,12 @@ class ShopifyGraphQLExecutor:
                 raw = [_loader_product_to_gql_shape(p) for p in loader_products]
             else:
                 logger.info("[ShopifyGQL] Layer1: no collection filter — querying full catalog")
-                raw = _fetch_products(tag_query, token)
+                raw = _fetch_products(tag_query, token, domain)
 
         elif len(collections) == 1:
             gid = self._slug_to_gid(collections[0])
             logger.info(f"[ShopifyGQL] Layer1: single collection slug={collections[0]!r} gid={gid!r}")
-            raw = _fetch_from_collection(gid, tag_query, token)
+            raw = _fetch_from_collection(gid, tag_query, token, domain)
 
         else:
             col_rel = _collection_relation(filter_tree) or "AND"
@@ -784,12 +784,18 @@ class ShopifyGraphQLExecutor:
                 f"relation={col_rel}"
             )
             if col_rel == "OR":
+                # domain and token are resolved ONCE above, in this calling
+                # thread, and passed explicitly into every worker — the same
+                # reasoning as woo_client.execute_all()'s thread pool: a
+                # worker calling get_store_loader() itself would see no
+                # request context and get None, and the wrong-tenant-data
+                # risk from resolving it some other way is worse than that.
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=min(len(collections), 5)
                 ) as pool:
                     futures = [
                         pool.submit(_fetch_from_collection,
-                                    self._slug_to_gid(col), tag_query, token)
+                                    self._slug_to_gid(col), tag_query, token, domain)
                         for col in collections
                     ]
                     raw = _deduplicate(
@@ -802,7 +808,7 @@ class ShopifyGraphQLExecutor:
                     f"[ShopifyGQL] Layer1: AND collections — fetching first "
                     f"slug={collections[0]!r} gid={gid!r}, post-filter enforces rest"
                 )
-                raw = _fetch_from_collection(gid, tag_query, token)
+                raw = _fetch_from_collection(gid, tag_query, token, domain)
 
         logger.info(f"[ShopifyGQL] Layer1 done | raw_products={len(raw)}")
 
@@ -814,7 +820,7 @@ class ShopifyGraphQLExecutor:
         )
 
         # ── Convert to Woo-shaped dicts ───────────────────────
-        woo_products = [_to_woo_shape(p) for p in filtered]
+        woo_products = [_to_woo_shape(p, domain) for p in filtered]
 
         # ── Paginate ──────────────────────────────────────────
         total  = len(woo_products)
@@ -841,7 +847,7 @@ class ShopifyGraphQLExecutor:
     # ── private ──────────────────────────────────────────────
 
     def _get_token(self) -> str:
-        token_row = ShopifyToken.query.get(SHOPIFY_STORE_DOMAIN)
+        token_row = ShopifyToken.query.get(self._loader.shopify_domain)
         if not token_row or token_row.is_expired:
             raise RuntimeError("Shopify Admin token missing or expired")
         return token_row.access_token
@@ -888,7 +894,7 @@ class ShopifyGraphQLExecutor:
         logger.warning(f"ShopifyGraphQLExecutor: no GID found for slug '{slug}', using slug as-is")
         return _to_gid(slug)
 
-    def _fetch_by_ids(self, ids: list, page: int, per_page: int, token: str) -> dict:
+    def _fetch_by_ids(self, ids: list, page: int, per_page: int, token: str, domain: str) -> dict:
         """
         Fetch specific products by Shopify GID or synthetic numeric id.
         Resolves numeric ids → GIDs via store_loader.categories raw list.
@@ -913,10 +919,10 @@ class ShopifyGraphQLExecutor:
         raw = []
         for gid in gids:
             numeric = gid.split("/")[-1]
-            result  = _fetch_products(f"id:{numeric}", token, max_fetch=1)
+            result  = _fetch_products(f"id:{numeric}", token, domain, max_fetch=1)
             raw.extend(result)
 
-        woo_products = [_to_woo_shape(p) for p in raw]
+        woo_products = [_to_woo_shape(p, domain) for p in raw]
         total  = len(woo_products)
         pages  = max(1, -(-total // per_page)) if total else 0
         start  = (page - 1) * per_page

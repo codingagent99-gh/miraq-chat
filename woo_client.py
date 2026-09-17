@@ -10,10 +10,7 @@ import requests as http_requests
 from requests.auth import HTTPBasicAuth
 
 from models import WooAPICall
-from app_config import (
-    WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET, WOO_BASE_URL, CUSTOM_API_BASE_URL,
-    ECOMMERCE_BACKEND,
-)
+from store_registry import get_store_loader
 from chat_logger import get_logger, get_api_logger, get_order_logger, sanitize_url
 
 logger = get_logger("miraq_chat")
@@ -41,6 +38,16 @@ order_logger = get_order_logger()
 # ══════════════════════════════════════════════════════════════════════
 _UPSTREAM_LOCK = _threading.Lock()
 _UNHEALTHY_AFTER = 3        # consecutive hard failures before "down"
+
+# NOTE (multi-store, accepted knowingly): this health tracker is process-wide,
+# not per-tenant. One tenant's broken WooCommerce install will colour the
+# /health signal for every other tenant sharing this process. Not a
+# data-correctness issue — no catalog/order/rep data crosses tenant
+# boundaries because of this — just an imprecise monitoring signal once
+# there's more than one tenant. Key by tenant_id if/when that matters enough
+# to justify it; /health itself has the same "what does this even mean with
+# N tenants" question hanging over it (see store_registry.py's exempt-path
+# note), so this is deferred alongside that, not fixed in isolation here.
 
 # Upper bound on concurrent outbound WooCommerce calls per request. Four is
 # comfortably under requests' default HTTPAdapter pool_maxsize of 10, which
@@ -176,16 +183,24 @@ _BASE_HEADERS = {
     "Accept":     "application/json",
 }
 
-# Standard WooCommerce REST auth (Basic Auth)
-_WC_AUTH = HTTPBasicAuth(WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET)
+# Standard WooCommerce REST auth (Basic Auth) and the custom-plugin header
+# pair are now built per-call inside execute() from the resolved tenant
+# loader — see _build_auth() below. Was a module-level constant baked from
+# the single-store env at import time; that's exactly the bug this phase
+# exists to remove.
 
-# Custom plugin endpoints read credentials from these headers
-# (see WC_Chat_Security::validate_request in class-security.php)
-_CUSTOM_API_HEADERS = {
-    **_BASE_HEADERS,
-    "X-Consumer-Key":    WOO_CONSUMER_KEY,
-    "X-Consumer-Secret": WOO_CONSUMER_SECRET,
-}
+def _build_auth(loader, is_custom_api: bool):
+    """Auth strategy, resolved per-call from the tenant's own credentials:
+      - custom-api/v1/*  → X-Consumer-Key / X-Consumer-Secret headers
+      - wc/v3/*          → HTTPBasicAuth (no credentials in query string)
+    """
+    if is_custom_api:
+        return None, {
+            **_BASE_HEADERS,
+            "X-Consumer-Key":    loader.consumer_key,
+            "X-Consumer-Secret": loader.consumer_secret,
+        }
+    return HTTPBasicAuth(loader.consumer_key, loader.consumer_secret), {}
 
 
 class WooClient:
@@ -195,16 +210,34 @@ class WooClient:
         self.session = http_requests.Session()
         self.session.headers.update(_BASE_HEADERS)
 
-    def execute(self, api_call: WooAPICall) -> dict:
-        """Execute a single API call and return raw response."""
+    def execute(self, api_call: WooAPICall, loader=None) -> dict:
+        """Execute a single API call and return raw response.
+
+        loader: the tenant StoreLoader to resolve credentials/URLs from.
+        Defaults to get_store_loader() (the current request's bound tenant)
+        for the ~25 call sites across handlers/parsers/routes that call this
+        directly inside a request. execute_all() resolves it once itself and
+        passes it explicitly instead, because its ThreadPoolExecutor workers
+        have no request context of their own — get_store_loader() would
+        return None there, silently, which is a wrong-tenant-data risk, not
+        an exception.
+        """
         import json as _json
         import time as _time
 
+        if loader is None:
+            loader = get_store_loader()
+        if not loader:
+            raise RuntimeError(
+                "woo_client.execute(): no tenant loader resolved — "
+                "is X-MiraQ-License-Id missing from the request?"
+            )
+
         # ── Shopify backstop ──────────────────────────────────────────────────
-        # On a Shopify deployment no WooCommerce request is ever legitimate.
+        # On a Shopify tenant no WooCommerce request is ever legitimate.
         # ShopifyEndpoints returns surface="shopify_admin" stubs whose endpoint
-        # paths are placeholders; executing them would resolve against
-        # WOO_BASE_URL and hit an unrelated store.
+        # paths are placeholders; executing them would resolve against this
+        # tenant's woo_base_url and hit an unrelated store.
         #
         # This guard lives here (not only in chat.py's dispatcher) because
         # ~25 call sites across handlers, parsers and routes call woo_client
@@ -214,9 +247,10 @@ class WooClient:
         # Returning the standard failure envelope — rather than raising —
         # means every existing caller's `if result.get("success")` branch
         # degrades safely with no other change.
-        if ECOMMERCE_BACKEND == "shopify":
+        if loader.ecommerce_backend == "shopify":
             logger.warning(
-                "WooClient: blocked WooCommerce call on Shopify deployment | "
+                "WooClient: blocked WooCommerce call on Shopify tenant | "
+                f"tenant={loader.license_id!r} | "
                 f"{api_call.method} {api_call.endpoint} | "
                 f"surface={getattr(api_call, 'surface', '')} | "
                 f"description={api_call.description!r}"
@@ -242,17 +276,14 @@ class WooClient:
         )
         _api_log = order_logger if is_order_create else api_logger
 
-        # Resolve relative endpoints to full URLs
+        # Resolve relative endpoints to full URLs — from this tenant's own
+        # loader, not a process-wide global.
         endpoint = api_call.endpoint
         if not endpoint.startswith("http"):
-            base = CUSTOM_API_BASE_URL if is_custom_api else WOO_BASE_URL
+            base = loader.custom_api_base if is_custom_api else loader.base
             endpoint = base.rstrip("/") + endpoint
 
-        # Auth strategy:
-        #   - custom-api/v1/*  → X-Consumer-Key / X-Consumer-Secret headers
-        #   - wc/v3/*          → HTTPBasicAuth (no credentials in query string)
-        auth    = None       if is_custom_api else _WC_AUTH
-        headers = _CUSTOM_API_HEADERS if is_custom_api else {}
+        auth, headers = _build_auth(loader, is_custom_api)
 
         # ── Logging ───────────────────────────────────────────────────────────
         sanitized_endpoint = sanitize_url(endpoint)
@@ -460,6 +491,21 @@ class WooClient:
         Results stay in the order of api_calls -- callers downstream pair
         each response with its .call by position.
 
+        TENANT RESOLUTION: get_store_loader() reads Flask's g, which is
+        request-context-local — ThreadPoolExecutor workers below have no
+        request context of their own, so a call to it from inside a worker
+        returns None silently. That's not an exception; every call in the
+        batch would look like a normal failure, or worse, would each fail
+        the "if not loader: raise" check independently in a way that's easy
+        to shrug off as flaky. The actual risk if this were missed is worse
+        than either: a WRONG loader (a different tenant's, resolved by
+        chance from process state) rather than no loader — wrong-tenant
+        data, not an error at all. So the loader is resolved exactly once,
+        here, in this calling thread (which does have request context), and
+        passed explicitly into every worker's execute() call. Every call in
+        one batch is provably the same tenant's, and no worker thread ever
+        calls get_store_loader() itself.
+
         TIMING: execute() records into the "woo_api" bucket, but
         timing_logger.accumulate() no-ops outside a request context, and
         worker threads have none. So the batch is wrapped here instead, which
@@ -471,8 +517,15 @@ class WooClient:
         if not api_calls:
             return []
 
+        loader = get_store_loader()
+        if not loader:
+            raise RuntimeError(
+                "woo_client.execute_all(): no tenant loader resolved — "
+                "is X-MiraQ-License-Id missing from the request?"
+            )
+
         if len(api_calls) == 1:
-            return [self.execute(api_calls[0])]
+            return [self.execute(api_calls[0], loader=loader)]
 
         import timing_logger
         from concurrent.futures import ThreadPoolExecutor
@@ -485,8 +538,10 @@ class WooClient:
         def _run(call):
             # execute() already converts failures into an error dict; this is
             # a backstop so one unexpected raise cannot lose the whole batch.
+            # loader is captured from the enclosing scope — resolved once,
+            # above, in the calling thread — never re-resolved in the worker.
             try:
-                return self.execute(call)
+                return self.execute(call, loader=loader)
             except Exception as exc:
                 logger.error(f"execute_all: call failed | error={exc}", exc_info=True)
                 return {"success": False, "error": str(exc), "call": call}

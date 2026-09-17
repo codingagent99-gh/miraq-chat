@@ -468,7 +468,7 @@ def build_fuzzy_vocab(loader):
     # rule, not here.
     try:
         from utils.checkout_fields import rep_name_tokens
-        _reps = rep_name_tokens()
+        _reps = rep_name_tokens(loader=loader)
         if _reps:
             protected.update(_reps)
             logger.debug(f"build_fuzzy_vocab: protected {len(_reps)} rep name token(s)")

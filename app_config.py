@@ -13,31 +13,32 @@ from models import Intent
 load_dotenv()
 
 # ═══════════════════════════════════════════
-# BASE URLs
+# BASE URLs — REMOVED (Phase 2)
 # ═══════════════════════════════════════════
+#
+# _WP_BASE / WOO_BASE_URL / WOO_STORE_API_URL / CUSTOM_API_BASE_URL /
+# WOO_CONSUMER_KEY / WOO_CONSUMER_SECRET used to live here as single-store
+# globals read from the environment at import.
+#
+# They are now per-tenant: resolved from the tenants table into TenantConfig
+# by tenant_registry._rehydrate(), carried on the request-scoped StoreLoader,
+# and read at call time via get_store_loader() — see woo_client.execute() and
+# utils/checkout_fields.py. A module-level global cannot express "whichever
+# store this request belongs to", so keeping them would only invite a call
+# site to silently use the wrong tenant's credentials.
+#
+# Equivalents on the loader:
+#   _WP_BASE            -> loader.wp_base_url
+#   WOO_BASE_URL        -> loader.base
+#   WOO_STORE_API_URL   -> loader.store_api_base
+#   CUSTOM_API_BASE_URL -> loader.custom_api_base
+#   WOO_CONSUMER_KEY    -> loader.consumer_key
+#   WOO_CONSUMER_SECRET -> loader.consumer_secret
+#
+# seed_tenant_one.py still needs the pre-migration single-store values to
+# create tenant #1; it reads os.environ directly rather than importing from
+# here, so nothing has to keep these alive for its sake.
 
-_WP_BASE = os.getenv("WP_BASE_URL", "https://wgc.net.in/hn")
-
-# WooCommerce admin REST API  (/wc/v3 — products, orders, customers)
-WOO_BASE_URL = os.getenv(
-    "WOO_BASE_URL",
-    f"{_WP_BASE}/wp-json/wc/v3",
-)
-
-# WooCommerce Store API  (/wc/store/v1 — cart, checkout, session-aware)
-WOO_STORE_API_URL = os.getenv(            # ← was reading WOO_BASE_URL by mistake
-    "WOO_STORE_API_URL",
-    f"{_WP_BASE}/wp-json/wc/store/v1",
-)
-
-# Custom plugin API  (/custom-api/v1 — nonce refresh, etc.)
-CUSTOM_API_BASE_URL = os.getenv(
-    "CUSTOM_API_BASE_URL",
-    f"{_WP_BASE}/wp-json/custom-api/v1",
-)
-
-WOO_CONSUMER_KEY = os.getenv("WOO_CONSUMER_KEY", "")
-WOO_CONSUMER_SECRET = os.getenv("WOO_CONSUMER_SECRET", "")
 PORT = int(os.getenv("PORT", 5009))
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 USE_RELOADER = os.getenv("USE_RELOADER", "false").lower() == "true"

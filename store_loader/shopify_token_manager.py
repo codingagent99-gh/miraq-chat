@@ -1,19 +1,22 @@
 """
-store_loader/shopify_token_manager.py — Shopify OAuth token lifecycle.
+store_loader/shopify_token_manager.py — Shopify OAuth token lifecycle, per tenant.
 
 Responsibilities:
   1. On startup: read saved token from Postgres.
      - If missing or expired → fetch a fresh one and save it.
      - If valid but near expiry (< 1 h) → use it now, trigger background refresh.
      - If healthy → use it directly.
-  2. Background thread: checks every 30 minutes, refreshes when needed.
+  2. Periodic check: the shared RefreshScheduler (refresh_scheduler.py) calls
+     check_and_refresh_if_needed() on its own tick for every resident
+     Shopify tenant — this manager has no dedicated background thread of its
+     own (see check_and_refresh_if_needed's docstring for why).
   3. get_token() → always returns a ready-to-use token (blocks briefly if a
      refresh is in progress).
 
 Usage (called from store_loader/__init__.py):
 
     from store_loader.shopify_token_manager import ShopifyTokenManager
-    token_mgr = ShopifyTokenManager(app=flask_app)
+    token_mgr = ShopifyTokenManager(config=tenant_config, app=flask_app)
     token_mgr.start()
     token = token_mgr.get_token()   # use in every API call
 """
@@ -27,38 +30,47 @@ from typing import Optional
 import requests
 
 from chat_logger import get_logger
-from store_loader.config import (
-    SHOPIFY_STORE_DOMAIN,
-    SHOPIFY_CLIENT_ID,
-    SHOPIFY_CLIENT_SECRET,
-)
+from tenant_config import TenantConfig
+from app_config import SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET
 
 logger = get_logger("miraq_chat")
 
-# How often the background thread wakes up to check token health (seconds)
-_CHECK_INTERVAL = 30 * 60   # 30 minutes
-# Retry interval after a failed refresh attempt
+# Retry interval after a failed refresh attempt — still used by
+# _ensure_valid_token()'s proactive-refresh path. The 30-minute periodic
+# check interval this module used to run itself is gone; the shared
+# RefreshScheduler owns that cadence now (see check_and_refresh_if_needed's
+# docstring below).
 _RETRY_INTERVAL = 2  * 60   # 2 minutes
 
 
 class ShopifyTokenManager:
     """
-    Manages fetching, persisting, and background-refreshing the Shopify
-    Admin API access token using the client_credentials OAuth flow.
+    Manages fetching, persisting, and refreshing the Shopify Admin API
+    access token using the client_credentials OAuth flow, for one tenant.
     """
 
-    def __init__(self, app=None):
+    def __init__(self, config: TenantConfig, app=None):
         """
         Args:
-            app: Flask app instance. If provided, all DB operations run inside
-                 an app context (required when called from outside a request).
+            config: this tenant's TenantConfig — only shopify_domain is read
+                    from it. The client credentials are app-level, not
+                    per-tenant (see below).
+            app:    Flask app instance. If provided, all DB operations run inside
+                    an app context (required when called from outside a request).
         """
-        self._app    = app
-        self._domain = SHOPIFY_STORE_DOMAIN
+        self._app            = app
+
+        # Per-tenant: which store this manager holds a token for.
+        self._domain          = config.shopify_domain
+
+        # App-level: the MiraQ app's own credentials, identical for every
+        # tenant. Read from app_config rather than TenantConfig so there is
+        # exactly one copy to rotate.
+        self._client_id       = SHOPIFY_CLIENT_ID
+        self._client_secret   = SHOPIFY_CLIENT_SECRET
 
         self._lock           = threading.Lock()
         self._current_token: Optional[str] = None
-        self._refresh_thread: Optional[threading.Thread] = None
 
     # ──────────────────────────────────────────────
     # Public API
@@ -66,8 +78,8 @@ class ShopifyTokenManager:
 
     def start(self):
         """
-        Load (or fetch) the initial token then start the background refresh loop.
-        Call this once at server startup, after db.init_app() and db.create_all().
+        Load (or fetch) the initial token. Call this once when the tenant's
+        StoreLoader is built (see StoreLoader.start_background_refresh).
 
         A failed INITIAL fetch is deliberately not fatal. _do_refresh() logs and
         re-raises so that get_token() still surfaces the failure to whoever
@@ -76,20 +88,61 @@ class ShopifyTokenManager:
         the very same failure, caught it, and carried on degraded. Two paths,
         two answers, and the strict one won by accident of ordering.
 
-        Boot degraded instead: log loudly, start the retry loop anyway, and let
-        the first request that genuinely needs a token be the thing that fails.
+        Boot degraded instead: log loudly, and let the first request that
+        genuinely needs a token be the thing that fails. The shared
+        RefreshScheduler's periodic sweep (see check_and_refresh_if_needed)
+        will retry it on its own tick — no dedicated retry loop needed here.
         """
         try:
             self._ensure_valid_token()
         except Exception as e:
             logger.error(
                 "ShopifyTokenManager: ⚠️  startup token fetch failed — starting "
-                "DEGRADED. Background loop will retry every "
-                f"{_RETRY_INTERVAL // 60} min; requests needing a token will "
-                f"fail until one succeeds. {type(e).__name__}: {e}",
+                "DEGRADED. The shared refresh scheduler will retry on its next "
+                f"tick; requests needing a token will fail until one succeeds. "
+                f"{type(e).__name__}: {e}",
                 exc_info=True,
             )
-        self._start_background_loop()
+
+    def check_and_refresh_if_needed(self):
+        """
+        Called once per tick by the shared RefreshScheduler (refresh_scheduler.py)
+        instead of this manager running its own background thread.
+
+        This used to be a `while True: sleep(...)` loop owned by this instance
+        (_start_background_loop, now removed) — one per Shopify tenant's
+        StoreLoader. TenantRegistry's LRU eviction pops an evicted loader from
+        its dict, but a loop like that keeps running and keeps this instance
+        (and everything it holds) alive forever regardless — one leaked thread
+        per evicted Shopify tenant, the exact same failure mode
+        StoreLoader._reason_to_reload() was written to avoid for catalog
+        refresh. Moving the periodic check into the shared scheduler fixes it
+        the same way: no thread survives past this tenant's eviction.
+        """
+        try:
+            row = self._load_from_db()
+            if not row or row.needs_refresh:
+                label = "expired/missing" if (not row or row.is_expired) else "near-expiry"
+                logger.info(f"ShopifyTokenManager: 🔄 scheduled refresh triggered ({label}) | domain={self._domain}")
+                self._do_refresh()
+            else:
+                # The DB row looks healthy, but our in-memory copy may not
+                # match it — e.g. another worker refreshed the token since
+                # our last check. Re-sync unconditionally.
+                with self._lock:
+                    was_stale = self._current_token != row.access_token
+                    self._current_token = row.access_token
+                if was_stale:
+                    logger.info(
+                        "ShopifyTokenManager: 🔁 in-memory token was stale "
+                        f"— synced from DB | domain={self._domain} "
+                        f"({row.seconds_until_expiry / 3600:.1f}h remaining)"
+                    )
+        except Exception as e:
+            logger.error(
+                f"ShopifyTokenManager: scheduled check failed | domain={self._domain} | {e}",
+                exc_info=True,
+            )
 
     def get_token(self) -> str:
         """
@@ -111,7 +164,8 @@ class ShopifyTokenManager:
 
         raise RuntimeError(
             "ShopifyTokenManager: could not obtain a valid access token. "
-            "Check SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET and server logs."
+            "Check SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET in the environment, "
+            "that this tenant's shopify_domain is correct, and server logs."
         )
 
     def invalidate(self, bad_token: str):
@@ -230,8 +284,8 @@ class ShopifyTokenManager:
                 url = f"https://{self._domain}/admin/oauth/access_token"
                 params = {
                     "grant_type":    "client_credentials",
-                    "client_id":     SHOPIFY_CLIENT_ID,
-                    "client_secret": SHOPIFY_CLIENT_SECRET,
+                    "client_id":     self._client_id,
+                    "client_secret": self._client_secret,
                 }
                 resp = requests.post(url, params=params, timeout=15)
                 resp.raise_for_status()
@@ -318,59 +372,3 @@ class ShopifyTokenManager:
                     db.session.commit()
         except Exception:
             pass
-
-    # ──────────────────────────────────────────────
-    # Internal: background loop
-    # ──────────────────────────────────────────────
-
-    def _start_background_loop(self):
-        if self._refresh_thread and self._refresh_thread.is_alive():
-            return
-
-        def _loop():
-            while True:
-                # Retry on the SHORT interval while we hold no usable token at
-                # all (i.e. the startup fetch failed and we booted degraded),
-                # and on the normal health-check cadence once one is in hand.
-                # Sleeping the full check interval first would leave a degraded
-                # boot unrecoverable for 30 minutes even after the network came
-                # back.
-                with self._lock:
-                    _have_token = bool(self._current_token)
-                time.sleep(_CHECK_INTERVAL if _have_token else _RETRY_INTERVAL)
-                try:
-                    row = self._load_from_db()
-                    if not row or row.needs_refresh:
-                        label = "expired/missing" if (not row or row.is_expired) else "near-expiry"
-                        logger.info(f"ShopifyTokenManager: 🔄 background refresh triggered ({label})")
-                        self._do_refresh()
-                    else:
-                        # The DB row looks healthy, but our in-memory copy may
-                        # not match it -- e.g. another worker refreshed the
-                        # token (which invalidates whatever we're holding)
-                        # since our last check. Re-sync unconditionally so a
-                        # worker that lost that race recovers here instead of
-                        # failing every request until it's restarted.
-                        with self._lock:
-                            was_stale = self._current_token != row.access_token
-                            self._current_token = row.access_token
-                        if was_stale:
-                            logger.info(
-                                "ShopifyTokenManager: 🔁 in-memory token was stale "
-                                "(refreshed by another worker) — synced from DB "
-                                f"({row.seconds_until_expiry / 3600:.1f}h remaining)"
-                            )
-                        else:
-                            logger.debug(
-                                f"ShopifyTokenManager: token healthy "
-                                f"({row.seconds_until_expiry / 3600:.1f}h remaining)"
-                            )
-                except Exception as e:
-                    logger.error(
-                        f"ShopifyTokenManager: background loop error — {e}", exc_info=True
-                    )
-                    time.sleep(_RETRY_INTERVAL)
-
-        self._refresh_thread = threading.Thread(target=_loop, daemon=True, name="shopify-token-refresh")
-        self._refresh_thread.start()
-        logger.info("ShopifyTokenManager: background refresh loop started (checks every 30 min)")
