@@ -166,6 +166,31 @@ SHOPIFY_CUSTOMER_AUTH = os.getenv("SHOPIFY_CUSTOMER_AUTH", "app_proxy").lower()
 # Replay window for signed proxy requests, in seconds (0 disables the check).
 SHOPIFY_PROXY_MAX_AGE = int(os.getenv("SHOPIFY_PROXY_MAX_AGE", "900"))
 
+# ── Shopify APP credentials — process-wide, NOT per-tenant ──────────────────
+#
+# These identify the MiraQ Shopify app itself, not any individual store. One
+# pair is issued once in the Partner Dashboard (SHOPIFY_CLIENT_ID is the same
+# value as `client_id` in shopify.app.miraq-commerce-agent.toml) and is shared
+# by every merchant who installs the app, however many that becomes.
+#
+# SHOPIFY_CLIENT_SECRET is used for three things, all of them app-wide:
+#   1. exchanging an OAuth `code` for a per-store access token at install
+#   2. verifying App Proxy request signatures  (ecommerce/shopify_proxy.py)
+#   3. verifying webhook / Events API body HMACs  (routes/shopify.py)
+#
+# They are therefore NOT on the Tenant row. A per-tenant copy would be N
+# duplicates of one secret: rotating it would mean rewriting every row, and
+# any row left unpopulated would fail signature verification outright.
+#
+# What IS per-tenant: Tenant.shopify_domain (captured from the `shop` param at
+# install) and the access token in models/shopify_token.py keyed by domain.
+SHOPIFY_CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID", "")
+SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET", "")
+
+# Admin GraphQL version this codebase targets. App-wide: one version for every
+# store, bumped deliberately when the schema is verified against it.
+SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-10")
+
 if ECOMMERCE_BACKEND == "shopify" and SHOPIFY_CUSTOMER_AUTH != "app_proxy":
     # Loud, once, at startup — in addition to the per-request warning.
     import logging as _logging
