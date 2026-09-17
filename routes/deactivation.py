@@ -79,8 +79,46 @@ def deactivate_tenant():
         logger.info(f"deactivate-tenant: already archived | license_id={license_id}")
         return jsonify({"success": True, "license_id": license_id, "status": "archived"}), 200
 
+    result = teardown_tenant(tenant, log_prefix="deactivate-tenant")
+    if not result["success"]:
+        return jsonify({"success": False, "error": result["error"]}), 500
+
+    return jsonify({
+        "success":    True,
+        "license_id": license_id,
+        "status":     "archived",
+    }), 200
+
+
+def teardown_tenant(tenant, *, log_prefix: str = "teardown") -> dict:
+    """
+    Tear a tenant down: evict from registries, drop its database, archive the
+    control-plane row, delete its snapshot.
+
+    Extracted from deactivate_tenant() so the Shopify app/uninstalled webhook
+    can reuse it. The two callers authenticate completely differently — a
+    signed licence payload versus a Shopify body HMAC — but everything AFTER
+    "we know which tenant, and we're allowed to remove it" is identical, and
+    duplicating it would mean one path eventually drifting (forgetting the
+    snapshot delete, or dropping the DB before evicting the engine and
+    hitting "database is being accessed by other users").
+
+    The caller is responsible for authenticating the request and for the
+    already-archived / not-found early returns, since their response shapes
+    differ.
+
+    Ordering is load-bearing:
+      1. evict registries first — a live engine holds connections, and
+         DROP DATABASE fails while any session is open
+      2. drop the physical database
+      3. archive the row (kept for audit; db_name preserved)
+      4. delete the snapshot, best-effort
+
+    Returns {"success": True} or {"success": False, "error": str}.
+    """
     db_name = tenant.db_name
-    logger.info(f"deactivate-tenant: starting teardown | license_id={license_id} db={db_name}")
+    label = f"license_id={tenant.license_id}" if tenant.license_id else f"shop={tenant.shopify_domain}"
+    logger.info(f"{log_prefix}: starting teardown | {label} db={db_name}")
 
     # ── 1. Evict from in-memory registries FIRST ──────────────────────────────
     try:
@@ -88,49 +126,40 @@ def deactivate_tenant():
         registry = get_tenant_registry()
         if registry:
             registry.evict(str(tenant.tenant_id))
-            logger.info(f"deactivate-tenant: loader evicted | license_id={license_id}")
+            logger.info(f"{log_prefix}: loader evicted | {label}")
 
         engine_registry = get_engine_registry()
         if engine_registry:
             engine_registry.dispose_for(db_name)
-            logger.info(f"deactivate-tenant: engine disposed | license_id={license_id}")
+            logger.info(f"{log_prefix}: engine disposed | {label}")
     except Exception as e:
-        logger.error(f"deactivate-tenant: registry eviction failed | license_id={license_id} | {e}", exc_info=True)
+        logger.error(f"{log_prefix}: registry eviction failed | {label} | {e}", exc_info=True)
         # Non-fatal — continue with DB drop even if registry eviction fails
 
     # ── 2. Drop the physical database ─────────────────────────────────────────
     base_dsn = current_app.config["SQLALCHEMY_DATABASE_URI"]
     try:
         drop_tenant_database(base_dsn, db_name)
-        logger.info(f"deactivate-tenant: database dropped | license_id={license_id} db={db_name}")
+        logger.info(f"{log_prefix}: database dropped | {label} db={db_name}")
     except TenantDBProvisionError as e:
-        logger.error(f"deactivate-tenant: DROP failed | license_id={license_id} | {e}", exc_info=True)
-        return jsonify({"success": False, "error": f"database drop failed: {e}"}), 500
+        logger.error(f"{log_prefix}: DROP failed | {label} | {e}", exc_info=True)
+        return {"success": False, "error": f"database drop failed: {e}"}
 
     # ── 3. Mark archived in the control-plane row ─────────────────────────────
     try:
         tenant.status = "archived"
         tenant.archived_at = datetime.now(timezone.utc)
         db.session.commit()
-        logger.info(f"deactivate-tenant: ✅ teardown complete | license_id={license_id}")
+        logger.info(f"{log_prefix}: teardown complete | {label}")
     except Exception as e:
-        logger.error(f"deactivate-tenant: failed to archive row | license_id={license_id} | {e}", exc_info=True)
-        return jsonify({"success": False, "error": f"archive failed: {e}"}), 500
+        logger.error(f"{log_prefix}: failed to archive row | {label} | {e}", exc_info=True)
+        return {"success": False, "error": f"archive failed: {e}"}
 
     # ── 4. Best-effort snapshot cleanup ───────────────────────────────────────
     # delete() is self-guarding (logs and returns on failure), so a leftover
     # snapshot never blocks a completed teardown. Keyed by tenant_id, matching
     # how snapshots are stored since the re-key.
-    #
-    # The reference also prunes CatalogSnapshot rows here (a control-plane
-    # table backing its catalog-push feature). Not included — that model
-    # doesn't exist in this codebase; catalog-push is out of scope per the
-    # conversion plan's D2 unless a tenant's host turns out to need it.
     from tenant_snapshot_store import snapshot_store
     snapshot_store.delete(str(tenant.tenant_id))
 
-    return jsonify({
-        "success":    True,
-        "license_id": license_id,
-        "status":     "archived",
-    }), 200
+    return {"success": True}

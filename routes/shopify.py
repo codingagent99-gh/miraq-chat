@@ -356,3 +356,97 @@ def shopify_order_paid_event():
     )
 
     return jsonify({"received": True}), 200
+
+@shopify_bp.route("/events/app-uninstalled", methods=["POST"])
+def shopify_app_uninstalled():
+    """
+    Shopify app/uninstalled webhook — the Shopify equivalent of the WordPress
+    plugin's uninstall.php.
+
+    Declared in shopify.app.miraq-commerce-agent.toml under
+    [[webhooks.subscriptions]]. Without this route Shopify POSTs into a 404 on
+    every uninstall, which means the tenant row and its physical database
+    survive forever and RefreshScheduler keeps polling a store whose token
+    Shopify has already revoked — a 401 on every tick, indefinitely.
+
+    IMPORTANT: Shopify revokes the access token BEFORE sending this webhook,
+    so no Admin API call can succeed from here. Teardown must be purely local.
+
+    Verification differs from the WordPress path by necessity. /deactivate-tenant
+    verifies a licence payload signed by the licensing server; Shopify has no
+    such payload, so the proof is the body HMAC over the exact delivered bytes,
+    keyed with the app-level client secret. The Shopify-Shop-Domain header only
+    says which tenant the delivery CLAIMS to be for — the HMAC is what proves
+    the delivery came from Shopify at all.
+
+    Always returns 2xx once the request is authenticated, including when the
+    tenant is already gone. Shopify retries non-2xx deliveries with backoff for
+    days, and "no such tenant" means the work is already done, not that it
+    failed. Only a genuine teardown error returns 500 so the retry is useful.
+    """
+    raw_body = request.get_data()  # exact signed bytes — request.get_json()
+    # re-serialises and would break the HMAC.
+    header_hmac = request.headers.get("Shopify-Hmac-Sha256")
+    shop_domain = request.headers.get("Shopify-Shop-Domain", "")
+    delivery_id = request.headers.get("Shopify-Webhook-Id", "")
+
+    # Authenticate FIRST, before any tenant lookup. Verifying the signature
+    # before touching the database means an unsigned request gets an identical
+    # 401 whether or not it named a real store, so this cannot be used to
+    # enumerate which shops have the app installed.
+    ok, reason = verify_events_hmac(raw_body, header_hmac, SHOPIFY_CLIENT_SECRET)
+    if not ok:
+        logger.warning(
+            f"shopify events: rejected /events/app-uninstalled delivery | "
+            f"reason={reason} | shop={shop_domain!r} delivery_id={delivery_id!r}"
+        )
+        return jsonify({"error": "unverified_request"}), 401
+
+    tenant = _resolve_tenant_by_shopify_domain(shop_domain)
+    if tenant is None:
+        # Authenticated but unknown: a store that never completed provisioning,
+        # or a repeat delivery after a successful teardown. Nothing to do.
+        logger.info(
+            f"shopify events: app/uninstalled for unknown shop={shop_domain!r} "
+            f"— nothing to tear down | delivery_id={delivery_id!r}"
+        )
+        return jsonify({"received": True, "status": "not_found"}), 200
+
+    if tenant.status == "archived":
+        logger.info(
+            f"shopify events: app/uninstalled — tenant already archived | "
+            f"shop={shop_domain!r} delivery_id={delivery_id!r}"
+        )
+        return jsonify({"received": True, "status": "archived"}), 200
+
+    # Drop the stored Admin API token before teardown. Shopify has already
+    # revoked it, so it is now a dead credential sitting in the control-plane
+    # DB; and ShopifyTokenManager would otherwise keep trying to refresh it.
+    try:
+        ShopifyToken.query.filter_by(domain=tenant.shopify_domain).delete()
+        db.session.commit()
+        logger.info(f"shopify events: token row deleted | shop={shop_domain!r}")
+    except Exception as e:
+        # Non-fatal: the token is already useless. Roll back so the session is
+        # clean for the teardown's own commit.
+        db.session.rollback()
+        logger.error(
+            f"shopify events: failed to delete token row | shop={shop_domain!r} | {e}",
+            exc_info=True,
+        )
+
+    from routes.deactivation import teardown_tenant
+    result = teardown_tenant(tenant, log_prefix="app-uninstalled")
+    if not result["success"]:
+        # 500 so Shopify retries — teardown is idempotent, and the
+        # already-archived check above short-circuits a successful retry.
+        logger.error(
+            f"shopify events: teardown failed | shop={shop_domain!r} | {result['error']}"
+        )
+        return jsonify({"error": result["error"]}), 500
+
+    logger.info(
+        f"shopify events: app/uninstalled teardown complete | "
+        f"shop={shop_domain!r} delivery_id={delivery_id!r}"
+    )
+    return jsonify({"received": True, "status": "archived"}), 200
