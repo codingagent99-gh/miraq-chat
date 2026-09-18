@@ -33,6 +33,7 @@ import urllib.parse
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from routes.sales_rep import sales_rep_bp
+from routes.channel import channel_bp
 # ═══════════════════════════════════════════
 # FLASK APP & DATABASE
 # ═══════════════════════════════════════════
@@ -144,6 +145,7 @@ app.register_blueprint(admin_bp)
 app.register_blueprint(products_bp)
 app.register_blueprint(shopify_bp)
 app.register_blueprint(sales_rep_bp)
+app.register_blueprint(channel_bp)
 
 # ── Request timing instrumentation ───────────────────────────────────────────
 # Writes plain text to logs/<date>/timing.txt, separate from chat.txt and

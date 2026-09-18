@@ -183,6 +183,16 @@ DEFAULT_ORDER_PER_PAGE  = int(os.getenv("CHAT_ORDERS_PER_PAGE", "5"))
 DEFAULT_STATUS          = "publish"
 DEFAULT_STOCK_STATUS    = "instock"
 REQUEST_TIMEOUT         = int(os.getenv("REQUEST_TIMEOUT", "30"))
+
+# ═══════════════════════════════════════════
+# MESSAGING CHANNELS (WhatsApp / Instagram)
+# ═══════════════════════════════════════════
+# Shared secret the webhook service sends as X-MiraQ-Channel-Key on
+# POST /chat/channel. Empty = endpoint rejects every request.
+CHANNEL_API_KEY = os.getenv("CHANNEL_API_KEY", "").strip()
+# Product cards sent per turn. Each card is a separate message on WhatsApp.
+CHANNEL_MAX_PRODUCT_CARDS = int(os.getenv("CHANNEL_MAX_PRODUCT_CARDS", "5"))
+
 LOG_LEVEL               = os.getenv("LOG_LEVEL", "INFO")
 
 # ═══════════════════════════════════════════
