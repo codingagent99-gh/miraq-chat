@@ -18,7 +18,6 @@ from models.catalog import (
     CatalogCategory,
     CatalogTag,
 )
-from store_loader.config import ECOMMERCE_BACKEND
 logger = get_logger("miraq_chat")
 
 

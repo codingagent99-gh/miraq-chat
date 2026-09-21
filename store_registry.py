@@ -4,8 +4,14 @@ store_registry.py — Tenant resolution, per-request loader + DB-engine binding.
 Resolution order on each request (before_request):
   1. Exempt path?             → skip tenant binding entirely.
   2. X-MiraQ-License-Id set?  → look up tenant, bind loader + engine, or 4xx.
-  3. Header absent            → 400. No fallback to a default tenant — every
-     request must identify itself once this is registered.
+  3. Signed App Proxy request → resolve by the signed `shop` parameter. This
+     is how a Shopify STOREFRONT identifies itself: the theme app extension
+     has no licence id to send (see extensions/.../miraq_widget.liquid — it
+     passes only shop domain and the proxy path), and Shopify signs `shop`,
+     `timestamp` and `signature` into every proxied request. Without this
+     every chat message from a Shopify store 400s.
+  4. Neither                  → 400. No fallback to a default tenant — every
+      request must identify itself once this is registered.
 
 get_store_loader() returns g.store_loader within a request, else None
 (startup / background threads have no request context).
@@ -32,23 +38,28 @@ _LICENSE_HEADER = "X-MiraQ-License-Id"
 # licence signature instead (or is deliberately unauthenticated for now, in
 # activate-free's case — see that route's docstring).
 # /customer-addresses, /events/product-update, /events/order-paid and
-# /events/app-uninstalled (Stage 2, routes/shopify.py) are Shopify-native mechanisms — App Proxy and Events
+# /events/app-uninstalled (Stage 2, routes/shopify.py) are Shopify-native mechanism
 # webhooks — that carry their own signed tenant identifier (a `shop` query
 # param or a Shopify-Shop-Domain header) and verify it themselves. Shopify
 # has no way to send X-MiraQ-License-Id, so these must not be gated behind
 # it either.
 #
-# No Shopify OAuth callback path is listed because this project has none to
-# exempt: store_loader/shopify_token_manager.py uses the client_credentials
-# grant (server-to-server, POST straight to /admin/oauth/access_token), not
-# the authorization-code flow's browser-redirect callback. If Stage 2 adds a
-# tenant-facing Shopify app install flow with a real callback route, it goes
-# here then.
+# The Shopify install flow (routes/shopify_oauth.py) is exempt for a different
+# reason: it runs BEFORE a tenant exists — the callback is what creates it —
+# and authenticates with the app-level query hmac plus a signed state nonce.
+# The client_credentials grant in store_loader/shopify_token_manager.py cannot
+# reach stores outside our own Partner organisation, which is why a
+# distributable app needs this authorization-code callback at all.
 _EXEMPT_PATHS = {
     "/provision-tenant", "/activate-free", "/deactivate-tenant",
     "/customer-addresses", "/events/product-update", "/events/order-paid",
     "/events/app-uninstalled",
+    # Shopify install flow (routes/shopify_oauth.py). These run BEFORE a
+    # tenant exists — the callback is what creates it — and authenticate with
+    # the app-level hmac + state nonce instead.
+    "/shopify/install", "/shopify/auth/callback", "/installed",
 }
+
 
 # Paths where the tenant header is OPTIONAL. With it, the tenant is bound
 # (so /health and /status describe THAT store); without it, or with a tenant
@@ -138,13 +149,63 @@ def bind_tenant_db(tenant) -> None:
     g.ecommerce_backend = tenant.ecommerce_backend
     g.db_engine = _engine_registry.get_engine(tenant.db_name)
 
+def _tenant_from_app_proxy():
+    """
+    Resolve a tenant from a Shopify App Proxy request, or None.
+
+    The `shop` parameter alone is attacker-suppliable, so it only decides WHOSE
+    signature to check; the signature itself — HMAC-SHA256 over the query
+    string, keyed with the app-level client secret — is the authentication.
+    Same scheme /customer-addresses already uses, applied to every route.
+
+    Returns None (never an error response) when this is not a proxied request,
+    so the caller can fall through to the usual missing-header 400.
+    """
+    args = request.args
+    if not args.get("signature") or not args.get("shop"):
+        return None
+
+    from app_config import SHOPIFY_CLIENT_SECRET, SHOPIFY_PROXY_MAX_AGE
+    from ecommerce.shopify_proxy import verify_app_proxy_signature
+
+    ok, reason = verify_app_proxy_signature(
+        args.to_dict(flat=True),
+        SHOPIFY_CLIENT_SECRET,
+        max_age_seconds=SHOPIFY_PROXY_MAX_AGE,
+    )
+    if not ok:
+        logger.warning(f"App Proxy signature rejected | shop={args.get('shop')!r} | reason={reason}")
+        return None
+
+    from models import Tenant
+    shop = (args.get("shop") or "").strip().lower()
+    tenant = Tenant.query.filter_by(shopify_domain=shop).first()
+    if tenant is None:
+        logger.warning(f"App Proxy request for an unknown shop | shop={shop!r}")
+        return None
+
+    logger.info(f"Tenant resolved via App Proxy | shop={shop} tenant_id={tenant.tenant_id}")
+    return tenant
+
+
 def _bind_optional_tenant(license_id: str) -> None:
+    """
+    Best-effort binding for _OPTIONAL_TENANT_PATHS. Never returns an error
+    response and never triggers a catalog rehydrate — a health poll must not
+    be the thing that makes a cold tenant spend seconds rebuilding. Uses the
+    tenant's loader only if it is already resident.
+    """
     g.store_loader = None
-    if not license_id:
-        return
     try:
         from models import Tenant
-        tenant = Tenant.query.filter_by(license_id=license_id).first()
+        if license_id:
+            tenant = Tenant.query.filter_by(license_id=license_id).first()
+        else:
+            # A Shopify storefront polls /health through the App Proxy, so it
+            # identifies itself by signed `shop` rather than a header — same
+            # as every other route. Without this its health checks were never
+            # bound and always reported the store as "unknown".
+            tenant = _tenant_from_app_proxy()
         if tenant is None:
             return
         g.tenant = tenant
@@ -154,7 +215,7 @@ def _bind_optional_tenant(license_id: str) -> None:
             resident = dict(_tenant_registry.resident_loaders())
             g.store_loader = resident.get(str(tenant.tenant_id))
     except Exception as e:
-        logger.warning(f"_bind_optional_tenant: could not bind | license_id={license_id[:8]!r} | {e}")
+        logger.warning(f"_bind_optional_tenant: could not bind | license_id={(license_id or '')[:8]!r} | {e}")
         g.store_loader = None
 
 def register_before_request(app) -> None:
@@ -178,17 +239,19 @@ def register_before_request(app) -> None:
 
         logger.info(f"_resolve_tenant: path={path} | license_id={'present:'+license_id[:8] if license_id else 'MISSING'}")
 
-        # ── No header ─────────────────────────────────────────────────────────
-        if not license_id:
-            logger.warning(f"Tenant header missing on {path} → 400")
-            return jsonify({"success": False, "error": "missing tenant"}), 400
-
-        # ── Header present — resolve the tenant ──────────────────────────────
-        from models import Tenant
-        tenant = Tenant.query.filter_by(license_id=license_id).first()
-        if tenant is None:
-            logger.warning(f"Unknown license_id={license_id!r} on {path} → 404")
-            return jsonify({"success": False, "error": "unknown tenant"}), 404
+        # ── Resolve the tenant: licence header, else signed App Proxy ────────
+        if license_id:
+            from models import Tenant
+            tenant = Tenant.query.filter_by(license_id=license_id).first()
+            if tenant is None:
+                logger.warning(f"Unknown license_id={license_id!r} on {path} → 404")
+                return jsonify({"success": False, "error": "unknown tenant"}), 404
+        else:
+            tenant = _tenant_from_app_proxy()
+            if tenant is None:
+                logger.warning(f"No tenant header and no valid App Proxy signature on {path} → 400")
+                return jsonify({"success": False, "error": "missing tenant"}), 400
+            license_id = tenant.license_id or ""
 
         # Auto-mark expired tenants before checking is_active.
         if (tenant.status == "active"

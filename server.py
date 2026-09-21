@@ -24,6 +24,7 @@ from app_config import PORT, DEBUG, STORE_NAME, USE_RELOADER
 from store_registry import get_store_loader, register_before_request
 from models import db, Conversation
 from routes.webhook_routes import webhook_bp
+from routes.shopify_oauth import shopify_oauth_bp
 from routes.chat import chat_bp
 from routes.admin import admin_bp
 from routes.products import products_bp
@@ -168,6 +169,7 @@ app.register_blueprint(sales_rep_bp)
 app.register_blueprint(provisioning_bp)
 app.register_blueprint(deactivation_bp)
 app.register_blueprint(webhook_bp)
+app.register_blueprint(shopify_oauth_bp)
 
 # ── Request timing instrumentation ───────────────────────────────────────────
 # Writes plain text to logs/<date>/timing.txt, separate from chat.txt and

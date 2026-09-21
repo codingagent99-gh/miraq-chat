@@ -31,7 +31,6 @@ from app_config import (
     DEFAULT_PAYMENT_METHOD,
     DEFAULT_PAYMENT_METHOD_TITLE,
     BULK_ORDER_FULL_SCOPE_ROLES,
-    ECOMMERCE_BACKEND,
 )
 from conversation_flow import FlowState
 from chat_logger import get_logger

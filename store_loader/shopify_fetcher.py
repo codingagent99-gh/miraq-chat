@@ -28,7 +28,7 @@ from chat_logger import get_logger
 
 logger = get_logger("miraq_chat")
 
-API_VERSION = "2024-10"
+from app_config import SHOPIFY_API_VERSION as API_VERSION
 PAGE_SIZE = 100  # Shopify GraphQL connection max
 TIMEOUT = 30
 MAX_RETRIES = 3

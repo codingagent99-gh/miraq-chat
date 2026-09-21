@@ -67,7 +67,7 @@ def _current_shop_domain() -> str:
     
     if not domain:
         raise RuntimeError(
-            "shopify_oders_executor: no Shopify tenant bound to this request "
+            "shopify_orders_executor: no Shopify tenant bound to this request "
             "(missing loader or empty shopify_domain)"
         )
         
@@ -75,7 +75,7 @@ def _current_shop_domain() -> str:
 
 logger = get_logger("miraq_chat")
 
-API_VERSION = "2024-10"
+from app_config import SHOPIFY_API_VERSION as API_VERSION
 
 # Must stay in sync with shopify_order_calls.PLACEHOLDER_CUSTOMER_ID.
 # Defined locally rather than imported to keep the executor free of a
