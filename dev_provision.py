@@ -14,6 +14,10 @@ Subcommands
   free        POST /activate-free        (free path)
   deactivate  POST /deactivate-tenant    (credential path — the free-tier one)
   revoke      POST /deactivate-tenant    (signed path)
+  shopify     Convert an existing tenant row to a Shopify tenant (no endpoint
+              provisions Shopify tenants yet — the row is seeded by hand).
+  event       Send a signed Shopify webhook (order-paid / app-uninstalled /
+              product-update), HMAC'd with SHOPIFY_CLIENT_SECRET.
   status      Read the control-plane DB directly and print every tenant:
               row state, whether its database still exists, table counts.
   wait        Poll `status` until a tenant leaves "warming" (build finished).
@@ -50,8 +54,7 @@ import uuid as uuid_mod
 
 import requests
 
-DEFAULT_BACKEND = os.environ.get("MIRAQ_DEV_BACKEND", "http://localhost:5009")
-DEFAULT_DSN = os.environ.get("DATABASE_URL", "postgresql://postgres:admin@localhost:5432/miraq_chat_multi")
+DEFAULT_BACKEND = os.environ.get("MIRAQ_DEV_BACKEND", "http://localhost:5000")
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -94,10 +97,75 @@ def _redact(d: dict) -> dict:
 
 
 def _dsn(args) -> str:
-    dsn = args.dsn or DEFAULT_DSN
+    """
+    The control-plane DSN, resolved the same way the backend resolves it, so
+    the two cannot silently disagree:
+
+        --dsn  >  .env's DATABASE_URL  >  the shell's DATABASE_URL
+
+    .env deliberately outranks the shell environment here. The backend calls
+    load_dotenv(), which does NOT override an already-set shell variable — so
+    a stale DATABASE_URL left in a terminal session points this script at one
+    database while the server uses another, and you get "database ... does
+    not exist" for a tenant that was just created successfully.
+    """
+    if args.dsn:
+        return args.dsn
+
+    env_file_dsn = ""
+    try:
+        from dotenv import dotenv_values
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        env_file_dsn = (dotenv_values(env_path) or {}).get("DATABASE_URL") or ""
+    except Exception:
+        pass
+
+    shell_dsn = os.environ.get("DATABASE_URL", "")
+
+    if env_file_dsn and shell_dsn and env_file_dsn != shell_dsn:
+        print(f"note: .env and $DATABASE_URL differ — using .env ({_hide_pw(env_file_dsn)})")
+        print(f"      shell value was {_hide_pw(shell_dsn)}")
+
+    dsn = env_file_dsn or shell_dsn
     if not dsn:
-        raise SystemExit("No control-plane DSN. Pass --dsn or set DATABASE_URL.")
+        raise SystemExit("No control-plane DSN. Pass --dsn, or set DATABASE_URL in .env.")
     return dsn
+
+
+def _hide_pw(dsn: str) -> str:
+    import urllib.parse
+    try:
+        p = urllib.parse.urlparse(dsn)
+        if p.password:
+            netloc = p.netloc.replace(f":{p.password}@", ":***@")
+            return p._replace(netloc=netloc).geturl()
+    except Exception:
+        pass
+    return dsn
+
+
+def _connect(dsn: str):
+    """Connect, or explain what went wrong and which databases do exist."""
+    import psycopg2
+    import urllib.parse
+    try:
+        return psycopg2.connect(dsn)
+    except Exception as e:
+        print(f"✗ cannot connect to the control-plane DB: {e}".rstrip())
+        print(f"  DSN in use: {_hide_pw(dsn)}")
+        try:
+            admin = urllib.parse.urlparse(dsn)._replace(path="/postgres").geturl()
+            conn = psycopg2.connect(admin)
+            cur = conn.cursor()
+            cur.execute("SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname")
+            names = [r[0] for r in cur.fetchall()]
+            conn.close()
+            control = [n for n in names if not n.startswith("tenant_")]
+            print(f"  databases on this server: {', '.join(control) or '(none)'}")
+            print("  Pick the one the backend uses (check DATABASE_URL in .env) and pass it with --dsn.")
+        except Exception:
+            pass
+        return None
 
 
 def _fake_signed_payload(license_id: str) -> tuple[str, str]:
@@ -176,10 +244,8 @@ def cmd_status(args) -> int:
     import urllib.parse
 
     dsn = _dsn(args)
-    try:
-        conn = psycopg2.connect(dsn)
-    except Exception as e:
-        print(f"✗ cannot connect to control-plane DB: {e}")
+    conn = _connect(dsn)
+    if conn is None:
         return 1
 
     try:
@@ -249,12 +315,13 @@ def cmd_status(args) -> int:
 
 def cmd_wait(args) -> int:
     """Poll until the tenant leaves `warming`, so a build failure is visible."""
-    import psycopg2
     dsn = _dsn(args)
     deadline = time.time() + args.timeout
 
     while time.time() < deadline:
-        conn = psycopg2.connect(dsn)
+        conn = _connect(dsn)
+        if conn is None:
+            return 1
         try:
             cur = conn.cursor()
             cur.execute(
@@ -284,6 +351,125 @@ def cmd_wait(args) -> int:
 
     print(f"✗ still warming after {args.timeout}s — check the backend log")
     return 1
+
+
+# ── Shopify ──────────────────────────────────────────────────────────────────
+
+def cmd_shopify(args) -> int:
+    """
+    Flip a tenant to the Shopify backend.
+
+    Nothing in the backend creates Shopify tenants: /provision-tenant and
+    /activate-free are both WooCommerce flows, and Stage 2 has no Shopify
+    install endpoint yet. So the working path for testing is: create a tenant
+    the normal way (`free`), which builds its database and schema, then
+    convert the row here.
+
+    Restart the backend afterwards. The tenant's StoreLoader is cached in the
+    TenantRegistry as a WooCommerce loader; the row change is only picked up
+    when it is rebuilt.
+    """
+    dsn = _dsn(args)
+    conn = _connect(dsn)
+    if conn is None:
+        return 1
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE tenants
+               SET ecommerce_backend = 'shopify',
+                   shopify_domain    = %s,
+                   site_domain       = COALESCE(site_domain, %s)
+             WHERE tenant_id = %s
+         RETURNING license_id, db_name
+            """,
+            (args.shopify_domain, args.shopify_domain, args.tenant_uuid),
+        )
+        row = cur.fetchone()
+        if row is None:
+            print(f"✗ no tenant with tenant_id={args.tenant_uuid}")
+            return 1
+        conn.commit()
+    finally:
+        conn.close()
+
+    license_id, db_name = row
+    print(f"✓ tenant {args.tenant_uuid} is now a Shopify tenant")
+    print(f"  shopify_domain : {args.shopify_domain}")
+    print(f"  license_id     : {license_id}   (send as X-MiraQ-License-Id)")
+    print(f"  database       : {db_name}")
+    print("\n  Restart the backend so the cached WooCommerce loader is dropped.")
+    print("  Then: curl -H \"X-MiraQ-License-Id: <license_id>\" <backend>/shopify-token-status")
+    return 0
+
+
+def cmd_event(args) -> int:
+    """
+    Send a Shopify Events/webhook delivery, signed the way Shopify signs it:
+    base64(HMAC-SHA256(raw_body, SHOPIFY_CLIENT_SECRET)) in Shopify-Hmac-Sha256,
+    with the store in Shopify-Shop-Domain. The backend resolves the tenant from
+    that domain — these routes are exempt from X-MiraQ-License-Id because
+    Shopify cannot send it.
+    """
+    import base64
+    import hashlib
+    import hmac as hmac_mod
+
+    secret = args.client_secret or os.environ.get("SHOPIFY_CLIENT_SECRET", "")
+    if not secret:
+        try:
+            from dotenv import dotenv_values
+            env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+            secret = (dotenv_values(env_path) or {}).get("SHOPIFY_CLIENT_SECRET") or ""
+        except Exception:
+            pass
+    if not secret:
+        raise SystemExit("No SHOPIFY_CLIENT_SECRET (pass --client-secret, or set it in .env)")
+
+    if args.body:
+        raw = args.body.encode()
+    elif args.topic == "order-paid":
+        raw = json.dumps({
+            "id": 5551234567890,
+            "name": "#1001",
+            "financial_status": "paid",
+            "note_attributes": [{"name": "miraq_session_id", "value": args.session_id}],
+        }).encode()
+    elif args.topic == "product-update":
+        raw = json.dumps({"id": 1234567890, "title": "Test product"}).encode()
+    else:  # app-uninstalled
+        raw = json.dumps({"id": 1234567890, "domain": args.shopify_domain}).encode()
+
+    digest = base64.b64encode(
+        hmac_mod.new(secret.encode(), raw, hashlib.sha256).digest()
+    ).decode()
+
+    url = f"{args.backend.rstrip('/')}/events/{args.topic}"
+    print(f"\n→ POST {url}")
+    print(f"  shop    : {args.shopify_domain}")
+    print(f"  body    : {raw.decode()[:200]}")
+    try:
+        resp = requests.post(
+            url,
+            data=raw,
+            headers={
+                "Content-Type": "application/json",
+                "Shopify-Hmac-Sha256": digest,
+                "Shopify-Shop-Domain": args.shopify_domain,
+            },
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        print(f"✗ request failed: {type(e).__name__}: {e}")
+        return 1
+
+    print(f"← {resp.status_code}")
+    print(f"  {resp.text[:500]}")
+    if args.topic == "order-paid" and resp.status_code < 300:
+        print("\n  Now check the confirmation landed in the TENANT database, not the")
+        print("  control-plane one:  python dev_provision.py status")
+    return 0 if resp.status_code < 300 else 1
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -324,6 +510,22 @@ def main() -> int:
     sp.add_argument("--license-id", required=True)
     sp.add_argument("--tenant-uuid", default=None)
     sp.set_defaults(func=cmd_revoke)
+
+    sp = sub.add_parser("shopify", help="convert a tenant row to the Shopify backend")
+    sp.add_argument("--tenant-uuid", required=True)
+    sp.add_argument("--shopify-domain", required=True, help="e.g. my-store.myshopify.com")
+    sp.add_argument("--dsn", default=None, help="defaults to .env's DATABASE_URL")
+    sp.set_defaults(func=cmd_shopify)
+
+    sp = sub.add_parser("event", help="send a signed Shopify webhook")
+    sp.add_argument("--topic", required=True,
+                    choices=["order-paid", "app-uninstalled", "product-update"])
+    sp.add_argument("--shopify-domain", required=True)
+    sp.add_argument("--session-id", default="dev-session-1",
+                    help="order-paid: the miraq_session_id note attribute")
+    sp.add_argument("--body", default=None, help="raw JSON body, overrides the built-in sample")
+    sp.add_argument("--client-secret", default=None, help="defaults to SHOPIFY_CLIENT_SECRET")
+    sp.set_defaults(func=cmd_event)
 
     sp = sub.add_parser("status", help="dump every tenant from the control-plane DB")
     sp.add_argument("--dsn", default=None, help="defaults to $DATABASE_URL")
