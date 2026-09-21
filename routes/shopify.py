@@ -20,6 +20,7 @@ about X-MiraQ-License-Id).
 """
 
 import json
+import re
 from datetime import datetime, timezone
 import requests
 from flask import Blueprint, jsonify, request
@@ -453,7 +454,12 @@ def shopify_app_uninstalled():
     token_row = db.session.get(ShopifyToken, tenant.shopify_domain)
     if triggered_at_raw and token_row is not None and token_row.fetched_at is not None:
         try:
-            triggered_at = datetime.fromisoformat(triggered_at_raw.replace("Z", "+00:00"))
+            # Shopify sends nanoseconds ("...06:12:02.066047170Z"); Python's
+            # fromisoformat accepts at most microseconds, so this raised and the
+            # guard fell open. Trim the fraction to 6 digits first.
+            ts = triggered_at_raw.strip().replace("Z", "+00:00")
+            ts = re.sub(r"(\.\d{6})\d+", r"\1", ts)
+            triggered_at = datetime.fromisoformat(ts)
             if triggered_at.tzinfo is None:
                 triggered_at = triggered_at.replace(tzinfo=timezone.utc)
             installed_at = token_row.fetched_at

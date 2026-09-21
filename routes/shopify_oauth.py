@@ -27,8 +27,9 @@ WHY THE CODE GRANT, NOT client_credentials
 store_loader/shopify_token_manager.py mints tokens with the client_credentials
 grant. That grant only works for stores inside your own Partner organisation,
 so it cannot serve a distributable app — which is exactly what the app's toml
-comment says. The token minted here is an OFFLINE token: it does not expire, so
-the token manager's refresh path never needs to run for these stores.
+comment says. The token minted here is an EXPIRING offline token (expiring=1):
+Shopify no longer accepts non-expiring ones on the Admin API. It comes with a
+rotating refresh token, which the token manager uses to renew it.
 
 SECURITY
 --------
@@ -107,11 +108,6 @@ def _app_url(path: str) -> str:
 _STATE_MAX_AGE_SECONDS = 600
 _SHOP_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-]*\.myshopify\.com$")
 
-# Offline tokens have no expiry, but ShopifyToken.expires_at is NOT NULL and
-# the token manager treats "expiring soon" as "mint a new one". A far-future
-# value keeps the row valid and keeps the client_credentials refresh path —
-# which cannot work for an external store — from ever firing.
-_OFFLINE_TOKEN_LIFETIME = timedelta(days=3650)
 
 
 def _valid_shop(shop: str) -> bool:
@@ -255,17 +251,27 @@ def shopify_auth_callback():
         logger.warning(f"shopify callback: state invalid or expired | shop={shop}")
         return redirect(_app_url(f"shopify/install?shop={urllib.parse.quote(shop)}"), code=302)
 
-    # ── Exchange the code for an offline Admin API token ─────────────────────
+    # ── Exchange the code for an EXPIRING offline Admin API token ────────────
+    # expiring=1 is required. Without it Shopify issues a non-expiring offline
+    # token, which the Admin API now rejects outright with 403 "Non-expiring
+    # access tokens are no longer accepted" — the install appears to succeed
+    # and every catalog fetch after it fails.
     try:
         resp = http_requests.post(
             f"https://{shop}/admin/oauth/access_token",
-            json={
+            data={
                 "client_id":     SHOPIFY_CLIENT_ID,
                 "client_secret": SHOPIFY_CLIENT_SECRET,
                 "code":          code,
+                "expiring":      "1",
             },
             timeout=20,
         )
+        if resp.status_code >= 400:
+            logger.error(
+                f"shopify callback: token exchange refused | shop={shop} "
+                f"HTTP {resp.status_code} | body={resp.text[:500]!r}"
+            )
         resp.raise_for_status()
         payload = resp.json()
     except Exception as e:
@@ -274,6 +280,19 @@ def shopify_auth_callback():
 
     access_token = payload.get("access_token")
     granted_scope = payload.get("scope", "")
+    refresh_token = payload.get("refresh_token")
+    expires_in = payload.get("expires_in")
+    refresh_expires_in = payload.get("refresh_token_expires_in")
+
+    if not refresh_token or not expires_in:
+        # Shopify returned a non-expiring token after all. It will be refused
+        # by the Admin API, so fail the install loudly here rather than let
+        # every catalog fetch 403 afterwards with no hint why.
+        logger.error(
+            f"shopify callback: expected an expiring token (refresh_token + "
+            f"expires_in) but got keys={sorted(payload)} | shop={shop}"
+        )
+        return jsonify({"error": "shopify did not issue an expiring token"}), 502
     if not access_token:
         logger.error(f"shopify callback: no access_token in response | shop={shop}")
         return jsonify({"error": "token exchange returned no token"}), 502
@@ -329,11 +348,18 @@ def shopify_auth_callback():
     token_row.access_token  = access_token
     token_row.scope         = granted_scope
     token_row.fetched_at    = now
-    token_row.expires_at    = now + _OFFLINE_TOKEN_LIFETIME
+    token_row.expires_at    = now + timedelta(seconds=int(expires_in))
+    token_row.refresh_token = refresh_token
+    token_row.refresh_token_expires_at = (
+        now + timedelta(seconds=int(refresh_expires_in)) if refresh_expires_in else None
+    )
     token_row.refresh_count = (token_row.refresh_count or 0) + 1
     token_row.last_error    = None
     db.session.commit()
-    logger.info(f"shopify callback: token stored | shop={shop}")
+    logger.info(
+        f"shopify callback: token stored | shop={shop} "
+        f"access_expires_in={int(expires_in)}s refresh_expires_in={refresh_expires_in}"
+    )
 
     # ── Database + schema ────────────────────────────────────────────────────
     base_dsn = current_app.config["SQLALCHEMY_DATABASE_URI"]

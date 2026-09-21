@@ -282,12 +282,39 @@ class ShopifyTokenManager:
                     return
 
                 url = f"https://{self._domain}/admin/oauth/access_token"
-                params = {
-                    "grant_type":    "client_credentials",
-                    "client_id":     self._client_id,
-                    "client_secret": self._client_secret,
-                }
-                resp = requests.post(url, params=params, timeout=15)
+
+                # Two ways to get a new token, depending on how the store was
+                # installed:
+                #   * OAuth install (routes/shopify_oauth.py) → the row holds a
+                #     refresh token. Use the refresh_token grant. Shopify ROTATES
+                #     it: the response carries a new refresh token and the old
+                #     one is dead, so it must be saved in this same commit.
+                #   * Store inside our own Partner org, never OAuth-installed →
+                #     no refresh token; client_credentials, as before.
+                refresh_token = getattr(row, "refresh_token", None) if row else None
+                if refresh_token:
+                    grant = "refresh_token"
+                    resp = requests.post(url, data={
+                        "grant_type":    "refresh_token",
+                        "client_id":     self._client_id,
+                        "client_secret": self._client_secret,
+                        "refresh_token": refresh_token,
+                    }, timeout=15)
+                else:
+                    grant = "client_credentials"
+                    resp = requests.post(url, params={
+                        "grant_type":    "client_credentials",
+                        "client_id":     self._client_id,
+                        "client_secret": self._client_secret,
+                    }, timeout=15)
+
+                if resp.status_code >= 400:
+                    # Same reason as the fetcher: Shopify explains refusals in
+                    # the body, and raise_for_status() throws that away.
+                    logger.error(
+                        f"ShopifyTokenManager: {grant} refresh refused | "
+                        f"domain={self._domain} HTTP {resp.status_code} | body={resp.text[:500]!r}"
+                    )
                 resp.raise_for_status()
                 data = resp.json()
 
@@ -298,6 +325,18 @@ class ShopifyTokenManager:
                 now        = datetime.now(timezone.utc)
                 expires_at = now + timedelta(seconds=expires_in)
 
+                new_refresh = data.get("refresh_token")
+                refresh_expires_in = data.get("refresh_token_expires_in")
+                if grant == "refresh_token" and not new_refresh:
+                    # The old refresh token is spent. Without a new one the
+                    # NEXT refresh has nothing to use, and the store will need
+                    # re-installing once this access token expires.
+                    logger.error(
+                        f"ShopifyTokenManager: refresh response had no new refresh_token — "
+                        f"store will need re-install when this token expires | "
+                        f"domain={self._domain} keys={sorted(data)}"
+                    )
+
                 if row:
                     row.access_token  = access_token
                     row.scope         = scope
@@ -305,6 +344,12 @@ class ShopifyTokenManager:
                     row.expires_at    = expires_at
                     row.refresh_count = (row.refresh_count or 0) + 1
                     row.last_error    = None
+                    if new_refresh:
+                        row.refresh_token = new_refresh
+                        row.refresh_token_expires_at = (
+                            now + timedelta(seconds=int(refresh_expires_in))
+                            if refresh_expires_in else None
+                        )
                 else:
                     row = ShopifyToken(
                         store_domain  = self._domain,
@@ -321,7 +366,7 @@ class ShopifyTokenManager:
                     self._current_token = access_token
 
                 logger.info(
-                    f"ShopifyTokenManager: ✅ token refreshed — "
+                    f"ShopifyTokenManager: ✅ token refreshed via {grant} — "
                     f"expires at {expires_at.isoformat()} "
                     f"(in {expires_in / 3600:.1f}h)"
                 )
