@@ -351,6 +351,18 @@ def shopify_auth_callback():
     tenant.status = "warming"
     db.session.commit()
 
+    # Evict any loader already cached for this tenant. On a re-install the
+    # registry still holds the loader built with the PREVIOUS token — degraded,
+    # if that token stopped working — and the build thread's get_loader() is a
+    # cache hit that returns it untouched: no fetch, no use of the token just
+    # stored, straight to provision_failed. Evicting forces a real rebuild.
+    if reinstall:
+        from store_registry import get_tenant_registry
+        registry = get_tenant_registry()
+        if registry is not None:
+            registry.evict(str(tenant.tenant_id))
+            logger.info(f"shopify callback: evicted cached loader | tenant_id={tenant.tenant_id}")
+
     logger.info(f"shopify callback: starting catalog build | shop={shop} tenant_id={tenant.tenant_id}")
     _start_background_build(tenant.tenant_id, current_app._get_current_object())
 

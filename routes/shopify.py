@@ -20,6 +20,7 @@ about X-MiraQ-License-Id).
 """
 
 import json
+from datetime import datetime, timezone
 import requests
 from flask import Blueprint, jsonify, request
 from chat_logger import get_logger
@@ -36,6 +37,22 @@ from app_config import (
 
 logger = get_logger("miraq_chat")
 shopify_bp = Blueprint("shopify", __name__)
+
+
+def _shopify_header(name: str) -> str:
+    """
+    Read a Shopify delivery header under either naming scheme.
+
+    Classic webhooks — which is what app/uninstalled is, declared under
+    [webhooks] in the app toml — send X-Shopify-Hmac-Sha256,
+    X-Shopify-Shop-Domain, X-Shopify-Webhook-Id and X-Shopify-Triggered-At.
+    These handlers read only the unprefixed names used by the newer Events
+    deliveries, so every real app/uninstalled delivery arrived looking unsigned
+    ("missing_hmac_header", shop='') and was rejected, and Shopify kept
+    retrying it. The prefixed name is tried first because it is the documented
+    one for [webhooks]; the unprefixed one keeps the Events deliveries working.
+    """
+    return request.headers.get(f"X-{name}") or request.headers.get(name) or ""
 
 
 def _resolve_tenant_by_shopify_domain(domain: str):
@@ -212,8 +229,8 @@ def shopify_product_update_event():
     """
     raw_body = request.get_data()  # must be the exact bytes Shopify signed —
     # request.json / request.get_json() re-serializes and would break this.
-    header_hmac = request.headers.get("Shopify-Hmac-Sha256")
-    shop_domain = request.headers.get("Shopify-Shop-Domain", "")
+    header_hmac = _shopify_header("Shopify-Hmac-Sha256") or None
+    shop_domain = _shopify_header("Shopify-Shop-Domain")
 
     tenant = _resolve_tenant_by_shopify_domain(shop_domain)
     if not tenant:
@@ -229,7 +246,7 @@ def shopify_product_update_event():
         logger.warning(f"shopify events: rejected /events/product-update delivery | reason={reason} | shop={shop_domain!r}")
         return jsonify({"error": "unverified_request"}), 401
 
-    delivery_id = request.headers.get("Shopify-Webhook-Id", "")
+    delivery_id = _shopify_header("Shopify-Webhook-Id")
     logger.info(
         f"shopify events: Product/update delivery accepted | "
         f"delivery_id={delivery_id!r} shop={shop_domain!r}"
@@ -288,8 +305,8 @@ def shopify_order_paid_event():
     route owns, so a retried webhook delivery can't double-post the message.
     """
     raw_body = request.get_data()
-    header_hmac = request.headers.get("Shopify-Hmac-Sha256")
-    shop_domain = request.headers.get("Shopify-Shop-Domain", "")
+    header_hmac = _shopify_header("Shopify-Hmac-Sha256") or None
+    shop_domain = _shopify_header("Shopify-Shop-Domain")
 
     tenant = _resolve_tenant_by_shopify_domain(shop_domain)
     if not tenant:
@@ -311,7 +328,7 @@ def shopify_order_paid_event():
     from store_registry import bind_tenant_db
     bind_tenant_db(tenant)
 
-    delivery_id = request.headers.get("Shopify-Webhook-Id", "")
+    delivery_id = _shopify_header("Shopify-Webhook-Id")
 
     try:
         payload = json.loads(raw_body)
@@ -392,9 +409,9 @@ def shopify_app_uninstalled():
     """
     raw_body = request.get_data()  # exact signed bytes — request.get_json()
     # re-serialises and would break the HMAC.
-    header_hmac = request.headers.get("Shopify-Hmac-Sha256")
-    shop_domain = request.headers.get("Shopify-Shop-Domain", "")
-    delivery_id = request.headers.get("Shopify-Webhook-Id", "")
+    header_hmac = _shopify_header("Shopify-Hmac-Sha256") or None
+    shop_domain = _shopify_header("Shopify-Shop-Domain")
+    delivery_id = _shopify_header("Shopify-Webhook-Id")
 
     # Authenticate FIRST, before any tenant lookup. Verifying the signature
     # before touching the database means an unsigned request gets an identical
@@ -424,6 +441,36 @@ def shopify_app_uninstalled():
             f"shop={shop_domain!r} delivery_id={delivery_id!r}"
         )
         return jsonify({"received": True, "status": "archived"}), 200
+
+    # A delivery for an uninstall that happened BEFORE the store's current
+    # install must not tear that install down. Shopify retries a failed
+    # delivery for up to 48 hours, so an uninstall that was rejected (as every
+    # one was, before the header fix above), followed by a reinstall, is
+    # otherwise retried into archiving the brand-new tenant. The OAuth callback
+    # stamps ShopifyToken.fetched_at at install time, which is exactly the
+    # moment to compare against.
+    triggered_at_raw = _shopify_header("Shopify-Triggered-At")
+    token_row = db.session.get(ShopifyToken, tenant.shopify_domain)
+    if triggered_at_raw and token_row is not None and token_row.fetched_at is not None:
+        try:
+            triggered_at = datetime.fromisoformat(triggered_at_raw.replace("Z", "+00:00"))
+            if triggered_at.tzinfo is None:
+                triggered_at = triggered_at.replace(tzinfo=timezone.utc)
+            installed_at = token_row.fetched_at
+            if installed_at.tzinfo is None:
+                installed_at = installed_at.replace(tzinfo=timezone.utc)
+            if triggered_at < installed_at:
+                logger.info(
+                    f"shopify events: app/uninstalled predates the current install — "
+                    f"ignored | shop={shop_domain!r} triggered_at={triggered_at_raw} "
+                    f"installed_at={installed_at.isoformat()} delivery_id={delivery_id!r}"
+                )
+                return jsonify({"received": True, "status": "stale_ignored"}), 200
+        except ValueError:
+            logger.warning(
+                f"shopify events: unparseable X-Shopify-Triggered-At={triggered_at_raw!r} "
+                f"— processing the uninstall | shop={shop_domain!r}"
+            )
 
     # Drop the stored Admin API token before teardown. Shopify has already
     # revoked it, so it is now a dead credential sitting in the control-plane

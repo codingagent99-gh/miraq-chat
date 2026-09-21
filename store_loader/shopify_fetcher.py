@@ -64,6 +64,12 @@ def _gql(session, store_domain: str, admin_token: str, query: str,
         }
         try:
             resp = session.post(url, json=payload, headers=headers, timeout=TIMEOUT)
+            if resp.status_code >= 400:
+                logger.error(
+                    f"ShopifyFetcher: HTTP {resp.status_code} from {store_domain} "
+                    f"(api {API_VERSION}) | body={resp.text[:500]!r} | "
+                    f"token=...{(token or '')[-4:]}"
+                )
             resp.raise_for_status()
             data = resp.json()
             if "errors" in data:
