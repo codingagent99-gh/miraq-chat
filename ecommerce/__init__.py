@@ -1,6 +1,6 @@
 from typing import cast
 from ecommerce.endpoints import EcommerceEndpoints
-from platform_config import ECOMMERCE_BACKEND, VALID_ECOMMERCE_BACKENDS
+from platform_config import current_backend
 
 class DynamicEndpointsRouter:
     """
@@ -20,39 +20,15 @@ class DynamicEndpointsRouter:
         # A Shopify GID in the arguments is positive evidence, so it still
         # wins. Note this only ever fires for STRING args: a plain int id
         # (e.g. endpoints.fetch_customer(customer_id=int(rep_id))) cannot
-        # self-route this way and depends entirely on the deployment constant
-        # below -- which is how a Shopify customer id ended up being fetched
-        # from WooCommerce.
+        
         for arg in args:
             if isinstance(arg, str) and arg.startswith("gid://"):
                 return "shopify"
         for val in kwargs.values():
             if isinstance(val, str) and val.startswith("gid://"):
                 return "shopify"
-
-        # Read the override INSIDE the try (touching `g` with no application
-        # context raises RuntimeError from werkzeug's proxy, and getattr's
-        # default does not suppress it), but VALIDATE it outside -- otherwise
-        # the except clause swallows our own rejection along with it.
-        override = None
-        try:
-            from flask import g, has_app_context
-            if has_app_context():
-                override = getattr(g, "ecommerce_backend", None)
-        except Exception:
-            override = None
-
-        if override:
-            override = str(override).strip().lower()
-            if override not in VALID_ECOMMERCE_BACKENDS:
-                raise RuntimeError(
-                    f"g.ecommerce_backend={override!r} is not a recognised "
-                    "backend. Valid values: "
-                    + ", ".join(sorted(VALID_ECOMMERCE_BACKENDS))
-                )
-            return override
-
-        return ECOMMERCE_BACKEND
+            
+        return current_backend()
 
     def __getattr__(self, name):
         """Intercepts all endpoint methods and resolves them at call-time."""

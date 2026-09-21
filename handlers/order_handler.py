@@ -31,7 +31,7 @@ from handlers.chat_utils import (
     _get_safe_options,
 )
 from ecommerce import endpoints
-
+from platform_config import current_backend
 logger = get_logger("miraq_chat")
 
 def handle_historical_search(intent, entities, order_data, customer_id, session_id, page, start_time):
@@ -345,11 +345,10 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
     # Check Stock Status Before Reordering!
     product_ids = [item["product_id"] for item in source_line_items if item.get("product_id")]
 
-    from app_config import ECOMMERCE_BACKEND
 
     out_of_stock_items = []
 
-    if product_ids and ECOMMERCE_BACKEND == "shopify":
+    if product_ids and current_backend()== "shopify":
         # Shopify has no check_stock endpoint wired, but the store loader
         # already holds availableForSale for every variant in memory — so the
         # same protection the Woo path gets costs nothing here. Without this,
@@ -386,7 +385,7 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
                 f"Step 3.5: Shopify availability check skipped | error={_stock_exc}"
             )
 
-    if product_ids and ECOMMERCE_BACKEND != "shopify":
+    if product_ids and current_backend()!= "shopify":
         stock_call = endpoints.check_stock(
             product_ids=product_ids,
             description="Check stock status for reorder items",
@@ -447,8 +446,7 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
     if not new_line_items:
         return None
 
-    from app_config import ECOMMERCE_BACKEND
-    if ECOMMERCE_BACKEND == "shopify":
+    if current_backend()== "shopify":
         from api_builder.shopify_orders_executor import ShopifyOrdersExecutor
         from models import WooAPICall
         reorder_call = WooAPICall(

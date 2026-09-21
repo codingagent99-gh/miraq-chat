@@ -14,17 +14,15 @@ from requests.auth import HTTPBasicAuth
 from chat_logger import get_logger
 from store_loader.config import (
     DATA_DIR, FILE_MAP, DEV_CACHE_DIR,
-    CURRENCY_MAP,
+    CURRENCY_MAP, BROWSER_HEADERS,
 )
 
 logger = get_logger("miraq_chat")
 
 
 
-_API_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept":     "application/json",
-}
+# Sent on every outbound call to a tenant's store.
+_API_HEADERS = dict(BROWSER_HEADERS)
 
 def _custom_api_headers(consumer_key: str, consumer_secret: str) -> dict:
     """

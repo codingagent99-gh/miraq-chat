@@ -29,7 +29,7 @@ function rather than hunting call sites.
 
 from typing import Any, Dict, Optional, Tuple
 
-from app_config import ECOMMERCE_BACKEND
+from platform_config import current_backend
 from chat_logger import get_logger
 from core.actions import build_add_to_cart, build_shopify_add_to_cart
 
@@ -168,7 +168,7 @@ def build_cart_add_action(
     multi-line caller (bulk order) sets it while a single-item caller
     (confirm_add_to_cart) does not.
     """
-    if ECOMMERCE_BACKEND == "shopify":
+    if current_backend() == "shopify":
         variant_gid = resolve_shopify_variant_gid(
             product_id=product_id,
             variant_id=variation_id,

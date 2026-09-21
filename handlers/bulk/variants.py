@@ -15,7 +15,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from woo_client import woo_client
 from ecommerce import endpoints
-from app_config import ECOMMERCE_BACKEND
+from platform_config import current_backend
 from conversation_flow import FlowState
 from chat_logger import get_logger
 from handlers.chat_utils import default_pagination, _get_safe_options
@@ -122,7 +122,7 @@ def _parent_axis_meta(product_id, user_context):
     # otherwise be a guaranteed-failed fetch per product per prompt, logged
     # as a warning each time. The empty dict IS the correct answer here, not
     # a degraded one, so it is cached like any other success.
-    if ECOMMERCE_BACKEND == "shopify":
+    if current_backend() == "shopify":
         cache[key] = axes
         user_context["bulk_parent_axis_cache"] = cache
         return axes

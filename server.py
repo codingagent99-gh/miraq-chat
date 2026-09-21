@@ -23,7 +23,7 @@ from werkzeug.exceptions import HTTPException
 from app_config import PORT, DEBUG, STORE_NAME, USE_RELOADER
 from store_registry import get_store_loader, register_before_request
 from models import db, Conversation
-
+from routes.webhook_routes import webhook_bp
 from routes.chat import chat_bp
 from routes.admin import admin_bp
 from routes.products import products_bp
@@ -149,11 +149,14 @@ db.init_app(app)
 # route below, including ones registered later in this file.
 register_before_request(app)
 
-# Create Tables on Startup
+# Create CONTROL-PLANE tables on startup
 with app.app_context():
-    # Import ShopifyToken here so SQLAlchemy registers it before create_all()
-    from models.shopify_token import ShopifyToken  # noqa: F401
-    db.create_all()
+    from models import Tenant
+    from models.shopify_token import ShopifyToken
+    db.metadata.create_all(
+        bind=db.engine,
+        tables=[Tenant.__table__, ShopifyToken.__table__],
+    )
     _cors_manager.refresh_from_db()   # seed dynamic origins from existing tenants
 
 # Register blueprints
@@ -164,6 +167,7 @@ app.register_blueprint(shopify_bp)
 app.register_blueprint(sales_rep_bp)
 app.register_blueprint(provisioning_bp)
 app.register_blueprint(deactivation_bp)
+app.register_blueprint(webhook_bp)
 
 # ── Request timing instrumentation ───────────────────────────────────────────
 # Writes plain text to logs/<date>/timing.txt, separate from chat.txt and
@@ -229,13 +233,26 @@ def health():
     Returns 200 OK if the server is running, 503 if store is degraded.
     """
     from woo_client import upstream_health
+    # Tenant is bound only if the probe sent X-MiraQ-License-Id AND that
+    # tenant's loader is already resident (see store_registry
+    # _OPTIONAL_TENANT_PATHS). No tenant / not resident = "unknown", which is
+    # NOT a failure: this used to report store_degraded=True for every
+    # header-less or cold probe, i.e. 503 + blocking for every tenant.
+    from flask import g
 
     loader = get_store_loader()
-    store_degraded = loader._degraded if loader else True
-    store_reasons = (
-        loader._degraded_reasons if loader else ["store not initialised"]
-    )
-    upstream = upstream_health()
+    
+    tenant = g.__dict__.get("tenant")
+    store_degraded = bool(loader._degraded) if loader else False
+    store_reasons = list(loader._degraded_reasons or []) if loader else []
+    if loader is not None:
+        store_component = "degraded" if store_degraded else "ok"
+    elif tenant is not None and tenant.status == "warming":
+        store_component = "warming"
+    else:
+        store_component = "unknown"
+    upstream = upstream_health(str(tenant.tenant_id) if tenant is not None else None)
+    
 
     # Three states:
     #   down     — block the UI. This backend is up (it answered), but the
@@ -268,7 +285,7 @@ def health():
         "blocking": overall == "down",
         "components": {
             "backend": "ok",   # reaching this line proves it
-            "store": "degraded" if store_degraded else "ok",
+            "store": store_component,
             "upstream": upstream["status"],
         },
         "upstream": upstream,
@@ -311,14 +328,25 @@ def shopify_token_status():
         206  — token is near expiry (< 1 h) but still valid
         503  — token is expired or missing
     """
+    
+    # Per-tenant: requires X-MiraQ-License-Id and reports
+    # the token for THAT tenant's shop, not a process-wide env domain.
+    from flask import g
     from models.shopify_token import ShopifyToken
-    from store_loader.config import SHOPIFY_STORE_DOMAIN
-
-    row = ShopifyToken.query.get(SHOPIFY_STORE_DOMAIN)
+    tenant = g.__dict__.get("tenant")
+    shop_domain = (tenant.shopify_domain or "") if tenant is not None else ""
+    
+    if tenant is None or tenant.ecommerce_backend != "shopify" or not shop_domain:
+        return jsonify({
+            "status": "not_applicable",
+            "message": "This tenant is not a Shopify store."
+        }), 404
+        
+    row = ShopifyToken.query.get(shop_domain)
     if not row:
         return jsonify({
             "status": "missing",
-            "store_domain": SHOPIFY_STORE_DOMAIN,
+            "store_domain": shop_domain,
             "message": "No token found in DB. Has the server started with valid credentials?",
         }), 503
 
@@ -392,37 +420,32 @@ def get_session(session_id):
 
 @app.route("/widget-config", methods=["GET"])
 def widget_config():
-    import requests as req
-    from store_loader.config import BROWSER_HEADERS
-
-    logger = get_logger("miraq_chat")
-    loader = get_store_loader()
-    if not loader:
+    """
+    Pure read of the tenant row's cached branding. The values are kept fresh
+    by widget_branding.py (post-build fetch, 24h scheduler sweep, and the
+    plugin's branding-push). This used to make a live call to the tenant's
+    WordPress site on every widget load — one outbound request per page view,
+    and a malformed URL for Shopify tenants (empty wp_base_url).
+    """
+    from flask import g
+    tenant = g.__dict__.get("tenant")
+    if tenant is None:
         return jsonify({"image_url": "", "text": ""}), 200
-
-    target_url = f"{loader.wp_base_url}/wp-json/wdget-logo-uploader/v1/data"
-
-    try:
-        headers = {
-            **BROWSER_HEADERS,
-            "X-Consumer-Key":    loader.consumer_key,
-            "X-Consumer-Secret": loader.consumer_secret,
-        }
-        resp = req.get(target_url, headers=headers, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        return jsonify({
-            "image_url": data.get("image_url", ""),
-            "text":      data.get("text", ""),
-        })
-    except Exception as e:
-        logger.error(f"widget_config: Failed — {type(e).__name__}: {e}", exc_info=True)
-        return jsonify({"image_url": "", "text": ""}), 200
+    return jsonify({
+        "image_url": tenant.widget_logo_url or "",
+        "text":      tenant.widget_header_text or "",
+    })
 
 @app.route("/debug-plan")
 def debug_plan():
+    # Development only. License ids are visible in the browser, so anything
+    # reachable with just that header is effectively public: this 404s unless
+    # DEBUG is on, and never returns the DSN's password.
+    if not DEBUG:
+        return jsonify({"error": "not found"}), 404
     from flask import g
     from models import db
+    from sqlalchemy.engine import make_url
     try:
         db_name = db.session.execute(db.text("SELECT current_database()")).scalar()
     except Exception as e:
@@ -430,7 +453,10 @@ def debug_plan():
     tenant = g.__dict__.get("tenant")
     return {
         "connected_database": db_name,
-        "database_url_from_config": app.config.get("SQLALCHEMY_DATABASE_URI", "not set"),
+        "database_url_from_config": (
+            make_url(app.config["SQLALCHEMY_DATABASE_URI"]).render_as_string(hide_password=True)
+            if app.config.get("SQLALCHEMY_DATABASE_URI") else "not set"
+        ),
         "tenant_id": str(tenant.tenant_id) if tenant else None,
         "plan": tenant.plan if tenant else None,
         "features": dict(tenant.features or {}) if tenant else {},

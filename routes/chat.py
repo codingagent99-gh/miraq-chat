@@ -32,10 +32,10 @@ from app_config import (
     CLASSIFIER_PROVIDER_TAG,
     BULK_ORDER_ROLES,
     BULK_ORDER_FULL_SCOPE_ROLES,
-    ECOMMERCE_BACKEND,
     get_currency_symbol,
     MOST_POPULAR_WINDOW_DAYS
 )
+from platform_config import current_backend
 from core.actions import build_open_checkout_panel, build_open_cart_panel
 from woo_client import woo_client
 from formatters import format_product, format_custom_product, format_category, _entities_to_dict
@@ -708,7 +708,7 @@ def _maybe_attach_address_proposal(
         # stub (the woo_client backstop would block it anyway). The proposal
         # still works — it just has no address on file to compare against.
         existing = None
-        if ECOMMERCE_BACKEND != "shopify":
+        if current_backend() != "shopify":
             try:
                 from woo_client import woo_client as _woo
                 cust_resp = _woo.execute(endpoints.fetch_customer(
@@ -1418,7 +1418,7 @@ def _build_final_response(
     # flows they open depend on custom-plugin endpoints with no Shopify
     # implementation. Suppress them entirely rather than surfacing buttons
     # that dead-end (SHOW_PRODUCT_RECENT_ORDERS also triggers a Woo call).
-    _sr_rep_features = ECOMMERCE_BACKEND != "shopify"
+    _sr_rep_features = current_backend() != "shopify"
 
     from app_config import CUSTOM_ORDER_ROLES, ORDER_REPORT_ADMIN_ROLES
     _can_view_orders = CUSTOM_ORDER_ROLES | ORDER_REPORT_ADMIN_ROLES
@@ -1457,7 +1457,7 @@ def _build_final_response(
             _data = _resp.get("data")
             # Woo's products-advanced-new puts a LIST here; only the Shopify
             # orders executor returns a dict with _meta. Guard on the shape
-            # rather than on ECOMMERCE_BACKEND — one envelope, two payloads,
+            # rather than on current_backend() — one envelope, two payloads,
             # and the backend flag is a second source of truth that can drift.
             if not isinstance(_data, dict):
                 continue
@@ -1714,15 +1714,11 @@ def chat():
     # on would be about the wrong catalogue, and cart/order actions would
     # reference ids that don't exist on the other side, so reject the request
     # outright rather than serving plausible-looking nonsense.
-    #
-    # This is validation, NOT selection: the backend is chosen per deployment
-    # by ECOMMERCE_BACKEND (imported at module load in several modules), so a
-    # per-request switch would be a lie. Absent field = older widget = allowed.
     _claimed_platform = (body.get("platform") or "").strip().lower()
-    if _claimed_platform and _claimed_platform != ECOMMERCE_BACKEND:
+    if _claimed_platform and _claimed_platform != current_backend():
         logger.error(
             f"POST /chat | platform mismatch | widget={_claimed_platform!r} "
-            f"backend={ECOMMERCE_BACKEND!r} — rejecting request"
+            f"backend={current_backend()!r} — rejecting request"
         )
         return jsonify({
             "success":     False,
@@ -1736,7 +1732,7 @@ def chat():
             "metadata": {
                 "error": "platform_mismatch",
                 "widget_platform": _claimed_platform,
-                "backend_platform": ECOMMERCE_BACKEND,
+                "backend_platform": current_backend(),
             },
             "pagination": default_pagination(),
         }), 400
@@ -2477,7 +2473,7 @@ def chat():
         # set, and Shopify customer multi-line ordering is fully supported
         # (see the next comment block). The actual Shopify safety net for the
         # "customer" case lives in the parser itself (bulk_order_parser.py:
-        # forces self-scoped-only behavior whenever ECOMMERCE_BACKEND ==
+        # forces self-scoped-only behavior whenever current_backend() ==
         # "shopify" for any non-true-rep role), so a Shopify customer's "for
         # Ashlynn at Beck LTD" is silently stripped as noise there rather than
         # surfacing here as an error message.
@@ -2489,7 +2485,7 @@ def chat():
         # Intent.BULK_ORDER` branch below), which is why this check has to
         # happen before that branch rather than relying on the unsupported-
         # call guard further down.
-        if (intent == Intent.BULK_ORDER and ECOMMERCE_BACKEND == "shopify"
+        if (intent == Intent.BULK_ORDER and current_backend() == "shopify"
                 and role in BULK_ORDER_ROLES):
             _msg, _sugg = unsupported_message_for(Intent.BULK_ORDER)
             logger.info(
@@ -2819,7 +2815,7 @@ def chat():
             # leaked admin/custom_plugin call) cannot be fulfilled here. The
             # woo_client backstop already guarantees no request is sent; this
             # turns that into a clear answer instead of an empty-results reply.
-            if ECOMMERCE_BACKEND == "shopify":
+            if current_backend() == "shopify":
                 _unsupported = find_unsupported_call(api_calls)
                 if _unsupported is not None:
                     _msg, _sugg = unsupported_message_for(intent)

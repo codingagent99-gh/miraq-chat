@@ -29,7 +29,7 @@ from api_builder.store_helpers import (
 )
 from api_builder.filter_builder import build_advanced_filter_call
 from ecommerce import endpoints
-from app_config import ECOMMERCE_BACKEND
+from platform_config import current_backend
 logger = get_logger("miraq_chat")
 
 # ══════════════════════════════════════════════════════════════
@@ -259,7 +259,7 @@ def _build_last_order(e, page, customer_id=None, role=None) -> list:
             requires_resolution=["customer_id"],
         )]
 
-    if ECOMMERCE_BACKEND == "shopify":
+    if current_backend() == "shopify":
         from api_builder.shopify_order_calls import build_last_order_call
         return [build_last_order_call(
             customer_id=customer_id or "CURRENT_USER_ID",
@@ -343,7 +343,7 @@ def _build_order_history(e, page, customer_id=None, role=None) -> list:
         ADMIN_ORDER_PER_PAGE if is_order_report_admin(role) else DEFAULT_ORDER_PER_PAGE
     )
 
-    if ECOMMERCE_BACKEND == "shopify":
+    if current_backend() == "shopify":
         from api_builder.shopify_order_calls import build_order_history_call
         return [build_order_history_call(
             customer_id=customer_id or "CURRENT_USER_ID",
@@ -370,7 +370,7 @@ def _build_order_history(e, page, customer_id=None, role=None) -> list:
     )]
 
 def _build_reorder(e, page, customer_id=None, role=None) -> list:
-    if ECOMMERCE_BACKEND == "shopify":
+    if current_backend() == "shopify":
         from api_builder.shopify_order_calls import build_fetch_order_call, build_last_order_call
         if e.order_id:
             return [build_fetch_order_call(
@@ -417,7 +417,7 @@ def _build_historical_search(e, page, customer_id=None, role=None) -> list:
     per_page = e.order_count if getattr(e, "order_count", None) else 20
     include_ids = [e.order_id] if getattr(e, "order_id", None) else None
 
-    if ECOMMERCE_BACKEND == "shopify":
+    if current_backend() == "shopify":
         from api_builder.shopify_order_calls import build_historical_search_call
         return [build_historical_search_call(
             customer_id=customer_id or "CURRENT_USER_ID",
@@ -478,7 +478,7 @@ def _build_quick_order(e, page) -> list:
     )
 
     if not has_taxonomy and search_term:
-        if ECOMMERCE_BACKEND == "shopify":
+        if current_backend() == "shopify":
             # Same rationale as _build_product_search: the shopify_admin
             # search_products stub is undispatched; the GraphQL executor's
             # post-filter handles free text. Keep the resolution step so the
@@ -535,7 +535,7 @@ def _loader_memory_call(op: str, description: str) -> WooAPICall:
 
 def _build_category_browse(e, page) -> list:
     if not e.target_category_slugs:
-        if ECOMMERCE_BACKEND == "shopify":
+        if current_backend() == "shopify":
             return [_loader_memory_call(
                 "list_categories",
                 "List all Shopify collections (no category specified, in-memory)",
@@ -576,7 +576,7 @@ def _build_category_browse(e, page) -> list:
 
 
 def _build_category_list(e, page) -> list:
-    if ECOMMERCE_BACKEND == "shopify":
+    if current_backend() == "shopify":
         return [_loader_memory_call(
             "list_categories", "List all Shopify collections (in-memory)",
         )]
@@ -643,7 +643,7 @@ def _build_product_search(e, page, user_message: str = "") -> list:
         or e.in_stock is not None
     )
     if not has_taxonomy and actual_search:
-        if ECOMMERCE_BACKEND == "shopify":
+        if current_backend() == "shopify":
             # Shopify has no search_products endpoint wired — but the GraphQL
             # executor's post-filter does substring matching over title + tags
             # + variant option values (filter_builder always writes
@@ -771,7 +771,7 @@ def _build_related_products(e, page) -> list:
 
 
 def _build_product_catalog(e, page) -> list:
-    if ECOMMERCE_BACKEND == "shopify":
+    if current_backend() == "shopify":
         return [
             _loader_memory_call("list_categories", "All Shopify collections (in-memory)"),
             _loader_memory_call("list_tags",       "All Shopify tags (in-memory)"),
@@ -869,7 +869,7 @@ def _build_most_popular(e, page) -> list:
     ones specifically.
     """
     
-    if ECOMMERCE_BACKEND == "shopify":
+    if current_backend() == "shopify":
         from api_builder.shopify_order_calls import build_top_selling_products_call
         
         _cats = list(e.target_category_slugs or [])
@@ -1042,7 +1042,7 @@ def _build_order_tracking(e, page, customer_id=None, role=None) -> list:
             requires_resolution=["customer_id"],
         )]
 
-    if ECOMMERCE_BACKEND == "shopify":
+    if current_backend() == "shopify":
         from api_builder.shopify_order_calls import build_fetch_order_call, build_order_history_call
         if getattr(e, "order_id", None):
             return [build_fetch_order_call(

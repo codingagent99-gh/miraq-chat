@@ -2,31 +2,80 @@
 routes/deactivation.py — Tenant teardown endpoint.
 
 POST /deactivate-tenant — called by the WordPress plugin's uninstall hook
-when the plugin is deleted (not just deactivated). Verifies the licence
-signature, marks the tenant archived, evicts it from both registries, and
-drops the physical database.
+when the plugin is deleted (not just deactivated).
+
+TWO WAYS TO AUTHENTICATE, because two kinds of tenant have to be able to
+leave:
+
+  1. Signed licence payload (raw_payload + signature). Paid tenants, as
+     before. Resolves the tenant by the licenceId inside the verified claims.
+
+  2. tenant_uuid + the store's own WooCommerce credentials, sent as
+     X-Consumer-Key / X-Consumer-Secret. This is the free-tier path: a free
+     activation never receives a licence, so it has nothing to sign with and
+     previously could not be torn down at all — its row stayed active and its
+     database was never reclaimed. The credentials are the same ones the
+     branding-push webhook already authenticates with, and they are checked
+     the same way (timing-safe, against the stored pair). Paid tenants may use
+     this path too; the plugin falls back to it when a signed call is rejected
+     after a licence rotation.
+
+     tenant_uuid ALONE is deliberately not enough. It identifies, it does not
+     authorise — it sits in wp_options, travels in site exports, and cannot be
+     rotated if it leaks (the db_name is derived from it).
 
 Lifecycle after this call:
   tenants.status = "archived"   ← row is kept for audit; db_name preserved
   loader evicted from TenantRegistry
   engine disposed from DBEngineRegistry
-  physical database DROPPED
+  snapshot deleted
+  physical database LEFT IN PLACE — dropped later by RefreshScheduler's
+  archived-tenant sweep, TENANT_ARCHIVE_GRACE_DAYS after archived_at
 
-Idempotent: safe to call twice (DB already gone = not an error).
+Idempotent: safe to call twice (already archived = 200, not an error).
 """
 
+import hmac
 from datetime import datetime, timezone
 import json
-from flask import Blueprint, request, jsonify, current_app
+import uuid as uuid_mod
+from flask import Blueprint, request, jsonify
 
 from chat_logger import get_logger
 from models import db, Tenant
 from license_verifier import verify_license_payload, LicenseVerificationError
-from tenant_db_provisioner import drop_tenant_database, TenantDBProvisionError
+from tenant_crypto import decrypt_secret
 
 logger = get_logger("miraq_chat")
 
 deactivation_bp = Blueprint("deactivation", __name__)
+
+def _verify_store_credentials(tenant) -> bool:
+    """
+    Timing-safe check of X-Consumer-Key / X-Consumer-Secret against the
+    tenant's stored WooCommerce credentials. Same check as
+    routes/webhook_routes.py::_verify_credentials — the store proving it is
+    the store, with a credential that CAN be rotated if it leaks.
+    """
+    key = request.headers.get("X-Consumer-Key", "")
+    secret = request.headers.get("X-Consumer-Secret", "")
+    if not key or not secret:
+        return False
+
+    expected_key = tenant.woo_key or ""
+    try:
+        expected_secret = decrypt_secret(tenant.woo_secret_encrypted or "")
+    except Exception as e:
+        logger.error(f"deactivate-tenant: could not decrypt stored secret | tenant_id={tenant.tenant_id} | {e}")
+        return False
+    if not expected_key or not expected_secret:
+        return False
+
+    # Both comparisons always run, so timing cannot reveal which half matched.
+    key_ok = hmac.compare_digest(key, expected_key)
+    secret_ok = hmac.compare_digest(secret, expected_secret)
+    return key_ok and secret_ok
+
 
 
 @deactivation_bp.route("/deactivate-tenant", methods=["POST"])
@@ -53,8 +102,19 @@ def deactivate_tenant():
 
     logger.info(f"deactivate-tenant: raw_payload={'present' if raw_payload else 'MISSING'} | signature={'present' if signature_b64 else 'MISSING'}")
 
+    tenant_uuid_raw = (body.get("tenant_uuid") or "").strip()
+
+    logger.info(
+        f"deactivate-tenant: raw_payload={'present' if raw_payload else 'MISSING'} | "
+        f"signature={'present' if signature_b64 else 'MISSING'} | "
+        f"tenant_uuid={tenant_uuid_raw or 'MISSING'}"
+    )
+
+    # ── Path 2: no signature — tenant_uuid + store credentials ───────────────
     if not raw_payload or not signature_b64:
-        return jsonify({"success": False, "error": "missing raw_payload/signature"}), 400
+        if not tenant_uuid_raw:
+            return jsonify({"success": False, "error": "missing raw_payload/signature or tenant_uuid"}), 400
+        return _deactivate_by_credentials(tenant_uuid_raw)
 
     # Verify the signature — same check as /provision-tenant.
     # This prevents a third party from triggering teardown by guessing a licenseId.
@@ -89,11 +149,40 @@ def deactivate_tenant():
         "status":     "archived",
     }), 200
 
+def _deactivate_by_credentials(tenant_uuid_raw: str):
+    """Path 2 — see this module's docstring."""
+    try:
+        tenant_uuid = uuid_mod.UUID(tenant_uuid_raw)
+    except (ValueError, AttributeError, TypeError):
+        return jsonify({"success": False, "error": "tenant_uuid is not a valid UUID"}), 400
+
+    tenant = db.session.get(Tenant, tenant_uuid)
+
+    # Unknown tenant returns the same 401 as bad credentials, on purpose: a
+    # "this UUID exists but your credentials are wrong" answer would turn this
+    # endpoint into a way to test whether a given UUID is a real tenant.
+    if tenant is None or not _verify_store_credentials(tenant):
+        logger.warning(f"deactivate-tenant: credential auth rejected | tenant_uuid={tenant_uuid_raw}")
+        return jsonify({"success": False, "error": "unauthorized"}), 401
+
+    if tenant.status == "archived":
+        logger.info(f"deactivate-tenant: already archived | tenant_id={tenant_uuid}")
+        return jsonify({"success": True, "tenant_id": str(tenant_uuid), "status": "archived"}), 200
+
+    result = teardown_tenant(tenant, log_prefix="deactivate-tenant(creds)")
+    if not result["success"]:
+        return jsonify({"success": False, "error": result["error"]}), 500
+
+    return jsonify({
+        "success":   True,
+        "tenant_id": str(tenant_uuid),
+        "status":    "archived",
+    }), 200
 
 def teardown_tenant(tenant, *, log_prefix: str = "teardown") -> dict:
     """
-    Tear a tenant down: evict from registries, drop its database, archive the
-    control-plane row, delete its snapshot.
+    Tear a tenant down: evict from registries, archive the control-plane row,
+    delete its snapshot. The physical database is deliberately LEFT IN PLACE.
 
     Extracted from deactivate_tenant() so the Shopify app/uninstalled webhook
     can reuse it. The two callers authenticate completely differently — a
@@ -107,12 +196,21 @@ def teardown_tenant(tenant, *, log_prefix: str = "teardown") -> dict:
     already-archived / not-found early returns, since their response shapes
     differ.
 
-    Ordering is load-bearing:
-      1. evict registries first — a live engine holds connections, and
-         DROP DATABASE fails while any session is open
-      2. drop the physical database
-      3. archive the row (kept for audit; db_name preserved)
-      4. delete the snapshot, best-effort
+    The database is dropped later, by RefreshScheduler's archived-tenant
+    sweep, TENANT_ARCHIVE_GRACE_DAYS after archived_at. Teardown is triggered
+    by a credential that lives on a WordPress site, so the destructive half is
+    made reversible: for the length of the grace period a reprovision with the
+    same tenant_uuid clears archived_at, reuses the same db_name, and the
+    tenant is back with its history. After the sweep runs there is nothing to
+    come back to, which is why it is a sweep and not part of this call.
+
+    Ordering:
+      1. evict registries first — a live engine holds open connections, and
+         they must be gone before the eventual DROP DATABASE
+      2. archive the row (kept for audit; db_name preserved so the sweep and
+         any reprovision both know which database this was)
+      3. delete the snapshot, best-effort. It is a rebuildable catalog cache,
+         not tenant data, so there is nothing to preserve for the grace period.
 
     Returns {"success": True} or {"success": False, "error": str}.
     """
@@ -136,26 +234,17 @@ def teardown_tenant(tenant, *, log_prefix: str = "teardown") -> dict:
         logger.error(f"{log_prefix}: registry eviction failed | {label} | {e}", exc_info=True)
         # Non-fatal — continue with DB drop even if registry eviction fails
 
-    # ── 2. Drop the physical database ─────────────────────────────────────────
-    base_dsn = current_app.config["SQLALCHEMY_DATABASE_URI"]
-    try:
-        drop_tenant_database(base_dsn, db_name)
-        logger.info(f"{log_prefix}: database dropped | {label} db={db_name}")
-    except TenantDBProvisionError as e:
-        logger.error(f"{log_prefix}: DROP failed | {label} | {e}", exc_info=True)
-        return {"success": False, "error": f"database drop failed: {e}"}
-
-    # ── 3. Mark archived in the control-plane row ─────────────────────────────
+    # ── 2. Mark archived in the control-plane row ─────────────────────────────
     try:
         tenant.status = "archived"
         tenant.archived_at = datetime.now(timezone.utc)
         db.session.commit()
-        logger.info(f"{log_prefix}: teardown complete | {label}")
+        logger.info(f"{log_prefix}: archived — database {db_name} kept for the grace period | {label}")
     except Exception as e:
         logger.error(f"{log_prefix}: failed to archive row | {label} | {e}", exc_info=True)
         return {"success": False, "error": f"archive failed: {e}"}
 
-    # ── 4. Best-effort snapshot cleanup ───────────────────────────────────────
+    # ── 3. Best-effort snapshot cleanup ───────────────────────────────────────
     # delete() is self-guarding (logs and returns on failure), so a leftover
     # snapshot never blocks a completed teardown. Keyed by tenant_id, matching
     # how snapshots are stored since the re-key.

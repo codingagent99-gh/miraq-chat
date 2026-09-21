@@ -17,7 +17,8 @@ from typing import Optional, List
 from woo_client import woo_client
 from ecommerce import endpoints
 from chat_logger import get_logger
-from app_config import BULK_ORDER_FULL_SCOPE_ROLES, BULK_ORDER_ROLES, ECOMMERCE_BACKEND
+from app_config import BULK_ORDER_FULL_SCOPE_ROLES, BULK_ORDER_ROLES
+from platform_config import current_backend
 from handlers.chat_utils import normalize_spelling_variants, _attribute_display_name, variation_declares_self_contained_term, _normalize_term_key
 from models import ExtractedEntities
 from classifier.extractors import extract_attributes
@@ -553,7 +554,7 @@ def parse_bulk_order_utterance(
     # (stripped as noise, same as any other unrecognised text) exactly as it
     # already was before this change, instead of crashing. True reps are left
     # alone here since that path is unreachable in practice today.
-    if _is_rep and not _is_true_rep and ECOMMERCE_BACKEND == "shopify":
+    if _is_rep and not _is_true_rep and current_backend()== "shopify":
         _is_rep = False
 
     # ── Step -0.5: Optional checkout-field clauses ("rep X", "order type Y") ─
@@ -1188,7 +1189,7 @@ def parse_bulk_order_utterance(
                 # when bulk-ordered. Same engine, same answer.
                 _attr_ok = False
                 _attr_products = []
-                if ECOMMERCE_BACKEND == "shopify":
+                if current_backend()== "shopify":
                     try:
                         from api_builder.shopify_graphql_executor import (
                             ShopifyGraphQLExecutor,

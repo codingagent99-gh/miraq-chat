@@ -31,9 +31,8 @@ _LICENSE_HEADER = "X-MiraQ-License-Id"
 # routes/provisioning.py and routes/deactivation.py. Each verifies its own
 # licence signature instead (or is deliberately unauthenticated for now, in
 # activate-free's case — see that route's docstring).
-#
-# /customer-addresses, /events/product-update, /events/order-paid (Stage 2,
-# routes/shopify.py) are Shopify-native mechanisms — App Proxy and Events
+# /customer-addresses, /events/product-update, /events/order-paid and
+# /events/app-uninstalled (Stage 2, routes/shopify.py) are Shopify-native mechanisms — App Proxy and Events
 # webhooks — that carry their own signed tenant identifier (a `shop` query
 # param or a Shopify-Shop-Domain header) and verify it themselves. Shopify
 # has no way to send X-MiraQ-License-Id, so these must not be gated behind
@@ -46,10 +45,20 @@ _LICENSE_HEADER = "X-MiraQ-License-Id"
 # tenant-facing Shopify app install flow with a real callback route, it goes
 # here then.
 _EXEMPT_PATHS = {
-    "/health", "/status", "/shopify-token-status",
     "/provision-tenant", "/activate-free", "/deactivate-tenant",
     "/customer-addresses", "/events/product-update", "/events/order-paid",
+    "/events/app-uninstalled",
 }
+
+# Paths where the tenant header is OPTIONAL. With it, the tenant is bound
+# (so /health and /status describe THAT store); without it, or with a tenant
+# that cannot be bound, the request still goes through unbound — a health
+# probe must never 4xx. Previously these were fully exempt, so the loader was
+# always None and /health reported every store as "down" (503, blocking).
+#
+# /shopify-token-status is intentionally NOT here any more: it is a per-store
+# diagnostic and now requires the header like any other tenant route.
+_OPTIONAL_TENANT_PATHS = {"/health", "/status"}
 _EXEMPT_PREFIXES = ("/static/",)
 
 _tenant_registry = None
@@ -109,6 +118,44 @@ def get_tenant_registry():
 def _is_exempt(path: str) -> bool:
     return path in _EXEMPT_PATHS or path.startswith(_EXEMPT_PREFIXES)
 
+def bind_tenant_db(tenant) -> None:
+    """
+    Bind a tenant resolved by some OTHER means than X-MiraQ-License-Id (e.g.
+    a Shopify webhook's signed shop domain) so that per-tenant models
+    (Conversation, Message, ChatUsage, ShopifyOrderConfirmation) are read and
+    written in THAT tenant's database.
+
+    Exempt routes skip _resolve_tenant, so without this g.db_engine is unset
+    and _TenantRoutingSession falls back to the control-plane database —
+    which is how /events/order-paid used to write confirmations where
+    /chat/order-status (tenant DB) could never see them.
+
+    Does not build a StoreLoader: webhook handlers that need one should call
+    get_tenant_registry().get_loader(tenant) themselves.
+    """
+    g.tenant = tenant
+    g.tenant_features = dict(tenant.features or {})
+    g.ecommerce_backend = tenant.ecommerce_backend
+    g.db_engine = _engine_registry.get_engine(tenant.db_name)
+
+def _bind_optional_tenant(license_id: str) -> None:
+    g.store_loader = None
+    if not license_id:
+        return
+    try:
+        from models import Tenant
+        tenant = Tenant.query.filter_by(license_id=license_id).first()
+        if tenant is None:
+            return
+        g.tenant = tenant
+        g.tenant_features = dict(tenant.features or {})
+        g.ecommerce_backend = tenant.ecommerce_backend
+        if tenant.status in ("active", "provision_failed") and _tenant_registry is not None:
+            resident = dict(_tenant_registry.resident_loaders())
+            g.store_loader = resident.get(str(tenant.tenant_id))
+    except Exception as e:
+        logger.warning(f"_bind_optional_tenant: could not bind | license_id={license_id[:8]!r} | {e}")
+        g.store_loader = None
 
 def register_before_request(app) -> None:
     @app.before_request
@@ -124,6 +171,11 @@ def register_before_request(app) -> None:
             return None
 
         license_id = request.headers.get(_LICENSE_HEADER, "").strip()
+
+        if path in _OPTIONAL_TENANT_PATHS:
+            _bind_optional_tenant(license_id)
+            return None
+
         logger.info(f"_resolve_tenant: path={path} | license_id={'present:'+license_id[:8] if license_id else 'MISSING'}")
 
         # ── No header ─────────────────────────────────────────────────────────

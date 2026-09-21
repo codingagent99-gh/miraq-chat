@@ -55,7 +55,23 @@ import requests as http_requests
 
 from chat_logger import get_logger
 from models.shopify_token import ShopifyToken
-from store_loader.config import SHOPIFY_STORE_DOMAIN
+
+def _current_shop_domain() -> str:
+    """
+    The shopify domain of the tenant bound to the current requrest
+    """
+    
+    from store_registry import get_store_loader
+    loader = get_store_loader()
+    domain = (getattr(loader, "shopify_domain", "") or "").strip() if loader else ""
+    
+    if not domain:
+        raise RuntimeError(
+            "shopify_oders_executor: no Shopify tenant bound to this request "
+            "(missing loader or empty shopify_domain)"
+        )
+        
+    return domain
 
 logger = get_logger("miraq_chat")
 
@@ -259,7 +275,7 @@ query FetchOrder($order_gid: ID!) {
 def _gql(query: str, variables: dict, token: str) -> dict:
     """Execute one GraphQL request against the Shopify Admin API."""
     resp = http_requests.post(
-        f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{API_VERSION}/graphql.json",
+        f"https://{_current_shop_domain()}/admin/api/{API_VERSION}/graphql.json",
         json={"query": query, "variables": variables},
         headers={
             "Content-Type":           "application/json",
@@ -890,7 +906,7 @@ class ShopifyOrdersExecutor:
         Load the Shopify Admin access token from the DB.
         Mirrors the pattern used in ShopifyGraphQLExecutor._get_token().
         """
-        token_row = ShopifyToken.query.get(SHOPIFY_STORE_DOMAIN)
+        token_row = ShopifyToken.query.get(_current_shop_domain())
         if not token_row or token_row.is_expired:
             raise RuntimeError(
                 "Shopify Admin token missing or expired — "

@@ -494,9 +494,8 @@ def _start_background_build(tenant_id, app):
                     tenant.last_build_error = None
                     logger.info(f"_start_background_build: ✅ build complete | tenant_id={tenant_id}")
 
-                    # Widget branding (logo/header text) fetch omitted — optional
-                    # per the conversion plan, nothing depends on it yet. Add a
-                    # widget_branding.py and call it here if that's wanted later.
+                    from widget_branding import fetch_and_store_widget_branding
+                    fetch_and_store_widget_branding(tenant)
 
                 except Exception as e:
                     logger.error(

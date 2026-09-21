@@ -122,3 +122,34 @@ def drop_tenant_database(base_dsn: str, db_name: str) -> None:
         raise TenantDBProvisionError(f"Failed to drop database {db_name!r}: {e}") from e
     finally:
         conn.close()
+        
+def list_existing_databases(base_dsn: str, prefix: str = "tenant_") -> set:
+    """
+    Names of the databases that currently exist, restricted to `prefix`.
+
+    One query, so the archived-tenant drop sweep can skip rows whose database
+    is already gone instead of issuing a per-row existence check every tick
+    (archived rows are kept for audit and accumulate forever).
+
+    Returns an empty set on failure: the sweep then drops nothing this tick
+    rather than concluding every database is missing.
+    """
+    dsn = _maintenance_dsn(base_dsn)
+    try:
+        conn = psycopg2.connect(dsn)
+    except Exception as e:
+        logger.error(f"TenantDBProvisioner: could not list databases | {e}")
+        return set()
+
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT datname FROM pg_catalog.pg_database WHERE datname LIKE %s",
+            (prefix + "%",),
+        )
+        return {row[0] for row in cur.fetchall()}
+    except Exception as e:
+        logger.error(f"TenantDBProvisioner: could not list databases | {e}")
+        return set()
+    finally:
+        conn.close()

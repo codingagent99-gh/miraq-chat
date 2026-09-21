@@ -12,10 +12,22 @@ from datetime import datetime, timezone
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy import event
+from sqlalchemy import inspect as sa_inspect
 
 from flask import g, has_request_context
 from flask_sqlalchemy.session import Session as FSASession
 
+_CONTROL_PLANE_TABLES = frozenset({"tenants", "shopify_tokens"})
+
+def _targets_control_plane(mapper) -> bool:
+    """True if this ORM operation is for a control-plane model"""
+    if mapper is None:
+        return False
+    try:
+        m= sa_inspect(mapper)
+        return any(t.name in _CONTROL_PLANE_TABLES for t in m.tables)
+    except Exception:
+        return False
 
 class _TenantRoutingSession(FSASession):
     """
@@ -26,12 +38,12 @@ class _TenantRoutingSession(FSASession):
     context and no g, so they get the engine SQLAlchemy was configured with
     (the control-plane DB), which is exactly where Tenant itself lives.
     """
-    def get_bind(self, *args, **kwargs):
-        if has_request_context():
+    def get_bind(self, mapper=None, clause=None, **kwargs):
+        if has_request_context() and not _targets_control_plane(mapper):
             engine = g.__dict__.get("db_engine")
             if engine is not None:
                 return engine
-        return super().get_bind(*args, **kwargs)
+        return super().get_bind(mapper, clause=clause, **kwargs)
 
 
 db = SQLAlchemy(session_options={"class_": _TenantRoutingSession})

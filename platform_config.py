@@ -56,3 +56,49 @@ if ECOMMERCE_BACKEND not in VALID_ECOMMERCE_BACKENDS:
 # Convenience aliases, so call sites read as intent rather than string compare.
 IS_SHOPIFY     = ECOMMERCE_BACKEND == "shopify"
 IS_WOOCOMMERCE = ECOMMERCE_BACKEND == "woocommerce"
+
+# ── Per-tenant backend (multi-store) ────────────────────────────────────────
+
+def current_backend() -> str:
+    """
+    The backend for the tenant bound to the current request.
+
+    Resolution order:
+      1. g.ecommerce_backend  — set by register_before_request from the
+                                Tenant row (validated; an unknown value raises
+                                rather than silently becoming WooCommerce).
+      2. g.store_loader       — its TenantConfig.ecommerce_backend, for code
+                                paths that bound a loader without the flag.
+      3. ECOMMERCE_BACKEND    — process default, for startup and background
+                                threads that have no tenant context at all.
+    """
+    override = None
+    loader = None
+    try:
+        from flask import g, has_app_context
+        if has_app_context():
+            override = g.__dict__.get("ecommerce_backend")
+            loader = g.__dict__.get("store_loader")
+    except Exception:
+        override, loader = None, None
+
+    if override:
+        value = str(override).strip().lower()
+        if value not in VALID_ECOMMERCE_BACKENDS:
+            raise RuntimeError(
+                f"g.ecommerce_backend={override!r} is not a recognised "
+                "backend. Valid values: " + ", ".join(sorted(VALID_ECOMMERCE_BACKENDS))
+            )
+        return value
+
+    if loader is not None:
+        value = str(getattr(loader, "ecommerce_backend", "") or "").strip().lower()
+        if value in VALID_ECOMMERCE_BACKENDS:
+            return value
+
+    return ECOMMERCE_BACKEND
+
+
+def is_shopify() -> bool:
+    """True when the current request's tenant is a Shopify store."""
+    return current_backend() == "shopify"

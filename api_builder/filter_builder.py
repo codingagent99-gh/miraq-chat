@@ -28,7 +28,7 @@ from api_builder.store_helpers import (
     attr_slug_for_label,
     get_attribute_term_slug,
 )
-from store_loader.config import ECOMMERCE_BACKEND
+from platform_config import current_backend
 
 logger = get_logger("miraq_chat")
 
@@ -172,7 +172,7 @@ def build_advanced_filter_call(
             body["variation_page"] = variation_page
 
     elif search_term:
-        if ECOMMERCE_BACKEND == "shopify":
+        if current_backend() == "shopify":
             # Shopify executor does in-memory name/tag/variant matching — always
             # write the term. It cannot "return arbitrary products" because the
             # haystack search in _apply_body() is a strict substring filter.
@@ -205,7 +205,7 @@ def build_advanced_filter_call(
 
     logger.debug(f"api_builder: Advanced filter body: {json.dumps(body)}")
     
-    if ECOMMERCE_BACKEND == "shopify":
+    if current_backend() == "shopify":
         return WooAPICall(
             method="POST",
             endpoint="shopify-graphql",       # logical name, never fetched

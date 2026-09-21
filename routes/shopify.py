@@ -305,6 +305,12 @@ def shopify_order_paid_event():
         logger.warning(f"shopify events: rejected /events/order-paid delivery | reason={reason} | shop={shop_domain!r}")
         return jsonify({"error": "unverified_request"}), 401
 
+    if tenant.status == "archived":
+        return jsonify({"received": True, "skipped": "tenant_archived"}), 200
+    
+    from store_registry import bind_tenant_db
+    bind_tenant_db(tenant)
+
     delivery_id = request.headers.get("Shopify-Webhook-Id", "")
 
     try:
@@ -423,7 +429,7 @@ def shopify_app_uninstalled():
     # revoked it, so it is now a dead credential sitting in the control-plane
     # DB; and ShopifyTokenManager would otherwise keep trying to refresh it.
     try:
-        ShopifyToken.query.filter_by(domain=tenant.shopify_domain).delete()
+        ShopifyToken.query.filter_by(store_domain=tenant.shopify_domain).delete()
         db.session.commit()
         logger.info(f"shopify events: token row deleted | shop={shop_domain!r}")
     except Exception as e:

@@ -39,16 +39,10 @@ order_logger = get_order_logger()
 _UPSTREAM_LOCK = _threading.Lock()
 _UNHEALTHY_AFTER = 3        # consecutive hard failures before "down"
 
-# NOTE (multi-store, accepted knowingly): this health tracker is process-wide,
-# not per-tenant. One tenant's broken WooCommerce install will colour the
-# /health signal for every other tenant sharing this process. Not a
-# data-correctness issue — no catalog/order/rep data crosses tenant
-# boundaries because of this — just an imprecise monitoring signal once
-# there's more than one tenant. Key by tenant_id if/when that matters enough
-# to justify it; /health itself has the same "what does this even mean with
-# N tenants" question hanging over it (see store_registry.py's exempt-path
-# note), so this is deferred alongside that, not fixed in isolation here.
-
+# Per-tenant: one state dict per tenant_id. A process-wide tracker let one
+# tenant's broken WooCommerce install turn /health "down" (503, blocking) for
+# every other tenant sharing this process. /health now reports the upstream
+# state of whichever tenant the probe identified itself as.
 # Upper bound on concurrent outbound WooCommerce calls per request. Four is
 # comfortably under requests' default HTTPAdapter pool_maxsize of 10, which
 # the WooClient singleton shares across every gunicorn thread -- going wider
@@ -57,47 +51,63 @@ _UNHEALTHY_AFTER = 3        # consecutive hard failures before "down"
 _MAX_PARALLEL_WOO_CALLS = 4
 _SALVAGE_WINDOW_S = 300     # a salvage older than this stops mattering
 
-_UPSTREAM = {
-    "consecutive_failures": 0,
-    "last_success_ts": None,
-    "last_failure_ts": None,
-    "last_failure_endpoint": "",
-    "last_failure_error": "",
-    "last_salvage_ts": None,
-    "last_salvage_endpoint": "",
-    "salvage_count": 0,
-}
+def _new_upstream_state() -> dict:
+    return {
+        "consecutive_failures": 0,
+        "last_success_ts": None,
+        "last_failure_ts": None,
+        "last_failure_endpoint": "",
+        "last_failure_error": "",
+        "last_salvage_ts": None,
+        "last_salvage_endpoint": "",
+        "salvage_count": 0,
+    }
 
 
-def _record_upstream(outcome, endpoint="", error=""):
-    """Record one API outcome: 'ok', 'salvaged' or 'failed'."""
+_UPSTREAM_BY_TENANT: dict = {}
+
+
+def _record_upstream(outcome, endpoint="", error="", tenant_key=""):
+    """Record one API outcome for one tenant: 'ok', 'salvaged' or 'failed'."""
     _now = _health_time.time()
     with _UPSTREAM_LOCK:
+        _st = _UPSTREAM_BY_TENANT.setdefault(str(tenant_key or ""), _new_upstream_state())
         if outcome == "failed":
-            _UPSTREAM["consecutive_failures"] += 1
-            _UPSTREAM["last_failure_ts"] = _now
-            _UPSTREAM["last_failure_endpoint"] = str(endpoint)
-            _UPSTREAM["last_failure_error"] = str(error)[:200]
+            _st["consecutive_failures"] += 1
+            _st["last_failure_ts"] = _now
+            _st["last_failure_endpoint"] = str(endpoint)
+            _st["last_failure_error"] = str(error)[:200]
             return
         # Any usable response clears the failure streak.
-        _UPSTREAM["consecutive_failures"] = 0
-        _UPSTREAM["last_success_ts"] = _now
+        _st["consecutive_failures"] = 0
+        _st["last_success_ts"] = _now
         if outcome == "salvaged":
-            _UPSTREAM["salvage_count"] += 1
-            _UPSTREAM["last_salvage_ts"] = _now
-            _UPSTREAM["last_salvage_endpoint"] = str(endpoint)
+            _st["salvage_count"] += 1
+            _st["last_salvage_ts"] = _now
+            _st["last_salvage_endpoint"] = str(endpoint)
 
 
-def upstream_health():
-    """Snapshot for /health. 'down' | 'degraded' | 'ok'.
-
+def upstream_health(tenant_key=None):
+    """Snapshot of ONE tenant's upstream for /health. 'down' | 'degraded' | 'ok' | 'unknown'.
+    unknown  — no tenant identified, or no call recorded for it yet
+    
     down     — _UNHEALTHY_AFTER consecutive hard failures, nothing usable since
     degraded — usable, but a body needed salvaging recently (a real server-side
                fault that has not yet cost the user anything)
     """
     _now = _health_time.time()
     with _UPSTREAM_LOCK:
-        _snap = dict(_UPSTREAM)
+        _state = _UPSTREAM_BY_TENANT.get(str(tenant_key or "")) if tenant_key else None
+        _snap = dict(_state) if _state is not None else None
+    
+    if _snap is None:
+        return {
+            "status": "unknown",
+            "reasons": [],
+            "consecutive_failures": 0,
+            "salvage_count": 0,
+            "seconds_since_success": None,
+        }
 
     _fails = _snap["consecutive_failures"]
     _recent_salvage = (
@@ -348,8 +358,7 @@ class WooClient:
             resp.raise_for_status()
             _elapsed_ms = round((_time.time() - _req_start) * 1000)
             data, _salvaged = _parse_json_tolerant(resp, endpoint_short)
-            _record_upstream("salvaged" if _salvaged else "ok", endpoint_short)
-
+            _record_upstream("salvaged" if _salvaged else "ok", endpoint_short, tenant_key=loader.tenant_id)
             # ── Response logging ──────────────────────────────────────────────
             # `count` is the number of ITEMS in a list-shaped response. Aggregate
             # endpoints return a dict of totals with no item list, which used to
@@ -452,7 +461,7 @@ class WooClient:
                 except Exception:
                     pass
             _elapsed_ms = round((_time.time() - _req_start) * 1000)
-            _record_upstream("failed", endpoint_short, str(e))
+            _record_upstream("failed", endpoint_short, str(e), tenant_key=loader.tenant_id)
             _api_log.error(
                 f"RESPONSE {api_call.method} {endpoint_short} | "
                 f"status=ERROR | time_ms={_elapsed_ms} | "

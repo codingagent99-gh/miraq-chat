@@ -10,12 +10,23 @@ becomes garbage-collectable.
 """
 
 from __future__ import annotations
+import os
 import time
 import threading
 
 from chat_logger import get_logger
 
 logger = get_logger("miraq_chat")
+
+# How long an archived tenant's database is kept before it is dropped.
+#
+# /deactivate-tenant no longer drops anything: it archives, and this window is
+# what makes that call reversible. A teardown fired by a leaked credential, or
+# by a staging clone carrying a copy of the real store's credentials, can be
+# undone by reprovisioning with the same tenant_uuid — until the sweep below
+# runs. 0 is honoured (drop on the next tick) for anyone who wants the old
+# behaviour back.
+TENANT_ARCHIVE_GRACE_DAYS = int(os.getenv("TENANT_ARCHIVE_GRACE_DAYS", "7"))
 
 # How often the scheduler wakes to scan. The per-loader cadence lives in
 # StoreLoader._reason_to_reload() (catalog-version probe + interval backstop,
@@ -92,11 +103,71 @@ class RefreshScheduler:
         except Exception as e:
             logger.error(f"RefreshScheduler: stuck tenant sweep failed | {e}", exc_info=True)
 
-        # ── Widget branding refresh — omitted ───────────────────────────────
-        # The reference runs a widget-branding fetch sweep here (gated to once
-        # per 24h per tenant). Not included — widget_branding.py is optional
-        # per the conversion plan and nothing has been built against it yet.
-        # Add both if that's wanted later.
+        # ── Widget branding refresh ─────────────────────────────────────────
+        # Runs every tick, but is_widget_branding_stale() gates real fetches
+        # to once per 24h per tenant (and skips non-Woo tenants). This is what
+        # lets /widget-config be a pure DB read instead of a live call to the
+        # tenant's WordPress site on every widget load.
+        try:
+            with self._app.app_context():
+                from models import Tenant
+                from widget_branding import (
+                    fetch_and_store_widget_branding, is_widget_branding_stale,
+                )
+
+                active_tenants = Tenant.query.filter(
+                    Tenant.status == "active",
+                    Tenant.archived_at.is_(None),
+                ).all()
+                for tenant in active_tenants:
+                    if is_widget_branding_stale(tenant):
+                        fetch_and_store_widget_branding(tenant)
+        except Exception as e:
+            logger.error(f"RefreshScheduler: widget branding sweep failed | {e}", exc_info=True)
+
+        # ── Drop databases of long-archived tenants ─────────────────────────
+        # The deferred half of teardown. Rows stay for audit with db_name
+        # intact; only the physical database goes. Tenants whose database is
+        # already gone are skipped via one pg_database query rather than a
+        # per-row existence check, because archived rows accumulate forever.
+        try:
+            with self._app.app_context():
+                from datetime import datetime, timezone, timedelta
+                from flask import current_app
+                from models import Tenant
+                from tenant_db_provisioner import (
+                    drop_tenant_database, list_existing_databases, TenantDBProvisionError,
+                )
+
+                cutoff = datetime.now(timezone.utc) - timedelta(days=TENANT_ARCHIVE_GRACE_DAYS)
+                expired = Tenant.query.filter(
+                    Tenant.status == "archived",
+                    Tenant.archived_at.isnot(None),
+                    Tenant.archived_at < cutoff,
+                ).all()
+
+                if expired:
+                    base_dsn = current_app.config["SQLALCHEMY_DATABASE_URI"]
+                    existing = list_existing_databases(base_dsn)
+                    for tenant in expired:
+                        if tenant.db_name not in existing:
+                            continue   # already dropped on an earlier tick
+                        try:
+                            drop_tenant_database(base_dsn, tenant.db_name)
+                            logger.info(
+                                f"RefreshScheduler: dropped archived tenant database | "
+                                f"tenant={tenant.tenant_id} db={tenant.db_name} "
+                                f"archived_at={tenant.archived_at}"
+                            )
+                        except TenantDBProvisionError as e:
+                            # Left in `existing` for the next tick — a failed
+                            # drop must not silently become a skipped one.
+                            logger.error(
+                                f"RefreshScheduler: drop failed | tenant={tenant.tenant_id} "
+                                f"db={tenant.db_name} | {e}"
+                            )
+        except Exception as e:
+            logger.error(f"RefreshScheduler: archived tenant sweep failed | {e}", exc_info=True)
 
         # ── Shopify token refresh ───────────────────────────────────────────────
         # Same reasoning as the catalog-refresh sweep below: ShopifyTokenManager

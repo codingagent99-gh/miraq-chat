@@ -191,8 +191,7 @@ SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET", "")
 # store, bumped deliberately when the schema is verified against it.
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2026-10")
 
-if ECOMMERCE_BACKEND == "shopify" and SHOPIFY_CUSTOMER_AUTH != "app_proxy":
-    # Loud, once, at startup — in addition to the per-request warning.
+if SHOPIFY_CUSTOMER_AUTH != "app_proxy":
     import logging as _logging
     _logging.getLogger("miraq_chat").error(
         "⚠️  SHOPIFY_CUSTOMER_AUTH=%s — customer identity is NOT verified. "
