@@ -35,6 +35,7 @@ import urllib.parse
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 from routes.sales_rep import sales_rep_bp
+from routes.channel import channel_bp
 # ═══════════════════════════════════════════
 # FLASK APP & DATABASE
 # ═══════════════════════════════════════════
@@ -154,9 +155,10 @@ register_before_request(app)
 with app.app_context():
     from models import Tenant
     from models.shopify_token import ShopifyToken
+    from models.channel_connection import ChannelConnection
     db.metadata.create_all(
         bind=db.engine,
-        tables=[Tenant.__table__, ShopifyToken.__table__],
+        tables=[Tenant.__table__, ShopifyToken.__table__, ChannelConnection.__table__],
     )
     _cors_manager.refresh_from_db()   # seed dynamic origins from existing tenants
 
@@ -170,6 +172,7 @@ app.register_blueprint(provisioning_bp)
 app.register_blueprint(deactivation_bp)
 app.register_blueprint(webhook_bp)
 app.register_blueprint(shopify_oauth_bp)
+app.register_blueprint(channel_bp)
 
 # ── Request timing instrumentation ───────────────────────────────────────────
 # Writes plain text to logs/<date>/timing.txt, separate from chat.txt and

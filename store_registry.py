@@ -58,6 +58,12 @@ _EXEMPT_PATHS = {
     # tenant exists — the callback is what creates it — and authenticate with
     # the app-level hmac + state nonce instead.
     "/shopify/install", "/shopify/auth/callback", "/installed",
+    # Messaging channels (routes/channel.py). Called server-to-server by the
+    # webhook service, which has no licence id to send: /chat/channel resolves
+    # its tenant from the WhatsApp/Instagram account the customer messaged
+    # (channel_connections) and binds it with bind_tenant_db, the same way the
+    # Shopify webhooks above do. Both authenticate with X-MiraQ-Channel-Key.
+    "/chat/channel", "/channel-connections",
 }
 
 

@@ -417,3 +417,13 @@ LLM_RETRY_ON_EMPTY_RESULTS = os.getenv("LLM_RETRY_ON_EMPTY_RESULTS", "true").low
 # Cost estimation (USD per 1000 tokens)
 LLM_COST_PER_1K_INPUT = float(os.getenv("LLM_COST_PER_1K_INPUT", "0.002"))
 LLM_COST_PER_1K_OUTPUT = float(os.getenv("LLM_COST_PER_1K_OUTPUT", "0.008"))
+
+
+# ═══════════════════════════════════════════
+# MESSAGING CHANNELS (WhatsApp / Instagram)
+# ═══════════════════════════════════════════
+# Shared secret the webhook service sends as X-MiraQ-Channel-Key on
+# /chat/channel and /channel-connections. Empty = both reject every request.
+CHANNEL_API_KEY = os.getenv("CHANNEL_API_KEY", "").strip()
+# Product cards sent per turn. Each card is a separate message on WhatsApp.
+CHANNEL_MAX_PRODUCT_CARDS = int(os.getenv("CHANNEL_MAX_PRODUCT_CARDS", "5"))

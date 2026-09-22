@@ -17,7 +17,7 @@ from sqlalchemy import inspect as sa_inspect
 from flask import g, has_request_context
 from flask_sqlalchemy.session import Session as FSASession
 
-_CONTROL_PLANE_TABLES = frozenset({"tenants", "shopify_tokens"})
+_CONTROL_PLANE_TABLES = frozenset({"tenants", "shopify_tokens", "channel_connections"})
 
 def _targets_control_plane(mapper) -> bool:
     """True if this ORM operation is for a control-plane model"""

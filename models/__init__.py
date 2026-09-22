@@ -35,4 +35,7 @@ from models.catalog import (
 from models.shopify_token import ShopifyToken
 
 from models.chat_usage import ChatUsage
+
+# ── Messaging channels (WhatsApp / Instagram account -> tenant) ──
+from models.channel_connection import ChannelConnection
 from models import db
