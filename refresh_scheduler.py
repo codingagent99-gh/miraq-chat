@@ -72,6 +72,51 @@ class RefreshScheduler:
     def stop(self):
         self._stop.set()
 
+    def _reap_non_live_loaders(self):
+        try:
+            with self._app.app_context():
+                import uuid as uuid_mod
+                from models import Tenant
+                from store_registry import get_engine_registry
+
+                resident = [tid for tid, _ in self._registry.resident_loaders()]
+                if not resident:
+                    return
+
+                ids = []
+                for tid in resident:
+                    try:
+                        ids.append(uuid_mod.UUID(str(tid)))
+                    except ValueError:
+                        logger.warning(f"RefreshScheduler: resident loader with a non-UUID id | tenant={tid!r}")
+
+                # "warming" counts as live: a build may be running right now.
+                live = {
+                    str(t.tenant_id): t for t in Tenant.query.filter(
+                        Tenant.tenant_id.in_(ids),
+                        Tenant.status.in_(["active", "provision_failed", "warming"]),
+                    ).all()
+                }
+                gone = {
+                    str(t.tenant_id): t for t in Tenant.query.filter(Tenant.tenant_id.in_(ids)).all()
+                    if str(t.tenant_id) not in live
+                }
+
+                engines = get_engine_registry()
+                for tid in resident:
+                    if str(tid) in live:
+                        continue
+                    row = gone.get(str(tid))
+                    self._registry.evict(str(tid))
+                    if engines is not None and row is not None and row.db_name:
+                        engines.dispose_for(row.db_name)
+                    logger.info(
+                        f"RefreshScheduler: evicted loader for a non-live tenant | tenant={tid} "
+                        f"status={row.status if row is not None else 'row missing'}"
+                    )
+        except Exception as e:
+            logger.error(f"RefreshScheduler: reap of non-live loaders failed | {e}", exc_info=True)
+
     def _loop(self):
         while not self._stop.wait(self._tick):
             try:
@@ -81,6 +126,21 @@ class RefreshScheduler:
 
     def _scan_once(self):
         from tenant_snapshot_store import snapshot_store, loader_to_snapshot_dict
+
+        # ── Reap loaders whose tenant is no longer live ─────────────────────
+        # Runs FIRST, so nothing below touches a torn-down tenant.
+        #
+        # Teardown (uninstall, deactivate) evicts the loader and disposes the
+        # engine only in the worker that handled the request. Every other
+        # gunicorn worker keeps its own TenantRegistry, and there the loader
+        # stays resident. The token sweep below would then find the
+        # shopify_tokens row gone, treat it as "expired/missing", and try a
+        # client_credentials refresh for an app the store has just uninstalled
+        # — failing and logging an error every tick, per worker, until that
+        # worker restarted. The catalog sweep would keep probing the store
+        # with a revoked token the same way. Checking status here fixes it
+        # within one tick, in every worker, with no cross-process signalling.
+        self._reap_non_live_loaders()
 
         # ── Retry stuck tenants ───────────────────────────────────────────────
         try:
