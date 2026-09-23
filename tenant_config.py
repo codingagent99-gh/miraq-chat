@@ -10,7 +10,7 @@ bridge anymore — removed rather than left as unreachable code.)
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -31,6 +31,12 @@ class TenantConfig:
 
     # Backend selector
     ecommerce_backend: str = "woocommerce"  # "woocommerce" | "shopify"
+
+    # Outbound HTTP header profile — see http_profiles.py. Read from
+    # tenants.features; "" means "use the default profile".
+    http_profile: str = ""
+    http_profile_pinned: bool = False
+    http_extra_headers: dict = field(default_factory=dict)
 
     # Shopify — per-tenant values only.
     #

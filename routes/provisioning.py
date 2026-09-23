@@ -425,6 +425,71 @@ def activate_free():
     }), 200
 
 
+def _select_http_profile(tenant, tenant_registry, app) -> None:
+    """Probe the store with each header profile and store the first that its
+    firewall lets through in tenant.features["http_profile"].
+
+    Raises when EVERY profile is firewall-blocked: the catalog could still
+    load through wc/v3 while every custom-api call fails, which is exactly
+    the "active but every search returns zero results" state this replaces.
+    A network-level failure is not treated as a block — the build goes ahead
+    and reports its own error. Shopify tenants are skipped (no WordPress).
+    """
+    if (tenant.ecommerce_backend or "woocommerce") != "woocommerce":
+        return
+
+    from http_profiles import HttpProfileState, probe_profiles
+    from tenant_crypto import decrypt_secret
+
+    wp_base = (tenant.wp_base_url or "").rstrip("/")
+    if not wp_base:
+        return  # _rehydrate raises its own clear error for this
+
+    features = dict(tenant.features or {})
+    state = HttpProfileState.from_features(
+        features, tenant_id=tenant.tenant_id, license_id=tenant.license_id, app=app,
+    )
+    result = probe_profiles(
+        state=state,
+        wc_base=f"{wp_base}/wp-json/wc/v3",
+        custom_api_base=f"{wp_base}/wp-json/custom-api/v1",
+        consumer_key=tenant.woo_key or "",
+        consumer_secret=decrypt_secret(tenant.woo_secret_encrypted or ""),
+    )
+
+    if result.chosen:
+        if features.get("http_profile") != result.chosen:
+            features["http_profile"] = result.chosen
+            features["http_profile_source"] = "probe"
+            features["http_profile_updated_at"] = datetime.now(timezone.utc).isoformat()
+            tenant.features = features  # reassign: plain JSONB has no in-place change tracking
+            db.session.commit()
+        logger.info(
+            f"provision-tenant: http_profile={result.chosen} | tenant_id={tenant.tenant_id} | "
+            f"{result.summary()}"
+        )
+        # A re-provision of a tenant that is already resident: get_loader()
+        # will return the cached loader, so update its state in place.
+        resident = dict(tenant_registry.resident_loaders()).get(str(tenant.tenant_id))
+        if resident is not None and getattr(resident, "http", None) is not None:
+            resident.http.reconfigure(profile=result.chosen)
+        return
+
+    if result.all_blocked:
+        raise RuntimeError(
+            "Store firewall blocked every header profile — ask the host to "
+            "whitelist /wp-json/ for this server's IP, or set "
+            "features.http_profile / http_extra_headers on the tenant row. "
+            f"Probe: {result.summary()}"
+        )
+
+    logger.warning(
+        f"provision-tenant: http profile probe inconclusive — keeping "
+        f"{state.name!r} | tenant_id={tenant.tenant_id} | "
+        f"unreachable={result.unreachable} | {result.summary()}"
+    )
+
+
 def _start_background_build(tenant_id, app):
     """
     Kick off the catalog build in a background thread.
@@ -477,6 +542,10 @@ def _start_background_build(tenant_id, app):
                 # _active_builds above is the duplicate-build guard; the lock
                 # inside get_loader() is the single-flight rehydration guard.
                 try:
+                    # Before the catalog build: find the header profile this
+                    # store's firewall accepts, so the loader starts on it.
+                    _select_http_profile(tenant, tenant_registry, app)
+
                     logger.info(f"_start_background_build: calling get_loader() | tenant_id={tenant_id}")
                     loader = tenant_registry.get_loader(tenant)
                     logger.info(

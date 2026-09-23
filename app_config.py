@@ -84,15 +84,8 @@ def get_currency_symbol() -> str:
 # HTTP HEADERS
 # ═══════════════════════════════════════════
 
-BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/121.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+# BROWSER_HEADERS used to live here (unused — nothing imported it).
+# Outbound headers are per tenant now: see http_profiles.py.
 
 # ═══════════════════════════════════════════
 # ORDER & USER HANDLING CONSTANTS

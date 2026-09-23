@@ -16,11 +16,12 @@ from typing import List, Dict, Optional
 from chat_logger import get_logger
 from models.catalog import CatalogAttribute, CatalogCategory, CatalogTag
 from store_loader.config import (
-    REQUEST_TIMEOUT, BROWSER_HEADERS,
+    REQUEST_TIMEOUT,
     DEV_CACHE_ENABLED, UPDATE_DEV_CACHE_ENABLED,
     CURRENCY_MAP,
 )
 from tenant_config import TenantConfig
+from http_profiles import HttpProfileState
 from store_loader.cache import BoundedVariationCache
 from store_loader.fetcher import (
     load_from_local_files,
@@ -94,8 +95,19 @@ class StoreLoader(StoreQueryMixin):
                     "in .env — these are app-wide, not per tenant."
                 )
 
+        # No headers on the session itself: every outbound call takes them
+        # from self.http, this tenant's header profile (see http_profiles.py).
+        # woo_client reads the same state, so the catalog fetch and the chat
+        # calls can no longer drift onto different header sets.
         self.session = requests.Session()
-        self.session.headers.update(BROWSER_HEADERS)
+        self.http = HttpProfileState(
+            tenant_id=config.tenant_id,
+            license_id=config.license_id,
+            profile=config.http_profile or None,
+            pinned=config.http_profile_pinned,
+            extra_headers=config.http_extra_headers,
+            app=app,
+        )
 
         # NOTE: the all-MiniLM-L6-v2 semantic vector model and its
         # tag/attribute/category tensors were removed — utils/typo_correction.py
@@ -203,6 +215,7 @@ class StoreLoader(StoreQueryMixin):
                 data = load_from_live_api(
                     self.session, self.base, self.custom_api_base,
                     self.consumer_key, self.consumer_secret, self.timeout,
+                    http=self.http,
                 )
                 self._loaded_from_cache = False
 
@@ -337,6 +350,7 @@ class StoreLoader(StoreQueryMixin):
             version = fetch_catalog_version(
                 self.session, self.custom_api_base,
                 self.consumer_key, self.consumer_secret,
+                http=self.http,
             )
             if version and version != self._catalog_version:
                 previous = self._catalog_version

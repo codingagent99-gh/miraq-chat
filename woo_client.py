@@ -11,6 +11,7 @@ from requests.auth import HTTPBasicAuth
 
 from models import WooAPICall
 from store_registry import get_store_loader
+from http_profiles import send as http_send, is_waf_block
 from chat_logger import get_logger, get_api_logger, get_order_logger, sanitize_url
 
 logger = get_logger("miraq_chat")
@@ -186,27 +187,22 @@ def _parse_json_tolerant(resp, endpoint_short):
     )
     return data, True
 
-# Minimal headers that pass WordPress.com Atomic's bot detection.
-# Full BROWSER_HEADERS with query-string credentials triggered 429s.
-_BASE_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept":     "application/json",
-}
-
-# Standard WooCommerce REST auth (Basic Auth) and the custom-plugin header
-# pair are now built per-call inside execute() from the resolved tenant
-# loader — see _build_auth() below. Was a module-level constant baked from
-# the single-store env at import time; that's exactly the bug this phase
-# exists to remove.
+# Browser/bot headers are NOT a constant here any more. This used to send a
+# hardcoded minimal set ("Mozilla/5.0" + Accept) — which WordPress.com Atomic
+# accepted and cPanel ModSecurity rejects with 406 — while the catalog
+# fetcher sent a different, full set. Both now come from the tenant's own
+# header profile (loader.http, see http_profiles.py), which is chosen at
+# provisioning and adapts at runtime when a firewall blocks it.
 
 def _build_auth(loader, is_custom_api: bool):
     """Auth strategy, resolved per-call from the tenant's own credentials:
       - custom-api/v1/*  → X-Consumer-Key / X-Consumer-Secret headers
       - wc/v3/*          → HTTPBasicAuth (no credentials in query string)
+    Returns (auth, auth_headers); the profile headers are layered underneath
+    by http_profiles.send().
     """
     if is_custom_api:
         return None, {
-            **_BASE_HEADERS,
             "X-Consumer-Key":    loader.consumer_key,
             "X-Consumer-Secret": loader.consumer_secret,
         }
@@ -217,8 +213,10 @@ class WooClient:
     """Executes WooCommerce API calls."""
 
     def __init__(self):
+        # Shared by every tenant, so it must carry no headers of its own —
+        # session-level headers are merged into every request and would leak
+        # one tenant's profile into another's.
         self.session = http_requests.Session()
-        self.session.headers.update(_BASE_HEADERS)
 
     def execute(self, api_call: WooAPICall, loader=None) -> dict:
         """Execute a single API call and return raw response.
@@ -336,18 +334,23 @@ class WooClient:
             # time waiting on WooCommerce from time spent in our own code.
             import timing_logger
             with timing_logger.stage("woo_api"):
+                # http_send retries with the tenant's other header profiles
+                # ONLY on a recognisable firewall block (nothing reached
+                # WordPress), never on timeouts or WordPress errors — so this
+                # is safe for order creation too.
                 if api_call.method == "GET":
-                    resp = self.session.get(
-                        endpoint,
+                    resp = http_send(
+                        self.session, "GET", endpoint,
+                        state=loader.http,
                         auth=auth,
                         headers=headers,
                         params=params,
                         timeout=45,
                     )
                 else:
-                    resp = self.session.request(
-                        method=api_call.method,
-                        url=endpoint,
+                    resp = http_send(
+                        self.session, api_call.method, endpoint,
+                        state=loader.http,
                         auth=auth,
                         headers=headers,
                         params=params,
@@ -477,6 +480,11 @@ class WooClient:
             # Collapsing it to a bare string forced every caller into a
             # generic "something went wrong", hiding the real cause.
             _err = {"success": False, "data": [], "error": str(e)}
+            # Lets callers tell "the store's firewall refused us" apart from
+            # a genuinely empty result instead of reporting "Zero results".
+            if is_waf_block(resp):
+                _err["waf_blocked"] = True
+                _err["http_profile"] = loader.http.name
             if hasattr(e, "response") and e.response is not None:
                 try:
                     _body = e.response.json()

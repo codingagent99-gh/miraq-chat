@@ -12,26 +12,27 @@ import requests
 from requests.auth import HTTPBasicAuth
 
 from chat_logger import get_logger
+from http_profiles import HttpProfileState, send
 from store_loader.config import (
     DATA_DIR, FILE_MAP, DEV_CACHE_DIR,
-    CURRENCY_MAP, BROWSER_HEADERS,
+    CURRENCY_MAP,
 )
 
 logger = get_logger("miraq_chat")
 
 
+def _state(http: Optional[HttpProfileState]) -> HttpProfileState:
+    return http if http is not None else HttpProfileState()
 
-# Sent on every outbound call to a tenant's store.
-_API_HEADERS = dict(BROWSER_HEADERS)
 
-def _custom_api_headers(consumer_key: str, consumer_secret: str) -> dict:
+def _custom_api_auth_headers(consumer_key: str, consumer_secret: str) -> dict:
     """
-    Headers for the custom-api/v1/* endpoints.
+    Auth headers for the custom-api/v1/* endpoints — merged on top of the
+    tenant's profile headers by http_profiles.send().
     WC_Chat_Security.validate_request() reads credentials from
     X-Consumer-Key / X-Consumer-Secret, NOT from Basic Auth.
     """
     return {
-        **_API_HEADERS,
         "X-Consumer-Key":    consumer_key,
         "X-Consumer-Secret": consumer_secret,
     }
@@ -148,8 +149,10 @@ def _wait_for_retry(resp, attempt: int, url: str):
 
 def fetch_all_pages(session, url: str, consumer_key: str, consumer_secret: str,
                     extra_params: Dict = None, timeout: int = 30,
-                    max_retries: int = 3) -> List[Dict]:
+                    max_retries: int = 3,
+                    http: Optional[HttpProfileState] = None) -> List[Dict]:
     """Fetch all pages from a paginated WooCommerce REST endpoint."""
+    http      = _state(http)
     auth      = HTTPBasicAuth(consumer_key, consumer_secret)
     all_items = []
     page      = 1
@@ -163,8 +166,8 @@ def fetch_all_pages(session, url: str, consumer_key: str, consumer_secret: str,
         resp = None
         for attempt in range(max_retries):
             try:
-                resp = session.get(url, auth=auth, headers=_API_HEADERS,
-                                   params=params, timeout=timeout)
+                resp = send(session, "GET", url, state=http, auth=auth,
+                            params=params, timeout=timeout)
                 if page == 1:
                     logger.debug(f"RAW RESPONSE [{resp.status_code}]: {resp.text[:500]}")
                 resp.raise_for_status()
@@ -191,8 +194,11 @@ def fetch_all_pages(session, url: str, consumer_key: str, consumer_secret: str,
 
 def fetch_all_pages_with_total(session, url: str, consumer_key: str, consumer_secret: str,
                                extra_params: Dict = None, timeout: int = 30,
-                               max_retries: int = 3) -> Tuple[List[Dict], Optional[int]]:
+                               max_retries: int = 3,
+                               http: Optional[HttpProfileState] = None
+                               ) -> Tuple[List[Dict], Optional[int]]:
     """Fetch all pages and return (items, expected_total)."""
+    http           = _state(http)
     auth           = HTTPBasicAuth(consumer_key, consumer_secret)
     all_items      = []
     page           = 1
@@ -207,8 +213,8 @@ def fetch_all_pages_with_total(session, url: str, consumer_key: str, consumer_se
         resp = None
         for attempt in range(max_retries):
             try:
-                resp = session.get(url, auth=auth, headers=_API_HEADERS,
-                                   params=params, timeout=timeout)
+                resp = send(session, "GET", url, state=http, auth=auth,
+                            params=params, timeout=timeout)
                 resp.raise_for_status()
                 data = resp.json()
                 break
@@ -240,13 +246,14 @@ def fetch_all_pages_with_total(session, url: str, consumer_key: str, consumer_se
 
 
 def fetch_currency_symbol(session, base_url: str, consumer_key: str,
-                          consumer_secret: str, timeout: int = 30) -> str:
+                          consumer_secret: str, timeout: int = 30,
+                          http: Optional[HttpProfileState] = None) -> str:
     """Fetch the active currency symbol from WooCommerce."""
     logger.info("StoreLoader: Fetching store currency...")
     try:
         url  = f"{base_url}/data/currencies/current"
         auth = HTTPBasicAuth(consumer_key, consumer_secret)
-        resp = session.get(url, auth=auth, headers=_API_HEADERS, timeout=timeout)
+        resp = send(session, "GET", url, state=_state(http), auth=auth, timeout=timeout)
         resp.raise_for_status()
         data   = resp.json()
         symbol = data.get("symbol")
@@ -261,7 +268,8 @@ def fetch_currency_symbol(session, base_url: str, consumer_key: str,
 
 def fetch_catalog_version(session, custom_api_base: str,
                          consumer_key: str, consumer_secret: str,
-                         timeout: int = 10) -> Optional[str]:
+                         timeout: int = 10,
+                         http: Optional[HttpProfileState] = None) -> Optional[str]:
     """Fetch the store's catalog fingerprint from custom-api/v1/catalog-version.
 
     Returns the token, or None if the probe could not be completed for ANY
@@ -277,9 +285,9 @@ def fetch_catalog_version(session, custom_api_base: str,
     """
     url = f"{custom_api_base}/catalog-version"
     try:
-        resp = session.get(
-            url,
-            headers=_custom_api_headers(consumer_key, consumer_secret),
+        resp = send(
+            session, "GET", url, state=_state(http),
+            headers=_custom_api_auth_headers(consumer_key, consumer_secret),
             timeout=timeout,
         )
         resp.raise_for_status()
@@ -301,24 +309,29 @@ def fetch_catalog_version(session, custom_api_base: str,
 
 def load_from_live_api(session, base_url: str, custom_api_base: str,
                        consumer_key: str, consumer_secret: str,
-                       timeout: int = 30) -> dict:
+                       timeout: int = 30,
+                       http: Optional[HttpProfileState] = None) -> dict:
     """
     Fetch all store data from live WooCommerce API.
     Returns same dict shape as load_from_local_files().
     """
-    logger.info("StoreLoader: 🌐 Fetching data from live WooCommerce API...")
+    http = _state(http)
+    logger.info(
+        f"StoreLoader: 🌐 Fetching data from live WooCommerce API... "
+        f"| http_profile={http.name}"
+    )
 
     currency_symbol = fetch_currency_symbol(
-        session, base_url, consumer_key, consumer_secret, timeout
+        session, base_url, consumer_key, consumer_secret, timeout, http=http,
     )
 
     # Attributes — custom endpoint, auth via HTTPBasicAuth
     custom_attr_url = f"{custom_api_base}/all-attributes"
     logger.info(f"StoreLoader: Fetching attributes from {custom_attr_url}")
     try:
-        resp = session.get(
-            custom_attr_url,
-            headers=_custom_api_headers(consumer_key, consumer_secret),
+        resp = send(
+            session, "GET", custom_attr_url, state=http,
+            headers=_custom_api_auth_headers(consumer_key, consumer_secret),
             timeout=timeout,
         )
         resp.raise_for_status()
@@ -337,21 +350,21 @@ def load_from_live_api(session, base_url: str, custom_api_base: str,
     logger.info("StoreLoader: Fetching categories...")
     categories = fetch_all_pages(
         session, f"{base_url}/products/categories",
-        consumer_key, consumer_secret, {"hide_empty": True}, timeout,
+        consumer_key, consumer_secret, {"hide_empty": True}, timeout, http=http,
     )
 
     # Tags
     logger.info("StoreLoader: Fetching tags...")
     tags = fetch_all_pages(
         session, f"{base_url}/products/tags",
-        consumer_key, consumer_secret, {"hide_empty": True}, timeout,
+        consumer_key, consumer_secret, {"hide_empty": True}, timeout, http=http,
     )
 
     # Products
     logger.info("StoreLoader: Fetching products...")
     products, expected_product_count = fetch_all_pages_with_total(
         session, f"{base_url}/products", consumer_key, consumer_secret,
-        {"status": "publish", "per_page": 100}, timeout,
+        {"status": "publish", "per_page": 100}, timeout, http=http,
     )
 
     return {

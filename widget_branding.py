@@ -27,8 +27,8 @@ from datetime import datetime, timezone
 import requests as req
 
 from chat_logger import get_logger
+from http_profiles import HttpProfileState, send as http_send
 from models import db, Tenant
-from store_loader.config import BROWSER_HEADERS
 from tenant_crypto import decrypt_secret
 
 logger = get_logger("miraq_chat")
@@ -62,12 +62,16 @@ def fetch_and_store_widget_branding(tenant: Tenant) -> bool:
 
     target_url = f"{wp_base}/wp-json/wdget-logo-uploader/v1/data"
     try:
+        # Same header profile as every other call to this store. Prefer the
+        # resident loader's live state (it may have switched profiles since
+        # the row was read); fall back to the row's stored profile.
+        http = _http_state_for(tenant)
         headers = {
-            **BROWSER_HEADERS,
             "X-Consumer-Key":    tenant.woo_key,
             "X-Consumer-Secret": decrypt_secret(tenant.woo_secret_encrypted),
         }
-        resp = req.get(target_url, headers=headers, timeout=10)
+        resp = http_send(req.Session(), "GET", target_url, state=http,
+                         headers=headers, timeout=10)
         resp.raise_for_status()
         data = resp.json()
 
@@ -88,6 +92,19 @@ def fetch_and_store_widget_branding(tenant: Tenant) -> bool:
             f"{type(e).__name__}: {e}"
         )
         return False
+
+
+def _http_state_for(tenant: Tenant) -> HttpProfileState:
+    try:
+        from store_registry import get_tenant_registry
+        registry = get_tenant_registry()
+        if registry is not None:
+            loader = dict(registry.resident_loaders()).get(str(tenant.tenant_id))
+            if loader is not None and getattr(loader, "http", None) is not None:
+                return loader.http
+    except Exception:
+        pass
+    return HttpProfileState.from_tenant(tenant)
 
 
 def store_widget_branding(tenant: Tenant, *, image_url: str, text: str) -> None:

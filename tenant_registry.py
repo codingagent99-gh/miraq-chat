@@ -170,6 +170,7 @@ class TenantRegistry:
                 raise RuntimeError(f"wp_base_url is empty for tenant {tenant_row.license_id}")
 
             logger.info(f"TenantRegistry: building TenantConfig (woocommerce) | tenant={tenant_row.license_id}")
+            _features = dict(tenant_row.features or {})
             config = TenantConfig(
                 wp_base_url=_wp_base,
                 woo_base_url=f"{_wp_base}/wp-json/wc/v3",
@@ -180,9 +181,16 @@ class TenantRegistry:
                 ecommerce_backend=tenant_row.ecommerce_backend,
                 license_id=tenant_row.license_id,
                 tenant_id=str(tenant_row.tenant_id),
+                http_profile=_features.get("http_profile") or "",
+                http_profile_pinned=bool(_features.get("http_profile_pinned")),
+                http_extra_headers=_features.get("http_extra_headers") or {},
             )
             logger.info(f"TenantRegistry: woo_key={'present' if config.woo_key else 'MISSING'} | tenant={tenant_row.license_id}")
             logger.info(f"TenantRegistry: woo_secret={'present' if config.woo_secret else 'MISSING'} | tenant={tenant_row.license_id}")
+            logger.info(
+                f"TenantRegistry: http_profile={config.http_profile or '<default>'} | "
+                f"pinned={config.http_profile_pinned} | tenant={tenant_row.license_id}"
+            )
 
         logger.info(f"TenantRegistry: constructing StoreLoader | tenant={tenant_row.license_id}")
         loader = StoreLoader(config=config, app=self._app)
