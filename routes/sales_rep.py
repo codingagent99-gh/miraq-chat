@@ -21,6 +21,10 @@ sales_rep_bp = Blueprint("sales_rep", __name__)
 def recent_products():
     t_start = time.time()
 
+    from store_registry import sales_tools_enabled
+    if not sales_tools_enabled():
+        return jsonify({"success": False, "products": [], "error": "not available for this store"}), 404
+
     # Step 1: Validate customer_id
     customer_id = request.args.get("customer_id")
     if not customer_id:

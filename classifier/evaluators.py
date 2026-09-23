@@ -277,6 +277,7 @@ class ProductDetailEvaluator(IntentEvaluator):
 
 
 class OrderStatsEvaluator(IntentEvaluator):
+    requires_sales_tools = True  # skipped unless the tenant opts in (store_registry.sales_tools_enabled)
     """
     Detects order/sample reporting: "how many samples did <rep> order this
     quarter", "who ordered how many last month", "month to date order list",
@@ -857,6 +858,7 @@ class CartCheckoutEvaluator(IntentEvaluator):
         return None, 0.0
 
 class BulkOrderEvaluator(IntentEvaluator):
+    requires_sales_tools = True  # skipped unless the tenant opts in (store_registry.sales_tools_enabled)
     KEYWORDS = frozenset({
         "bulk", "buy", "buying", "order", "ordering", "place", "purchase",
         "reorder",
@@ -991,8 +993,13 @@ class ClassifierPipeline:
 
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Intent, float]:
         logger.debug(f"ClassifierPipeline: Starting evaluation for text={text!r}")
+        from store_registry import sales_tools_enabled
+        _sales_tools = sales_tools_enabled()
         for evaluator in self.evaluators:
             name = evaluator.__class__.__name__
+            if getattr(evaluator, "requires_sales_tools", False) and not _sales_tools:
+                logger.debug(f"ClassifierPipeline: ⏭️ {name} skipped (sales tools off for this tenant).")
+                continue
             intent, confidence = evaluator.evaluate(text, entities)
             if intent is not None:
                 logger.info(f"ClassifierPipeline: 🎯 {name} -> intent={intent.value} (conf={confidence})")

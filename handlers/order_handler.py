@@ -254,6 +254,8 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
     try:
         from flask import request as _req
         _role = (_req.get_json(silent=True) or {}).get("user_context", {}).get("role", "")
+        from store_registry import effective_role
+        _role = effective_role(_role)
     except Exception:
         pass
     _can_view = CUSTOM_ORDER_ROLES | ORDER_REPORT_ADMIN_ROLES

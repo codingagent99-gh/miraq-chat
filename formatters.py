@@ -78,6 +78,13 @@ def format_category(raw: dict) -> dict:
     }
 
 
+def _store_currency_symbol() -> str:
+    """This tenant's currency symbol, or "" when no loader is bound — an empty
+    symbol lets the widget fall back to its own, never to a wrong one."""
+    loader = get_store_loader()
+    return getattr(loader, "currency_symbol", "") or ""
+
+
 def format_product(raw: dict) -> dict:
     """Convert raw WooCommerce product to clean response format."""
     images = raw.get("images", [])
@@ -150,6 +157,8 @@ def format_product(raw: dict) -> dict:
         "raw_attributes": _format_attributes(raw.get("attributes", []), include_hidden=True),
         "variations":    raw.get("variations", []),
         "total_sales":   raw.get("total_sales", 0),
+        # The store's currency, so the widget's product cards stop assuming $.
+        "currency_symbol": _store_currency_symbol(),
     }
 
 def _format_attributes(attrs: list, include_hidden: bool = False) -> list:
@@ -218,6 +227,8 @@ def format_custom_product(raw: dict) -> dict:
         "attributes":    attributes,
         "variations":    raw.get("variations", []),
         "total_sales":   raw.get("total_sales", 0),
+        # The store's currency, so the widget's product cards stop assuming $.
+        "currency_symbol": _store_currency_symbol(),
     }
 
 def variation_image_urls(raw: dict) -> list:

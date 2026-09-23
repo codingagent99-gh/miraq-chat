@@ -80,12 +80,6 @@ def get_currency_symbol() -> str:
         return loader.currency_symbol
     return "$"
 
-# ═══════════════════════════════════════════
-# HTTP HEADERS
-# ═══════════════════════════════════════════
-
-# BROWSER_HEADERS used to live here (unused — nothing imported it).
-# Outbound headers are per tenant now: see http_profiles.py.
 
 # ═══════════════════════════════════════════
 # ORDER & USER HANDLING CONSTANTS

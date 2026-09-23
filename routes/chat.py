@@ -65,7 +65,7 @@ _LEGACY_FLOW_STATE_ALIASES = {
     "awaiting_order_for_email": FlowState.AWAITING_ORDER_FOR_CUSTOMER,
 }
 from chat_logger import get_logger, sanitize_log_string
-from store_registry import get_store_loader
+from store_registry import get_store_loader, effective_role
 from ecommerce import endpoints
 from ecommerce.cart_actions import build_cart_add_action
 from ecommerce.unsupported import (
@@ -1805,8 +1805,13 @@ def chat():
     customer_id  = conversation.customer_id
     user_context = conversation.context_data or {}
 
-    # Persist role into user_context so handlers can read it without payload_context
-    role = payload_context.get("role", "")
+    # Persist role into user_context so handlers can read it without payload_context.
+    # effective_role(): with this tenant's sales tools off, staff roles are
+    # served as a customer — see store_registry.effective_role.
+    _raw_role = payload_context.get("role", "")
+    role = effective_role(_raw_role)
+    if role != (_raw_role or "").strip():
+        logger.info(f"chat: role {_raw_role!r} served as {role!r} (sales tools off for this tenant)")
     if role and user_context.get("role") != role:
         user_context["role"] = role
 

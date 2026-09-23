@@ -435,10 +435,14 @@ def widget_config():
     from flask import g
     tenant = g.__dict__.get("tenant")
     if tenant is None:
-        return jsonify({"image_url": "", "text": ""}), 200
+        return jsonify({"image_url": "", "text": "", "currency_symbol": ""}), 200
+    # The store's currency, for the widget's cart/checkout fallbacks. Read
+    # from the resident loader (already bound for this request) — no store call.
+    _loader = get_store_loader()
     return jsonify({
-        "image_url": tenant.widget_logo_url or "",
-        "text":      tenant.widget_header_text or "",
+        "image_url":       tenant.widget_logo_url or "",
+        "text":            tenant.widget_header_text or "",
+        "currency_symbol": getattr(_loader, "currency_symbol", "") or "",
     })
 
 @app.route("/debug-plan")
