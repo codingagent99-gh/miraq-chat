@@ -805,11 +805,31 @@ def extract_collection_year(text: str, entities: ExtractedEntities):
                     entities.tag_slugs.append(_resolve_tag_key_with_fallback(loader, tag["slug"]))
 
 
+# Words the stock/sale extractor keys off. Protected from typo correction via
+# classifier/keywords.py — undeclared, "stock" was rewritten to the catalog
+# word "stick" (one edit away) on an appliance store, so "in stock" became
+# "in stick" and no stock question on that store ever reached this function.
+STOCK_STATUS_KEYWORDS = frozenset({
+    "stock", "instock", "outofstock", "available", "unavailable",
+    "availability", "sold", "soldout", "sale", "discount", "discounted",
+    "clearance",
+})
+
+# Negatives first: "not available" contains "available", "not in stock"
+# contains "in stock". [\s-]* accepts "in stock", "in-stock" and "instock".
+_OUT_OF_STOCK_RE = re.compile(
+    r"\b(?:out[\s-]*of[\s-]*stock|no\s+stock|sold[\s-]*out|unavailable"
+    r"|not\s+(?:in[\s-]*stock|available))\b",
+    re.IGNORECASE,
+)
+_IN_STOCK_RE = re.compile(r"\b(?:in[\s-]*stock|available)\b", re.IGNORECASE)
+
+
 def extract_stock_status(text: str, entities: ExtractedEntities):
     """Extract stock and sale status flags."""
-    if re.search(r"\b(?:out\s+of\s+stock|no\s+stock|unavailable)\b", text, re.IGNORECASE):
+    if _OUT_OF_STOCK_RE.search(text):
         entities.in_stock = False
-    elif re.search(r"\b(?:in\s+stock|available)\b", text, re.IGNORECASE):
+    elif _IN_STOCK_RE.search(text):
         entities.in_stock = True
     if re.search(r"\b(?:on\s+sale|discount(?:ed)?|clearance)\b", text, re.IGNORECASE):
         entities.on_sale = True

@@ -83,8 +83,9 @@ def build_classifier_keywords() -> frozenset:
     # reaching the classifier. Failing soft: a missing/renamed constant must
     # never block vocab build, same as the evaluator union above.
     try:
-        from classifier.extractors import TIME_RANGE_KEYWORDS
+        from classifier.extractors import TIME_RANGE_KEYWORDS, STOCK_STATUS_KEYWORDS
         words.update(w.lower() for w in TIME_RANGE_KEYWORDS)
+        words.update(w.lower() for w in STOCK_STATUS_KEYWORDS)
     except Exception as exc:
         logger.error(f"build_classifier_keywords: extractor keywords failed: {exc}")
 

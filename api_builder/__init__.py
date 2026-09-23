@@ -572,6 +572,7 @@ def _build_category_browse(e, page) -> list:
         or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
         description=f"Browse category '{e.category_name}'",
         min_price=e.min_price, max_price=e.max_price,
+        in_stock=e.in_stock,
     )]
 
 
@@ -833,9 +834,13 @@ def _build_filter_by_attribute(e, page, user_message: str = "") -> list:
     # (e.g. "gray" when the catalog stores "FOLATA Gray", "FOLATA Dark Gray").
     # Only promote search_term to actual_search when there are NO taxonomy signals
     # at all and it must act as a last-resort text search.
+    # A stock filter is a real filter on its own, as in _build_product_search:
+    # without it, "anything out of stock?" sent the leftover words
+    # ("anything of") as a text search and matched nothing.
     _has_taxonomy = bool(
         attr_filters or deduped_tag_slugs
         or e.target_category_slugs or e.attr_tag_or_pairs or e.product_id
+        or e.in_stock is not None
     )
     actual_search = e.product_name or (e.search_term if not _has_taxonomy else None)
     if not actual_search and not _has_taxonomy:

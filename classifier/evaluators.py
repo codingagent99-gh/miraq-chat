@@ -815,7 +815,9 @@ class GeneralFallbackEvaluator(IntentEvaluator):
                         return Intent.PRODUCT_SEARCH, 0.80
                 return Intent.PRODUCT_LIST, 0.75
 
-        if (entities.attributes or getattr(entities, 'attr_tag_or_pairs', []) or entities.in_stock) and not entities.product_name:
+        # `is not None`: in_stock=False ("what's out of stock?") is a real
+        # filter too — truthiness dropped it and the question came back UNKNOWN.
+        if (entities.attributes or getattr(entities, 'attr_tag_or_pairs', []) or entities.in_stock is not None) and not entities.product_name:
             return Intent.FILTER_BY_ATTRIBUTE, 0.89
 
         return Intent.UNKNOWN, 0.0
