@@ -222,12 +222,21 @@ def _product_card(p: dict, symbol: str) -> Optional[ProductCard]:
     name = (p.get("name") or "").replace("&amp;", "&").strip()
     if not name:
         return None
-    price = _money(p.get("price"), symbol)
+    # No price shown for a product the store won't sell: in WooCommerce that
+    # means it has no price, which would otherwise read as "$0.00".
+    price = _money(p.get("price"), symbol) if p.get("purchasable") is not False else ""
     if p.get("on_sale") and p.get("regular_price") and price:
         regular = _money(p.get("regular_price"), symbol)
         if regular and regular != price:
             price = f"{price} (was {regular})"
-    stock = "In stock" if p.get("in_stock") else "Out of stock"
+    # Stock and purchasability are separate (formatters._stock_flags): an
+    # unpriced product is in stock but can't be ordered.
+    if p.get("in_stock") is False:
+        stock = "Out of stock"
+    elif p.get("purchasable") is False:
+        stock = "Not available to buy"
+    else:
+        stock = "In stock"
     price_line = " · ".join(x for x in (price, stock) if x)
     images = p.get("images") or []
     image = images[0] if images and isinstance(images[0], str) else ""

@@ -85,6 +85,25 @@ def _store_currency_symbol() -> str:
     return getattr(loader, "currency_symbol", "") or ""
 
 
+def _stock_flags(raw: dict) -> tuple:
+    """(in_stock, purchasable) — two different facts, reported separately.
+
+    in_stock used to be "in stock AND purchasable". WooCommerce marks a
+    product unpurchasable when it has no price, so every unpriced product was
+    shown as OUT OF STOCK — on the widget and on WhatsApp/Instagram — while
+    actually in stock. Now in_stock is stock only (WooCommerce's own
+    is_in_stock() when the plugin sends it, else stock_status, where
+    "onbackorder" counts as orderable just as WooCommerce treats it), and
+    purchasable says whether it can be ordered at all.
+    """
+    reported = raw.get("in_stock")
+    if isinstance(reported, bool):
+        in_stock = reported
+    else:
+        in_stock = (raw.get("stock_status") or "instock") != "outofstock"
+    return in_stock, bool(raw.get("purchasable", True))
+
+
 def format_product(raw: dict) -> dict:
     """Convert raw WooCommerce product to clean response format."""
     images = raw.get("images", [])
@@ -124,8 +143,7 @@ def format_product(raw: dict) -> dict:
     
     # ── SMART STOCK CHECK ──
     raw_status = raw.get("stock_status", "instock")
-    purchasable = raw.get("purchasable", True)  # False when all variations are OOS
-    is_in_stock = (raw_status != "outofstock") and purchasable
+    is_in_stock, purchasable = _stock_flags(raw)
     
     if raw.get("type") == "variable" and not is_in_stock:
         variations = raw.get("variations", [])
@@ -141,6 +159,7 @@ def format_product(raw: dict) -> dict:
         "id": raw.get("id"),
         "name": raw.get("name"),
         "in_stock": is_in_stock, 
+        "purchasable": purchasable,
         "stock_status": raw_status,
         "slug":          raw.get("slug", ""),
         "sku":           raw.get("sku", ""),
@@ -193,7 +212,7 @@ def format_custom_product(raw: dict) -> dict:
     sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
     
     # ── HONEST DATA ──
-    is_in_stock = raw.get("stock_status") == "instock" and raw.get("purchasable", True)
+    is_in_stock, purchasable = _stock_flags(raw)
     is_on_sale = bool(sale_price_raw and sale_price_raw != "")
 
     # Attributes come as {slug: {...}} — convert to [{name, options}]
@@ -221,6 +240,7 @@ def format_custom_product(raw: dict) -> dict:
         "sale_price":    sale_price,
         "on_sale":       is_on_sale,
         "in_stock":      is_in_stock,
+        "purchasable":   purchasable,
         "categories":    cat_names,
         "tags":          tag_names,
         "images":        image_urls,
@@ -269,7 +289,7 @@ def format_variation(raw: dict, parent: dict = None) -> dict:
     sale_price = _safe_float(sale_price_raw) if sale_price_raw else None
 
     # ── HONEST DATA ──
-    is_in_stock = raw.get("stock_status") == "instock" and raw.get("purchasable", True)
+    is_in_stock, purchasable = _stock_flags(raw)
     is_on_sale = raw.get("on_sale", False)
 
     attrs_raw = raw.get("attributes", [])
@@ -307,6 +327,7 @@ def format_variation(raw: dict, parent: dict = None) -> dict:
         "sale_price":      sale_price,
         "on_sale":         is_on_sale,
         "in_stock":        is_in_stock,
+        "purchasable":     purchasable,
         "images":          var_images,
         "attributes":      attrs,
         "variation_label": attr_label,

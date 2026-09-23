@@ -1767,6 +1767,7 @@ def chat():
             "pagination": default_pagination(),
         }), 400
 
+    print(f"POST /chat | body: {body}")
     message = body.get("message", "").strip()
     page    = int(body.get("page", 1))
 
