@@ -1097,6 +1097,37 @@ def _execute_loader_memory_call(call) -> list:
     return []
 
 
+def _store_unreachable(api_responses) -> bool:
+    """True when nothing came back because the store could not be reached.
+
+    Every call failed, and every failure is on the store's side of the wire:
+    a firewall block, a timeout / connection error (no HTTP status), or a
+    5xx. A WordPress error with its own code ("no rep by that name", 404 on
+    an order) is a real answer and is left to the normal handling. Without
+    this, a blocked store fell through to the empty-results path and told the
+    customer the product does not exist.
+    """
+    if not api_responses:
+        return False
+    for resp in api_responses:
+        if resp.get("success"):
+            return False
+        if resp.get("waf_blocked"):
+            continue
+        if resp.get("error_code"):
+            return False
+        status = resp.get("status_code")
+        if status is not None and status < 500:
+            return False
+    return True
+
+
+_STORE_UNREACHABLE_MESSAGE = (
+    "I'm having trouble reaching the store right now, so I can't look that up. "
+    "Please try again in a few minutes."
+)
+
+
 def _execute_api_calls(intent, api_calls, _resolve_variant):
     if _resolve_variant:
         return [], [], [], []
@@ -2863,6 +2894,33 @@ def chat():
             all_products_raw, order_data, api_responses, api_calls_to_execute = (
                 _execute_api_calls(intent, api_calls, _resolve_variant)
             )
+
+            # ── Store unreachable: say so instead of "no results" ────────────
+            # Flow state is left as it was, so the customer can simply resend.
+            if _store_unreachable(api_responses):
+                _waf = any(r.get("waf_blocked") for r in api_responses)
+                logger.error(
+                    f"Store unreachable | intent={intent.value} | calls={len(api_responses)} | "
+                    f"waf_blocked={_waf} | errors="
+                    f"{[(r.get('status_code'), str(r.get('error', ''))[:80]) for r in api_responses]}"
+                )
+                elapsed = round((time.time() - start_time) * 1000)
+                return _ft((jsonify({
+                    "success":     True,
+                    "bot_message": _STORE_UNREACHABLE_MESSAGE,
+                    "intent":      intent.value,
+                    "products":    [],
+                    "suggestions": [],
+                    "session_id":  str(conversation.id),
+                    "metadata": {
+                        "response_time_ms":   elapsed,
+                        "store_unreachable":  True,
+                        "waf_blocked":        _waf,
+                    },
+                    "flow_state":  current_flow_state.value,
+                    "pagination":  default_pagination(page),
+                    "actions":     [],
+                }), 200))
 
             log_matched_products(all_products_raw, api_calls_to_execute, intent=intent)
 

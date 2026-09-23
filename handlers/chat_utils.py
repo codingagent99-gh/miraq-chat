@@ -2,6 +2,7 @@
 handlers/chat_utils.py — Shared helper functions used across chat handlers.
 """
 
+import html
 import re
 
 import uuid
@@ -610,7 +611,7 @@ def format_order_for_frontend(order: dict) -> dict:
         "id": order.get("id"),
         "order_number": str(order.get("number") or order.get("id", "")),
         "status": order.get("status", "unknown"),
-        "currency": order.get("currency_symbol") or get_currency_symbol(),
+        "currency": html.unescape(order.get("currency_symbol") or "") or get_currency_symbol(),
         # ISO code as well as the symbol: a spreadsheet wants "INR", which
         # sorts and filters, not "₹", which does neither.
         "currency_code": order.get("currency", ""),

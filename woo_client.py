@@ -486,12 +486,12 @@ class WooClient:
                 _err["waf_blocked"] = True
                 _err["http_profile"] = loader.http.name
             if hasattr(e, "response") and e.response is not None:
+                _err["status_code"] = e.response.status_code
                 try:
                     _body = e.response.json()
                     if isinstance(_body, dict) and _body.get("code"):
                         _err["error_code"] = _body.get("code")
                         _err["error_message"] = _body.get("message")
-                    _err["status_code"] = e.response.status_code
                 except Exception:
                     pass
             return _err

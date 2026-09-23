@@ -4,6 +4,7 @@ from raw WooCommerce data: category keywords, tag/attribute indexes,
 product search index, and longest-match catalog.
 """
 
+import html
 import os
 import re
 import json
@@ -203,6 +204,13 @@ def build_all_lookups(loader, raw=None):
     Passing it here rather than assigning it on the loader first means the raw
     data and the indexes derived from it become visible in the same instant.
     """
+    raw = dict(raw or {})
+    if "currency_symbol" in raw:
+        # WooCommerce's /data/currencies/current returns the symbol
+        # HTML-encoded ("&#36;" for $), which the bot then showed verbatim.
+        # Decoded here rather than in the fetcher so snapshots saved before
+        # this fix come back clean too.
+        raw["currency_symbol"] = html.unescape(str(raw["currency_symbol"] or "")).strip() or "$"
     staging = _LookupStaging(loader, raw)
     _build_lookups_into(staging)
     staging.publish()

@@ -2,6 +2,7 @@
 Response generation module for bot messages, suggestions, and formatting.
 """
 
+import html
 from typing import List, Optional
 from datetime import datetime
 
@@ -981,7 +982,7 @@ def format_order_detail(order: dict) -> str:
     order_number = order.get("number", str(order.get("id", "N/A")))
     status = order.get("status", "unknown").title()
     # Prefer currency_symbol from WooCommerce order response, fall back to configured symbol
-    currency = order.get("currency_symbol") or CS
+    currency = html.unescape(order.get("currency_symbol") or "") or CS
     total = order.get("total", "0")
     subtotal = order.get("subtotal", "")
     date_created = order.get("date_created", "")
