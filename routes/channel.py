@@ -56,6 +56,7 @@ from channels.common import build_turn
 from chat_logger import get_logger
 from models import db, ChannelConnection, Conversation, Message, Tenant
 from store_registry import bind_tenant_db, get_tenant_registry
+from identity import CHANNEL_ENVIRON_KEY
 
 logger = get_logger("miraq_chat")
 
@@ -113,6 +114,10 @@ def _dispatch_chat(body: dict, session_id: uuid.UUID, license_id: str):
     """Run POST /chat in-process for this tenant. Returns (status_code, json_dict)."""
     app = current_app._get_current_object()
     remote_addr = request.remote_addr or ""
+    # /chat ignores identity in the body (identity.py). The channel service is
+    # authenticated by X-MiraQ-Channel-Key, so its customer_id is passed on
+    # the in-process request's environ, which an HTTP client cannot set.
+    _customer_id = ((body.get("user_context") or {}).get("customer_id")) or ""
     with app.app_context():
         with app.test_request_context(
             "/chat",
@@ -122,7 +127,10 @@ def _dispatch_chat(body: dict, session_id: uuid.UUID, license_id: str):
                 "X-MiraQ-Session": str(session_id),
                 "X-MiraQ-License-Id": license_id,
             },
-            environ_base={"REMOTE_ADDR": remote_addr},
+            environ_base={
+                "REMOTE_ADDR": remote_addr,
+                CHANNEL_ENVIRON_KEY: {"customer_id": str(_customer_id)},
+            },
         ):
             resp = app.full_dispatch_request()
             return resp.status_code, (resp.get_json(silent=True) or {})

@@ -255,6 +255,26 @@ def _bind_optional_tenant(license_id: str) -> None:
         logger.warning(f"_bind_optional_tenant: could not bind | license_id={(license_id or '')[:8]!r} | {e}")
         g.store_loader = None
 
+def _bind_identity(tenant):
+    """Bind the VERIFIED caller identity to g.identity (see identity.py).
+
+    Every handler reads who the customer is from here — never from the
+    request body. Returns a 401 response only for a genuine WooCommerce token
+    that has expired, so the widget refreshes it and retries; anything else
+    that fails verification is simply served as a guest.
+    """
+    from identity import resolve_identity, IdentityExpired, GUEST
+    try:
+        g.identity = resolve_identity(tenant)
+    except IdentityExpired:
+        g.identity = GUEST
+        return jsonify({"success": False, "error": "identity_expired"}), 401
+    except Exception as e:
+        logger.error(f"identity: resolution failed — serving as guest | license_id={tenant.license_id!r} | {e}")
+        g.identity = GUEST
+    return None
+
+
 def register_before_request(app) -> None:
     @app.before_request
     def _resolve_tenant():
@@ -327,7 +347,7 @@ def register_before_request(app) -> None:
                 )
                 g.store_loader = None
             g.db_engine = _engine_registry.get_engine(tenant.db_name)
-            return None
+            return _bind_identity(tenant)
 
         if not tenant.is_active:
             logger.warning(f"Inactive tenant={license_id!r} ({tenant.status}) → 403")
@@ -340,4 +360,4 @@ def register_before_request(app) -> None:
         g.ecommerce_backend = tenant.ecommerce_backend
         g.store_loader = _tenant_registry.get_loader(tenant)
         g.db_engine = _engine_registry.get_engine(tenant.db_name)
-        return None
+        return _bind_identity(tenant)

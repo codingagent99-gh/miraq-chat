@@ -66,6 +66,7 @@ _LEGACY_FLOW_STATE_ALIASES = {
 }
 from chat_logger import get_logger, sanitize_log_string
 from store_registry import get_store_loader, effective_role
+from identity import current_identity
 from ecommerce import endpoints
 from ecommerce.cart_actions import build_cart_add_action
 from ecommerce.unsupported import (
@@ -944,6 +945,11 @@ def get_chat_history():
         if not conversation:
             return jsonify({"messages": [], "has_more": False}), 200
 
+        # A transcript can hold order details and addresses: only its owner
+        # (the verified identity it was created under) gets it back.
+        if (conversation.customer_id or "") != current_identity().customer_id:
+            return jsonify({"messages": [], "has_more": False}), 200
+
         page  = int(request.args.get("page", 1))
         limit = int(request.args.get("limit", 20))
         offset = (page - 1) * limit
@@ -1095,6 +1101,32 @@ def _execute_loader_memory_call(call) -> list:
         ]
     logger.warning(f"_execute_loader_memory_call: unknown op {op!r}")
     return []
+
+
+def _only_own_orders(order_data, intent, role, customer_id):
+    """WooCommerce: drop orders that do not belong to the verified customer.
+
+    "Track order #1234" fetches /wc/v3/orders/1234 with the store's admin
+    keys, which returns ANY order — so without this, a customer could read
+    another customer's order, address and email by typing its number. Staff
+    roles (reps, admins — on stores with sales tools on) keep full access, by
+    design. Shopify is not filtered here: its order executor already verifies
+    ownership before returning contents.
+    """
+    from app_config import CUSTOM_ORDER_ROLES, ORDER_REPORT_ADMIN_ROLES, BULK_ORDER_ROLES
+    if intent not in ORDER_INTENTS or not order_data or current_backend() == "shopify":
+        return order_data
+    if role in (CUSTOM_ORDER_ROLES | ORDER_REPORT_ADMIN_ROLES | BULK_ORDER_ROLES):
+        return order_data
+    own = str(customer_id or "")
+    kept = [o for o in order_data
+            if isinstance(o, dict) and own and str(o.get("customer_id") or "") == own]
+    if len(kept) != len(order_data):
+        logger.warning(
+            f"orders: withheld {len(order_data) - len(kept)} order(s) not owned by "
+            f"customer {own or 'guest'!r} | intent={intent.value}"
+        )
+    return kept
 
 
 def _store_unreachable(api_responses) -> bool:
@@ -1797,29 +1829,43 @@ def chat():
         db.session.add(conversation)
         db.session.commit()
 
-    payload_context = body.get("user_context", {})
-    if payload_context.get("customer_id") and not conversation.customer_id:
-        conversation.customer_id = str(payload_context.get("customer_id"))
+    # ── Who is asking: the VERIFIED identity only (identity.py) ──
+    # customer_id / role / email in the request body are ignored. They came
+    # from the page's JavaScript config, so anyone could set them — and read
+    # another customer's orders, or claim an admin role.
+    ident = current_identity()
+    if (conversation.customer_id or "") != ident.customer_id:
+        if conversation.customer_id:
+            # A session that belonged to someone else (logged out on a shared
+            # device, or a replayed session id): drop its state rather than
+            # let the new caller inherit that person's cart, pending order or
+            # order-for customer.
+            logger.warning(
+                f"chat: session {session_id} changed hands "
+                f"({conversation.customer_id!r} → {ident.customer_id or 'guest'!r}) — context reset"
+            )
+            conversation.context_data = {}
+            conversation.flow_state = FlowState.IDLE.value
+        conversation.customer_id = ident.customer_id or None
         db.session.commit()
 
     customer_id  = conversation.customer_id
     user_context = conversation.context_data or {}
 
-    # Persist role into user_context so handlers can read it without payload_context.
-    # effective_role(): with this tenant's sales tools off, staff roles are
-    # served as a customer — see store_registry.effective_role.
-    _raw_role = payload_context.get("role", "")
-    role = effective_role(_raw_role)
-    if role != (_raw_role or "").strip():
-        logger.info(f"chat: role {_raw_role!r} served as {role!r} (sales tools off for this tenant)")
-    if role and user_context.get("role") != role:
+    # Persist role into user_context so handlers can read it. Always set —
+    # never left over from an earlier turn. effective_role(): with this
+    # tenant's sales tools off, staff roles are served as a customer.
+    role = effective_role(ident.role)
+    if role != ident.role:
+        logger.info(f"chat: role {ident.role!r} served as {role!r} (sales tools off for this tenant)")
+    if user_context.get("role") != role:
         user_context["role"] = role
+        flag_modified(conversation, "context_data")
 
     # Persist rep email so order creation can default project_rep to the
     # logged-in rep (custom-api saves the rep's email into _billing_project_rep).
-    _incoming_email = payload_context.get("email", "")
-    if _incoming_email and user_context.get("rep_email") != _incoming_email:
-        user_context["rep_email"] = _incoming_email
+    if user_context.get("rep_email") != ident.email:
+        user_context["rep_email"] = ident.email
         flag_modified(conversation, "context_data")
 
     if user_context is not conversation.context_data:
@@ -2899,6 +2945,7 @@ def chat():
             all_products_raw, order_data, api_responses, api_calls_to_execute = (
                 _execute_api_calls(intent, api_calls, _resolve_variant)
             )
+            order_data = _only_own_orders(order_data, intent, role, customer_id)
 
             # ── Store unreachable: say so instead of "no results" ────────────
             # Flow state is left as it was, so the customer can simply resend.
@@ -3155,7 +3202,9 @@ def chat():
         return _build_final_response(
             intent, entities, confidence, all_products_raw, order_data,
             api_responses, api_calls_to_execute, conversation, page, start_time,
-            payload_context=payload_context,
+            # The verified, effective role — not the request body's. This
+            # decides rep features and CSV export of customer orders.
+            payload_context={"role": role},
             customer_id=customer_id,
             refinement_summary=(describe_active_filters(entities) if _did_refine else None),
         )

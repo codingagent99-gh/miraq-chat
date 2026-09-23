@@ -21,9 +21,16 @@ sales_rep_bp = Blueprint("sales_rep", __name__)
 def recent_products():
     t_start = time.time()
 
-    from store_registry import sales_tools_enabled
+    from store_registry import sales_tools_enabled, effective_role
     if not sales_tools_enabled():
         return jsonify({"success": False, "products": [], "error": "not available for this store"}), 404
+
+    # Staff only. Looks up ANY customer's purchases, so the caller's role must
+    # be the verified one (identity.py), never a request parameter.
+    from app_config import BULK_ORDER_ROLES
+    from identity import current_identity
+    if effective_role(current_identity().role) not in BULK_ORDER_ROLES:
+        return jsonify({"success": False, "products": [], "error": "forbidden"}), 403
 
     # Step 1: Validate customer_id
     customer_id = request.args.get("customer_id")

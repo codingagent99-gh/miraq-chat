@@ -252,10 +252,10 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
     _product_id = getattr(entities, "product_id", None)
     _role = ""
     try:
-        from flask import request as _req
-        _role = (_req.get_json(silent=True) or {}).get("user_context", {}).get("role", "")
+        # Verified identity only — never the request body's role.
+        from identity import current_identity
         from store_registry import effective_role
-        _role = effective_role(_role)
+        _role = effective_role(current_identity().role)
     except Exception:
         pass
     _can_view = CUSTOM_ORDER_ROLES | ORDER_REPORT_ADMIN_ROLES
