@@ -449,21 +449,50 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
         return None
 
     if current_backend()== "shopify":
-        from api_builder.shopify_orders_executor import ShopifyOrdersExecutor
-        from models import WooAPICall
-        reorder_call = WooAPICall(
-            method="POST",
-            endpoint="orders",
-            params={},
-            body={
-                "_op":         "create_order",
-                "customer_id": str(customer_id),
-                "line_items":  new_line_items,
+        # Shopify: never create the order here. The App Store forbids apps
+        # that bypass Shopify checkout, so the reorder is a cart link that
+        # opens Shopify's checkout with the same items; Shopify creates the
+        # order when the customer pays, and /events/order-paid reports it
+        # back into this chat via the session attribute on the link.
+        from api_builder.shopify_orders_executor import build_reorder_checkout_url
+        items = [i for i in source_line_items if i.get("product_id")]
+        checkout_url = build_reorder_checkout_url(items, session_id=session_id)
+        elapsed = time.time() - (start_time or time.time())
+        item_lines = "\n".join(f"  • {i.get('name','Item')} × {i.get('quantity',1)}" for i in items)
+        source_ref = source_order.get("number") or source_order.get("id")
+        if checkout_url:
+            logger.info(f"Step 3.5: Shopify reorder checkout link built | source_order={source_ref} | items={len(items)}")
+            bot_message = (
+                f"🛒 **Your reorder is ready** (items from order #{source_ref})\n\n"
+                f"{item_lines}\n\n"
+                f"[Continue to checkout]({checkout_url}) to review your order and pay "
+                f"on the store's secure checkout."
+            )
+            suggestions = ["Show my orders", "Browse products"]
+        else:
+            logger.warning(f"Step 3.5: Shopify reorder — no variant IDs for a checkout link | source_order={source_ref}")
+            bot_message = (
+                f"🔄 **Items identified** (from order #{source_ref})\n\n"
+                f"{item_lines}\n\n"
+                "⚠️ I couldn't prepare a checkout link for these items. You can add them "
+                "to your cart from the store, or contact support."
+            )
+            suggestions = ["Show my orders", "Browse products", "Contact support"]
+        return jsonify({
+            "success": True,
+            "bot_message": bot_message,
+            "intent": intent.value,
+            "products": [],
+            "suggestions": suggestions,
+            "session_id": session_id,
+            "metadata": {
+                "flow_state": FlowState.IDLE.value,
+                "response_time_ms": round(elapsed * 1000),
+                **({"checkout_url": checkout_url} if checkout_url else {}),
             },
-            surface="shopify_orders",
-            description="Create Shopify reorder",
-        )
-        reorder_resp = ShopifyOrdersExecutor().execute(reorder_call)
+            "flow_state": FlowState.IDLE.value,
+            "pagination": default_pagination(page),
+        }), 200
     else:
         reorder_call = endpoints.create_order(
             payload={

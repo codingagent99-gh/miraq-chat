@@ -214,8 +214,8 @@ def get_customer_addresses():
 
 @shopify_bp.route("/events/product-update", methods=["POST"])
 def shopify_product_update_event():
-    """Minimal receiver for the Product/update Events subscription declared in
-    shopify.app.miraq-commerce-agent.toml.
+    """Minimal receiver for the products/update webhook declared in the app
+    toml (stable webhook topic; replaced the unstable Events API subscription).
 
     Nothing in the app currently NEEDS this data — it exists purely to give
     ``shopify app deploy`` a real, working endpoint instead of a stub that
@@ -290,9 +290,10 @@ def _order_is_paid(payload: dict) -> bool:
 
 @shopify_bp.route("/events/order-paid", methods=["POST"])
 def shopify_order_paid_event():
-    """Receiver for the Order/update Events subscription (filtered to paid
-    orders in-handler — see the TOML comment on this subscription for why
-    there's no dedicated "paid" action here).
+    """Receiver for the orders/paid webhook declared in the app toml (stable
+    webhook topic; replaced the unstable Events API Order/update subscription).
+    The financial-status check below is kept as a guard, though orders/paid
+    only fires for paid orders.
 
     Correlates the order back to the widget session via a `miraq_session_id`
     note attribute, which the frontend sets as a cart attribute
@@ -380,6 +381,62 @@ def shopify_order_paid_event():
     )
 
     return jsonify({"received": True}), 200
+
+@shopify_bp.route("/events/compliance", methods=["POST"])
+def shopify_compliance_webhook():
+    """Shopify's three mandatory privacy webhooks, on one URL.
+
+    Declared in the app toml as compliance_topics = [customers/data_request,
+    customers/redact, shop/redact]; X-Shopify-Topic says which one this is.
+    The work itself lives in shopify_compliance.py.
+
+    Shopify's rules for these, all checked in App Store review:
+      - an invalid HMAC must get 401 Unauthorized
+      - a genuine request gets 200 once handled
+    A store we hold nothing for (never installed, or already redacted) is a
+    valid, handled request: 200. A failure while deleting returns 500 so
+    Shopify retries — a redaction must not be silently dropped.
+    """
+    raw_body = request.get_data()  # exact signed bytes; don't re-serialise
+    header_hmac = _shopify_header("Shopify-Hmac-Sha256") or None
+
+    # Authenticate FIRST, with the app-level secret, before reading anything.
+    ok, reason = verify_events_hmac(raw_body, header_hmac, SHOPIFY_CLIENT_SECRET)
+    if not ok:
+        logger.warning(f"shopify compliance: rejected delivery | reason={reason}")
+        return jsonify({"error": "unauthorized"}), 401
+
+    topic = _shopify_header("Shopify-Topic").strip().lower()
+    try:
+        payload = json.loads(raw_body or b"{}")
+    except Exception:
+        logger.error(f"shopify compliance: unparseable body | topic={topic!r}")
+        return jsonify({"error": "bad_payload"}), 400
+
+    shop_domain = (payload.get("shop_domain") or _shopify_header("Shopify-Shop-Domain") or "").strip().lower()
+    tenant = _resolve_tenant_by_shopify_domain(shop_domain)
+    if tenant is None:
+        logger.info(f"shopify compliance: {topic} for a shop we hold nothing for | shop={shop_domain!r}")
+        return jsonify({"received": True, "held": False}), 200
+
+    import shopify_compliance as compliance
+    try:
+        if topic == "customers/data_request":
+            result = compliance.export_customer_data(tenant, payload)
+        elif topic == "customers/redact":
+            result = compliance.redact_customer(tenant, payload)
+        elif topic == "shop/redact":
+            result = compliance.redact_shop(tenant)
+        else:
+            logger.warning(f"shopify compliance: unexpected topic {topic!r} | shop={shop_domain!r}")
+            return jsonify({"received": True, "skipped": "unknown_topic"}), 200
+    except Exception as e:
+        logger.error(f"shopify compliance: {topic} failed — Shopify will retry | shop={shop_domain!r} | {e}",
+                     exc_info=True)
+        return jsonify({"error": "processing_failed"}), 500
+
+    return jsonify({"received": True, "topic": topic, **result}), 200
+
 
 @shopify_bp.route("/events/app-uninstalled", methods=["POST"])
 def shopify_app_uninstalled():

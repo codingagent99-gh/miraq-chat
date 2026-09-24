@@ -491,7 +491,12 @@ class ShopifyOrdersExecutor:
         if op == "fetch_order":
             result = self._fetch_single_order(body, token)
         elif op == "create_order":
-            result = self._create_order(body, token)
+            # Orders are never created from the chat on Shopify: the App Store
+            # forbids apps that bypass Shopify checkout or payment processing.
+            # A reorder is a checkout link instead (build_reorder_checkout_url),
+            # so the customer pays on Shopify's own checkout.
+            logger.error("[ShopifyOrders] create_order refused — use build_reorder_checkout_url")
+            return {"success": False, "error": "order_creation_not_supported"}
         elif op == "top_selling_products":
             result = self._top_selling_products(body, token)
         else:
@@ -915,137 +920,6 @@ class ShopifyOrdersExecutor:
         return token_row.access_token
     
     
-    def _create_order(self, body: dict, token: str) -> dict:
-        customer_id = body.get("customer_id", "")
-        line_items  = body.get("line_items", [])
-
-        customer_gid = (
-            customer_id if str(customer_id).startswith("gid://")
-            else f"gid://shopify/Customer/{customer_id}"
-        )
-
-        # ── Fetch customer's default address ──
-        shipping_address = None
-        try:
-            addr_data = _gql(_CUSTOMER_ADDRESS_GQL, {"customer_gid": customer_gid}, token)
-            default_addr = (
-                (addr_data.get("customer") or {}).get("defaultAddress") or {}
-            )
-            if default_addr.get("address1") or default_addr.get("city"):
-                shipping_address = {
-                    "firstName": default_addr.get("firstName") or "",
-                    "lastName":  default_addr.get("lastName")  or "",
-                    "address1":  default_addr.get("address1")  or "",
-                    "address2":  default_addr.get("address2")  or "",
-                    "city":      default_addr.get("city")      or "",
-                    "province":  default_addr.get("province")  or "",
-                    "zip":       default_addr.get("zip")       or "",
-                    "country":   default_addr.get("country")   or "",
-                    "phone":     default_addr.get("phone")     or "",
-                }
-                logger.debug(f"[ShopifyOrders] _create_order: resolved shipping from customer default address")
-            else:
-                logger.warning(f"[ShopifyOrders] _create_order: customer has no default address")
-        except Exception as exc:
-            logger.warning(f"[ShopifyOrders] _create_order: failed to fetch customer address | {exc}")
-
-        # ── Build line items ──
-        line_item_inputs = []
-        for item in line_items:
-            vid = item.get("variation_id") or item.get("variant_gid")
-            pid = item.get("product_id")
-            qty = item.get("quantity", 1)
-            if vid:
-                variant_gid = vid if str(vid).startswith("gid://") else f"gid://shopify/ProductVariant/{vid}"
-                line_item_inputs.append({"variantId": variant_gid, "quantity": qty})
-            elif pid:
-                product_gid = pid if str(pid).startswith("gid://") else f"gid://shopify/Product/{pid}"
-                line_item_inputs.append({"variantId": product_gid, "quantity": qty})
-
-        # ── Create draft order ──
-        draft_input = {
-            "customerId": customer_gid,
-            "lineItems":  line_item_inputs,
-        }
-        if shipping_address:
-            draft_input["shippingAddress"] = shipping_address
-
-        mutation = """
-        mutation CreateDraftOrder($input: DraftOrderInput!) {
-          draftOrderCreate(input: $input) {
-            draftOrder {
-              id
-              name
-              status
-              totalPriceSet { shopMoney { amount } }
-              customer { id }
-            }
-            userErrors { field message }
-          }
-        }
-        """
-
-        data   = _gql(mutation, {"input": draft_input}, token)
-        result = (data.get("draftOrderCreate") or {})
-        errors = result.get("userErrors") or []
-        if errors:
-            raise ValueError(f"Shopify draftOrderCreate errors: {errors}")
-
-        draft    = result.get("draftOrder") or {}
-        draft_id = draft.get("id", "")
-
-        # ── Complete draft → real order ──
-        # paymentPending is passed EXPLICITLY. Shopify's draftOrderComplete
-        # defaults it to false, which marks the resulting order as PAID via a
-        # manual payment — i.e. every chat reorder would record revenue that
-        # was never collected. The WooCommerce path deliberately creates the
-        # reorder unpaid (`set_paid: False`, DEFAULT_PAYMENT_METHOD), so
-        # paymentPending=true is the behaviour-matching AND financially safe
-        # choice: the order is created awaiting payment.
-        #
-        # VERIFY (open item C5): confirm against current Shopify docs that
-        # draftOrderComplete(paymentPending:) still carries these semantics,
-        # then confirm on the dev store that a chat reorder lands as
-        # "Payment pending" — NOT "Paid" — in the Shopify admin.
-        complete_mutation = """
-        mutation CompleteDraftOrder($id: ID!, $paymentPending: Boolean) {
-          draftOrderComplete(id: $id, paymentPending: $paymentPending) {
-            draftOrder {
-              order { id name }
-            }
-            userErrors { field message }
-          }
-        }
-        """
-        complete_data   = _gql(
-            complete_mutation,
-            {"id": draft_id, "paymentPending": True},
-            token,
-        )
-        complete_result = (complete_data.get("draftOrderComplete") or {})
-        complete_errors = complete_result.get("userErrors") or []
-
-        if complete_errors:
-            logger.warning(f"[ShopifyOrders] draftOrderComplete errors: {complete_errors}")
-            return {
-                "success": True,
-                "data": {
-                    "id":     draft_id,
-                    "number": (draft.get("name") or "").lstrip("#"),
-                    "status": "draft",
-                }
-            }
-
-        real_order = (complete_result.get("draftOrder") or {}).get("order") or {}
-        return {
-            "success": True,
-            "data": {
-                "id":     real_order.get("id") or draft_id,
-                "number": (real_order.get("name") or draft.get("name") or "").lstrip("#"),
-                "status": "processing",
-            }
-        }
-
     @staticmethod
     def _empty_result(body: dict) -> dict:
         return {
@@ -1060,6 +934,42 @@ class ShopifyOrdersExecutor:
 # ══════════════════════════════════════════════════════════════
 # Helpers
 # ══════════════════════════════════════════════════════════════
+
+def build_reorder_checkout_url(line_items: list, session_id: Optional[str] = None) -> Optional[str]:
+    """Shopify cart permalink for a reorder: {shop}/cart/{variant}:{qty},...
+
+    Opens a cart holding exactly these items and goes straight to Shopify's
+    own checkout, where the customer reviews and pays. Nothing is created in
+    the merchant's order list until they do — Shopify creates the order.
+    This replaces completing a draft order from the chat, which produced a
+    real, unpaid order that never went through checkout (not allowed for
+    App Store apps).
+
+    The chat session travels as a cart attribute (attributes[miraq_session_id]);
+    cart attributes become the order's note attributes, which is how
+    /events/order-paid posts the "order placed" message back into the chat —
+    the same correlation the widget's own checkout uses.
+
+    Returns None when any item has no variant ID, so the caller can fall back
+    rather than silently dropping items from the customer's reorder.
+    """
+    from urllib.parse import quote
+    domain = _current_shop_domain()
+    parts = []
+    for item in line_items or []:
+        gid = str(item.get("variation_id") or item.get("variant_gid") or "")
+        variant = gid.rsplit("/", 1)[-1] if gid else ""
+        if not variant.isdigit():
+            return None
+        qty = max(1, int(item.get("quantity") or 1))
+        parts.append(f"{variant}:{qty}")
+    if not domain or not parts:
+        return None
+    url = f"https://{domain}/cart/{','.join(parts)}"
+    if session_id:
+        url += f"?attributes%5Bmiraq_session_id%5D={quote(str(session_id))}"
+    return url
+
 
 def _same_id(a, b) -> bool:
     """Compare two Shopify ids that may be GIDs or bare numerics.

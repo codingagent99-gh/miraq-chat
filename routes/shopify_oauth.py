@@ -46,6 +46,7 @@ Three checks, all required:
 import base64
 import hashlib
 import hmac
+import html
 import os
 import re
 import time
@@ -97,6 +98,10 @@ SHOPIFY_SCOPES = "read_customers,read_orders,read_products,write_draft_orders"
 # Falls back to url_root only so local testing without the variable still
 # works; a deployed backend must set it.
 SHOPIFY_APP_BASE_URL = os.getenv("SHOPIFY_APP_BASE_URL", "").rstrip("/")
+
+# Handle of the storefront app embed, used for the theme editor deep link:
+# the block's file name in extensions/miraq-commerce-agent/blocks/.
+_EMBED_BLOCK_HANDLE = "miraq_widget"
 
 
 def _app_url(path: str) -> str:
@@ -407,18 +412,39 @@ def installed():
     The catalog build is still running when the merchant lands here.
     """
     shop = (request.args.get("shop") or "").strip().lower()
-    admin_link = f"https://{shop}/admin/themes/current/editor" if _valid_shop(shop) else ""
+    # App Store 5.1.3: detailed embed setup, ideally a deep link. This one
+    # opens the live theme's editor with the MiraQ app embed ALREADY switched
+    # on (context=apps&activateAppId=<client_id>/<embed block handle>); the
+    # merchant only reviews and clicks Save. The handle is the block's file
+    # name: extensions/miraq-commerce-agent/blocks/miraq_widget.liquid.
+    embed_link = (
+        f"https://{shop}/admin/themes/current/editor?context=apps"
+        f"&activateAppId={SHOPIFY_CLIENT_ID}/{_EMBED_BLOCK_HANDLE}"
+        if _valid_shop(shop) and SHOPIFY_CLIENT_ID else ""
+    )
+    button = (
+        f"<p><a class='btn' href='{html.escape(embed_link)}' target='_top'>"
+        "Turn on the MiraQ widget</a></p>" if embed_link else ""
+    )
 
     return (
         "<!doctype html><meta charset='utf-8'>"
         "<title>MiraQ Commerce Agent</title>"
         "<style>body{font-family:system-ui,sans-serif;max-width:34rem;margin:4rem auto;"
-        "padding:0 1rem;line-height:1.6;color:#1a1a1a}</style>"
+        "padding:0 1rem;line-height:1.6;color:#1a1a1a}"
+        ".btn{display:inline-block;background:#1a1a1a;color:#fff;padding:.6rem 1.1rem;"
+        "border-radius:8px;text-decoration:none}li{margin:.3rem 0}</style>"
         "<h1>MiraQ is installed</h1>"
         "<p>Your catalog is being indexed now. This usually takes a few minutes for "
         "a small store, longer for a large one.</p>"
-        "<p>To finish setup, enable the <strong>MiraQ Commerce Widget</strong> app embed "
-        "in your theme editor, under App embeds."
-        + (f" <a href='{admin_link}'>Open the theme editor</a>." if admin_link else "")
-        + "</p>"
+        "<h2>Finish setup: turn on the chat widget</h2>"
+        "<ol>"
+        "<li>Click <strong>Turn on the MiraQ widget</strong> below. Your theme editor "
+        "opens with the MiraQ app embed already switched on.</li>"
+        "<li>Check the widget in the preview, then click <strong>Save</strong>.</li>"
+        "<li>Open your store and look for the chat button in the corner.</li>"
+        "</ol>"
+        + button +
+        "<p>To turn it off later: theme editor → <strong>App embeds</strong> → "
+        "switch off <strong>Miraq Shopper Agent</strong> → Save.</p>"
     ), 200

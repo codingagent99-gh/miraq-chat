@@ -54,6 +54,9 @@ _EXEMPT_PATHS = {
     "/provision-tenant", "/activate-free", "/deactivate-tenant",
     "/customer-addresses", "/events/product-update", "/events/order-paid",
     "/events/app-uninstalled",
+    # Shopify's mandatory privacy webhooks (routes/shopify.py). Signed with
+    # the app secret; the store comes from the signed payload's shop_domain.
+    "/events/compliance",
     # Shopify install flow (routes/shopify_oauth.py). These run BEFORE a
     # tenant exists — the callback is what creates it — and authenticate with
     # the app-level hmac + state nonce instead.
