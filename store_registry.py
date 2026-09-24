@@ -57,6 +57,10 @@ _EXEMPT_PATHS = {
     # Shopify's mandatory privacy webhooks (routes/shopify.py). Signed with
     # the app secret; the store comes from the signed payload's shop_domain.
     "/events/compliance",
+    # Channel customer sign-in pages (routes/channel_link.py). Opened from a
+    # Sign in button in Instagram/WhatsApp, so no licence header; the store
+    # comes from the state value, which also authenticates the request.
+    "/channel-link/start", "/channel-link/shopify/callback",
     # Shopify install flow (routes/shopify_oauth.py). These run BEFORE a
     # tenant exists — the callback is what creates it — and authenticate with
     # the app-level hmac + state nonce instead.

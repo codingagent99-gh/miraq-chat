@@ -93,12 +93,15 @@ def _per_tenant_tables():
     from models.db_models import Conversation, Message
     from models.chat_usage import ChatUsage
     from models.shopify_order_confirmation import ShopifyOrderConfirmation
+    from models.channel_link import ChannelLink, ChannelLinkRequest
 
     return [
         Conversation.__table__,
         Message.__table__,
         ChatUsage.__table__,
         ShopifyOrderConfirmation.__table__,
+        ChannelLink.__table__,
+        ChannelLinkRequest.__table__,
     ]
 
 

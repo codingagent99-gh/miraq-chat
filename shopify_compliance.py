@@ -19,6 +19,7 @@ What MiraQ holds per customer, and where
   conversations.customer_id  the Shopify customer ID (numeric, or a GID)
   messages                   everything said in those conversations
   shopify_order_confirmations  order IDs matched to a chat session
+  channel_links              Instagram/WhatsApp users signed in as this customer
   Guest conversations carry no customer ID, so they cannot be tied to a
   person and are not part of a customer's data here.
 
@@ -75,7 +76,9 @@ def _bind(tenant) -> bool:
     if not _tenant_database_exists(tenant):
         return False
     from store_registry import bind_tenant_db
+    import channel_link
     bind_tenant_db(tenant)
+    channel_link.ensure_tables(tenant)  # older stores: link tables may not exist yet
     return True
 
 
@@ -99,6 +102,7 @@ def export_customer_data(tenant, payload: dict) -> dict:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "conversations": [],
         "order_confirmations": [],
+        "channel_links": [],
     }
 
     if ids and _bind(tenant):
@@ -125,6 +129,13 @@ def export_customer_data(tenant, payload: dict) -> dict:
             {"session_id": r.session_id, "order_id": r.order_id, "order_number": r.order_number}
             for r in rows
         ]
+        from models.channel_link import ChannelLink
+        export["channel_links"] = [
+            {"channel": l.channel, "channel_user_id": l.channel_user_id,
+             "linked_at": l.linked_at.isoformat() if l.linked_at else None,
+             "expires_at": l.expires_at.isoformat() if l.expires_at else None}
+            for l in ChannelLink.query.filter(ChannelLink.customer_id.in_(ids)).all()
+        ]
         db.session.rollback()  # read-only; release the connection cleanly
 
     folder = os.path.join(COMPLIANCE_EXPORT_DIR, tenant.shopify_domain or "unknown-shop")
@@ -135,7 +146,8 @@ def export_customer_data(tenant, payload: dict) -> dict:
         json.dump(export, f, ensure_ascii=False, indent=2)
 
     counts = {"conversations": len(export["conversations"]),
-              "order_confirmations": len(export["order_confirmations"])}
+              "order_confirmations": len(export["order_confirmations"]),
+              "channel_links": len(export["channel_links"])}
     # ERROR level on purpose: a person must send this file to the merchant
     # within 30 days. No personal data in the log line itself.
     logger.error(
@@ -156,7 +168,7 @@ def redact_customer(tenant, payload: dict) -> dict:
     ids = _customer_ids(payload)
     if not ids or not _bind(tenant):
         logger.info(f"compliance: customers/redact — nothing held | shop={tenant.shopify_domain}")
-        return {"deleted": {"conversations": 0, "messages": 0, "order_confirmations": 0}}
+        return {"deleted": {"conversations": 0, "messages": 0, "order_confirmations": 0, "channel_links": 0}}
 
     try:
         conversations = Conversation.query.filter(Conversation.customer_id.in_(ids)).all()
@@ -170,6 +182,9 @@ def redact_customer(tenant, payload: dict) -> dict:
             (ShopifyOrderConfirmation.session_id.in_(sessions)) |
             (ShopifyOrderConfirmation.order_id.in_(order_ids))
         ).delete(synchronize_session=False)) if (sessions or order_ids) else 0
+        from models.channel_link import ChannelLink
+        links = (ChannelLink.query.filter(ChannelLink.customer_id.in_(ids))
+                 .delete(synchronize_session=False))
         for conv in conversations:
             db.session.delete(conv)
         db.session.commit()
@@ -178,7 +193,7 @@ def redact_customer(tenant, payload: dict) -> dict:
         raise
 
     deleted = {"conversations": len(conversations), "messages": messages,
-               "order_confirmations": confirmations}
+               "order_confirmations": confirmations, "channel_links": links}
     logger.info(f"compliance: customers/redact done | shop={tenant.shopify_domain} | {deleted}")
     return {"deleted": deleted}
 

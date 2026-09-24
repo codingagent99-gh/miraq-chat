@@ -14,7 +14,7 @@ from handlers.handoff_handler import (
 )
 from api_builder.store_helpers import attr_slug_for_label
 from datetime import datetime, timezone
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, g
 from models import db, Conversation, Message, Intent
 from sqlalchemy.orm.attributes import flag_modified
 import re
@@ -1103,6 +1103,51 @@ def _execute_loader_memory_call(call) -> list:
     return []
 
 
+_ACCOUNT_INTENTS = ORDER_INTENTS | {Intent.FETCH_CUSTOMER, Intent.UPDATE_CUSTOMER}
+
+_SIGN_IN_TEXT = (
+    "To show your orders, please sign in once with your account at this store. "
+    "It only takes a moment, and you won't need to do it again on this chat."
+)
+_SIGN_IN_UNAVAILABLE_TEXT = (
+    "I can't show order or account details in this chat yet. You can see them "
+    "on our website, and I'm happy to help with products here."
+)
+
+
+def _channel_sign_in_prompt(intent, conversation, page):
+    """A Sign in button for a channel guest asking about their orders or account.
+
+    None for everyone else: website visitors (their identity comes from the
+    widget), signed-in channel customers, and questions that need no account.
+    Sign-in currently uses the store's Shopify customer login, so WooCommerce
+    stores get a plain "not available here" instead of a link.
+    """
+    ident = current_identity()
+    if ident.source != "channel" or not ident.is_guest or intent not in _ACCOUNT_INTENTS:
+        return None
+    base = {
+        "success": True, "intent": intent.value, "products": [], "suggestions": [],
+        "session_id": str(conversation.id), "flow_state": FlowState.IDLE.value,
+        "pagination": default_pagination(page),
+    }
+    if current_backend() != "shopify" or not ident.channel_user_id:
+        return jsonify({**base, "bot_message": _SIGN_IN_UNAVAILABLE_TEXT, "actions": [],
+                        "metadata": {"sign_in_required": True, "sign_in_available": False}}), 200
+
+    import channel_link
+    url = channel_link.create_link_request(
+        g.tenant, ident.channel, ident.channel_user_id, conversation.id,
+    )
+    logger.info(f"channel sign-in: link sent | intent={intent.value} | channel={ident.channel}")
+    return jsonify({
+        **base,
+        "bot_message": _SIGN_IN_TEXT,
+        "actions": [{"type": "SHOW_SIGN_IN", "payload": {"url": url, "label": "Sign in to your account"}}],
+        "metadata": {"sign_in_required": True, "sign_in_available": True},
+    }), 200
+
+
 def _only_own_orders(order_data, intent, role, customer_id):
     """WooCommerce: drop orders that do not belong to the verified customer.
 
@@ -1767,7 +1812,6 @@ def chat():
             "pagination": default_pagination(),
         }), 400
 
-    print(f"POST /chat | body: {body}")
     message = body.get("message", "").strip()
     page    = int(body.get("page", 1))
 
@@ -2877,6 +2921,13 @@ def chat():
                 entities.target_category_slugs -= cat_slugs_in_collision
                 if not entities.target_category_slugs:
                     entities.category_name = None
+
+        # ── Channel guests: account questions need a one-time sign-in ──
+        # Before any store call: a guest on Instagram/WhatsApp asking for
+        # orders gets a Sign in button, not "no orders found".
+        _sign_in = _channel_sign_in_prompt(intent, conversation, page)
+        if _sign_in is not None:
+            return _ft(_sign_in)
 
         if _resolve_variant or intent == Intent.BULK_ORDER:
             # Variant resolution uses session-cached variations — no API calls needed.

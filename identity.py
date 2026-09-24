@@ -63,6 +63,9 @@ class Identity:
     role: str = "guest"
     email: str = ""
     source: str = "anonymous"  # wp_token | shopify_proxy | channel | anonymous
+    # Channel requests only: who is writing, so a guest can be sent a sign-in link.
+    channel: str = ""
+    channel_user_id: str = ""
 
     @property
     def is_guest(self) -> bool:
@@ -200,8 +203,12 @@ def resolve_identity(tenant) -> Identity:
     """Verified identity for this request. Raises IdentityExpired (WooCommerce only)."""
     channel = request.environ.get(CHANNEL_ENVIRON_KEY)
     if isinstance(channel, dict):
+        # customer_id here comes from channel_links (a verified Shopify
+        # sign-in), looked up by routes/channel.py — never from the caller.
         cid = str(channel.get("customer_id") or "")
-        return Identity(customer_id=cid, role="customer" if cid else "guest", source="channel")
+        return Identity(customer_id=cid, role="customer" if cid else "guest", source="channel",
+                        channel=str(channel.get("channel") or ""),
+                        channel_user_id=str(channel.get("channel_user_id") or ""))
 
     if (tenant.ecommerce_backend or "woocommerce") == "shopify":
         return _shopify_identity(tenant)

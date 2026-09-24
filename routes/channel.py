@@ -57,6 +57,7 @@ from chat_logger import get_logger
 from models import db, ChannelConnection, Conversation, Message, Tenant
 from store_registry import bind_tenant_db, get_tenant_registry
 from identity import CHANNEL_ENVIRON_KEY
+import channel_link
 
 logger = get_logger("miraq_chat")
 
@@ -65,10 +66,17 @@ channel_bp = Blueprint("channel", __name__)
 # Fixed namespace: changing it orphans every existing channel conversation.
 _SESSION_NAMESPACE = uuid.UUID("6f1c2a9e-3b7d-4c55-9a2e-6d0f5b8e41c7")
 
-# Only these user_context keys are accepted from the caller. role/email unlock
-# rep and admin flows in /chat, which rely on the widget's own login — a
-# channel user never gets them.
-_ALLOWED_CONTEXT_KEYS = ("customer_id",)
+# No identity is accepted from the caller: not role/email (they unlock rep and
+# admin flows) and, since channel sign-in, not customer_id either. Who a
+# channel user is comes only from channel_links — a verified, one-time sign-in
+# with the store's Shopify login (channel_link.py).
+_ALLOWED_CONTEXT_KEYS = ()
+
+UNLINKED_TEXT = (
+    "You're signed out of this chat. I can still help you find products; "
+    "to see your orders again, just ask and I'll send a sign-in link."
+)
+NOT_LINKED_TEXT = "You're not signed in on this chat, so there's nothing to sign out of."
 
 # Statuses the inner /chat turn knows how to answer (see store_registry).
 _SERVABLE_STATUSES = frozenset({"active", "warming", "provision_failed"})
@@ -110,14 +118,16 @@ def _last_user_message(session_id: uuid.UUID) -> str:
     return msg.content if msg else ""
 
 
-def _dispatch_chat(body: dict, session_id: uuid.UUID, license_id: str):
-    """Run POST /chat in-process for this tenant. Returns (status_code, json_dict)."""
+def _dispatch_chat(body: dict, session_id: uuid.UUID, license_id: str,
+                   channel: str, channel_user_id: str, customer_id: str):
+    """Run POST /chat in-process for this tenant. Returns (status_code, json_dict).
+
+    /chat ignores identity in the body (identity.py). The verified customer
+    (from channel_links, or "" for a guest) and the channel user travel on the
+    in-process request's environ, which an HTTP client cannot set.
+    """
     app = current_app._get_current_object()
     remote_addr = request.remote_addr or ""
-    # /chat ignores identity in the body (identity.py). The channel service is
-    # authenticated by X-MiraQ-Channel-Key, so its customer_id is passed on
-    # the in-process request's environ, which an HTTP client cannot set.
-    _customer_id = ((body.get("user_context") or {}).get("customer_id")) or ""
     with app.app_context():
         with app.test_request_context(
             "/chat",
@@ -129,7 +139,11 @@ def _dispatch_chat(body: dict, session_id: uuid.UUID, license_id: str):
             },
             environ_base={
                 "REMOTE_ADDR": remote_addr,
-                CHANNEL_ENVIRON_KEY: {"customer_id": str(_customer_id)},
+                CHANNEL_ENVIRON_KEY: {
+                    "customer_id": str(customer_id or ""),
+                    "channel": channel,
+                    "channel_user_id": channel_user_id,
+                },
             },
         ):
             resp = app.full_dispatch_request()
@@ -195,6 +209,7 @@ def channel_chat():
 
     # Per-tenant models (Conversation, Message) now read that store's database.
     bind_tenant_db(tenant)
+    channel_link.ensure_tables(tenant)
 
     session_id = _session_id_for(channel, user_id)
 
@@ -213,6 +228,26 @@ def channel_chat():
     if not message:
         return _error(400, "EMPTY_MESSAGE", "message or a known reply_id is required.")
 
+    # ── "unlink" / "log out": handled here, never sent to the chat engine ──
+    if message.strip().lower() in channel_link.UNLINK_COMMANDS:
+        was_linked = channel_link.unlink(channel, user_id)
+        conv = db.session.get(Conversation, session_id)
+        if conv is not None and was_linked:
+            # Clear the account state the signed-in turns built up.
+            conv.customer_id = None
+            conv.context_data = {}
+            conv.flow_state = "idle"
+            db.session.commit()
+        _bind_resident_loader(tenant)
+        text = UNLINKED_TEXT if was_linked else NOT_LINKED_TEXT
+        messages = RENDERERS[channel](build_turn({"bot_message": text}, max_products=0), user_id)
+        logger.info(f"POST /chat/channel | unlink | tenant={tenant.tenant_id} | {channel} | linked={was_linked}")
+        return jsonify({"success": True, "channel": channel, "user_id": user_id,
+                        "session_id": str(session_id), "intent": "unlink", "messages": messages}), 200
+
+    # Who is writing: the verified link for this channel user, or a guest.
+    link = channel_link.find_link(channel, user_id)
+
     # ── Build the widget-equivalent request ──
     conversation = db.session.get(Conversation, session_id)
     raw_ctx = body.get("user_context") if isinstance(body.get("user_context"), dict) else {}
@@ -222,7 +257,16 @@ def channel_chat():
 
     chat_body = {"message": message, "page": page, "user_context": user_context}
 
-    status, data = _dispatch_chat(chat_body, session_id, tenant.license_id)
+    status, data = _dispatch_chat(chat_body, session_id, tenant.license_id,
+                                  channel, user_id, link.customer_id if link else "")
+
+    # First message after signing in: confirm who they're signed in as, once.
+    if link is not None and link.notice_pending and status < 400:
+        notice = (f"✅ Signed in as {link.email_display or 'your account'}. "
+                  "Not you? Reply unlink.")
+        data["bot_message"] = f"{notice}\n\n{data.get('bot_message') or ''}".strip()
+        link.notice_pending = False
+        db.session.commit()
 
     # ── Non-turn failures from /chat ──
     if status == 429:

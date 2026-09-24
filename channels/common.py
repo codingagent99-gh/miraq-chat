@@ -297,7 +297,14 @@ def build_turn(data: dict, max_products: int) -> ChannelTurn:
         payload = (action or {}).get("payload") or {}
         if a_type in WIDGET_ONLY_ACTIONS:
             continue
-        if a_type == "SHOW_HUMAN_HANDOFF" and payload.get("url"):
+        if a_type == "SHOW_SIGN_IN" and payload.get("url"):
+            # One-time customer sign-in (channel_link.py): a real link button.
+            links.append(LinkButton(
+                label=payload.get("label") or "Sign in to your account",
+                url=payload["url"],
+                short_label="Sign in",
+            ))
+        elif a_type == "SHOW_HUMAN_HANDOFF" and payload.get("url"):
             links.append(LinkButton(
                 label=payload.get("label") or "Chat with us",
                 url=payload["url"],
