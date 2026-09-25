@@ -13,8 +13,8 @@ module.exports = {
       env: {
         PYTHONUNBUFFERED: "1",
       },
-      error_file: "/home/apps/varchaswi/logs/libretranslate-error.log",
-      out_file: "/home/apps/varchaswi/logs/libretranslate-out.log",
+      error_file: "/home/apps/varchaswi/miraq-chat-shopify-multi/logs/libretranslate-error.log",
+      out_file: "/home/apps/varchaswi/miraq-chat-shopify-multi/logs/libretranslate-out.log",
       log_date_format: "YYYY-MM-DD HH:mm:ss",
     },
   ],
