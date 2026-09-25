@@ -83,7 +83,10 @@ _EXEMPT_PATHS = {
 # /shopify-token-status is intentionally NOT here any more: it is a per-store
 # diagnostic and now requires the header like any other tenant route.
 _OPTIONAL_TENANT_PATHS = {"/health", "/status"}
-_EXEMPT_PREFIXES = ("/static/",)
+# /admin/translation/ (routes/translation_admin.py) names its tenant in the
+# URL and edits only the control-plane row — binding a StoreLoader there would
+# make "change a language" trigger a catalogue load for a cold tenant.
+_EXEMPT_PREFIXES = ("/static/", "/admin/translation/")
 
 _tenant_registry = None
 _engine_registry = None

@@ -101,7 +101,7 @@ from handlers.no_results_choice_handler import build_no_results_prompt, resolve_
 from config.store_config import SEMANTIC_AUTO_APPLY_THRESHOLD, ATTRIBUTE_DISAMBIGUATION_GROUPS
 from parsers.catalog_parser import parse_csv_message
 from parsers.address_parser import extract_address, address_summary
-from utils.language_utils import detect_and_translate
+from translation.turn import prepare_inbound, translate_reply, user_message_i18n_metadata
 from handlers.cart_handler import handle_cart_intent
 from handlers.order_stats_handler import (
     handle_order_stats,
@@ -968,20 +968,27 @@ def get_chat_history():
 
         history = []
         for msg in messages_query:
+            # Translated turns (translation/turn.py): replay what the customer
+            # saw/typed, not the English the pipeline stored.
+            _i18n = (msg.metadata_json or {}).get("i18n") or {}
             item = {
                 "role":      msg.role,
                 # Structured picks are stored verbatim so the flow handlers can
                 # re-read them, but the raw "__SENTINEL__{json}" is not what the
                 # user typed and must never surface in a replayed transcript.
                 # The live path masks these in the widget; this covers reload.
-                "message":   _display_message(msg.content) if msg.role == "user" else msg.content,
+                "message":   (
+                    _i18n.get("original") or _display_message(msg.content)
+                    if msg.role == "user"
+                    else _i18n.get("bot_message") or msg.content
+                ),
                 "intent":    msg.intent,
                 "timestamp": msg.created_at.isoformat(),
             }
             if msg.role == "bot" and msg.metadata_json:
                 item["products"]    = msg.metadata_json.get("products", [])
                 item["categories"]  = msg.metadata_json.get("categories", [])
-                item["suggestions"] = msg.metadata_json.get("suggestions", [])
+                item["suggestions"] = _i18n.get("suggestions") or msg.metadata_json.get("suggestions", [])
                 item["actions"]     = msg.metadata_json.get("actions", [])
                 # Top-level on a live response, so they must be top-level here
                 # too — mapHistoryEntryToMessage reads m.orders, not
@@ -996,7 +1003,7 @@ def get_chat_history():
                 item["metadata"]    = {
                     k: v for k, v in msg.metadata_json.items()
                     if k not in ("products", "categories", "suggestions",
-                                 "actions", "orders", "order_pagination")
+                                 "actions", "orders", "order_pagination", "i18n")
                 }
             history.append(item)
 
@@ -1795,6 +1802,7 @@ def handle_cart_result():
     }), 200
     
 @chat_bp.route("/chat", methods=["POST"])
+@translate_reply
 @enforce_daily_limit
 def chat():
     start_time = time.time()
@@ -1844,27 +1852,6 @@ def chat():
             },
             "pagination": default_pagination(),
         }), 400
-
-    # ── Language detection ──
-    # Skip translation during variant selection — the user is typing back
-    # catalog attribute values (colors, dimensions, finishes) that were shown
-    # to them verbatim. Running translation on these corrupts the strings
-    # (e.g. 12"X24" → 12 "X24") and breaks attribute matching downstream.
-    _payload_flow_state = body.get("user_context", {}).get("flow_state", "idle")
-    if _payload_flow_state == FlowState.AWAITING_VARIANT_SELECTION.value:
-        was_translated, detected_lang = False, "en"
-        logger.debug("[LangCheck] Skipping translation — AWAITING_VARIANT_SELECTION flow")
-    else:
-        message, was_translated, detected_lang = detect_and_translate(message)
-        if was_translated:
-            logger.info(f"[LangCheck] translated from '{detected_lang}' | '{message[:100]}'")
-
-    # ── Generic word synonyms (e.g. "material" → "category") ──
-    # Runs on the final English text, after translation, so every downstream
-    # extractor/classifier/keyword-matcher that already understands the
-    # internal word ("category") automatically handles the user's word
-    # ("material") too, with zero changes needed at each individual site.
-    message = _apply_generic_word_synonyms(message)
 
     # ── Session & DB setup ──
     session_id   = resolve_session_id()
@@ -1916,6 +1903,27 @@ def chat():
     if user_context is not conversation.context_data:
         conversation.context_data = user_context
 
+    # ── Language (per tenant: tenants.features["translation"]) ──
+    # Everything below runs on English. prepare_inbound() is a no-op for a
+    # tenant without translation, skips variant picks (catalogue values typed
+    # back verbatim — translating 12"X24" gives 12 "X24") and resolves tapped
+    # translated chips to their exact English original. The reply is
+    # translated back by @translate_reply on this view. See translation/turn.py.
+    # Runs after the conversation is loaded because the conversation's sticky
+    # language and chip map live in its context_data.
+    message = prepare_inbound(
+        message, conversation,
+        flow_state=conversation.flow_state or "",
+        payload_flow_state=(body.get("user_context") or {}).get("flow_state", ""),
+    )
+
+    # ── Generic word synonyms (e.g. "material" → "category") ──
+    # Runs on the final English text, after translation, so every downstream
+    # extractor/classifier/keyword-matcher that already understands the
+    # internal word ("category") automatically handles the user's word
+    # ("material") too, with zero changes needed at each individual site.
+    message = _apply_generic_word_synonyms(message)
+
     truncated_msg = message[:100] + "..." if len(message) > 100 else message
     logger.info(
         f'POST /chat | session={session_id} | message="{sanitize_log_string(truncated_msg)}" '
@@ -1959,7 +1967,12 @@ def chat():
 
     try:
         # ── Save user message ──
-        user_msg = Message(conversation_id=conversation.id, role="user", content=message)
+        # content is the English text the pipeline ran on; what the customer
+        # actually typed (if translated) rides along in metadata for history.
+        user_msg = Message(
+            conversation_id=conversation.id, role="user", content=message,
+            metadata_json=user_message_i18n_metadata(),
+        )
         db.session.add(user_msg)
         db.session.commit()
         
