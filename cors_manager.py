@@ -37,7 +37,7 @@ _STATIC_ORIGINS: Set[str] = {
 }
 
 _ALLOW_HEADERS = (
-    "Content-Type, X-MiraQ-Session, X-MiraQ-License-Id, "
+    "Content-Type, X-MiraQ-Session, X-MiraQ-License-Id, X-MiraQ-Identity, "
     "X-WC-Session, X-WP-Nonce, Authorization"
 )
 _ALLOW_METHODS = "GET, POST, PUT, DELETE, PATCH, OPTIONS"
