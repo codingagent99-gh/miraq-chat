@@ -4,7 +4,7 @@ module.exports = {
       name: "libretranslate",
       script: "/home/apps/varchaswi/miraq-chat/.venv/bin/libretranslate",
       interpreter: "none",
-      args: "--host 0.0.0.0 --port 5012 --load-only en,es",
+      args: "--host 0.0.0.0 --port 5000 --load-only en,es",
       watch: false,
       autorestart: true,
       max_restarts: 5,

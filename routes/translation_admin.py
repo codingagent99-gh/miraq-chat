@@ -35,7 +35,7 @@ from models import db, Tenant
 from translation.base import TranslationUnavailable
 from translation.registry import get_provider, provider_names
 from translation.settings import FEATURE_KEY, from_features, validate
-from translation.text import translate_markdown, translate_texts
+from translation.text import translate_inbound, translate_markdown
 from translation.turn import pick_input_language
 
 logger = get_logger("miraq_admin")
@@ -163,7 +163,7 @@ def test_settings(tenant_key):
               "input_lang": lang or None}
     try:
         if lang and lang != "en":
-            result["to_english"] = translate_texts(provider, [text], lang, "en")[0]
+            result["to_english"] = translate_inbound(provider, text, lang, "en")
             result["reply_translated"] = translate_markdown(provider, reply, "en", lang)
         result["reply_english"] = reply
     except TranslationUnavailable as e:

@@ -9,11 +9,10 @@ module.exports = {
   apps: [
     {
       name: "indictrans2",
-      script:
-        "/home/apps/varchaswi/miraq-chat-shopify-multi/.venv-indictrans2/bin/gunicorn",
+      script: "/home/apps/varchaswi/miraq-chat/.venv-indictrans2/bin/gunicorn",
       interpreter: "none",
-      args: "indictrans2_server:app --bind 127.0.0.1:5013 --workers 1 --threads 4 --timeout 180",
-      cwd: "/home/apps/varchaswi/miraq-chat-shopify-multi/translation_service",
+      args: "indictrans2_server:app --bind 127.0.0.1:5018 --workers 1 --threads 4 --timeout 180",
+      cwd: "/home/apps/varchaswi/miraq-chat/translation_service",
       watch: false,
       autorestart: true,
       max_restarts: 5,

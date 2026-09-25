@@ -165,4 +165,43 @@ def translate_markdown(provider: TranslationProvider, text: str,
     return "\n".join(lines)
 
 
-__all__ = ["translate_texts", "translate_markdown", "TranslationUnavailable"]
+# ── customer message (Indic -> English) ──────────────────────────────────────
+#
+# Customers mix scripts: "मला Carrara Marble च्या 12x24 टाइल्स दाखवा". The
+# English runs are almost always product names, sizes, SKUs — exactly what
+# the search needs verbatim. Each run of Latin/digit tokens becomes one
+# placeholder, so the model translates the Marathi around it and cannot
+# transliterate "Carrara" into Devanagari or split 12x24.
+
+_LATIN_RUN_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9&'’./+×\-\"]*"
+    r"(?:[ \t]+[A-Za-z0-9][A-Za-z0-9&'’./+×\-\"]*)*"
+)
+
+
+def translate_inbound(provider: TranslationProvider, text: str,
+                      source: str, target: str = "en") -> str:
+    """Translate a customer message, keeping English/number runs verbatim.
+    Raises TranslationUnavailable."""
+    kept: List[str] = []
+
+    def repl(m):
+        kept.append(m.group(0))
+        return _PLACEHOLDER.format(len(kept))
+
+    masked = _LATIN_RUN_RE.sub(repl, text)
+    if not kept:
+        return translate_texts(provider, [text], source, target)[0]
+    if not _HAS_LETTER_RE.search(_PLACEHOLDER_RE.sub("", masked)):
+        return text  # nothing but English/numbers left — no translation needed
+
+    out = translate_texts(provider, [masked], source, target)[0]
+    if _placeholders_intact(out, len(kept)):
+        return _unmask(out, kept)
+    # The model dropped or rewrote a placeholder: translating the raw text
+    # is still better than losing a product name.
+    logger.debug("[Translate] inbound placeholder lost, translating unmasked")
+    return translate_texts(provider, [text], source, target)[0]
+
+
+__all__ = ["translate_texts", "translate_markdown", "translate_inbound", "TranslationUnavailable"]

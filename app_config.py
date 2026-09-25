@@ -414,3 +414,26 @@ LLM_COST_PER_1K_OUTPUT = float(os.getenv("LLM_COST_PER_1K_OUTPUT", "0.008"))
 CHANNEL_API_KEY = os.getenv("CHANNEL_API_KEY", "").strip()
 # Product cards sent per turn. Each card is a separate message on WhatsApp.
 CHANNEL_MAX_PRODUCT_CARDS = int(os.getenv("CHANNEL_MAX_PRODUCT_CARDS", "5"))
+
+
+# ═══════════════════════════════════════════
+# TRANSLATION (per-tenant; see translation/)
+# ═══════════════════════════════════════════
+# WHICH provider and WHICH languages a tenant uses live on its row
+# (tenants.features["translation"], edited via /admin/translation/...).
+# Only where each provider runs is process-wide config.
+#
+# LIBRE_TRANSLATE_PORT is the old single-store setting; still honoured as the
+# default port so an existing .env keeps working.
+LIBRETRANSLATE_URL = os.getenv(
+    "LIBRETRANSLATE_URL",
+    f"http://localhost:{os.getenv('LIBRE_TRANSLATE_PORT', '5012')}",
+).rstrip("/")
+LIBRETRANSLATE_API_KEY = os.getenv("LIBRETRANSLATE_API_KEY", "").strip()
+INDICTRANS2_URL = os.getenv("INDICTRANS2_URL", "http://localhost:5013").rstrip("/")
+
+# Short connect timeout: a provider that is not listening must cost ~1s once,
+# then the per-provider circuit breaker skips it for the cooldown.
+TRANSLATION_CONNECT_TIMEOUT = float(os.getenv("TRANSLATION_CONNECT_TIMEOUT", "1.0"))
+TRANSLATION_READ_TIMEOUT = float(os.getenv("TRANSLATION_READ_TIMEOUT", "30"))
+TRANSLATION_BREAKER_COOLDOWN = float(os.getenv("TRANSLATION_BREAKER_COOLDOWN", "60"))

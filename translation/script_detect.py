@@ -10,6 +10,10 @@ Limits, on purpose:
   * Romanised Indian text ("mala tiles pahije") is Latin script and comes out
     as English. Telling romanised Marathi from English needs a real
     language-ID model — out of scope here.
+  * Code-mixed messages ("मला Carrara Marble दाखवा") are common: product
+    names stay in English. Any real Indic text (MIN_INDIC_CHARS or more)
+    therefore decides the language even when Latin letters outnumber it —
+    an English message essentially never contains Devanagari.
   * Very short messages ("हो", "ठीक") carry no marker words; the caller
     resolves those with the conversation's sticky language or the tenant's
     default_language.
@@ -18,6 +22,7 @@ Limits, on purpose:
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import List
 
 from translation.base import Detection
@@ -50,11 +55,16 @@ _HI_MARKERS = {
     "लिए", "का", "की", "को", "से", "था", "थी",
 }
 _WORD_RE = re.compile(r"[\u0900-\u097F]+")
+MIN_INDIC_CHARS = 2
 
 
 def _script_counts(text: str) -> dict:
     counts = {"latin": 0}
     for ch in text:
+        # Letters and combining vowel signs only: the danda (।), digits and
+        # punctuation must not count as "Devanagari text".
+        if unicodedata.category(ch)[0] not in ("L", "M"):
+            continue
         cp = ord(ch)
         if ("a" <= ch <= "z") or ("A" <= ch <= "Z"):
             counts["latin"] += 1
@@ -86,10 +96,17 @@ def detect_by_script(text: str) -> List[Detection]:
     letters = sum(counts.values())
     if letters == 0:
         return []
-    dominant = max(counts, key=counts.get)
-    share = counts[dominant] / letters
+    indic = {k: v for k, v in counts.items() if k != "latin" and v}
+    if sum(indic.values()) >= MIN_INDIC_CHARS:
+        dominant = max(indic, key=indic.get)
+        share = indic[dominant] / sum(indic.values())
+    else:
+        dominant = "latin"
+        share = counts["latin"] / letters if counts["latin"] else 0.0
 
     if dominant == "latin":
+        if not counts["latin"]:
+            return []
         return [Detection("en", 0.6 + 0.3 * share)]
     if dominant == "devanagari":
         return _devanagari_ranking(text)
@@ -104,7 +121,7 @@ def script_languages(text: str) -> List[str]:
     """Every language that could have written this text, by script. Unranked."""
     counts = _script_counts(text or "")
     counts.pop("latin", None)
-    if not counts or not any(counts.values()):
+    if sum(counts.values()) < MIN_INDIC_CHARS:
         return []
     dominant = max(counts, key=counts.get)
     return list(next(l for n, _lo, _hi, l in _SCRIPTS if n == dominant))

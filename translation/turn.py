@@ -46,7 +46,7 @@ from translation.base import TranslationUnavailable
 from translation.registry import get_provider
 from translation.script_detect import script_languages
 from translation.settings import TranslationSettings, from_features
-from translation.text import translate_markdown, translate_texts
+from translation.text import translate_inbound, translate_markdown, translate_texts
 
 logger = get_logger("miraq_translation")
 
@@ -186,7 +186,7 @@ def prepare_inbound(message: str, conversation, *, flow_state: str = "",
 
     st.reply_lang = lang
     try:
-        english = translate_texts(provider, [text], lang, "en")[0].strip()
+        english = translate_inbound(provider, text, lang, "en").strip()
     except TranslationUnavailable:
         return message  # pipeline gets the original; reply falls back to English below
     if not english:
