@@ -16,7 +16,8 @@ Run it in its OWN virtualenv — torch + transformers are large and must not
 be installed into the chat backend's env. See indictrans2.config.js and
 requirements-indictrans2.txt.
 
-Env:
+Env (read from the process environment, then the project .env):
+    HF_TOKEN             Hugging Face read token — needed once, to download the gated models
     IT2_EN_INDIC_MODEL   default ai4bharat/indictrans2-en-indic-dist-200M
     IT2_INDIC_EN_MODEL   default ai4bharat/indictrans2-indic-en-dist-200M
     IT2_DEVICE           "cpu" | "cuda" (default: cuda if available)
@@ -37,6 +38,16 @@ import time
 from contextlib import nullcontext
 
 from flask import Flask, jsonify, request
+
+# Load the project .env (one level up from translation_service/) before
+# anything touches Hugging Face, so HF_TOKEN and the IT2_* settings can live
+# there instead of in the PM2 config. Values already set in the environment
+# (e.g. PM2 env block) win over .env.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+except ImportError:
+    pass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("indictrans2")
