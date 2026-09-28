@@ -88,7 +88,12 @@ _OPTIONAL_TENANT_PATHS = {"/health", "/status"}
 # make "change a language" trigger a catalogue load for a cold tenant.
 # /admin/shopify-apps/ (routes/shopify_apps_admin.py) edits control-plane rows
 # only and must work before any tenant exists for the store.
-_EXEMPT_PREFIXES = ("/static/", "/admin/translation/", "/admin/shopify-apps")
+# /shopify/install/<client_id> and /shopify/auth/callback/<client_id> are the
+# custom-distribution install routes (routes/shopify_oauth.py). Like their
+# exact-path public-app twins in _EXEMPT_PATHS, they run before the store has
+# a tenant, so they must skip tenant resolution.
+_EXEMPT_PREFIXES = ("/static/", "/admin/translation/", "/admin/shopify-apps",
+                    "/shopify/install/", "/shopify/auth/callback/")
 
 _tenant_registry = None
 _engine_registry = None
