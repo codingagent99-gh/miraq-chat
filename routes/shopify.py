@@ -33,8 +33,10 @@ from ecommerce.shopify_proxy import resolve_shopify_customer_id, verify_events_h
 from app_config import (
     SHOPIFY_CUSTOMER_AUTH,
     SHOPIFY_PROXY_MAX_AGE,
-    SHOPIFY_CLIENT_SECRET,
 )
+# Per store: the public app's secret, or the custom app the store installed
+# through (shopify_apps.py). Replaces the single app-wide SHOPIFY_CLIENT_SECRET.
+from shopify_apps import app_for_shop
 
 logger = get_logger("miraq_chat")
 shopify_bp = Blueprint("shopify", __name__)
@@ -127,10 +129,10 @@ def get_customer_addresses():
         logger.error(f"customer-addresses: no tenant found for shop={shop!r}")
         return jsonify({"error": "unverified_request"}), 403
 
-    # App-level secret: one value for every store. The tenant lookup above
-    # only decides WHICH tenant the request claims to be; this key is what
-    # proves the claim, and Shopify signs every store's traffic with it.
-    client_secret = SHOPIFY_CLIENT_SECRET
+    # The secret of the app this store installed (public or custom). The shop
+    # value only chooses WHICH secret; the signature check below is what
+    # proves the request came from Shopify.
+    client_secret = app_for_shop(shop).client_secret
 
     customer_id, proxy_error = resolve_shopify_customer_id(
         request.args,
@@ -238,10 +240,9 @@ def shopify_product_update_event():
         logger.warning(f"shopify events: no tenant found for shop={shop_domain!r} on /events/product-update")
         return jsonify({"error": "unverified_request"}), 401
 
-    # App-level secret: one value for every store. The tenant lookup above
-    # only decides WHICH tenant the request claims to be; this key is what
-    # proves the claim, and Shopify signs every store's traffic with it.
-    client_secret = SHOPIFY_CLIENT_SECRET
+    # Secret of the app this store installed (public or custom); the header
+    # only chooses which one, the HMAC check proves the delivery.
+    client_secret = app_for_shop(shop_domain).client_secret
     ok, reason = verify_events_hmac(raw_body, header_hmac, client_secret)
     if not ok:
         logger.warning(f"shopify events: rejected /events/product-update delivery | reason={reason} | shop={shop_domain!r}")
@@ -315,10 +316,9 @@ def shopify_order_paid_event():
         logger.warning(f"shopify events: no tenant found for shop={shop_domain!r} on /events/order-paid")
         return jsonify({"error": "unverified_request"}), 401
 
-    # App-level secret: one value for every store. The tenant lookup above
-    # only decides WHICH tenant the request claims to be; this key is what
-    # proves the claim, and Shopify signs every store's traffic with it.
-    client_secret = SHOPIFY_CLIENT_SECRET
+    # Secret of the app this store installed (public or custom); the header
+    # only chooses which one, the HMAC check proves the delivery.
+    client_secret = app_for_shop(shop_domain).client_secret
     ok, reason = verify_events_hmac(raw_body, header_hmac, client_secret)
     if not ok:
         logger.warning(f"shopify events: rejected /events/order-paid delivery | reason={reason} | shop={shop_domain!r}")
@@ -400,8 +400,12 @@ def shopify_compliance_webhook():
     raw_body = request.get_data()  # exact signed bytes; don't re-serialise
     header_hmac = _shopify_header("Shopify-Hmac-Sha256") or None
 
-    # Authenticate FIRST, with the app-level secret, before reading anything.
-    ok, reason = verify_events_hmac(raw_body, header_hmac, SHOPIFY_CLIENT_SECRET)
+    # Authenticate FIRST, before reading the body. The shop header only picks
+    # WHICH app's secret to check against (an unknown shop gets the public
+    # app's, so the answer is the same 401 whether or not the shop exists).
+    ok, reason = verify_events_hmac(
+        raw_body, header_hmac, app_for_shop(_shopify_header("Shopify-Shop-Domain")).client_secret
+    )
     if not ok:
         logger.warning(f"shopify compliance: rejected delivery | reason={reason}")
         return jsonify({"error": "unauthorized"}), 401
@@ -475,7 +479,9 @@ def shopify_app_uninstalled():
     # before touching the database means an unsigned request gets an identical
     # 401 whether or not it named a real store, so this cannot be used to
     # enumerate which shops have the app installed.
-    ok, reason = verify_events_hmac(raw_body, header_hmac, SHOPIFY_CLIENT_SECRET)
+    # The header only picks which app's secret (unknown shop -> the public
+    # app's), so an unsigned request still gets the same 401 either way.
+    ok, reason = verify_events_hmac(raw_body, header_hmac, app_for_shop(shop_domain).client_secret)
     if not ok:
         logger.warning(
             f"shopify events: rejected /events/app-uninstalled delivery | "

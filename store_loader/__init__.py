@@ -64,14 +64,14 @@ class StoreLoader(StoreQueryMixin):
         self.shopify_domain   = config.shopify_domain
 
         # ── Shopify token manager ─────────────────────────────────────────────
-        # The app's client credentials are process-wide (app_config), not
-        # per-tenant, so the gate is: are they configured at all, and does
-        # this tenant have a domain to hold a token for. Falls back to
-        # config.shopify_admin_token for local dev.
+        # The gate is: are the credentials of the app this store runs on (the
+        # public app from .env, or its custom-distribution app — see
+        # shopify_apps.py) configured, and does this tenant have a domain to
+        # hold a token for. Falls back to config.shopify_admin_token for local dev.
         self._token_manager = None
         if config.ecommerce_backend == "shopify":
-            from app_config import SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET
-            if SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET and config.shopify_domain:
+            from shopify_apps import app_for_shop
+            if app_for_shop(config.shopify_domain).configured and config.shopify_domain:
                 from store_loader.shopify_token_manager import ShopifyTokenManager
                 self._token_manager = ShopifyTokenManager(config=config, app=app)
                 logger.info(
@@ -92,7 +92,8 @@ class StoreLoader(StoreQueryMixin):
                 logger.error(
                     "StoreLoader: Shopify backend selected but the app's credentials "
                     "are not configured. Set SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET "
-                    "in .env — these are app-wide, not per tenant."
+                    "in .env (public app), or register this store's custom app at "
+                    "/admin/shopify-apps."
                 )
 
         # No headers on the session itself: every outbound call takes them

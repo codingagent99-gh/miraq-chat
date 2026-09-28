@@ -22,6 +22,20 @@ storefront request would 400.
       Plain landing page, so application_url resolves to something after the
       install instead of a 404.
 
+CUSTOM-DISTRIBUTION APPS
+------------------------
+The two routes above serve the public app (credentials in .env). A custom
+app has its own client id/secret (registered via /admin/shopify-apps, stored
+in shopify_apps) and its own pair of routes, with the client id in the path:
+
+  GET /shopify/install/<client_id>          <- that app's application_url
+  GET /shopify/auth/callback/<client_id>    <- that app's redirect_urls entry
+
+The client id in the URL decides whose secret signs the state and verifies
+the callback HMAC, whose credentials exchange the code, and which app the
+store is bound to afterwards (shopify_apps.record_install). A public-app
+install can never be routed to a custom app or the other way round.
+
 WHY THE CODE GRANT, NOT client_credentials
 ------------------------------------------
 store_loader/shopify_token_manager.py mints tokens with the client_credentials
@@ -57,11 +71,7 @@ from datetime import datetime, timedelta, timezone
 import requests as http_requests
 from flask import Blueprint, current_app, jsonify, redirect, request
 
-from app_config import (
-    SHOPIFY_API_VERSION,
-    SHOPIFY_CLIENT_ID,
-    SHOPIFY_CLIENT_SECRET,
-)
+from app_config import SHOPIFY_API_VERSION
 from chat_logger import get_logger
 from models import db, Tenant
 from models.shopify_token import ShopifyToken
@@ -71,6 +81,14 @@ from routes.provisioning import (
     _start_background_build,
 )
 from tenant_db_provisioner import ensure_tenant_database, TenantDBProvisionError
+from shopify_apps import (
+
+    app_for_install,
+    app_for_shop,
+    callback_path,
+    install_path,
+    record_install,
+)
 
 logger = get_logger("miraq_chat")
 
@@ -119,7 +137,7 @@ def _valid_shop(shop: str) -> bool:
     return bool(_SHOP_RE.match(shop or ""))
 
 
-def _verify_oauth_hmac(args) -> bool:
+def _verify_oauth_hmac(args, client_secret: str) -> bool:
     """
     Verify the `hmac` parameter on an OAuth request.
 
@@ -128,8 +146,8 @@ def _verify_oauth_hmac(args) -> bool:
     called `signature`; here they are joined with '&' and it is called `hmac`.
     Mixing them up produces a mismatch on every request.
     """
-    if not SHOPIFY_CLIENT_SECRET:
-        logger.error("shopify oauth: SHOPIFY_CLIENT_SECRET is not configured")
+    if not client_secret:
+        logger.error("shopify oauth: app client secret is not configured")
         return False
 
     supplied = args.get("hmac", "")
@@ -142,25 +160,19 @@ def _verify_oauth_hmac(args) -> bool:
         if k not in ("hmac", "signature")
     )
     expected = hmac.new(
-        SHOPIFY_CLIENT_SECRET.encode("utf-8"),
+        client_secret.encode("utf-8"),
         "&".join(pairs).encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
     return hmac.compare_digest(expected, supplied)
 
 
-def _make_state(shop: str) -> str:
+def _make_state(shop: str, client_secret: str) -> str:
     """Signed, stateless nonce: <timestamp>.<hmac(timestamp:shop)>."""
-    ts = str(int(time.time()))
-    digest = hmac.new(
-        SHOPIFY_CLIENT_SECRET.encode("utf-8"),
-        f"{ts}:{shop}".encode("utf-8"),
-        hashlib.sha256,
-    ).digest()
-    return f"{ts}.{base64.urlsafe_b64encode(digest).decode().rstrip('=')}"
+    return _make_state_for_ts(str(int(time.time())), shop, client_secret)
 
 
-def _valid_state(state: str, shop: str) -> bool:
+def _valid_state(state: str, shop: str, client_secret: str) -> bool:
     try:
         ts, _ = (state or "").split(".", 1)
         age = time.time() - int(ts)
@@ -168,12 +180,12 @@ def _valid_state(state: str, shop: str) -> bool:
         return False
     if age > _STATE_MAX_AGE_SECONDS or age < -60:
         return False
-    return hmac.compare_digest(_make_state_for_ts(ts, shop), state)
+    return hmac.compare_digest(_make_state_for_ts(ts, shop, client_secret), state)
 
 
-def _make_state_for_ts(ts: str, shop: str) -> str:
+def _make_state_for_ts(ts: str, shop: str, client_secret: str) -> str:
     digest = hmac.new(
-        SHOPIFY_CLIENT_SECRET.encode("utf-8"),
+        client_secret.encode("utf-8"),
         f"{ts}:{shop}".encode("utf-8"),
         hashlib.sha256,
     ).digest()
@@ -193,24 +205,44 @@ def _generate_shop_token() -> str:
     return "mq_shop_" + secrets.token_urlsafe(24)
 
 
-@shopify_oauth_bp.route("/shopify/install", methods=["GET"])
-def shopify_install():
-    """Start the OAuth flow. Point the app's application_url here."""
+def _app_or_error(client_id, shop: str, where: str):
+    """(app, None) for the app named by the route, or (None, error response)."""
+    app = app_for_install(client_id)
+    if app is None:
+        logger.warning(f"shopify {where}: unknown custom app | client_id={client_id!r} shop={shop!r}")
+        return None, (jsonify({"error": "unknown app"}), 404)
+    if not app.configured:
+        logger.error(f"shopify {where}: app credentials not configured | client_id={client_id!r}")
+        return None, (jsonify({"error": "app not configured"}), 500)
+    if app.custom and app.shops and shop not in app.shops:
+        # Shopify only lets the store(s) it was created for install a custom
+        # app anyway; this keeps a mis-pasted install link from creating a
+        # tenant bound to the wrong app.
+        logger.warning(f"shopify {where}: custom app {app.client_id} is not set up for shop={shop!r}")
+        return None, (jsonify({"error": "this app is not set up for this store"}), 403)
+    return app, None
+
+
+@shopify_oauth_bp.route("/shopify/install", methods=["GET"], defaults={"client_id": None})
+@shopify_oauth_bp.route("/shopify/install/<client_id>", methods=["GET"])
+def shopify_install(client_id):
+    """Start the OAuth flow. Point the app's application_url here
+    (the public app: /shopify/install; a custom app: /shopify/install/<its client id>)."""
     shop = (request.args.get("shop") or "").strip().lower()
 
     if not _valid_shop(shop):
         logger.warning(f"shopify install: invalid shop parameter | shop={shop!r}")
         return jsonify({"error": "invalid shop parameter"}), 400
 
-    if not SHOPIFY_CLIENT_ID or not SHOPIFY_CLIENT_SECRET:
-        logger.error("shopify install: app credentials not configured")
-        return jsonify({"error": "app not configured"}), 500
+    app, error = _app_or_error(client_id, shop, "install")
+    if error:
+        return error
 
     # Shopify signs this request too, but only once the app is known to the
     # store. A first-time install arrives unsigned, so a missing hmac is not
     # an error here — the callback's hmac + state are what actually gate the
     # token exchange.
-    if request.args.get("hmac") and not _verify_oauth_hmac(request.args):
+    if request.args.get("hmac") and not _verify_oauth_hmac(request.args, app.client_secret):
         logger.warning(f"shopify install: hmac present but invalid | shop={shop!r}")
         return jsonify({"error": "invalid signature"}), 401
 
@@ -220,22 +252,26 @@ def shopify_install():
             f"from the request ({request.url_root!r}). Shopify will reject it unless it "
             "matches redirect_urls in the app toml exactly."
         )
-    redirect_uri = _app_url("shopify/auth/callback")
+    redirect_uri = _app_url(callback_path(app))
     authorize_url = (
         f"https://{shop}/admin/oauth/authorize?"
         + urllib.parse.urlencode({
-            "client_id":    SHOPIFY_CLIENT_ID,
+            "client_id":    app.client_id,
             "scope":        SHOPIFY_SCOPES,
             "redirect_uri": redirect_uri,
-            "state":        _make_state(shop),
+            "state":        _make_state(shop, app.client_secret),
         })
     )
-    logger.info(f"shopify install: redirecting to consent screen | shop={shop} redirect_uri={redirect_uri}")
+    logger.info(
+        f"shopify install: redirecting to consent screen | shop={shop} "
+        f"app={'custom ' + app.client_id if app.custom else 'public'} redirect_uri={redirect_uri}"
+    )
     return redirect(authorize_url, code=302)
 
 
-@shopify_oauth_bp.route("/shopify/auth/callback", methods=["GET"])
-def shopify_auth_callback():
+@shopify_oauth_bp.route("/shopify/auth/callback", methods=["GET"], defaults={"client_id": None})
+@shopify_oauth_bp.route("/shopify/auth/callback/<client_id>", methods=["GET"])
+def shopify_auth_callback(client_id):
     shop  = (request.args.get("shop") or "").strip().lower()
     code  = (request.args.get("code") or "").strip()
     state = (request.args.get("state") or "").strip()
@@ -247,14 +283,17 @@ def shopify_auth_callback():
         return jsonify({"error": "invalid shop parameter"}), 400
     if not code:
         return jsonify({"error": "missing code"}), 400
-    if not _verify_oauth_hmac(request.args):
+    app, error = _app_or_error(client_id, shop, "callback")
+    if error:
+        return error
+    if not _verify_oauth_hmac(request.args, app.client_secret):
         logger.warning(f"shopify callback: hmac verification failed | shop={shop}")
         return jsonify({"error": "invalid signature"}), 401
-    if not _valid_state(state, shop):
+    if not _valid_state(state, shop, app.client_secret):
         # Either a replayed/forged callback, or a merchant who left the consent
         # screen open for more than 10 minutes. Both get sent back to the start.
         logger.warning(f"shopify callback: state invalid or expired | shop={shop}")
-        return redirect(_app_url(f"shopify/install?shop={urllib.parse.quote(shop)}"), code=302)
+        return redirect(_app_url(f"{install_path(app)}?shop={urllib.parse.quote(shop)}"), code=302)
 
     # ── Exchange the code for an EXPIRING offline Admin API token ────────────
     # expiring=1 is required. Without it Shopify issues a non-expiring offline
@@ -265,8 +304,8 @@ def shopify_auth_callback():
         resp = http_requests.post(
             f"https://{shop}/admin/oauth/access_token",
             data={
-                "client_id":     SHOPIFY_CLIENT_ID,
-                "client_secret": SHOPIFY_CLIENT_SECRET,
+                "client_id":     app.client_id,
+                "client_secret": app.client_secret,
                 "code":          code,
                 "expiring":      "1",
             },
@@ -366,6 +405,12 @@ def shopify_auth_callback():
         f"access_expires_in={int(expires_in)}s refresh_expires_in={refresh_expires_in}"
     )
 
+    # ── Which app this store now runs on ─────────────────────────────────────
+    # From here on, its App Proxy signatures, webhook HMACs and token refreshes
+    # are checked with THIS app's secret (shopify_apps.app_for_shop). Only a
+    # verified callback like this one can set it.
+    record_install(shop, app)
+
     # ── Database + schema ────────────────────────────────────────────────────
     base_dsn = current_app.config["SQLALCHEMY_DATABASE_URI"]
     try:
@@ -417,10 +462,12 @@ def installed():
     # on (context=apps&activateAppId=<client_id>/<embed block handle>); the
     # merchant only reviews and clicks Save. The handle is the block's file
     # name: extensions/miraq-commerce-agent/blocks/miraq_widget.liquid.
+    # The embed belongs to whichever app this store installed (public or custom).
+    app_client_id = app_for_shop(shop).client_id if _valid_shop(shop) else ""
     embed_link = (
         f"https://{shop}/admin/themes/current/editor?context=apps"
-        f"&activateAppId={SHOPIFY_CLIENT_ID}/{_EMBED_BLOCK_HANDLE}"
-        if _valid_shop(shop) and SHOPIFY_CLIENT_ID else ""
+        f"&activateAppId={app_client_id}/{_EMBED_BLOCK_HANDLE}"
+        if _valid_shop(shop) and app_client_id else ""
     )
     button = (
         f"<p><a class='btn' href='{html.escape(embed_link)}' target='_top'>"

@@ -86,7 +86,9 @@ _OPTIONAL_TENANT_PATHS = {"/health", "/status"}
 # /admin/translation/ (routes/translation_admin.py) names its tenant in the
 # URL and edits only the control-plane row — binding a StoreLoader there would
 # make "change a language" trigger a catalogue load for a cold tenant.
-_EXEMPT_PREFIXES = ("/static/", "/admin/translation/")
+# /admin/shopify-apps/ (routes/shopify_apps_admin.py) edits control-plane rows
+# only and must work before any tenant exists for the store.
+_EXEMPT_PREFIXES = ("/static/", "/admin/translation/", "/admin/shopify-apps")
 
 _tenant_registry = None
 _engine_registry = None
@@ -212,12 +214,15 @@ def _tenant_from_app_proxy():
     if not args.get("signature") or not args.get("shop"):
         return None
 
-    from app_config import SHOPIFY_CLIENT_SECRET, SHOPIFY_PROXY_MAX_AGE
+    from app_config import SHOPIFY_PROXY_MAX_AGE
     from ecommerce.shopify_proxy import verify_app_proxy_signature
+    from shopify_apps import app_for_shop
 
+    # Secret of the app this store installed (public or custom). The unsigned
+    # `shop` only chooses which secret; the signature is the authentication.
     ok, reason = verify_app_proxy_signature(
         args.to_dict(flat=True),
-        SHOPIFY_CLIENT_SECRET,
+        app_for_shop(args.get("shop")).client_secret,
         max_age_seconds=SHOPIFY_PROXY_MAX_AGE,
     )
     if not ok:

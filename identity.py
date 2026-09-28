@@ -184,13 +184,14 @@ def _shopify_identity(tenant) -> Identity:
         )
         return GUEST
 
-    from app_config import SHOPIFY_CLIENT_SECRET, SHOPIFY_CUSTOMER_AUTH, SHOPIFY_PROXY_MAX_AGE
+    from app_config import SHOPIFY_CUSTOMER_AUTH, SHOPIFY_PROXY_MAX_AGE
     from ecommerce.shopify_proxy import resolve_shopify_customer_id
+    from shopify_apps import app_for_shop
     claimed = ((request.get_json(silent=True) or {}).get("user_context") or {}).get("customer_id")
     customer_id, error = resolve_shopify_customer_id(
         args,
         mode=SHOPIFY_CUSTOMER_AUTH,
-        client_secret=SHOPIFY_CLIENT_SECRET,
+        client_secret=app_for_shop(shop).client_secret,  # public or this store's custom app
         claimed_customer_id=claimed,  # only honoured in the dev-only insecure mode
         max_age_seconds=SHOPIFY_PROXY_MAX_AGE or None,
     )

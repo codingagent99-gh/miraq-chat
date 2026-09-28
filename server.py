@@ -38,6 +38,7 @@ from routes.sales_rep import sales_rep_bp
 from routes.channel import channel_bp
 from routes.channel_link import channel_link_bp
 from routes.translation_admin import translation_admin_bp
+from routes.shopify_apps_admin import shopify_apps_admin_bp
 # ═══════════════════════════════════════════
 # FLASK APP & DATABASE
 # ═══════════════════════════════════════════
@@ -158,9 +159,11 @@ with app.app_context():
     from models import Tenant
     from models.shopify_token import ShopifyToken
     from models.channel_connection import ChannelConnection
+    from models.shopify_app import ShopifyApp
     db.metadata.create_all(
         bind=db.engine,
-        tables=[Tenant.__table__, ShopifyToken.__table__, ChannelConnection.__table__],
+        tables=[Tenant.__table__, ShopifyToken.__table__, ChannelConnection.__table__,
+                ShopifyApp.__table__],
     )
     _cors_manager.refresh_from_db()   # seed dynamic origins from existing tenants
 
@@ -177,6 +180,7 @@ app.register_blueprint(shopify_oauth_bp)
 app.register_blueprint(channel_bp)
 app.register_blueprint(channel_link_bp)
 app.register_blueprint(translation_admin_bp)
+app.register_blueprint(shopify_apps_admin_bp)
 
 # ── Request timing instrumentation ───────────────────────────────────────────
 # Writes plain text to logs/<date>/timing.txt, separate from chat.txt and

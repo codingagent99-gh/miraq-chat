@@ -31,7 +31,6 @@ import requests
 
 from chat_logger import get_logger
 from tenant_config import TenantConfig
-from app_config import SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET
 
 logger = get_logger("miraq_chat")
 
@@ -63,11 +62,10 @@ class ShopifyTokenManager:
         # Per-tenant: which store this manager holds a token for.
         self._domain          = config.shopify_domain
 
-        # App-level: the MiraQ app's own credentials, identical for every
-        # tenant. Read from app_config rather than TenantConfig so there is
-        # exactly one copy to rotate.
-        self._client_id       = SHOPIFY_CLIENT_ID
-        self._client_secret   = SHOPIFY_CLIENT_SECRET
+        # The app's credentials are NOT captured here: the store may run on the
+        # public app (.env) or on its own custom-distribution app, and that can
+        # change on a reinstall. _client_id / _client_secret below look it up
+        # at refresh time (shopify_apps.app_for_shop).
 
         self._lock           = threading.Lock()
         self._current_token: Optional[str] = None
@@ -75,6 +73,16 @@ class ShopifyTokenManager:
     # ──────────────────────────────────────────────
     # Public API
     # ──────────────────────────────────────────────
+
+    @property
+    def _client_id(self) -> str:
+        from shopify_apps import app_for_shop
+        return app_for_shop(self._domain).client_id
+
+    @property
+    def _client_secret(self) -> str:
+        from shopify_apps import app_for_shop
+        return app_for_shop(self._domain).client_secret
 
     def start(self):
         """

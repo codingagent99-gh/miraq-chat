@@ -259,15 +259,17 @@ def _code_challenge(verifier: str) -> str:
 
 def authorize_url(tenant, state: str, request_row) -> str:
     from urllib.parse import urlencode
-    from app_config import SHOPIFY_CLIENT_ID
+    from shopify_apps import app_for_shop
     from tenant_crypto import decrypt_secret
+    # The login client is the app this store installed (public or custom).
+    client_id = app_for_shop(tenant.shopify_domain).client_id
     config = _discover(tenant.shopify_domain, "/.well-known/openid-configuration")
     endpoint = config.get("authorization_endpoint")
-    if not endpoint or not SHOPIFY_CLIENT_ID:
+    if not endpoint or not client_id:
         raise ChannelLinkError("Sign-in isn't available for this store right now.",
-                               "no authorization_endpoint or SHOPIFY_CLIENT_ID")
+                               "no authorization_endpoint or app client id")
     params = {
-        "client_id": SHOPIFY_CLIENT_ID,
+        "client_id": client_id,
         "response_type": "code",
         "redirect_uri": callback_url(),
         "scope": CUSTOMER_SCOPE,
@@ -280,14 +282,15 @@ def authorize_url(tenant, state: str, request_row) -> str:
 
 def complete_sign_in(tenant, request_row, code: str) -> Tuple[str, str]:
     """Exchange the code and read the signed-in customer. Returns (customer_id, email)."""
-    from app_config import SHOPIFY_CLIENT_ID
+    from shopify_apps import app_for_shop
     from tenant_crypto import decrypt_secret
+    client_id = app_for_shop(tenant.shopify_domain).client_id
 
     config = _discover(tenant.shopify_domain, "/.well-known/openid-configuration")
     try:
         token_resp = http_requests.post(config["token_endpoint"], data={
             "grant_type": "authorization_code",
-            "client_id": SHOPIFY_CLIENT_ID,
+            "client_id": client_id,
             "redirect_uri": callback_url(),
             "code": code,
             "code_verifier": decrypt_secret(request_row.code_verifier_encrypted),

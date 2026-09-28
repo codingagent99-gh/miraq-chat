@@ -38,4 +38,7 @@ from models.chat_usage import ChatUsage
 
 # ── Messaging channels (WhatsApp / Instagram account -> tenant) ──
 from models.channel_connection import ChannelConnection
+
+# ── Shopify custom-distribution apps (client id/secret per app) ──
+from models.shopify_app import ShopifyApp
 from models import db
