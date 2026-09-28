@@ -45,6 +45,8 @@ FEATURE GATE
 """
 
 import hmac
+import json
+import os
 import time
 import uuid
 
@@ -163,10 +165,68 @@ def _bind_resident_loader(tenant) -> None:
     g.store_loader = dict(registry.resident_loaders()).get(str(tenant.tenant_id))
 
 
+# ── Payload logging ──────────────────────────────────────────────────────────
+# Every /chat/channel call logs what came in and what went back:
+#
+#   [channel] IN  | req=3f2a... | from=1.2.3.4 | key=ok | body={"channel": "instagram", ...}
+#   [channel] OUT | req=3f2a... | status=200 | 812ms | body={"messages": [...], ...}
+#
+# Same req id on both lines; grep it to see one turn. Logged on EVERY path
+# (bad key, unknown account, errors), so a call that "did nothing" still
+# shows up. The channel key itself is never logged, only whether it matched.
+#
+#   CHANNEL_LOG_PAYLOADS=false      turn it off
+#   CHANNEL_LOG_MAX_CHARS=4000      longer bodies are cut, with the full size noted
+
+CHANNEL_LOG_PAYLOADS = os.getenv("CHANNEL_LOG_PAYLOADS", "true").strip().lower() not in ("0", "false", "no", "off")
+CHANNEL_LOG_MAX_CHARS = int(os.getenv("CHANNEL_LOG_MAX_CHARS", "4000"))
+
+
+def _clip(text: str) -> str:
+    text = (text or "").replace("\r", " ").replace("\n", " ")
+    if len(text) <= CHANNEL_LOG_MAX_CHARS:
+        return text
+    return f"{text[:CHANNEL_LOG_MAX_CHARS]}... [cut, {len(text)} chars total]"
+
+
+def _body_for_log(raw: str) -> str:
+    """Compact JSON when the body parses (Unicode kept readable), raw text otherwise."""
+    try:
+        return _clip(json.dumps(json.loads(raw), ensure_ascii=False, separators=(", ", ": ")))
+    except (ValueError, TypeError):
+        return _clip(raw) or "<empty>"
+
+
 # ── POST /chat/channel ───────────────────────────────────────────────────────
 
 @channel_bp.route("/chat/channel", methods=["POST"])
 def channel_chat():
+    if not CHANNEL_LOG_PAYLOADS:
+        return _channel_chat()
+
+    req_id = uuid.uuid4().hex[:8]
+    started = time.time()
+    logger.info(
+        f"[channel] IN  | req={req_id} | from={request.headers.get('X-Forwarded-For') or request.remote_addr} | "
+        f"key={'ok' if _authorized() else ('missing' if not request.headers.get('X-MiraQ-Channel-Key') else 'WRONG')} | "
+        f"body={_body_for_log(request.get_data(as_text=True))}"
+    )
+    try:
+        rv = _channel_chat()
+    except Exception:
+        logger.error(f"[channel] OUT | req={req_id} | crashed after {round((time.time() - started) * 1000)}ms",
+                     exc_info=True)
+        raise
+
+    resp, status = (rv[0], rv[1]) if isinstance(rv, tuple) else (rv, getattr(rv, "status_code", 200))
+    logger.info(
+        f"[channel] OUT | req={req_id} | status={status} | {round((time.time() - started) * 1000)}ms | "
+        f"body={_body_for_log(resp.get_data(as_text=True))}"
+    )
+    return rv
+
+
+def _channel_chat():
     start_time = time.time()
 
     if not _authorized():
