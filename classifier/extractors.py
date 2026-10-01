@@ -12,6 +12,7 @@ from typing import Optional
 import calendar
 from models import ExtractedEntities
 from store_registry import get_store_loader
+from platform_config import current_backend
 from app_config import FISCAL_YEAR_START_MONTH
 from config.store_config import (
     PRODUCT_TYPE_TERMS,
@@ -361,6 +362,42 @@ def extract_category(text: str, entities: ExtractedEntities) -> str:
 # ATTRIBUTE EXTRACTION
 # ═══════════════════════════════��══════════════════════════════
 
+def _plural_stem(text: str) -> str:
+    """'Mosaics', 'mosaic', 'MOSAIC' -> 'mosaic'. Whole-phrase compare only."""
+    words = re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).split()
+    return " ".join(
+        w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w
+        for w in words
+    )
+
+
+def _collection_and_tag_words(loader, entities: ExtractedEntities) -> set:
+    """
+    Shopify only. Plural-insensitive names of the collections this message
+    already resolved, plus every tag name in the store.
+
+    A word that IS one of these names is the shopper naming that collection
+    or tag. On Shopify, option values are free text and merchants often put
+    product names in them ("CAIRO Ramad Block Mosaic" under Colors), so the
+    compound-tail pass below would otherwise read "mosaic" as the tail of
+    dozens of colour values and ask "which one did you mean?" once per
+    option, on top of the Mosaics collection it had already applied.
+    """
+    words = set()
+    by_key = getattr(loader, "category_by_key", None) or {}
+    for key in getattr(entities, "target_category_slugs", None) or ():
+        cat = by_key.get(key)
+        if cat is None and hasattr(loader, "resolve_category"):
+            cat = loader.resolve_category(key)
+        name = getattr(cat, "name", None) if cat is not None else None
+        if name:
+            words.add(_plural_stem(name))
+    for name_lower in (getattr(loader, "tag_by_name_lower", None) or {}):
+        words.add(_plural_stem(name_lower))
+    words.discard("")
+    return words
+
+
 def extract_attributes(text: str, entities: ExtractedEntities) -> str:
     """Extract WooCommerce product attributes from text."""
     loader = get_store_loader()
@@ -371,6 +408,9 @@ def extract_attributes(text: str, entities: ExtractedEntities) -> str:
     # Lowered once here, not per term: _match_term_in_text's fast-reject needs
     # it and is called once per attribute term (thousands per request).
     masked_text_lower = masked_text.lower()
+
+    # Built on first use only (Shopify, and only when a tail candidate exists).
+    _named_words = None
 
     for attr in loader.all_attributes_raw:
         label = attr.get("attribute_label", "").lower().strip()
@@ -423,6 +463,16 @@ def extract_attributes(text: str, entities: ExtractedEntities) -> str:
                     tail_cands = _compound_tail_candidates(
                         masked_text, masked_text_lower, terms, product_name_lower
                     )
+                    # Shopify: a word that exactly names a collection or tag
+                    # is not the tail of an option value (see
+                    # _collection_and_tag_words). WooCommerce unchanged.
+                    if tail_cands and current_backend() == "shopify":
+                        if _named_words is None:
+                            _named_words = _collection_and_tag_words(loader, entities)
+                        tail_cands = [
+                            c for c in tail_cands
+                            if _plural_stem(c[2]) not in _named_words
+                        ]
                     if tail_cands:
                         max_len = max(c[0] for c in tail_cands)
                         best = [c for c in tail_cands if c[0] == max_len]

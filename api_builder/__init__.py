@@ -638,7 +638,19 @@ def _build_product_search(e, page, user_message: str = "") -> list:
         attr_filters or active_or_pairs
         or e.tag_slugs or e.target_category_slugs or e.product_id
     )
-    actual_search = e.product_name or (e.search_term if not _has_taxonomy else None)
+    # Shopify only: an explicitly chosen search text ("Search 'mosaic'" chip)
+    # is the query itself, so it stays even alongside filters — unlike a
+    # leftover search_term, which is dropped then (see the comment above).
+    # The Shopify executor matches text and filters together; WooCommerce
+    # requests are deliberately left exactly as they were.
+    explicit_search = bool(
+        current_backend() == "shopify"
+        and getattr(e, "search_term_explicit", False) and e.search_term
+    )
+    if explicit_search:
+        actual_search = e.search_term
+    else:
+        actual_search = e.product_name or (e.search_term if not _has_taxonomy else None)
     if not actual_search and not _has_taxonomy:
         actual_search = user_message
 
@@ -657,7 +669,10 @@ def _build_product_search(e, page, user_message: str = "") -> list:
         or active_or_pairs
         or e.in_stock is not None
     )
-    if not has_taxonomy and actual_search:
+    # The Shopify text-only call below carries no price, so an explicit
+    # search with a price range goes to the full filter call instead.
+    _explicit_with_price = explicit_search and (e.min_price is not None or e.max_price is not None)
+    if not has_taxonomy and actual_search and not _explicit_with_price:
         if current_backend() == "shopify":
             # Shopify has no search_products endpoint wired — but the GraphQL
             # executor's post-filter does substring matching over title + tags
@@ -688,7 +703,7 @@ def _build_product_search(e, page, user_message: str = "") -> list:
     stock_only = e.in_stock is not None and not (
         e.product_id or e.tag_slugs or e.target_category_slugs or attr_filters or active_or_pairs
     )
-    if stock_only:
+    if stock_only and not explicit_search:
         actual_search = None
     # When a specific product_id is resolved, the endpoint finds that product
     # on page 1 of the product list — always. Passing page=2 moves past it
