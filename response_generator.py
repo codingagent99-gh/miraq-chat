@@ -147,8 +147,51 @@ def _build_attribute_value_summary(attributes: dict) -> str:
             values.append(_resolve_attribute_term_name(attr_key, attr_val))
     return " / ".join(values)
 
+def _join_names(names: List[str]) -> str:
+    """'**A**', '**A** & **B**', '**A**, **B** & **C**'."""
+    bolded = [f"**{n}**" for n in names if n]
+    if len(bolded) <= 1:
+        return "".join(bolded)
+    return ", ".join(bolded[:-1]) + " & " + bolded[-1]
+
+
+def _missing_named_products_note(entities: ExtractedEntities, products: List[dict]) -> str:
+    """For a multi-product lookup, name the requested products that did not
+    come back (unpublished, hidden, or removed since the catalog loaded), so
+    the shopper isn't left guessing why one is absent."""
+    names = list(getattr(entities, "product_names", None) or [])
+    ids = list(getattr(entities, "product_ids", None) or [])
+    if len(names) < 2:
+        return ""
+    returned_ids = {str(p.get("id")) for p in products if p.get("id") is not None}
+    returned_names = {str(p.get("name", "")).lower().strip() for p in products}
+    missing = []
+    for i, name in enumerate(names):
+        pid = ids[i] if i < len(ids) else None
+        if pid is not None and str(pid) in returned_ids:
+            continue
+        if name.lower().strip() in returned_names:
+            continue
+        missing.append(name)
+    if not missing:
+        return ""
+    verb = "is" if len(missing) == 1 else "are"
+    return f"\n\n{_join_names(missing)} {verb} not available right now."
+
+
 def _build_search_context_string(entities: ExtractedEntities,  or_pair_breakdown: dict = None) -> str:
+    # Multi-product lookup: the named products are the entire query (the API
+    # call carries only their ids — filters are not applied), so describe
+    # exactly that and nothing carried over from other slots.
+    if len(getattr(entities, 'product_names', None) or []) >= 2:
+        return f"Products: {_join_names(entities.product_names)}"
+
     desc_parts = []
+
+    # Text the shopper explicitly chose to search ("Search 'mosaic'" chip) is
+    # part of the query, so name it; a leftover search_term never is.
+    if getattr(entities, 'search_term_explicit', False) and getattr(entities, 'search_term', None):
+        desc_parts.append(f"Search: **{entities.search_term}**")
 
     consumed_cat_slugs, consumed_tag_slugs, consumed_attr = set(), set(), set()
     shown_category_names = set()
@@ -629,7 +672,13 @@ def generate_bot_message(
         
         # 🚀 FIX: Use the new context builder to explicitly announce tags/categories/attributes
         search_context = _build_search_context_string(entities, or_pair_breakdown)
-        match_intro = f"I found the perfect match for {search_context}! 🎯" if search_context else "I found the perfect match! 🎯"
+        _missing_note = _missing_named_products_note(entities, products)
+        if _missing_note:
+            # Several products were asked for and only this one came back —
+            # "perfect match" would read as if it answered the whole request.
+            match_intro = f"Here's what I found for {search_context}:"
+        else:
+            match_intro = f"I found the perfect match for {search_context}! 🎯" if search_context else "I found the perfect match! 🎯"
 
         msg = f"{match_intro}\n\n**{p['name']}**\n"
         
@@ -645,7 +694,7 @@ def generate_bot_message(
             for attr in p["attributes"][:8]:  # Show up to 8 attributes instead of just 3
                 opts = ", ".join(attr["options"][:10])
                 msg += f"• **{attr['name']}:** {opts}\n"
-        return msg
+        return msg + _missing_note
 
     # ── Multiple products ──
     msg = ""
@@ -718,7 +767,7 @@ def generate_bot_message(
             plural = "s" if remaining > 1 else ""
             msg += f"\n...and {remaining} more product{plural}."
 
-    return msg
+    return msg + _missing_named_products_note(entities, products)
 
 
 def _get_unresolved_category_qualifier(entities: ExtractedEntities) -> str:

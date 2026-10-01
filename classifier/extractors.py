@@ -226,20 +226,11 @@ def extract_exclusions(text: str, entities: ExtractedEntities) -> str:
 # PRODUCT NAME EXTRACTION
 # ══════════════════════════════════════════════════════════════
 
-def extract_product_name(text: str, entities: ExtractedEntities):
-    """Extract product name, slug, and ID from text using the store catalog."""
-    loader = get_store_loader()
-    if not loader:
-        return
-
-    match = loader.get_product_for_text(text)
-    logger.debug(f"extract_product_name: text='{text}' | match={match}")
-    if not match:
-        return
-
+def _is_usable_product_match(match: dict, text: str, loader) -> bool:
+    """Guards a catalog product match must pass before it is trusted."""
     generic_words = {"product", "products", "item", "items"} | set(PRODUCT_TYPE_TERMS)
     if match["name"].lower().strip() in generic_words:
-        return
+        return False
 
     matched_name_lower = match["name"].lower()
     if matched_name_lower not in text:
@@ -249,7 +240,49 @@ def extract_product_name(text: str, entities: ExtractedEntities):
         tag_names_lower = set(loader.tag_by_name_lower.keys())
         tag_words = {t for tag_name in tag_names_lower for t in re.split(r'[\s\-_/]+', tag_name) if t and len(t) > 2}
         if not overlapping_tokens or overlapping_tokens.issubset(tag_words):
-            return
+            return False
+    return True
+
+
+def _extract_product_names_multi(text: str, entities: ExtractedEntities, loader) -> None:
+    """Record every distinct product the text names ("show me Lexi and Luna").
+
+    Only sets product_ids/product_names when there are two or more; the
+    single-product fields are left exactly as extract_product_name set them.
+    Whether the multi-product reading is actually used is decided later by
+    CatalogSearchEvaluator — see classify() for the normalisation.
+    """
+    if not hasattr(loader, "get_products_for_text"):
+        return
+    matches = [
+        m for m in loader.get_products_for_text(text)
+        if _is_usable_product_match(m, text, loader)
+    ]
+    if len(matches) < 2:
+        return
+    entities.product_ids = [m.get("id") for m in matches]
+    entities.product_names = [m["name"] for m in matches]
+    logger.debug(
+        f"extract_product_name: multiple products named | "
+        f"names={entities.product_names} ids={entities.product_ids}"
+    )
+
+
+def extract_product_name(text: str, entities: ExtractedEntities):
+    """Extract product name, slug, and ID from text using the store catalog."""
+    loader = get_store_loader()
+    if not loader:
+        return
+
+    _extract_product_names_multi(text, entities, loader)
+
+    match = loader.get_product_for_text(text)
+    logger.debug(f"extract_product_name: text='{text}' | match={match}")
+    if not match:
+        return
+
+    if not _is_usable_product_match(match, text, loader):
+        return
 
     entities.product_name = match["name"]
     entities.product_slug = match.get("slug", "")

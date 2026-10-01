@@ -739,6 +739,12 @@ class CatalogSearchEvaluator(IntentEvaluator):
         "see", "show", "specification", "specs", "tell", "what",
     })
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
+        if len(entities.product_ids) >= 2:
+            entities.product_id = None
+            entities.product_name = None
+            entities.product_slug = None
+            return Intent.PRODUCT_SEARCH, 0.93
+
         if entities.product_id and entities.attributes:
             return Intent.PRODUCT_VARIATIONS, 0.93
         if entities.product_id and (entities.attributes or getattr(entities, 'in_stock', None) is not None):

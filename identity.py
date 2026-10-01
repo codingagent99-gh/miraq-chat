@@ -20,7 +20,10 @@ Identity now comes only from sources a browser cannot forge:
   Shopify      logged_in_customer_id from the App Proxy query, which Shopify
                signs. Also checks the signed `shop` matches this tenant, so a
                signed request from another store running the app cannot be
-               replayed against this one. No proxy signature → guest.
+               replayed against this one. No proxy signature → guest —
+               except under SHOPIFY_CUSTOMER_AUTH=insecure_client_claim
+               (development only, never production), where the widget's
+               own user_context.customer_id is trusted.
 
   Channels     routes/channel.py sets CHANNEL_ENVIRON_KEY on the in-process
                request it builds. WSGI environ keys without an HTTP_ prefix
@@ -62,7 +65,7 @@ class Identity:
     customer_id: str = ""      # "" = guest
     role: str = "guest"
     email: str = ""
-    source: str = "anonymous"  # wp_token | shopify_proxy | channel | anonymous
+    source: str = "anonymous"  # wp_token | shopify_proxy | channel | insecure_client_claim | anonymous
     # Channel requests only: who is writing, so a guest can be sent a sign-in link.
     channel: str = ""
     channel_user_id: str = ""
@@ -171,10 +174,38 @@ def _woo_consumer_secret(tenant) -> str:
         return ""
 
 
+def _claimed_customer_id() -> str:
+    """The customer id the widget says it is (POST /chat's user_context)."""
+    body = request.get_json(silent=True)
+    ctx = (body.get("user_context") if isinstance(body, dict) else None) or {}
+    return str(ctx.get("customer_id") or "").strip() if isinstance(ctx, dict) else ""
+
+
 def _shopify_identity(tenant) -> Identity:
     args = request.args
     if not args.get("signature"):
-        return GUEST  # not proxied (e.g. a direct call with the licence header)
+        # Not proxied: a direct call with the licence header, i.e. a widget
+        # served from somewhere other than the storefront (local dev). In
+        # production (app_proxy) that is always a guest. Only the development
+        # mode chosen explicitly in .env trusts the browser here — without
+        # this branch it could never apply to /chat, because the check below
+        # needs a signature first. That mode's own purpose is developing the
+        # widget before the app proxy is set up, which is exactly this case.
+        from app_config import SHOPIFY_CUSTOMER_AUTH
+        from ecommerce.shopify_proxy import MODE_INSECURE_CLIENT_CLAIM, resolve_shopify_customer_id
+        if SHOPIFY_CUSTOMER_AUTH != MODE_INSECURE_CLIENT_CLAIM:
+            return GUEST
+        claimed = _claimed_customer_id() or (args.get("customer_id") or "").strip()
+        if not claimed:
+            return GUEST
+        # Same helper as the signed path, so the per-request "NEVER use this
+        # in production" warning is logged here too.
+        customer_id, _err = resolve_shopify_customer_id(
+            args, mode=SHOPIFY_CUSTOMER_AUTH, client_secret="", claimed_customer_id=claimed,
+        )
+        if not customer_id:
+            return GUEST
+        return Identity(customer_id=str(customer_id), role="customer", source="insecure_client_claim")
 
     shop = (args.get("shop") or "").strip().lower()
     if shop != (tenant.shopify_domain or "").strip().lower():

@@ -404,6 +404,8 @@ def _entities_to_dict(entities: ExtractedEntities) -> dict:
     d = {}
     if getattr(entities, 'product_name', None):    d["product_name"] = entities.product_name
     if getattr(entities, 'product_id', None):      d["product_id"] = entities.product_id
+    if getattr(entities, 'product_ids', None):     d["product_ids"] = list(entities.product_ids)
+    if getattr(entities, 'product_names', None):   d["product_names"] = list(entities.product_names)
     if getattr(entities, 'category_name', None):   d["category_name"] = entities.category_name
 
     if getattr(entities, 'target_category_slugs', None): 

@@ -39,6 +39,7 @@ from routes.channel import channel_bp
 from routes.channel_link import channel_link_bp
 from routes.translation_admin import translation_admin_bp
 from routes.shopify_apps_admin import shopify_apps_admin_bp
+from routes.dev_shopify import dev_shopify_bp
 # ═══════════════════════════════════════════
 # FLASK APP & DATABASE
 # ═══════════════════════════════════════════
@@ -181,6 +182,9 @@ app.register_blueprint(channel_bp)
 app.register_blueprint(channel_link_bp)
 app.register_blueprint(translation_admin_bp)
 app.register_blueprint(shopify_apps_admin_bp)
+# Local-dev Shopify tenant provisioning. Every route 404s unless
+# DEV_PROVISIONING_ENABLED=true — see routes/dev_shopify.py.
+app.register_blueprint(dev_shopify_bp)
 
 # ── Request timing instrumentation ───────────────────────────────────────────
 # Writes plain text to logs/<date>/timing.txt, separate from chat.txt and

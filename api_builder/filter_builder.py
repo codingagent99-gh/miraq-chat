@@ -76,7 +76,7 @@ def build_advanced_filter_call(
     page=1, per_page=DEFAULT_PER_PAGE, description="",
     min_price=None, max_price=None, search_term=None,
     product_id=None, requires_resolution=None, in_stock=None,
-    variation_page=None, sort_by=None,
+    variation_page=None, sort_by=None, product_ids=None,
 ) -> WooAPICall:
 
     conditions = []
@@ -163,12 +163,18 @@ def build_advanced_filter_call(
     # body["ids"]) and ShopifyQueryExecutor (which checks body["ids"] for its
     # in-memory filter) can use it. When product_id is present, stock/filter
     # conditions are irrelevant — clear them to avoid cross-contamination.
-    if product_id:
-        body["ids"] = [product_id]
+    # product_ids is the multi-product form ("show me Lexi and Luna"); both
+    # executors and the Woo products-advanced-new endpoint already take a
+    # list here (check_stock relies on it).
+    _ids = [product_id] if product_id else [pid for pid in (product_ids or []) if pid]
+    if _ids:
+        body["ids"] = _ids
         body.pop("stock_status", None)
         body.pop("filters", None)
 
-        if variation_page is not None and variation_page > 1:
+        # variation_page paginates ONE product's variations — meaningless
+        # across several products.
+        if product_id and variation_page is not None and variation_page > 1:
             body["variation_page"] = variation_page
 
     elif search_term:

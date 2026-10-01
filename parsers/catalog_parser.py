@@ -343,11 +343,22 @@ def phase2_nlp_merge(
         'customer_fields_requested',
         'target_rep_name', 'target_rep_names', 'target_person_kind', 'team_scope',
         'sort_by', 'mode', 'scope',
+        'product_ids', 'product_names',
     ]
     for _f in _action_fields:
         _val = getattr(original_nlp_result.entities, _f, None)
         if _val is not None and _val != [] and _val != {}:
             setattr(entities, _f, _val)
+
+    # Multi-product lookup: phase 1 matched each product name on its own and
+    # kept only the first as product_id (`if not entities.product_id`). The
+    # full-text pass decided this is a multi-product lookup, so that stray
+    # single identity must go — otherwise it wins every product_id check
+    # downstream and the query collapses back to one product.
+    if entities.product_ids:
+        entities.product_id = None
+        entities.product_name = None
+        entities.product_slug = None
 
     # Merge OR pairs from original result
     if getattr(original_nlp_result.entities, 'attr_tag_or_pairs', None):
@@ -544,6 +555,12 @@ def resolve_final_intent(
 
     if resolved_intent.value in ACTION_INTENTS:
         pass
+    elif entities.product_ids:
+        # Named products are the whole query. Phase 1 may also have picked
+        # up an attribute/tag whose name overlaps a product name, which must
+        # not demote this to FILTER_BY_ATTRIBUTE below.
+        resolved_intent = Intent.PRODUCT_SEARCH
+        final_confidence = max(final_confidence, 0.95)
     elif resolved_intent.value in catalog_intent_values or entities.product_id:
         has_real_filters = bool(
             entities.attributes

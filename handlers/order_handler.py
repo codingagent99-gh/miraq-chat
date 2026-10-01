@@ -601,9 +601,13 @@ def handle_order_status(intent, entities, order_data, customer_id, session_id, p
         return None
 
     # ── 2+ results ─────────────────────────────────────────────────────────
-    # Present tappable order cards. AWAITING_ORDER_DETAIL is safe here: tapping
-    # a card sends "show me order #N", which re-enters the pipeline, resolves
-    # via extract_order_id -> fetch_order, and exits to flow_state IDLE.
+    # Present tappable order cards and hand the chat back to IDLE, the same as
+    # order history does. Tapping a card sends "show me order #N", which goes
+    # through the normal pipeline (extract_order_id -> fetch_order). This used
+    # to set AWAITING_ORDER_DETAIL, an order-flow state that conversation_flow
+    # has no handler for, so chat.py's mid-flow guard answered EVERY next
+    # message (card taps included) with "Please complete the current step" +
+    # a lone Cancel chip.
     # (Bot text is suppressed by the frontend when order cards render; the copy
     # below is an accessibility/fallback string only.)
     if lookup_email and period:
@@ -623,10 +627,12 @@ def handle_order_status(intent, entities, order_data, customer_id, session_id, p
         "intent": intent.value,
         "products": [],
         "orders": [format_order_for_frontend(o) for o in order_data],
-        "suggestions": [],
+        # Cancel leaves the picker; in IDLE it hits the bare-exit reset in
+        # chat.py ("No problem - I've cleared that...").
+        "suggestions": ["Cancel"],
         "session_id": session_id,
         "metadata": {
-            "flow_state": FlowState.AWAITING_ORDER_DETAIL.value,
+            "flow_state": FlowState.IDLE.value,
             "response_time_ms": round(elapsed * 1000),
             # Decided here, not in the widget: the export carries customer
             # names, emails and addresses, and the browser has no basis to
@@ -635,7 +641,7 @@ def handle_order_status(intent, entities, order_data, customer_id, session_id, p
             "allow_order_download": is_order_report_admin(role),
         },
         "pagination": default_pagination(page),
-        "flow_state": FlowState.AWAITING_ORDER_DETAIL.value,
+        "flow_state": FlowState.IDLE.value,
     }), 200
 
 def handle_order_detail(current_flow_state, customer_id, user_context, session_id, page, start_time):

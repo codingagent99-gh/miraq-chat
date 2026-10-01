@@ -80,8 +80,13 @@ def classify(utterance: str) -> ClassifiedResult:
     attr_text = entity_text
     tag_text = text
 
+    # Mask every product the message names, not just the one picked as
+    # product_name — otherwise the second name in "Lexi and Luna" is left
+    # for the attribute/tag extractors to misread as a filter value.
+    _names_to_mask = {n.lower() for n in entities.product_names if n}
     if entities.product_name:
-        p_lower = entities.product_name.lower()
+        _names_to_mask.add(entities.product_name.lower())
+    for p_lower in sorted(_names_to_mask, key=len, reverse=True):
         attr_text = attr_text.replace(p_lower, " ")
         tag_text = tag_text.replace(p_lower, " ")
 
@@ -160,6 +165,16 @@ def classify(utterance: str) -> ClassifiedResult:
     with timing_logger.stage("cls_pipeline"):
         pipeline = get_default_pipeline()
         intent, confidence = pipeline.evaluate(text, entities)
+
+    # ─── 5.5. Multi-product normalisation ───
+    # product_ids survives only when CatalogSearchEvaluator adopted the
+    # multi-product reading (it clears product_id when it does). Any other
+    # evaluator that claimed the message — order, discount, variations, … —
+    # still works on the single product_id exactly as before, so drop the
+    # list rather than leave two competing product identities around.
+    if entities.product_id is not None or len(entities.product_ids) < 2:
+        entities.product_ids = []
+        entities.product_names = []
 
     # ─── 6–7. Post-classification consolidation ───
     with timing_logger.stage("cls_consolidate"):

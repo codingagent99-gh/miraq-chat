@@ -25,6 +25,7 @@ def _get_missing_entity_hint(intent, entities, order_create_intents, user_contex
     if (
         intent == Intent.PRODUCT_SEARCH
         and entities.product_name is None
+        and not getattr(entities, 'product_ids', None)
         and not getattr(entities, 'target_category_slugs', None)
         and not entities.attr_tag_or_pairs
         and entities.in_stock is None
@@ -270,6 +271,7 @@ def _should_trigger_llm(intent, confidence, entities, order_create_intents, user
     if (
         intent == Intent.PRODUCT_SEARCH
         and entities.product_name is None
+        and not getattr(entities, 'product_ids', None)
         and not getattr(entities, 'target_category_slugs', None)
         and not entities.attr_tag_or_pairs
         and entities.in_stock is None

@@ -167,6 +167,13 @@ class ExtractedEntities:
     product_name: Optional[str] = None
     product_id: Optional[int] = None
     product_slug: Optional[str] = None
+    # Multi-product lookup ("show me Lexi and Luna"). Populated ONLY when the
+    # message names two or more distinct catalog products AND the catalog
+    # search evaluator adopted them — in that case product_id/product_name/
+    # product_slug are cleared, so every single-product path (variation dump,
+    # add-to-cart prompt, order flows) stays untouched. Empty otherwise.
+    product_ids: List[int] = field(default_factory=list)
+    product_names: List[str] = field(default_factory=list)
 
     # ──── Category fields ────
     category_name: Optional[str] = None
@@ -206,6 +213,12 @@ class ExtractedEntities:
     in_stock: Optional[bool] = None
     product_type: Optional[str] = None
     search_term: Optional[str] = None
+    # True only when the shopper explicitly chose to search this text (the
+    # "Search '<word>'" chip on a semantic clarification). Ordinarily
+    # search_term is whatever the parser couldn't place, so it is dropped
+    # whenever real filters exist; an explicit choice is the query itself
+    # and is sent together with them (api_builder._build_product_search).
+    search_term_explicit: bool = field(default=False, metadata={"llm_exclude": "internal"})
 
     # ──── Sorting ────    # Set by PopularityEvaluator when the shopper asks for "most popular" /
     # "best sellers" / etc. Only "popularity" is supported today (ranks by

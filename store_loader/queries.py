@@ -153,12 +153,7 @@ class StoreQueryMixin:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("get_product_for_text: candidates=%s", candidates)
 
-        stop_words = self._store_generic_terms.copy()
-        stop_words.update({"sample", "samples", "product", "item", "size", "sizes"})
-        for attr in self.attribute_by_key.values():
-            attr_name = attr.label.lower().strip()
-            stop_words.add(attr_name)
-            stop_words.update(attr_name.split())
+        stop_words = self._product_stop_words()
 
         specific = [c for c in candidates if c["name"].lower().strip() not in stop_words]
         generic = [c for c in candidates if c["name"].lower().strip() in stop_words]
@@ -192,6 +187,129 @@ class StoreQueryMixin:
         if generic:
             return max(generic, key=lambda x: len(x["name"]))
         return None
+
+    def _product_stop_words(self) -> set:
+        """Generic words that happen to be product names ("Sample", a
+        category word, an attribute label) and so are weak evidence that a
+        specific product was meant. Shared by the single- and multi-product
+        matchers so the two can't drift apart."""
+        stop_words = self._store_generic_terms.copy()
+        stop_words.update({"sample", "samples", "product", "item", "size", "sizes"})
+        for attr in self.attribute_by_key.values():
+            attr_name = attr.label.lower().strip()
+            stop_words.add(attr_name)
+            stop_words.update(attr_name.split())
+        return stop_words
+
+    def get_products_for_text(self, text: str) -> List[Dict]:
+        """Every DISTINCT product the text names, in the order it names them.
+
+        get_product_for_text() answers "which one product is this about" and
+        is still the right call for everything single-product. This answers
+        "show me Lexi and Luna": there, both names match, both are 4 chars,
+        and the single matcher's length tie-break silently dropped one.
+
+        A name only counts as a separate product when it stands on its own
+        in the text. Two cases are NOT a second product and are dropped:
+
+          • It sits inside a longer matched product name — "Aurora" inside
+            "Aurora Mosaic" is one product, not two.
+          • It sits inside an attribute term that another candidate owns —
+            "Aurora - Thunder Black" is Aurora's colour, not Aurora + Thunder
+            (see the comment in get_product_for_text). Ownership uses the
+            same slug/name-prefix rule as narrow_by_attribute_term.
+
+        Generic-word products (see _product_stop_words) are only returned
+        when nothing specific matched, mirroring get_product_for_text.
+
+        All matching runs on a punctuation-insensitive form of the text and
+        the names ("aurora thunder black" must still be recognised as the
+        term "Aurora - Thunder Black"); spans are only compared with each
+        other, so they never need mapping back to the original text.
+        """
+        def _norm(s: str) -> str:
+            return re.sub(r'[\W_]+', ' ', (s or '').lower()).strip()
+
+        text_n = f" {_norm(text)} "
+
+        hits = []  # (entry, [(start, end), ...])
+        for name_lower, entry in self.product_by_name_lower.items():
+            name_n = _norm(name_lower)
+            if not name_n:
+                continue
+            spans = [
+                m.span()
+                for m in re.finditer(rf'(?<!\w){re.escape(name_n)}(?!\w)', text_n)
+            ]
+            if spans:
+                hits.append((entry, spans))
+        if not hits:
+            return []
+
+        stop_words = self._product_stop_words()
+        specific = [h for h in hits if h[0]["name"].lower().strip() not in stop_words]
+        pool = specific or hits
+
+        def _inside(span, outer) -> bool:
+            return outer[0] <= span[0] and span[1] <= outer[1] and outer != span
+
+        # 1. Drop names only ever seen inside a longer matched product name.
+        all_spans = [s for _, spans in pool for s in spans]
+        pool = [
+            (e, spans) for e, spans in pool
+            if not all(any(_inside(s, o) for o in all_spans) for s in spans)
+        ]
+
+        # 2. Drop names only ever seen inside an attribute term owned by a
+        #    DIFFERENT candidate (the variation-named-after-a-product case).
+        if len(pool) > 1:
+            term_spans = []  # ((start, end), owner numeric_id)
+            for attr in self.attribute_by_key.values():
+                for term in attr.terms:
+                    tname = _norm(term.name)
+                    if len(tname) < 4 or tname not in text_n:
+                        continue
+                    tslug = str(term.key or "").lower().strip()
+                    owners = []
+                    for e, _ in pool:
+                        cname = _norm(e.get("name"))
+                        cslug = (e.get("slug") or "").lower().strip()
+                        if (cslug and tslug.startswith(cslug + "-")) or (cname and tname.startswith(cname)):
+                            owners.append(e.get("numeric_id"))
+                    if not owners:
+                        continue
+                    for m in re.finditer(rf'(?<!\w){re.escape(tname)}(?!\w)', text_n):
+                        for owner in owners:
+                            term_spans.append((m.span(), owner))
+
+            if term_spans:
+                def _absorbed(entry, spans) -> bool:
+                    nid = entry.get("numeric_id")
+                    return all(
+                        any(
+                            owner != nid and ts[0] <= s[0] and s[1] <= ts[1]
+                            for ts, owner in term_spans
+                        )
+                        for s in spans
+                    )
+                pool = [(e, spans) for e, spans in pool if not _absorbed(e, spans)]
+
+        # 3. One entry per product, ordered by first mention.
+        pool.sort(key=lambda h: min(s[0] for s in h[1]))
+        seen, result = set(), []
+        for e, _ in pool:
+            key = e.get("numeric_id") or e.get("id")
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(e)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "get_products_for_text: text=%r → %s",
+                text, [r["name"] for r in result],
+            )
+        return result
 
     def narrow_by_attribute_term(self, text_lower: str, candidates: List[Dict]) -> Optional[Dict]:
         """Pick the candidate that owns an attribute term appearing in the text.

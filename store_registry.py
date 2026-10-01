@@ -92,8 +92,12 @@ _OPTIONAL_TENANT_PATHS = {"/health", "/status"}
 # custom-distribution install routes (routes/shopify_oauth.py). Like their
 # exact-path public-app twins in _EXEMPT_PATHS, they run before the store has
 # a tenant, so they must skip tenant resolution.
+# /dev/shopify/ (routes/dev_shopify.py) creates Shopify tenants for local dev,
+# so like the install routes it runs before the tenant exists. It 404s unless
+# DEV_PROVISIONING_ENABLED is set.
 _EXEMPT_PREFIXES = ("/static/", "/admin/translation/", "/admin/shopify-apps",
-                    "/shopify/install/", "/shopify/auth/callback/")
+                    "/shopify/install/", "/shopify/auth/callback/",
+                    "/dev/shopify/")
 
 _tenant_registry = None
 _engine_registry = None

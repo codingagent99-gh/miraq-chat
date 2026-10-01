@@ -620,6 +620,20 @@ def _build_product_search(e, page, user_message: str = "") -> list:
     # Layer2 to AND text-search with taxonomy filters, producing 0 results
     # for unrecognised attribute values (e.g. "gray" when the catalog stores
     # "FOLATA Gray"). Same suppression logic as _build_filter_by_attribute.
+    product_ids = [pid for pid in (e.product_ids or []) if pid]
+
+    # ── Multi-product lookup ("show me Lexi and Luna") ──────────────────────
+    # The named products ARE the query: fetch exactly those ids in one call.
+    # Filters are deliberately not applied (same as the single product_id
+    # path — filter_builder drops them whenever ids are set).
+    if len(product_ids) >= 2:
+        return [build_advanced_filter_call(
+            product_ids=product_ids,
+            page=page,
+            per_page=max(DEFAULT_PER_PAGE, len(product_ids)),
+            description=f"Named products: {', '.join(e.product_names or [])}",
+        )]
+
     _has_taxonomy = bool(
         attr_filters or active_or_pairs
         or e.tag_slugs or e.target_category_slugs or e.product_id

@@ -2214,6 +2214,11 @@ def chat():
         _skip_classification = False
         bypass_result        = None
         _rfn_resolved        = False
+        # Set when a Shopify shopper answered a "which one did you mean" chip.
+        # That answer is final: the LLM fallback must not reinterpret it (a bare
+        # "Search 'mosaic'" has no category left and would otherwise trip the
+        # PRODUCT_SEARCH-with-nothing-resolved rule).
+        _clarification_resolved = False
 
         forced_search_match = re.match(r"(?i)^no\s*-\s*search\s*for\s*['\"](.*?)['\"]$", message)
 
@@ -2227,6 +2232,8 @@ def chat():
                     conversation.context_data       = user_context
                     bypass_result                   = clarification_result
                     _skip_classification            = True
+                    # Shopify only; WooCommerce keeps its original flow.
+                    _clarification_resolved         = current_backend() == "shopify"
 
         elif current_flow_state == FlowState.AWAITING_REFINEMENT_CHOICE:
             _pending_rfn = user_context.get("pending_refinement")
@@ -2415,7 +2422,7 @@ def chat():
         # ── Step 4: LLM fallback ──
         session_history = [{"role": m.role, "message": m.content} for m in conversation.messages[-4:-1]]
 
-        if not _resolve_variant:
+        if not _resolve_variant and not _clarification_resolved:
             logger.debug(
                 f"[STEP1.5_GATE_TRACE] intent={intent} | confidence={confidence} | "
                 f"product_name={entities.product_name!r} | "
