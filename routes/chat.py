@@ -881,6 +881,12 @@ def _finalize_turn(
         combined_metadata["orders"] = data.get("orders")
         if data.get("order_pagination"):
             combined_metadata["order_pagination"] = data.get("order_pagination")
+    # Same for product pagination. Without it a product list restored from
+    # /chat/history had no has_more, so the widget's "Load More Products"
+    # button vanished whenever the widget remounted — on Shopify that is
+    # every product click, since a product opens as a full page navigation.
+    if data.get("products") and data.get("pagination"):
+        combined_metadata["pagination"] = data.get("pagination")
 
     # 1. Save Bot Message
     bot_msg = Message(
@@ -1004,10 +1010,16 @@ def get_chat_history():
                     _opg = msg.metadata_json.get("order_pagination")
                     if _opg:
                         item["order_pagination"] = _opg
+                # Product-list pagination, top-level like on a live response
+                # (mapHistoryEntryToMessage reads m.pagination).
+                _ppg = msg.metadata_json.get("pagination")
+                if _ppg and item.get("products"):
+                    item["pagination"] = _ppg
                 item["metadata"]    = {
                     k: v for k, v in msg.metadata_json.items()
                     if k not in ("products", "categories", "suggestions",
-                                 "actions", "orders", "order_pagination", "i18n")
+                                 "actions", "orders", "order_pagination",
+                                 "pagination", "i18n")
                 }
             history.append(item)
 
