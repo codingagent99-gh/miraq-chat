@@ -154,9 +154,85 @@ def _flow_context_message(state: FlowState) -> dict:
             f"{hint}.\n\n"
             "Say **Cancel** to exit and start a new search."
         ),
-        "suggestions": ["Cancel"],
+        "suggestions": _REPROMPT_SUGGESTIONS.get(state, ["Cancel"]),
         "flow_state": state.value,
         "pass_through": False,
+        # Marks this as "the reply didn't answer the question", so routes/chat.py
+        # can count consecutive misses and switch to flow_recap_message().
+        "reprompt": True,
+    }
+
+
+# Buttons shown with a re-prompt. Yes/no questions get their answer buttons
+# back — the old re-prompt offered only "Cancel", so a shopper who had
+# scrolled past the original buttons had nothing to tap but an exit.
+_REPROMPT_SUGGESTIONS = {
+    FlowState.AWAITING_CART_CONFIRMATION:       ["Yes, add it", "No thanks"],
+    FlowState.AWAITING_BULK_ORDER_CONFIRMATION: ["Yes", "No", "Cancel"],
+}
+
+# How many consecutive unrecognised replies before the recap replaces the nudge.
+FLOW_RECAP_AFTER_MISSES = 2
+
+
+def flow_recap_message(state: FlowState, context: Optional[dict] = None) -> dict:
+    """
+    Shown when the shopper has answered the current question with something
+    the flow can't use twice in a row. Instead of repeating the same one-line
+    nudge, it recaps what the bot is waiting for, how to answer, and how to
+    leave the step to do something else.
+    """
+    ctx = context or {}
+    name = ctx.get("pending_product_name") or "this item"
+    qty = ctx.get("pending_quantity") or 1
+    resolved = ctx.get("resolved_attributes") or {}
+    variant = " / ".join(str(v) for v in resolved.values() if v) if isinstance(resolved, dict) else ""
+    item = f"**{name}**" + (f" ({variant})" if variant else "")
+
+    if state == FlowState.AWAITING_CART_CONFIRMATION:
+        lines = [
+            "Just to recap, I'm still waiting for one answer before we move on:",
+            "",
+            f"**Add {item.replace('**', '')} ×{qty} to your cart?**",
+            "",
+            "• Tap **Yes, add it** to add it to your cart",
+            "• Tap **No thanks** to skip it",
+            "",
+            "Looking for something else? Tap **No thanks** first, then type your search.",
+        ]
+        suggestions = ["Yes, add it", "No thanks"]
+    else:
+        questions = {
+            FlowState.AWAITING_QUANTITY:           f"how many of {item} you'd like",
+            FlowState.AWAITING_VARIANT_SELECTION:  f"which option of {item} you'd like",
+            FlowState.AWAITING_REORDER_ID:         "which order you'd like to reorder",
+        }
+        hint = _flow_context_message(state)["bot_message"].split("\n\n")[0] \
+            if state != FlowState.AWAITING_REORDER_ID else \
+            "Please give the order number (e.g. **#12345**), or say **my last order**."
+        lines = ["Just to recap, I'm still waiting for one answer before we move on."]
+        if state in questions:
+            lines += ["", f"I asked {questions[state]}."]
+        lines += [
+            "",
+            hint,
+            "",
+            "Want to do something else instead? Tap **Cancel** to stop this step, "
+            "then type your new request.",
+        ]
+        suggestions = list(_REPROMPT_SUGGESTIONS.get(state, []))
+        if state == FlowState.AWAITING_REORDER_ID:
+            suggestions = ["My last order"]
+        if "Cancel" not in suggestions:
+            suggestions.append("Cancel")
+
+    return {
+        "bot_message": "\n".join(lines),
+        "suggestions": suggestions,
+        "flow_state": state.value,
+        "pass_through": False,
+        "reprompt": True,
+        "recap": True,
     }
        
 @dataclass
@@ -377,6 +453,7 @@ def handle_flow_state(
             "suggestions": ["My last order", "Cancel"],
             "flow_state": FlowState.AWAITING_REORDER_ID.value,
             "pass_through": False,
+            "reprompt": True,
         }
     
     # ── State: Awaiting quantity for an order ──
