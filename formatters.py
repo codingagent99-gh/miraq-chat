@@ -7,6 +7,7 @@ from typing import List
 
 from models import ExtractedEntities
 from store_registry import get_store_loader
+from utils.attr_values import normalize_attr_value
 
 _SECONDARY_ATTRIBUTE_SUFFIX = " 2"
 
@@ -346,7 +347,7 @@ def _filter_variations_by_entities(
 
     for attr_label, attr_value in entities.attributes.items():
         # Split by comma to support OR logic
-        vals_lower = [v.strip() for v in attr_value.lower().replace("-", " ").split(",") if v.strip()]
+        vals_lower = [normalize_attr_value(v) for v in str(attr_value).split(",") if normalize_attr_value(v)]
         filters.append((attr_label, vals_lower))
         
         if attr_label == "finish":
@@ -372,12 +373,12 @@ def _filter_variations_by_entities(
                 # Normalize WooCommerce variation attribute keys. Three input formats:
                 #   attribute_pa_color → color  |  attribute_color → color  |  pa_color → color
                 clean_k = k.removeprefix("attribute_pa_").removeprefix("attribute_").removeprefix("pa_").replace("-", " ").strip().lower()
-                clean_v = str(v).replace("-", " ").strip().lower()
+                clean_v = normalize_attr_value(v)
                 var_attrs[clean_k] = clean_v
         elif isinstance(raw_attrs, list):
             for a in raw_attrs:
                 clean_k = a.get("name", "").replace("-", " ").strip().lower()
-                clean_v = a.get("option", "").replace("-", " ").strip().lower()
+                clean_v = normalize_attr_value(a.get("option", ""))
                 var_attrs[clean_k] = clean_v
 
         # Check if it matches ALL filter categories (AND logic across attributes)

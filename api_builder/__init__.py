@@ -21,6 +21,7 @@ from app_config import (
 )
 from config.store_config import TAG_SLUG_QUICK_SHIP
 from chat_logger import get_logger
+from utils.attr_values import normalize_attr_value
 
 from api_builder.store_helpers import (
     loader as _loader,
@@ -51,11 +52,11 @@ def match_variation_to_entities(variations: list, entities) -> list:
             ent_k = ent_label.replace("-", " ").strip().lower()
 
             if isinstance(ent_value, (list, tuple, set)):
-                ent_values = [str(v).strip().lower().replace("-", " ") for v in ent_value]
+                ent_values = [normalize_attr_value(v) for v in ent_value]
             else:
                 raw = re.sub(r'\s+(?:and|&)\s+', ',', str(ent_value), flags=re.IGNORECASE)
                 ent_values = [
-                    re.sub(r'[\"\'`]', '', t).strip().lower().replace("-", " ")
+                    normalize_attr_value(t)
                     for t in raw.split(",") if t.strip()
                 ]
 
@@ -97,10 +98,10 @@ def match_variations_all_attributes(variations: list, entities):
 
     def _values_for(ent_value):
         if isinstance(ent_value, (list, tuple, set)):
-            return [str(v).strip().lower().replace("-", " ") for v in ent_value]
+            return [normalize_attr_value(v) for v in ent_value]
         raw = re.sub(r'\s+(?:and|&)\s+', ',', str(ent_value), flags=re.IGNORECASE)
         return [
-            re.sub(r'[\"\'`]', '', t).strip().lower().replace("-", " ")
+            normalize_attr_value(t)
             for t in raw.split(",") if t.strip()
         ]
 
@@ -150,12 +151,12 @@ def _normalize_variation_attrs(variation: dict) -> dict:
             # Normalize WooCommerce variation attribute keys. Three input formats:
             #   attribute_pa_color → color  |  attribute_color → color  |  pa_color → color
             ck = k.removeprefix("attribute_pa_").removeprefix("attribute_").removeprefix("pa_").replace("-", " ").strip().lower()
-            cv = str(v).replace("-", " ").strip().lower()
+            cv = normalize_attr_value(v)
             result[ck] = cv
     elif isinstance(raw, list):
         for a in raw:
             ck = a.get("name", "").replace("-", " ").strip().lower()
-            cv = a.get("option", "").replace("-", " ").strip().lower()
+            cv = normalize_attr_value(a.get("option", ""))
             result[ck] = cv
     return result
 

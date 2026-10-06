@@ -712,9 +712,13 @@ def _no_variation_combination_response(
 
     def _label(key):
         try:
-            return _attribute_display_name(key, _sl)
+            return str(_attribute_display_name(key, _sl) or "").strip()
         except Exception:
-            return str(key).replace("-", " ").title()
+            return str(key).replace("-", " ").title().strip()
+
+    def _natural_key(opt):
+        # 8"x48" before 10"x63": compare the numbers as numbers, not text.
+        return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(opt))]
 
     def _values(val):
         return ", ".join(
@@ -775,9 +779,9 @@ def _no_variation_combination_response(
 
     _suggestions = []
     for name, opts in _options.items():
-        shown = sorted(opts)[:6]
+        shown = sorted(opts, key=_natural_key)[:6]
         lines.append("")
-        lines.append(f"Available **{name}**: {', '.join(shown)}")
+        lines.append(f"Available **{name.strip()}**: {', '.join(shown)}")
         _suggestions.extend(shown[:4])
 
     _products = [parent_formatted]
