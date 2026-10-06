@@ -46,7 +46,10 @@ from response_generator import (
 )
 from classifier import classify
 from api_builder import build_api_calls
-from conversation_flow import FlowState, handle_flow_state, is_order_flow, _flow_context_message, is_bare_exit
+from conversation_flow import (
+    FlowState, handle_flow_state, is_order_flow, _flow_context_message, is_bare_exit,
+    flow_recap_message, FLOW_RECAP_AFTER_MISSES,
+)
 
 # Maps a flow-state STRING that used to be a valid FlowState value onto its
 # current replacement. Consulted only when FlowState(conversation.flow_state)
@@ -902,6 +905,7 @@ def _finalize_turn(
     if conversation.flow_state in ("idle", "awaiting_anything_else", "closing"):
         for k in _WIPE_KEYS:
             context_data.pop(k, None)
+        context_data.pop("flow_miss", None)   # consecutive re-prompt counter
         if "metadata" in data:
             for k in _WIPE_KEYS:
                 data["metadata"].pop(k, None)
@@ -2308,6 +2312,30 @@ def chat():
                 state=current_flow_state, message=message,
                 entities=flow_context, confidence=0.0,
             )
+
+            # ── Consecutive "didn't answer the question" replies ──
+            # A re-prompt is either an explicit reprompt dict from the flow, or
+            # an order flow that fell through (the guard below re-prompts it).
+            # Counted per state in context_data["flow_miss"]; any real answer
+            # resets it. From the second miss in a row, the one-line nudge is
+            # replaced by a recap of what we're waiting for and how to leave.
+            _is_reprompt = bool(flow_result and flow_result.get("reprompt")) or (
+                flow_result is None and is_order_flow(current_flow_state)
+            )
+            _miss = user_context.get("flow_miss") or {}
+            if _is_reprompt:
+                _count = (_miss.get("count", 0) if _miss.get("state") == current_flow_state.value else 0) + 1
+                user_context["flow_miss"] = {"state": current_flow_state.value, "count": _count}
+                if _count >= FLOW_RECAP_AFTER_MISSES:
+                    logger.info(
+                        f"Flow recap | state={current_flow_state.value} | misses={_count} | "
+                        f"session={conversation.id}"
+                    )
+                    flow_result = flow_recap_message(current_flow_state, user_context)
+            else:
+                user_context.pop("flow_miss", None)
+            conversation.context_data = user_context
+            flag_modified(conversation, "context_data")
             # Guard: if an order flow returned None (fell through), don't let the
             # classifier run — the user sent something off-topic mid-flow.
             if flow_result is None and is_order_flow(current_flow_state):
@@ -2884,12 +2912,80 @@ def chat():
                     k: v for k, v in entities.attributes.items()
                     if str(v).strip().lower().rstrip('s') not in _cat_bases
                 }
+
+                # Mirror of the 'tag' case below: the user said "category", so a
+                # tag that merely shares the category's name is a catalog-name
+                # collision, not a second filter to AND on.
+                _cat_names = set()
+                for _s in _matched_cats:
+                    _c = store_loader.resolve_category(_s) if store_loader else None
+                    _cat_names.update({_s.lower(), _s.replace('-', ' ').lower(),
+                                       (getattr(_c, 'name', '') or '').lower()})
+                _cat_names.discard('')
+                if getattr(entities, 'tag_slugs', None):
+                    _keep_idx = []
+                    for _i, _t in enumerate(entities.tag_slugs):
+                        _tobj = store_loader.resolve_tag(_t) if store_loader else None
+                        _tname = (getattr(_tobj, 'name', '') or _t.replace('-', ' ')).lower()
+                        if _t.lower() not in _cat_names and _tname not in _cat_names:
+                            _keep_idx.append(_i)
+                    if len(_keep_idx) != len(entities.tag_slugs):
+                        _ids = list(getattr(entities, 'tag_ids', []) or [])
+                        _parallel = len(_ids) == len(entities.tag_slugs)
+                        _dropped = [t for i, t in enumerate(entities.tag_slugs) if i not in _keep_idx]
+                        entities.tag_slugs = [entities.tag_slugs[i] for i in _keep_idx]
+                        if _parallel:   # tag_ids line up with tag_slugs; keep them in step
+                            entities.tag_ids = [_ids[i] for i in _keep_idx]
+                        logger.debug(f"[CAT_SIGNAL] user said 'category' — dropped same-named tags {_dropped}")
         elif _signal == 'product_tag' and getattr(entities, 'tag_slugs', None):
             _matched_tags = set(entities.tag_slugs)
             entities.attr_tag_or_pairs = [
                 op for op in getattr(entities, 'attr_tag_or_pairs', [])
                 if op.get('tag_slug') not in _matched_tags
             ]
+
+            # The user said "tag", so a category/collection that merely shares
+            # the tag's name was a catalog-name collision, not a second filter.
+            # "Show me products with the Exterior tag" matched "exterior" as both
+            # a tag and a collection and ANDed them, dropping every product that
+            # has the tag but sits outside the collection. Drop only the
+            # categories that collide with a tag named in THIS message; other
+            # categories ("floor tiles with the exterior tag") stay.
+            _msg_lower = message.lower()
+            _tag_names = set()
+            for _t in _matched_tags:
+                _tobj = store_loader.resolve_tag(_t) if store_loader else None
+                _tname = (getattr(_tobj, "name", "") or _t.replace("-", " ")).lower()
+                if _tname in _msg_lower or _t.replace("-", " ") in _msg_lower:
+                    _tag_names.update({_t.lower(), _tname, _t.replace("-", " ").lower()})
+
+            def _cat_collides(slug):
+                _cobj = store_loader.resolve_category(slug) if store_loader else None
+                _cname = (getattr(_cobj, "name", "") or slug.replace("-", " ")).lower()
+                return slug.lower() in _tag_names or _cname in _tag_names
+
+            _colliding = {s for s in getattr(entities, 'target_category_slugs', set()) if _cat_collides(s)}
+            if _colliding:
+                _kept_groups = [g - _colliding for g in entities.category_groups if g - _colliding]
+                entities.clear_categories()
+                for _g in _kept_groups:
+                    entities.add_category_group(_g)
+                if entities.target_category_slugs:
+                    _names = []
+                    for _s in sorted(entities.target_category_slugs):
+                        _c = store_loader.resolve_category(_s) if store_loader else None
+                        _names.append(getattr(_c, 'name', '') or _s.replace('-', ' ').title())
+                    entities.category_name = ', '.join(_names)
+                elif intent == Intent.CATEGORY_BROWSE:
+                    # No category left: browsing would list every collection.
+                    # The shopper asked for products with a tag.
+                    intent = Intent.PRODUCT_BY_TAG
+                    result.intent = intent
+                logger.debug(
+                    f"[TAG_SIGNAL] user said 'tag' — dropped same-named categories "
+                    f"{sorted(_colliding)}; kept groups={entities.category_groups} | "
+                    f"tags={entities.tag_slugs}"
+                )
 
         elif _signal and _signal.startswith('pa_'):
             or_pairs = getattr(entities, 'attr_tag_or_pairs', [])
@@ -2999,14 +3095,39 @@ def chat():
             # _build_product_variations stamps resolved_attr_values into the
             # call body so build_variant_prompt knows which colours/sizes the
             # user already specified.  We carry that hint in user_context.
+            _rav_stamped = False
             for _ac in api_calls:
                 _rav = (_ac.body or {}).get("resolved_attr_values")
                 if _rav:
                     user_context["resolved_attr_values"] = _rav
+                    # Remember WHICH product these values describe, so they are
+                    # never applied to a different product on a later turn.
+                    user_context["resolved_attr_values_pid"] = getattr(entities, "product_id", None)
                     conversation.context_data = user_context
                     flag_modified(conversation, "context_data")
                     logger.debug(f"[EntityMerge] Stashed resolved_attr_values={_rav} in user_context")
+                    _rav_stamped = True
                     break
+
+            # Stale hint guard. The values above were stashed and never cleared,
+            # so "Allspice Brilho Azul polished 3x3" from one search was still
+            # being handed to the variant pre-filter on an unrelated search
+            # several turns later. Keep them only while this turn is about the
+            # same product; a variant-selection turn (_resolve_variant) skips
+            # this whole block and still sees them.
+            if not _rav_stamped and user_context.get("resolved_attr_values"):
+                _this_pid = getattr(entities, "product_id", None)
+                if not _this_pid or _this_pid != user_context.get("resolved_attr_values_pid"):
+                    logger.debug(
+                        f"[EntityMerge] Cleared stale resolved_attr_values="
+                        f"{user_context.get('resolved_attr_values')} "
+                        f"(was for product {user_context.get('resolved_attr_values_pid')!r}, "
+                        f"this turn product {_this_pid!r})"
+                    )
+                    user_context.pop("resolved_attr_values", None)
+                    user_context.pop("resolved_attr_values_pid", None)
+                    conversation.context_data = user_context
+                    flag_modified(conversation, "context_data")
 
             logger.debug(
                 f"[EntityMerge] user_context resolved_attr_values at Step 7 = "

@@ -27,7 +27,9 @@ def _detect_explicit_taxonomy_signal(msg: str, l) -> Optional[str]:
     msg_lower = msg.lower()
     if re.search(r'\bcategor\w*\b', msg_lower):
         return 'product_cat'
-    if re.search(r'\btags?\b', msg_lower):
+    # "tag", "tags", "tagged" — "products tagged exterior" is as explicit as
+    # "with the exterior tag".
+    if re.search(r'\btag(?:s|ged)?\b', msg_lower):
         return 'product_tag'
     if l and getattr(l, 'all_attributes_raw', None):
         for attr in sorted(l.all_attributes_raw,
@@ -36,7 +38,26 @@ def _detect_explicit_taxonomy_signal(msg: str, l) -> Optional[str]:
             label = (attr.get('attribute_label') or '').lower().strip()
             if label and re.search(rf'\b{re.escape(label)}\b', msg_lower):
                 return attr.get('taxonomy', '')
+    # "collection" means category on Shopify (collections ARE its categories)
+    # and is how many shoppers say it on WooCommerce too. Checked last, so a
+    # store with a real "Collection" attribute already returned its taxonomy
+    # in the loop above. Year phrases ("2024 collection", "collection 2024",
+    # "new/latest collection") are left alone: those are the collection-year
+    # search (extract_collection_year), not a category name.
+    if re.search(r'\bcollections?\b', msg_lower) and not _YEAR_COLLECTION_RE.search(msg_lower):
+        _has_collection_attr = any(
+            (a.get('attribute_label') or '').lower().strip() in ('collection', 'collections')
+            for a in (getattr(l, 'all_attributes_raw', None) or [])
+        ) if l else False
+        if not _has_collection_attr:
+            return 'product_cat'
     return None
+
+
+_YEAR_COLLECTION_RE = re.compile(
+    r'\b(?:20[12]\d\s*collections?|collections?\s*(?:of\s*)?20[12]\d|'
+    r'(?:new|newest|latest|recent)\s+collections?)\b'
+)
 
 # ══════════════════════════════════════════════════════════════
 # PHASE 1: Longest-String Catalog Match
