@@ -186,6 +186,7 @@ query Products($first: Int!, $after: String) {
           edges { node { url altText } }
         }
         variants(first: 100) {
+          pageInfo { hasNextPage endCursor }
           edges {
             node {
               id
@@ -206,6 +207,77 @@ query Products($first: Int!, $after: String) {
   }
 }
 """
+
+
+# Remaining variants of ONE product. The product queries embed only the first
+# 100 variants; products with more are topped up by _complete_variants().
+# Node fields MUST match the variants block in _PRODUCTS_QUERY.
+_PRODUCT_VARIANTS_QUERY = """
+query ProductVariants($id: ID!, $first: Int!, $after: String) {
+  product(id: $id) {
+    variants(first: $first, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      edges {
+        node {
+          id
+          title
+          sku
+          price
+          compareAtPrice
+          availableForSale
+          inventoryQuantity
+          selectedOptions { name value }
+          image { url }
+        }
+      }
+    }
+  }
+}
+"""
+
+VARIANT_PAGE_SIZE = 250  # Shopify connection max
+
+
+def _complete_variants(session, store_domain: str, admin_token: str,
+                       product_node: dict, token_manager=None) -> dict:
+    """
+    Fetch the rest of a product's variants when the embedded first page
+    (variants(first: 100)) was not all of them. Mutates and returns the node.
+
+    Why: options { values } is always complete, so every option value becomes
+    an attribute term the classifier can resolve — but the variants list was
+    capped at 100. On a product with more (Allspice: colours x finishes x
+    sizes) a colour past the cut-off resolved fine and then matched no
+    variant, and the chat replied "no variation satisfies ['color']" for a
+    variant that exists. Products with <= 100 variants make no extra call.
+    """
+    conn = product_node.get("variants") or {}
+    page_info = conn.get("pageInfo") or {}
+    if not page_info.get("hasNextPage"):
+        return product_node
+
+    edges = list(conn.get("edges") or [])
+    cursor = page_info.get("endCursor")
+    while cursor:
+        data = _gql(
+            session, store_domain, admin_token, _PRODUCT_VARIANTS_QUERY,
+            {"id": product_node["id"], "first": VARIANT_PAGE_SIZE, "after": cursor},
+            token_manager=token_manager,
+        )
+        vconn = ((data.get("product") or {}).get("variants")) or {}
+        new_edges = vconn.get("edges") or []
+        edges.extend(new_edges)
+        vpi = vconn.get("pageInfo") or {}
+        if not vpi.get("hasNextPage") or not new_edges:
+            break
+        cursor = vpi.get("endCursor")
+
+    product_node["variants"] = {"edges": edges, "pageInfo": {"hasNextPage": False}}
+    logger.info(
+        f"ShopifyFetcher: paged variants | product={product_node.get('id')} "
+        f"title={product_node.get('title')!r} total={len(edges)}"
+    )
+    return product_node
 
 
 # ══════════════════════════════════════════════════════════════
@@ -578,6 +650,7 @@ query Product($id: ID!) {
       edges { node { url altText } }
     }
     variants(first: 100) {
+      pageInfo { hasNextPage endCursor }
       edges {
         node {
           id title sku price compareAtPrice
@@ -621,6 +694,9 @@ def fetch_single_product(
                 f"product(id={product_gid}) returned null — product may not exist"
             )
             return None
+        raw = _complete_variants(
+            session, store_domain, admin_token, raw, token_manager=token_manager,
+        )
         normalised = _normalise_product(raw, idx=0, store_domain=store_domain)
         logger.info(
             f"ShopifyFetcher.fetch_single_product: fetched '{normalised.get('name')}' "
@@ -686,6 +762,10 @@ def load_from_shopify(store_domain: str, admin_token: str, token_manager=None) -
         session, store_domain, admin_token, _PRODUCTS_QUERY, "products",
         token_manager=token_manager,
     )
+    raw_products = [
+        _complete_variants(session, store_domain, admin_token, p, token_manager=token_manager)
+        for p in raw_products
+    ]
     products = [_normalise_product(p, i, store_domain=store_domain) for i, p in enumerate(raw_products)]
 
     # 4. Aggregate attributes + tags from products

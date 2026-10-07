@@ -69,6 +69,7 @@ query ($query: String!, $first: Int!, $after: String) {
         id title handle tags status
         images(first: 5) { edges { node { url altText } } }
         variants(first: 100) {
+          pageInfo { hasNextPage endCursor }
           edges {
             node {
               id title price availableForSale
@@ -93,6 +94,7 @@ query ($collectionId: ID!, $query: String!, $first: Int!, $after: String) {
           id title handle tags status
           images(first: 5) { edges { node { url altText } } }
           variants(first: 100) {
+            pageInfo { hasNextPage endCursor }
             edges {
               node {
                 id title price availableForSale
@@ -106,6 +108,26 @@ query ($collectionId: ID!, $query: String!, $first: Int!, $after: String) {
   }
 }
 """
+
+
+# Remaining variants of ONE product (> 100 variants). Same node fields as above.
+_VARIANTS_PAGE_GQL = """
+query ($id: ID!, $first: Int!, $after: String) {
+  product(id: $id) {
+    variants(first: $first, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      edges {
+        node {
+          id title price availableForSale
+          selectedOptions { name value }
+        }
+      }
+    }
+  }
+}
+"""
+
+_VARIANTS_PAGE_SIZE = 250  # Shopify connection max
 
 
 # ─────────────────────────────────────────────────────────────
@@ -322,6 +344,40 @@ def _gql(query, variables, token, domain):
     return data
 
 
+def _complete_variants(node, token, domain):
+    """
+    Drain the rest of a product's variants when the embedded variants(first: 100)
+    page was not all of them. Without this, variants past the 100th never reach
+    the option post-filter. No extra request for products with <= 100 variants.
+    """
+    conn = node.get("variants") or {}
+    page_info = conn.get("pageInfo") or {}
+    if not page_info.get("hasNextPage"):
+        return node
+
+    edges = list(conn.get("edges") or [])
+    cursor = page_info.get("endCursor")
+    while cursor:
+        data = _gql(
+            _VARIANTS_PAGE_GQL,
+            {"id": node["id"], "first": _VARIANTS_PAGE_SIZE, "after": cursor},
+            token, domain,
+        )
+        vconn = (((data.get("data") or {}).get("product") or {}).get("variants")) or {}
+        new_edges = vconn.get("edges") or []
+        edges.extend(new_edges)
+        vpi = vconn.get("pageInfo") or {}
+        if not vpi.get("hasNextPage") or not new_edges:
+            break
+        cursor = vpi.get("endCursor")
+
+    node["variants"] = {"edges": edges, "pageInfo": {"hasNextPage": False}}
+    logger.info(
+        f"shopify/products: variants paged | product={node.get('id')} total={len(edges)}"
+    )
+    return node
+
+
 def _normalize(node):
     """Map a Shopify GraphQL product node to our clean dict format."""
     return {
@@ -366,7 +422,7 @@ def _fetch_products(tag_query, token, domain, max_fetch=_MAX_FETCH):
         edges = pdata.get("edges", [])
 
         for edge in edges:
-            products.append(_normalize(edge["node"]))
+            products.append(_normalize(_complete_variants(edge["node"], token, domain)))
 
         page_info = pdata.get("pageInfo", {})
         if not page_info.get("hasNextPage") or not edges:
@@ -401,7 +457,7 @@ def _fetch_from_collection(collection_id, tag_query, token, domain, max_fetch=_M
         edges = pdata.get("edges", [])
 
         for edge in edges:
-            products.append(_normalize(edge["node"]))
+            products.append(_normalize(_complete_variants(edge["node"], token, domain)))
 
         page_info = pdata.get("pageInfo", {})
         if not page_info.get("hasNextPage") or not edges:

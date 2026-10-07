@@ -74,6 +74,7 @@ query ($query: String!, $first: Int!, $after: String) {
         images(first: 5) { edges { node { url altText } } }
         collections(first: 50) { edges { node { id handle title } } }
         variants(first: 100) {
+          pageInfo { hasNextPage endCursor }
           edges {
             node {
               id title price availableForSale
@@ -100,6 +101,7 @@ query ($collectionId: ID!, $first: Int!, $after: String) {
           images(first: 5) { edges { node { url altText } } }
           collections(first: 50) { edges { node { id handle title } } }
           variants(first: 100) {
+            pageInfo { hasNextPage endCursor }
             edges {
               node {
                 id title price availableForSale
@@ -114,6 +116,28 @@ query ($collectionId: ID!, $first: Int!, $after: String) {
   }
 }
 """
+
+
+# Remaining variants of ONE product, for products with more than the 100
+# variants embedded in the queries above. Same node fields as those queries.
+_VARIANTS_PAGE_GQL = """
+query ($id: ID!, $first: Int!, $after: String) {
+  product(id: $id) {
+    variants(first: $first, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      edges {
+        node {
+          id title price availableForSale
+          selectedOptions { name value }
+          image { url }
+        }
+      }
+    }
+  }
+}
+"""
+
+_VARIANTS_PAGE_SIZE = 250  # Shopify connection max
 
 
 # ══════════════════════════════════════════════════════════════
@@ -165,6 +189,49 @@ def _gql(query, variables, token, domain):
     return data
 
 
+def _complete_variants(node: dict, token: str, domain: str) -> dict:
+    """
+    Drain the rest of a product's variants when the embedded first page was
+    not all of them, appending to node["variants"]["edges"] in place.
+
+    The product queries embed variants(first: 100). A product with more
+    (Allspice: colours x finishes x sizes) silently lost everything past the
+    100th, so a colour the catalog knew about (option values are complete)
+    matched no fetched variant and the chat answered "no variation satisfies
+    ['color']" for a variant that exists. Products with <= 100 variants cost
+    nothing extra — hasNextPage is false and no request is made.
+    """
+    conn = node.get("variants") or {}
+    page_info = conn.get("pageInfo") or {}
+    if not page_info.get("hasNextPage"):
+        return node
+
+    edges = list(conn.get("edges") or [])
+    cursor = page_info.get("endCursor")
+    pages = 0
+    while cursor:
+        data = _gql(
+            _VARIANTS_PAGE_GQL,
+            {"id": node["id"], "first": _VARIANTS_PAGE_SIZE, "after": cursor},
+            token, domain,
+        )
+        vconn = (((data.get("data") or {}).get("product") or {}).get("variants")) or {}
+        new_edges = vconn.get("edges") or []
+        edges.extend(new_edges)
+        pages += 1
+        vpi = vconn.get("pageInfo") or {}
+        if not vpi.get("hasNextPage") or not new_edges:
+            break
+        cursor = vpi.get("endCursor")
+
+    node["variants"] = {"edges": edges, "pageInfo": {"hasNextPage": False}}
+    logger.info(
+        f"[ShopifyGQL] variants paged | product={node.get('id')} "
+        f"title={node.get('title')!r} total={len(edges)} extra_pages={pages}"
+    )
+    return node
+
+
 def _normalize(node: dict) -> dict:
     """Shopify GraphQL product node → clean dict (same shape as shopify_products.py)."""
     return {
@@ -207,7 +274,7 @@ def _fetch_products(tag_query: str, token: str, domain: str, max_fetch: int = _M
         data  = _gql(_PRODUCTS_GQL, {"query": tag_query, "first": batch, "after": cursor}, token, domain)
         pdata = data["data"]["products"]
         for edge in pdata.get("edges", []):
-            products.append(_normalize(edge["node"]))
+            products.append(_normalize(_complete_variants(edge["node"], token, domain)))
         pi = pdata.get("pageInfo", {})
         if not pi.get("hasNextPage") or not pdata.get("edges"):
             break
@@ -229,7 +296,7 @@ def _fetch_from_collection(collection_id: str, tag_query: str, token: str, domai
             break
         pdata = cdata.get("products", {})
         for edge in pdata.get("edges", []):
-            products.append(_normalize(edge["node"]))
+            products.append(_normalize(_complete_variants(edge["node"], token, domain)))
         pi = pdata.get("pageInfo", {})
         if not pi.get("hasNextPage") or not pdata.get("edges"):
             break
