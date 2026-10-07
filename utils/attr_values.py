@@ -24,3 +24,32 @@ def normalize_attr_value(value) -> str:
     s = _QUOTE_CHARS.sub("", str(value or "")).lower().replace("-", " ")
     s = _DIM_SEPARATOR.sub("x", s)
     return _SPACES.sub(" ", s).strip()
+
+
+def _clean_attr_name(name) -> str:
+    s = str(name or "").strip().lower()
+    for p in ("attribute_pa_", "attribute_", "pa_"):
+        s = s.removeprefix(p)
+    return _SPACES.sub(" ", s.replace("-", " ").replace("_", " ")).strip()
+
+
+def attr_name_matches(requested, variant_name) -> bool:
+    """Does the shopper's attribute (``requested``) refer to the variant's
+    attribute (``variant_name``)?
+
+    Shopify: only the SAME name. Color, Colors and Colous are three different
+    options set by the merchant, and a value resolved under one must not be
+    tested against another. The old substring test ("color" in "colors")
+    paired them, so a stray Color value was checked against Allspice's Colors
+    option and failed every variant.
+
+    WooCommerce: unchanged loose match (either name contains the other) — its
+    attribute label and slug can differ (label "Colour", slug "pa_color").
+    """
+    a, b = _clean_attr_name(requested), _clean_attr_name(variant_name)
+    if not a or not b:
+        return False
+    from platform_config import current_backend
+    if current_backend() == "shopify":
+        return a == b
+    return a in b or b in a

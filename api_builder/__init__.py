@@ -21,7 +21,7 @@ from app_config import (
 )
 from config.store_config import TAG_SLUG_QUICK_SHIP
 from chat_logger import get_logger
-from utils.attr_values import normalize_attr_value
+from utils.attr_values import normalize_attr_value, attr_name_matches
 
 from api_builder.store_helpers import (
     loader as _loader,
@@ -63,7 +63,7 @@ def match_variation_to_entities(variations: list, entities) -> list:
             for v_k, v_v in var_attrs.items():
                 if not v_v:
                     continue
-                if ent_k in v_k or v_k in ent_k:
+                if attr_name_matches(ent_k, v_k):
                     for ent_v in ent_values:
                         if ent_v == v_v:
                             score += 10
@@ -109,7 +109,7 @@ def match_variations_all_attributes(variations: list, entities):
         for v_k, v_v in var_attrs.items():
             if not v_v:
                 continue
-            if ent_k in v_k or v_k in ent_k:
+            if attr_name_matches(ent_k, v_k):
                 for ent_v in ent_values:
                     if ent_v == v_v or ent_v in v_v or v_v in ent_v:
                         return True
@@ -149,7 +149,7 @@ def match_variations_all_attributes(variations: list, entities):
             for variation in matches:
                 var_attrs = _normalize_variation_attrs(variation)
                 if any(
-                    (ent_k in v_k or v_k in ent_k) and v_v in vals
+                    attr_name_matches(ent_k, v_k) and v_v in vals
                     for v_k, v_v in var_attrs.items() if v_v
                 ):
                     exact.append(variation)

@@ -507,6 +507,10 @@ def extract_attributes(text: str, entities: ExtractedEntities) -> str:
                 return True
         return False
 
+    # Longest tail first, and an applied tail claims its words: "calacatta
+    # oro" (-> ALLSPICE Calacatta Oro under Colors) must stop "oro" alone from
+    # also guessing "VIRTUOSO Bernini Oro" under Color.
+    _deferred_tails.sort(key=lambda d: -max(c[0] for c in d[3]))
     for taxonomy, label, attr_key, tail_cands in _deferred_tails:
         if attr_key in entities.attributes:
             continue
@@ -532,6 +536,8 @@ def extract_attributes(text: str, entities: ExtractedEntities) -> str:
                 False,
                 rf"(?<![\w-]){re.escape(tail)}(?![\w-])",
             )
+            for _m in re.finditer(rf"(?<![\w-]){re.escape(tail)}(?![\w-])", masked_text_lower):
+                _full_spans.append(_m.span())
             logger.debug(
                 f"[CompoundTailMatch] taxonomy={taxonomy!r} "
                 f"| term={matched_term.get('name')!r} "

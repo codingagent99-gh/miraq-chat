@@ -38,6 +38,42 @@ from classifier.extractors import (
 
 logger = get_logger("miraq_chat")
 
+
+def _mask_name_outside_attr_terms(attr_text: str, name_lower: str) -> str:
+    """Blank out ``name_lower`` in ``attr_text`` except where it is part of a
+    full attribute value the message names.
+
+    Shopify merchants put the product name inside option values ("ALLSPICE
+    Calacatta Oro" under Colors on the Allspice product). Masking every
+    "allspice" left "calacatta oro", so the attribute pass never saw the full
+    value and fell back to guessing from its tail words: "calacatta oro" was
+    right by luck, but "oro" also guessed "VIRTUOSO Bernini Oro" under Color,
+    and that stray colour failed every Allspice variant. Keeping the name
+    inside a full value that is literally present lets the value match whole.
+    """
+    if not name_lower or name_lower not in attr_text:
+        return attr_text
+    loader = get_store_loader()
+    spans = []
+    for attr in (getattr(loader, "all_attributes_raw", None) or ()) if loader else ():
+        for term in attr.get("terms") or ():
+            t = (term.get("name") or "").lower().strip()
+            if len(t) <= len(name_lower) or name_lower not in t or t not in attr_text:
+                continue
+            for m in re.finditer(rf"(?<![\w-]){re.escape(t)}(?![\w-])", attr_text):
+                spans.append(m.span())
+    if not spans:
+        return attr_text.replace(name_lower, " ")
+    out, pos = [], 0
+    for m in re.finditer(re.escape(name_lower), attr_text):
+        if any(s <= m.start() and m.end() <= e for s, e in spans):
+            continue
+        out.append(attr_text[pos:m.start()])
+        out.append(" ")
+        pos = m.end()
+    out.append(attr_text[pos:])
+    return "".join(out)
+
 def classify(utterance: str) -> ClassifiedResult:
     
     """Classify user utterance into intent + entities using the Evaluation Pipeline."""
@@ -87,7 +123,7 @@ def classify(utterance: str) -> ClassifiedResult:
     if entities.product_name:
         _names_to_mask.add(entities.product_name.lower())
     for p_lower in sorted(_names_to_mask, key=len, reverse=True):
-        attr_text = attr_text.replace(p_lower, " ")
+        attr_text = _mask_name_outside_attr_terms(attr_text, p_lower)
         tag_text = tag_text.replace(p_lower, " ")
 
     # ── Mask order_item_name so the product word isn't matched as an attribute ──

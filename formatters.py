@@ -7,7 +7,7 @@ from typing import List
 
 from models import ExtractedEntities
 from store_registry import get_store_loader
-from utils.attr_values import normalize_attr_value
+from utils.attr_values import normalize_attr_value, attr_name_matches
 
 _SECONDARY_ATTRIBUTE_SUFFIX = " 2"
 
@@ -343,6 +343,12 @@ def _filter_variations_by_entities(
     Supports comma-separated OR logic (e.g., 'white,gray').
     """
     filters: List[tuple] = []
+    # Shopify: each option name is its own attribute (Color, Colors and Colous
+    # are three different options), so a value is only tested against the
+    # option with the same name — never against any option that happens to
+    # contain the text. WooCommerce keeps the original loose test.
+    from platform_config import current_backend
+    _shopify = current_backend() == "shopify"
     FINISH_SYNONYMS = {"matt": "matte", "glossy": "polished", "gloss": "polished"}
 
     for attr_label, attr_value in entities.attributes.items():
@@ -354,7 +360,7 @@ def _filter_variations_by_entities(
             norm_vals = [FINISH_SYNONYMS.get(v, v) for v in vals_lower]
             if norm_vals != vals_lower:
                 filters.append((attr_label, norm_vals))
-        if attr_label == "colors":
+        if attr_label == "colors" and not _shopify:
             filters.append(("colors 2", vals_lower))
 
     if not filters:
@@ -387,7 +393,14 @@ def _filter_variations_by_entities(
             matched_this_filter = False
             # For each category, it must match ANY of the provided comma-separated values (OR logic)
             for f_val in f_vals:
-                if any(f_val in var_attrs.get(f_name, "") for f_name in var_attrs if f_name == attr_name or f_name.startswith(attr_name)) or any(f_val in opt for opt in var_attrs.values()):
+                if _shopify:
+                    hit = any(
+                        f_val in v for f_name, v in var_attrs.items()
+                        if attr_name_matches(attr_name, f_name)
+                    )
+                else:
+                    hit = any(f_val in var_attrs.get(f_name, "") for f_name in var_attrs if f_name == attr_name or f_name.startswith(attr_name)) or any(f_val in opt for opt in var_attrs.values())
+                if hit:
                     matched_this_filter = True
                     break
             
