@@ -53,3 +53,34 @@ def attr_name_matches(requested, variant_name) -> bool:
     if current_backend() == "shopify":
         return a == b
     return a in b or b in a
+
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
+
+def is_size_attr(name) -> bool:
+    """True for size-style attributes (config FUZZY_SIZE_ATTRIBUTE_KEYS:
+    sample-size, tile-size by default) — the only attributes where the
+    catalog already treats spacing/punctuation as insignificant."""
+    from config.store_config import FUZZY_SIZE_ATTRIBUTE_KEYS
+    return _clean_attr_name(name).replace(" ", "-") in FUZZY_SIZE_ATTRIBUTE_KEYS
+
+
+def attr_values_equal(attr_name, requested, actual) -> bool:
+    """Exact value match, after normalize_attr_value on both sides.
+
+    Size attributes also match when they differ only in spacing/punctuation:
+    the merchant spells the same chip-card sample "Chip Card" on one product
+    and "Chipcard" on another. StoreLoader.resolve_attribute_term() and the
+    cart-side matcher (_variation_matches_resolved_neutral) already ignore
+    that difference for sizes, so the classifier hands over 'chip-card' for a
+    message saying "Chipcard" — and the variant matcher, comparing
+    'chip card' to 'chipcard' literally, reported "no variation satisfies
+    ['sample-size']" on Zelda Mosaic. Same scope as the resolver: sizes only,
+    because elsewhere punctuation can matter ("2.0" vs "20" in colour names).
+    """
+    a, b = normalize_attr_value(requested), normalize_attr_value(actual)
+    if a == b:
+        return True
+    if a and b and is_size_attr(attr_name):
+        return _NON_ALNUM.sub("", a) == _NON_ALNUM.sub("", b)
+    return False

@@ -7,7 +7,7 @@ from typing import List
 
 from models import ExtractedEntities
 from store_registry import get_store_loader
-from utils.attr_values import normalize_attr_value, attr_name_matches
+from utils.attr_values import normalize_attr_value, attr_name_matches, attr_values_equal
 
 _SECONDARY_ATTRIBUTE_SUFFIX = " 2"
 
@@ -395,7 +395,8 @@ def _filter_variations_by_entities(
             for f_val in f_vals:
                 if _shopify:
                     hit = any(
-                        f_val in v for f_name, v in var_attrs.items()
+                        (f_val in v or attr_values_equal(attr_name, f_val, v))
+                        for f_name, v in var_attrs.items()
                         if attr_name_matches(attr_name, f_name)
                     )
                 else:
