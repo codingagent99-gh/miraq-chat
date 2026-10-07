@@ -451,9 +451,15 @@ def widget_config():
     # The store's currency, for the widget's cart/checkout fallbacks. Read
     # from the resident loader (already bound for this request) — no store call.
     _loader = get_store_loader()
+    # Custom branding is a paid-plan feature: free tenants get empty values, so
+    # the widget keeps the default MiraQ mark. Every plan can SAVE branding in
+    # the plugin (WordPress.org forbids locking plugin features); this is the
+    # only place the rule is enforced. See widget_branding.branding_for_widget.
+    from widget_branding import branding_for_widget
+    logo_url, footer_text = branding_for_widget(tenant)
     return jsonify({
-        "image_url":       tenant.widget_logo_url or "",
-        "text":            tenant.widget_header_text or "",
+        "image_url":       logo_url,
+        "text":            footer_text,
         "currency_symbol": getattr(_loader, "currency_symbol", "") or "",
     })
 
