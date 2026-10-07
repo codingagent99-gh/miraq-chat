@@ -294,6 +294,48 @@ class StoreQueryMixin:
                     )
                 pool = [(e, spans) for e, spans in pool if not _absorbed(e, spans)]
 
+        # 2b. Shorter sibling named only through a variant value. "Show me
+        #     Ansel Mosaic - ANSEL Charcoal Block Mosaic / Matte" names ONE
+        #     product: the second "ansel" is part of the colour term, but
+        #     step 2 credits that term to "Ansel" (its name prefixes the
+        #     term), so "Ansel" survived as a second product, the message
+        #     was treated as a multi-product lookup, and the selected product
+        #     was cleared. Drop a candidate when a LONGER candidate starting
+        #     with its name is mentioned on its own, and every mention of the
+        #     shorter one is inside that longer name or inside a term.
+        if len(pool) > 1:
+            _term_spans = []
+            for attr in self.attribute_by_key.values():
+                for term in attr.terms:
+                    tname = _norm(term.name)
+                    if len(tname) < 4 or tname not in text_n:
+                        continue
+                    _term_spans.extend(
+                        m.span() for m in re.finditer(rf'(?<!\w){re.escape(tname)}(?!\w)', text_n)
+                    )
+            _prod_spans = [s for _, spans in pool for s in spans]
+
+            def _in_term(s) -> bool:
+                return any(ts[0] <= s[0] and s[1] <= ts[1] for ts in _term_spans)
+
+            def _free(s) -> bool:
+                return not _in_term(s) and not any(_inside(s, o) for o in _prod_spans)
+
+            def _shadowed(entry, spans) -> bool:
+                if any(_free(s) for s in spans):
+                    return False
+                short_n = _norm(entry.get("name"))
+                for other, ospans in pool:
+                    if other is entry:
+                        continue
+                    if _norm(other.get("name")).startswith(short_n + " ") and any(
+                        not _in_term(s) for s in ospans
+                    ):
+                        return True
+                return False
+
+            pool = [(e, spans) for e, spans in pool if not _shadowed(e, spans)]
+
         # 3. One entry per product, ordered by first mention.
         pool.sort(key=lambda h: min(s[0] for s in h[1]))
         seen, result = set(), []

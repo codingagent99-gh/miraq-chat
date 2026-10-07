@@ -138,6 +138,24 @@ def match_variations_all_attributes(variations: list, entities):
         if hits == len(dims):
             matches.append(variation)
 
+    # Exact beats partial, per dimension. The hit test above also accepts
+    # substrings, so "WATERFALL Havana" satisfied both the Havana and the
+    # Havana Linear variants and the shopper got two results for one exact
+    # request. Where some matches equal the requested value exactly, keep
+    # only those; a dimension with no exact match leaves the list unchanged.
+    if len(matches) > 1:
+        for label, ent_k, vals in dims:
+            exact = []
+            for variation in matches:
+                var_attrs = _normalize_variation_attrs(variation)
+                if any(
+                    (ent_k in v_k or v_k in ent_k) and v_v in vals
+                    for v_k, v_v in var_attrs.items() if v_v
+                ):
+                    exact.append(variation)
+            if exact:
+                matches = exact
+
     unsatisfied = [label for label, ok in satisfied_anywhere.items() if not ok]
     return matches, unsatisfied
 

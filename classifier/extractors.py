@@ -412,6 +412,18 @@ def extract_attributes(text: str, entities: ExtractedEntities) -> str:
     # Built on first use only (Shopify, and only when a tail candidate exists).
     _named_words = None
 
+    # Full-term matches across ALL taxonomies, and the tail-match attempts that
+    # have to wait for them. A tail match ("black" -> "MOHSONE Black") used to
+    # be applied the moment its own taxonomy found no full term, even when a
+    # LATER taxonomy matched a full term that contains the same word — "AURA
+    # 2.0 Black Dahila" under Color, after Colors had already guessed "MOHSONE
+    # Black" from its "black". The stray colour then failed every variant of
+    # the product ("no variation satisfies ['colors']"). Tail matches are now
+    # decided after every full term is known, and a tail that only appears
+    # inside a fully matched term is not evidence of anything.
+    _full_terms = []
+    _deferred_tails = []
+
     for attr in loader.all_attributes_raw:
         label = attr.get("attribute_label", "").lower().strip()
         taxonomy = attr.get("taxonomy", "")
@@ -428,7 +440,10 @@ def extract_attributes(text: str, entities: ExtractedEntities) -> str:
 
         product_name_lower = (entities.product_name or "").lower()
 
-        for term in terms:
+        # Longest term first: the loop stops at the first match, so in catalog
+        # order "WATERFALL Havana" beat "WATERFALL Havana Linear" on a message
+        # naming the Linear one. The most specific matching term must win.
+        for term in sorted(terms, key=lambda t: -len(t.get("name") or "")):
             term_name = term.get("name", "")
             term_name_lower = term_name.lower().strip()
             if not term_name_lower or len(term_name_lower) < 1:
@@ -447,6 +462,8 @@ def extract_attributes(text: str, entities: ExtractedEntities) -> str:
                     entities, loader, text, taxonomy, label, term,
                     term_name_lower, is_dimensional, matched_pattern,
                 )
+                if not is_dimensional:
+                    _full_terms.append(term_name_lower)
                 break
             except re.error:
                 pass
@@ -474,47 +491,77 @@ def extract_attributes(text: str, entities: ExtractedEntities) -> str:
                             if _plural_stem(c[2]) not in _named_words
                         ]
                     if tail_cands:
-                        max_len = max(c[0] for c in tail_cands)
-                        best = [c for c in tail_cands if c[0] == max_len]
-                        if len(best) == 1:
-                            _, matched_term, tail = best[0]
-                            _resolve_attribute_or_tag(
-                                entities, loader, text, taxonomy, label,
-                                matched_term,
-                                matched_term.get("name", "").lower().strip(),
-                                False,
-                                rf"(?<![\w-]){re.escape(tail)}(?![\w-])",
-                            )
-                            logger.debug(
-                                f"[CompoundTailMatch] taxonomy={taxonomy!r} "
-                                f"| term={matched_term.get('name')!r} "
-                                f"| tail={tail!r} (unambiguous auto-applied)"
-                            )
-                        else:
-                            # Multiple terms with same-length tail → disambiguation.
-                            _, _, tail = best[0]  # all share the same tail
-                            sem_candidates = []
-                            for _, matched_term, _ in best:
-                                term_key = _resolve_attr_term_key_with_fallback(
-                                    loader, taxonomy,
-                                    matched_term.get("name", matched_term.get("slug", "")),
-                                    matched_term.get("slug", matched_term.get("name", "")),
-                                )
-                                sem_candidates.append({
-                                    "type": "attribute",
-                                    "taxonomy": attr_key,
-                                    "slug": term_key,
-                                    "suggested_name": matched_term.get("name", ""),
-                                    "user_text": tail,
-                                    "is_negative": False,
-                                    "score": 0.80,
-                                })
-                            entities.semantic_matches.append(sem_candidates)
-                            logger.debug(
-                                f"[CompoundTailMatch] taxonomy={taxonomy!r} "
-                                f"| tail={tail!r} | ambiguous: "
-                                f"{[c['suggested_name'] for c in sem_candidates]}"
-                            )
+                        _deferred_tails.append((taxonomy, label, attr_key, tail_cands))
+
+    # ── Apply deferred tail matches ──────────────────────────────────────
+    _full_spans = []
+    for _ft in _full_terms:
+        for _m in re.finditer(re.escape(_ft), masked_text_lower):
+            _full_spans.append(_m.span())
+
+    def _tail_is_free(tail: str) -> bool:
+        """True when the tail word(s) appear at least once OUTSIDE every
+        fully matched term."""
+        for _m in re.finditer(rf"(?<![\w-]){re.escape(tail)}(?![\w-])", masked_text_lower):
+            if not any(fs[0] <= _m.start() and _m.end() <= fs[1] for fs in _full_spans):
+                return True
+        return False
+
+    for taxonomy, label, attr_key, tail_cands in _deferred_tails:
+        if attr_key in entities.attributes:
+            continue
+        if _full_spans:
+            _kept = [c for c in tail_cands if _tail_is_free(c[2])]
+            if len(_kept) != len(tail_cands):
+                logger.debug(
+                    f"[CompoundTailMatch] taxonomy={taxonomy!r} | ignored tail(s) "
+                    f"{sorted({c[2] for c in tail_cands if c not in _kept})} — only "
+                    f"inside a fully matched term"
+                )
+            tail_cands = _kept
+        if not tail_cands:
+            continue
+        max_len = max(c[0] for c in tail_cands)
+        best = [c for c in tail_cands if c[0] == max_len]
+        if len(best) == 1:
+            _, matched_term, tail = best[0]
+            _resolve_attribute_or_tag(
+                entities, loader, text, taxonomy, label,
+                matched_term,
+                matched_term.get("name", "").lower().strip(),
+                False,
+                rf"(?<![\w-]){re.escape(tail)}(?![\w-])",
+            )
+            logger.debug(
+                f"[CompoundTailMatch] taxonomy={taxonomy!r} "
+                f"| term={matched_term.get('name')!r} "
+                f"| tail={tail!r} (unambiguous auto-applied)"
+            )
+        else:
+            # Multiple terms with same-length tail → disambiguation.
+            _, _, tail = best[0]  # all share the same tail
+            sem_candidates = []
+            for _, matched_term, _ in best:
+                term_key = _resolve_attr_term_key_with_fallback(
+                    loader, taxonomy,
+                    matched_term.get("name", matched_term.get("slug", "")),
+                    matched_term.get("slug", matched_term.get("name", "")),
+                )
+                sem_candidates.append({
+                    "type": "attribute",
+                    "taxonomy": attr_key,
+                    "slug": term_key,
+                    "suggested_name": matched_term.get("name", ""),
+                    "user_text": tail,
+                    "is_negative": False,
+                    "score": 0.80,
+                })
+            entities.semantic_matches.append(sem_candidates)
+            logger.debug(
+                f"[CompoundTailMatch] taxonomy={taxonomy!r} "
+                f"| tail={tail!r} | ambiguous: "
+                f"{[c['suggested_name'] for c in sem_candidates]}"
+            )
 
     return masked_text
 
