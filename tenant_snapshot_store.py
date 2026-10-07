@@ -47,6 +47,11 @@ class SnapshotStore(ABC):
     @abstractmethod
     def delete(self, tenant_id: str) -> None: ...
 
+    def mtime(self, tenant_id: str) -> Optional[float]:
+        """When the snapshot was last written, or None. Lets each gunicorn
+        worker notice a snapshot another worker saved (catalog_events)."""
+        return None
+
 class LocalDiskSnapshotStore(SnapshotStore):
     """
     Per tenant, under TENANT_SNAPSHOT_DIR:
@@ -96,13 +101,28 @@ class LocalDiskSnapshotStore(SnapshotStore):
             return None
         try:
             with open(catalog_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            # When the catalog in this snapshot was fetched. apply_snapshot_to_
+            # loader used to stamp "loaded now", so every restart restarted the
+            # 6-hour refresh clock and an old snapshot could outlive it.
+            try:
+                with open(os.path.join(d, "meta.json"), "r", encoding="utf-8") as f:
+                    data["_built_at"] = json.load(f).get("snapshot_built_at")
+            except Exception:
+                data["_built_at"] = os.path.getmtime(catalog_path)
+            return data
         except Exception as e:
             logger.error(f"SnapshotStore: load failed | tenant={tenant_id} | error={e}", exc_info=True)
             return None
 
     def exists(self, tenant_id: str) -> bool:
         return os.path.exists(os.path.join(self._base_dir, tenant_id, "catalog.json"))
+
+    def mtime(self, tenant_id: str) -> Optional[float]:
+        try:
+            return os.path.getmtime(os.path.join(self._base_dir, tenant_id, "catalog.json"))
+        except OSError:
+            return None
 
     def delete(self, tenant_id: str) -> None:
         """
@@ -155,7 +175,10 @@ def apply_snapshot_to_loader(loader, snapshot: dict) -> None:
     from store_loader.lookup_builder import build_all_lookups
     build_all_lookups(loader, raw=raw)
     loader._validate_load()
-    loader._last_loaded = time.time()
+    # The snapshot's own fetch time, so the 6-hour refresh counts from when the
+    # data was actually fetched, not from this restart.
+    built_at = snapshot.get("_built_at")
+    loader._last_loaded = float(built_at) if built_at else time.time()
     loader._loaded_from_cache = True  # a snapshot is a form of cache, not a live fetch
 
 

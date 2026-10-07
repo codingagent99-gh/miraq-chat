@@ -258,6 +258,7 @@ class RefreshScheduler:
                             loader.load_all()
                             if not loader._degraded:
                                 snapshot_store.save(tenant_id, loader_to_snapshot_dict(loader))
+                                loader._snapshot_mtime = snapshot_store.mtime(tenant_id)
                                 logger.info(f"RefreshScheduler: snapshot updated | tenant={tenant_id}")
                     except Exception as e:
                         logger.error(f"RefreshScheduler: refresh failed | tenant={tenant_id} | error={e}", exc_info=True)

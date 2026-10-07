@@ -216,19 +216,14 @@ def get_customer_addresses():
 
 @shopify_bp.route("/events/product-update", methods=["POST"])
 def shopify_product_update_event():
-    """Minimal receiver for the products/update webhook declared in the app
-    toml (stable webhook topic; replaced the unstable Events API subscription).
+    """Receiver for the products/create, products/update and products/delete
+    webhooks declared in the app toml (all three share this URI; the
+    X-Shopify-Topic header says which).
 
-    Nothing in the app currently NEEDS this data — it exists purely to give
-    ``shopify app deploy`` a real, working endpoint instead of a stub that
-    would fail every delivery. Right now it does exactly one thing: verify
-    the delivery is genuinely from Shopify, log it, and acknowledge.
-
-    Deliberately not idempotency-guarded yet: with no side effects, receiving
-    the same delivery twice is harmless. If this grows into something that
-    actually acts on the payload (e.g. invalidating a cached product ahead of
-    StoreLoader's 6-hourly refresh), de-dupe on the Shopify-Webhook-Id header
-    before doing so.
+    Verifies the delivery is genuinely from Shopify, then hands the product
+    id to catalog_events, which refetches that product and updates the bot's
+    in-memory catalog and snapshot within a few seconds. Duplicate deliveries
+    are dropped there by Shopify-Webhook-Id.
     """
     raw_body = request.get_data()  # must be the exact bytes Shopify signed —
     # request.json / request.get_json() re-serializes and would break this.
@@ -249,10 +244,26 @@ def shopify_product_update_event():
         return jsonify({"error": "unverified_request"}), 401
 
     delivery_id = _shopify_header("Shopify-Webhook-Id")
+    topic = _shopify_header("Shopify-Topic") or "products/update"
     logger.info(
-        f"shopify events: Product/update delivery accepted | "
+        f"shopify events: product delivery accepted | topic={topic!r} "
         f"delivery_id={delivery_id!r} shop={shop_domain!r}"
     )
+
+    # Apply the change to the bot's catalog (in memory + snapshot) in the
+    # background — see catalog_events.py. Never fails the delivery: a bad
+    # payload or a queue problem is logged, and the 6-hourly refresh remains
+    # the backstop.
+    try:
+        from flask import current_app
+        from catalog_events import enqueue_product_event
+        payload = json.loads(raw_body or b"{}")
+        enqueue_product_event(
+            current_app._get_current_object(), str(tenant.tenant_id),
+            topic, payload if isinstance(payload, dict) else {}, webhook_id=delivery_id,
+        )
+    except Exception as e:
+        logger.error(f"shopify events: could not queue catalog update | shop={shop_domain!r} | {e}", exc_info=True)
 
     return jsonify({"received": True}), 200
 

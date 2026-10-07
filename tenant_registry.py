@@ -34,6 +34,7 @@ Deviations from the reference this was adapted from:
 from __future__ import annotations
 import os
 import threading
+import time
 from collections import OrderedDict
 from typing import Optional, List, Tuple
 
@@ -78,7 +79,9 @@ class TenantRegistry:
             if loader is not None:
                 self._loaders.move_to_end(tenant_id)
                 logger.info(f"TenantRegistry: cache hit | tenant={tenant_id}")
-                return loader
+        if loader is not None:
+            self.sync_from_snapshot_if_newer(tenant_id, loader)
+            return loader
 
         logger.info(f"TenantRegistry: cache miss — acquiring build lock | tenant={tenant_id}")
 
@@ -122,6 +125,65 @@ class TenantRegistry:
         finally:
             build_lock.release()
             logger.info(f"TenantRegistry: build lock released | tenant={tenant_id}")
+
+    # ── cross-worker catalog sync ───────────────────────────────────────────────
+
+    _SNAPSHOT_CHECK_SECONDS = 10
+
+    def sync_from_snapshot_if_newer(self, tenant_id: str, loader) -> None:
+        """Pick up a snapshot another gunicorn worker wrote.
+
+        Each worker holds its own copy of a tenant's catalog. When one worker
+        applies a Shopify product webhook (catalog_events) or runs a refresh,
+        it rewrites the snapshot on disk; the others notice the newer file
+        here — checked at most every _SNAPSHOT_CHECK_SECONDS per tenant, one
+        os.stat — and reload from it in the background. The request that
+        noticed is not held up; it and anything in flight read the current
+        catalog until the swap.
+        """
+        now = time.time()
+        if now - getattr(loader, "_snapshot_checked_at", 0) < self._SNAPSHOT_CHECK_SECONDS:
+            return
+        loader._snapshot_checked_at = now
+        try:
+            from tenant_snapshot_store import snapshot_store
+            disk = snapshot_store.mtime(tenant_id)
+        except Exception:
+            return
+        seen = getattr(loader, "_snapshot_mtime", None)
+        if not disk or (seen and disk <= seen) or getattr(loader, "_snapshot_syncing", False):
+            return
+        if seen is None:
+            # Loader built before this change tracked mtimes (or a live fetch
+            # with no snapshot yet): adopt the current file as the baseline.
+            loader._snapshot_mtime = disk
+            return
+        loader._snapshot_syncing = True
+        threading.Thread(
+            target=self._apply_newer_snapshot, args=(tenant_id, loader, disk),
+            name=f"snapshot-sync-{tenant_id[:8]}", daemon=True,
+        ).start()
+
+    def _apply_newer_snapshot(self, tenant_id: str, loader, disk_mtime: float) -> None:
+        from tenant_snapshot_store import snapshot_store, apply_snapshot_to_loader
+        try:
+            if not loader._lock.acquire(blocking=False):
+                return   # a full load is running; it is newer anyway — try again next check
+            try:
+                snap = snapshot_store.load(tenant_id)
+                if snap:
+                    apply_snapshot_to_loader(loader, snap)
+                    loader._snapshot_mtime = disk_mtime
+                    logger.info(
+                        f"TenantRegistry: catalog synced from newer snapshot | tenant={tenant_id} | "
+                        f"products={len(loader.products)}"
+                    )
+            finally:
+                loader._lock.release()
+        except Exception as e:
+            logger.error(f"TenantRegistry: snapshot sync failed | tenant={tenant_id} | {e}", exc_info=True)
+        finally:
+            loader._snapshot_syncing = False
 
     def _build_lock_for(self, tenant_id: str) -> threading.Lock:
         with self._build_locks_guard:
@@ -171,11 +233,22 @@ class TenantRegistry:
 
             logger.info(f"TenantRegistry: building TenantConfig (woocommerce) | tenant={tenant_row.license_id}")
             _features = dict(tenant_row.features or {})
+
+            # Plugin >= 1.0.6 serves its routes under miraq/v1; older plugins only
+            # under custom-api/v1. Ask the store which, through its own firewall
+            # header profile, before any plugin call is made. See plugin_routes.py.
+            from http_profiles import HttpProfileState
+            from plugin_routes import detect_plugin_namespace, plugin_api_base
+            _plugin_ns = detect_plugin_namespace(
+                _wp_base,
+                state=HttpProfileState.from_tenant(tenant_row),
+                license_id=tenant_row.license_id or "",
+            )
             config = TenantConfig(
                 wp_base_url=_wp_base,
                 woo_base_url=f"{_wp_base}/wp-json/wc/v3",
                 woo_store_api_url=f"{_wp_base}/wp-json/wc/store/v1",
-                custom_api_base_url=f"{_wp_base}/wp-json/custom-api/v1",
+                custom_api_base_url=plugin_api_base(_wp_base, _plugin_ns),
                 woo_key=tenant_row.woo_key or "",
                 woo_secret=decrypt_secret(tenant_row.woo_secret_encrypted or ""),
                 ecommerce_backend=tenant_row.ecommerce_backend,
@@ -202,6 +275,7 @@ class TenantRegistry:
         if snapshot is not None:
             logger.info(f"TenantRegistry: snapshot found — applying | tenant={tenant_row.license_id} | products={len(snapshot.get('products', []))}")
             apply_snapshot_to_loader(loader, snapshot)
+            loader._snapshot_mtime = snapshot_store.mtime(str(tenant_row.tenant_id))
             logger.info(f"TenantRegistry: snapshot applied | tenant={tenant_row.license_id}")
         else:
             logger.info(f"TenantRegistry: no snapshot — starting live fetch | tenant={tenant_row.license_id}")
@@ -220,6 +294,7 @@ class TenantRegistry:
             else:
                 logger.info(f"TenantRegistry: saving snapshot | tenant={tenant_row.license_id}")
                 snapshot_store.save(str(tenant_row.tenant_id), loader_to_snapshot_dict(loader))
+                loader._snapshot_mtime = snapshot_store.mtime(str(tenant_row.tenant_id))
                 logger.info(f"TenantRegistry: snapshot saved | tenant={tenant_row.license_id}")
 
         # Does this loader's one-time startup work: the initial Shopify
