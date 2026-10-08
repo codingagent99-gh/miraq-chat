@@ -499,11 +499,28 @@ def extract_attributes(text: str, entities: ExtractedEntities) -> str:
         for _m in re.finditer(re.escape(_ft), masked_text_lower):
             _full_spans.append(_m.span())
 
+    # Store tag names present in the text. A tail that only appears inside one
+    # ("black" inside "black tones") belongs to that tag — extract_tag() will
+    # match it — and is not a colour request. Without this, "black tones"
+    # became tag black-tones AND colour "MOHSONE Black", and the two together
+    # matched nothing. Only built when a tail candidate exists.
+    _tag_spans = []
+    if _deferred_tails:
+        for _tname, _tag in (getattr(loader, "tag_by_name_lower", None) or {}).items():
+            if len(_tname) < 4 or _tag.get("count", 0) == 0:
+                continue
+            try:
+                for _m in re.finditer(create_flexible_pattern(_tname), masked_text_lower):
+                    _tag_spans.append(_m.span())
+            except re.error:
+                pass
+
     def _tail_is_free(tail: str) -> bool:
         """True when the tail word(s) appear at least once OUTSIDE every
-        fully matched term."""
+        fully matched term and every store tag name in the text."""
+        _taken = _full_spans + _tag_spans
         for _m in re.finditer(rf"(?<![\w-]){re.escape(tail)}(?![\w-])", masked_text_lower):
-            if not any(fs[0] <= _m.start() and _m.end() <= fs[1] for fs in _full_spans):
+            if not any(fs[0] <= _m.start() and _m.end() <= fs[1] for fs in _taken):
                 return True
         return False
 
@@ -514,13 +531,13 @@ def extract_attributes(text: str, entities: ExtractedEntities) -> str:
     for taxonomy, label, attr_key, tail_cands in _deferred_tails:
         if attr_key in entities.attributes:
             continue
-        if _full_spans:
+        if _full_spans or _tag_spans:
             _kept = [c for c in tail_cands if _tail_is_free(c[2])]
             if len(_kept) != len(tail_cands):
                 logger.debug(
                     f"[CompoundTailMatch] taxonomy={taxonomy!r} | ignored tail(s) "
                     f"{sorted({c[2] for c in tail_cands if c not in _kept})} — only "
-                    f"inside a fully matched term"
+                    f"inside a fully matched term or a store tag name"
                 )
             tail_cands = _kept
         if not tail_cands:
@@ -804,15 +821,14 @@ def extract_tag(text: str, entities: ExtractedEntities) -> str:
     existing_ids = set(entities.tag_ids)
     resolved_attr_token_sets = [normalize_for_tag_compare(v) for v in entities.attributes.values() if v]
 
-    # Build category base words to avoid matching
-    cat_base_words = _build_cat_base_words(entities, loader)
+    # A tag with the same name as a matched category is no longer skipped
+    # here: consolidation._resolve_tag_category_overlap turns the two into one
+    # "category OR tag" search, so products carrying only the tag are found.
 
     # Collect candidates
     candidates = []
     for name_lower, tag in loader.tag_by_name_lower.items():
         if tag["id"] in existing_ids or tag.get("count", 0) == 0 or len(name_lower) < 4:
-            continue
-        if name_lower in cat_base_words:
             continue
         tag_tokens = normalize_for_tag_compare(name_lower)
         if tag_tokens and any(tag_tokens <= ats for ats in resolved_attr_token_sets):
@@ -833,24 +849,6 @@ def extract_tag(text: str, entities: ExtractedEntities) -> str:
             entities.tag_slugs.append(_resolve_tag_key_with_fallback(loader, tag["slug"]))
 
     return masked_text
-
-
-def _build_cat_base_words(entities, loader) -> set:
-    """Collect category name words to prevent tag false-positives."""
-    cat_base_words = set()
-    all_cat_names = []
-    if entities.category_name:
-        all_cat_names.append(entities.category_name.lower())
-    if hasattr(entities, 'target_category_slugs'):
-        for slug in entities.target_category_slugs:
-            cat_obj = loader.resolve_category(slug)
-            if cat_obj and cat_obj.name:
-                all_cat_names.append(cat_obj.name.lower())
-    for cname in all_cat_names:
-        cat_base_words.add(cname)
-        if cname.endswith("s") and len(cname) > 3:
-            cat_base_words.add(cname[:-1])
-    return cat_base_words
 
 
 def _try_tag_match(name_lower: str, tag: dict, text: str) -> Optional[str]:

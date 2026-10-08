@@ -508,6 +508,32 @@ def _extract_collections(node: dict) -> list:
     return found
 
 
+def _collection_in_or(node: dict) -> bool:
+    """True when a positive collection sits in an OR group beside something
+    else ("in Mosaics OR tagged mosaic-look"). Fetching only that collection
+    would never see products that match the other branch, so the caller
+    fetches the whole catalog and checks membership in Layer 2 instead."""
+    if "type" in node:
+        return False
+    conditions = node.get("conditions", [])
+    if node.get("relation", "AND").upper() == "OR":
+        has_coll = any(c.get("type") == "collection" and not c.get("negate") for c in conditions)
+        has_other = any(c.get("type") != "collection" for c in conditions)
+        if has_coll and has_other:
+            return True
+    return any(_collection_in_or(c) for c in conditions)
+
+
+def _enforce_collections(node: dict) -> None:
+    """Mark every positive collection node so _evaluate checks membership."""
+    if "type" in node:
+        if node["type"] == "collection" and not node.get("negate"):
+            node["enforce"] = True
+        return
+    for c in node.get("conditions", []):
+        _enforce_collections(c)
+
+
 def _collection_relation(node: dict) -> Optional[str]:
     if "type" in node:
         return None
@@ -542,9 +568,11 @@ def _evaluate(node: dict, product: dict, variant: dict) -> bool:
             result       = any(matches) if rel == "OR" else all(matches)
 
         elif t == "collection":
-            if not negate:
+            if not negate and not node.get("enforce"):
                 result = True  # positive filter enforced at fetch level
             else:
+                # Negated, or a collection inside an OR (see
+                # _collection_in_or): membership is checked here.
                 # Negated collections are NOT enforced at fetch (see
                 # _extract_collections), so membership must be evaluated here.
                 # result = "is a member"; the shared inversion below turns it
@@ -821,7 +849,23 @@ class ShopifyGraphQLExecutor:
             f"tag_query={tag_query!r}"
         )
 
-        if not collections:
+        if collections and _collection_in_or(filter_tree):
+            # "collection OR tag": a collection fetch would miss every product
+            # that only matches the other branch. Use the whole in-memory
+            # catalog and let Layer 2 check collection membership.
+            _enforce_collections(filter_tree)
+            loader_products = getattr(self._loader, "products", None) if self._loader else None
+            if loader_products:
+                logger.info(
+                    f"[ShopifyGQL] Layer1: collection inside an OR — using in-memory "
+                    f"catalog ({len(loader_products)} products), membership checked in Layer2"
+                )
+                raw = [_loader_product_to_gql_shape(p) for p in loader_products]
+            else:
+                logger.info("[ShopifyGQL] Layer1: collection inside an OR — querying full catalog")
+                raw = _fetch_products("", token, domain)
+
+        elif not collections:
             loader_products = getattr(self._loader, "products", None) if self._loader else None
             if not tag_query and loader_products:
                 # No native narrowing at all → a live fetch would be a

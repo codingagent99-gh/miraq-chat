@@ -9,7 +9,7 @@ Handles:
 """
 
 import re
-from classifier.utils import normalize_for_tag_compare, tokens_overlap_loose
+from classifier.utils import normalize_for_tag_compare, tokens_overlap_loose, create_flexible_pattern, _singularize
 from models import Intent, ExtractedEntities
 from store_registry import get_store_loader
 from chat_logger import get_logger
@@ -158,12 +158,104 @@ def _resolve_category_or_pair_overlap(entities: ExtractedEntities):
 def consolidate_entities(intent: Intent, entities: ExtractedEntities, text: str):
     _resolve_product_vs_category(intent, entities)
     _resolve_series_tag_conflict(entities, text)
+    _resolve_tag_category_overlap(entities, text)
     _deduplicate_or_pairs(entities)
     _resolve_category_attribute_overlap(entities)
     _resolve_tag_attribute_overlap(entities)
     _resolve_category_or_pair_overlap(entities)
     _prune_tag_covered_attrs(entities)
     _prune_redundant_attributes(entities)
+
+def _resolve_tag_category_overlap(entities: ExtractedEntities, text: str):
+    """
+    A matched tag and a matched category built from the same words.
+
+      * Same name (plural-insensitive) — tag "Mosaic Look" and a category
+        "Mosaic Look": the shopper could mean either, so search products in
+        the category OR with the tag (one OR pair, like attribute/tag pairs).
+      * The tag is longer and contains the category — tag "Mosaic Look",
+        category "Mosaics", and "mosaic" only appears inside "mosaic look":
+        the category is the tag's own word read a second time. Drop it, so
+        the search is every product with the tag, not just those that are
+        also in the category.
+      * The category is longer than the tag ("Exterior Wall" vs tag "wall")
+        is deliberately left as it is.
+
+    Needs the raw message to see where the words sit, so it does nothing on
+    the refinement re-consolidation (text="") — the first turn already ran it.
+    """
+    if not text or not entities.tag_slugs or not getattr(entities, "target_category_slugs", None):
+        return
+    loader = get_store_loader()
+    if not loader:
+        return
+    text_l = text.lower()
+
+    def _tokens(name: str) -> set:
+        return {_singularize(t) for t in normalize_for_tag_compare(name)}
+
+    def _spans(name: str) -> list:
+        try:
+            return [m.span() for m in re.finditer(create_flexible_pattern(name.lower()), text_l)]
+        except re.error:
+            return []
+
+    def _drop_category(slug: str):
+        entities.target_category_slugs.discard(slug)
+        for group in entities.category_groups:
+            group.discard(slug)
+
+    paired_tags = []
+    for tag_slug in list(entities.tag_slugs):
+        tag_obj = loader.resolve_tag(tag_slug) if hasattr(loader, "resolve_tag") else None
+        tag_name = getattr(tag_obj, "name", "") or tag_slug.replace("-", " ")
+        tag_tokens = _tokens(tag_name)
+        if not tag_tokens:
+            continue
+        tag_spans = None
+        for cat_slug in list(entities.target_category_slugs):
+            cat_obj = loader.resolve_category(cat_slug)
+            cat_name = getattr(cat_obj, "name", "") or cat_slug.replace("-", " ")
+            cat_tokens = _tokens(cat_name)
+            if not cat_tokens:
+                continue
+
+            if cat_tokens == tag_tokens:
+                entities.attr_tag_or_pairs.append({"tag_slug": tag_slug, "cat_slugs": [cat_slug]})
+                paired_tags.append(tag_slug)
+                _drop_category(cat_slug)
+                logger.info(
+                    f"_resolve_tag_category_overlap: tag='{tag_slug}' and category='{cat_slug}' "
+                    f"share a name — searching either (OR)"
+                )
+                break
+
+            if cat_tokens < tag_tokens:
+                if tag_spans is None:
+                    tag_spans = _spans(tag_name)
+                cat_spans = _spans(cat_name)
+                inside_tag = bool(cat_spans) and all(
+                    any(ts[0] <= cs[0] and cs[1] <= ts[1] for ts in tag_spans)
+                    for cs in cat_spans
+                )
+                if inside_tag:
+                    _drop_category(cat_slug)
+                    logger.info(
+                        f"_resolve_tag_category_overlap: dropped category='{cat_slug}' — "
+                        f"its words only appear inside the longer tag '{tag_name}'"
+                    )
+
+    for tag_slug in paired_tags:
+        if tag_slug in entities.tag_slugs:
+            idx = entities.tag_slugs.index(tag_slug)
+            if len(entities.tag_ids) == len(entities.tag_slugs):
+                entities.tag_ids.pop(idx)
+            entities.tag_slugs.pop(idx)
+
+    entities.category_groups = [g for g in entities.category_groups if g]
+    if not entities.target_category_slugs:
+        entities.category_name = None
+
 
 def _resolve_product_vs_category(intent: Intent, entities: ExtractedEntities):
     """When both product_id and category are set, drop the lower-priority one."""
