@@ -9,7 +9,7 @@ Handles:
 """
 
 import re
-from classifier.utils import normalize_for_tag_compare, tokens_overlap_loose, create_flexible_pattern, _singularize
+from classifier.utils import normalize_for_tag_compare, tokens_overlap_loose, create_flexible_pattern, _singularize, explicit_kind_near
 from models import Intent, ExtractedEntities
 from store_registry import get_store_loader
 from chat_logger import get_logger
@@ -171,8 +171,11 @@ def _resolve_tag_category_overlap(entities: ExtractedEntities, text: str):
     A matched tag and a matched category built from the same words.
 
       * Same name (plural-insensitive) — tag "Mosaic Look" and a category
-        "Mosaic Look": the shopper could mean either, so search products in
-        the category OR with the tag (one OR pair, like attribute/tag pairs).
+        "Mosaic Look". If the shopper said which ("mosaic look tag", "mosaic
+        look collection"), keep only that one. Otherwise they could mean
+        either, so search products in the category OR with the tag (one OR
+        pair, like attribute/tag pairs). Must agree with phase 1's decision
+        in catalog_parser, whose result this pair would otherwise override.
       * The tag is longer and contains the category — tag "Mosaic Look",
         category "Mosaics", and "mosaic" only appears inside "mosaic look":
         the category is the tag's own word read a second time. Drop it, so
@@ -205,7 +208,15 @@ def _resolve_tag_category_overlap(entities: ExtractedEntities, text: str):
         for group in entities.category_groups:
             group.discard(slug)
 
+    def _kind_for(name: str):
+        for span in _spans(name):
+            kind = explicit_kind_near(text_l, span[0], span[1])
+            if kind:
+                return kind
+        return None
+
     paired_tags = []
+    dropped_tags = []
     for tag_slug in list(entities.tag_slugs):
         tag_obj = loader.resolve_tag(tag_slug) if hasattr(loader, "resolve_tag") else None
         tag_name = getattr(tag_obj, "name", "") or tag_slug.replace("-", " ")
@@ -221,13 +232,27 @@ def _resolve_tag_category_overlap(entities: ExtractedEntities, text: str):
                 continue
 
             if cat_tokens == tag_tokens:
-                entities.attr_tag_or_pairs.append({"tag_slug": tag_slug, "cat_slugs": [cat_slug]})
-                paired_tags.append(tag_slug)
-                _drop_category(cat_slug)
-                logger.info(
-                    f"_resolve_tag_category_overlap: tag='{tag_slug}' and category='{cat_slug}' "
-                    f"share a name — searching either (OR)"
-                )
+                kind = _kind_for(tag_name) or _kind_for(cat_name)
+                if kind == "tag":
+                    _drop_category(cat_slug)
+                    logger.info(
+                        f"_resolve_tag_category_overlap: '{tag_name}' called a tag — "
+                        f"dropped same-named category='{cat_slug}'"
+                    )
+                elif kind == "category":
+                    dropped_tags.append(tag_slug)
+                    logger.info(
+                        f"_resolve_tag_category_overlap: '{cat_name}' called a collection/category — "
+                        f"dropped same-named tag='{tag_slug}'"
+                    )
+                else:
+                    entities.attr_tag_or_pairs.append({"tag_slug": tag_slug, "cat_slugs": [cat_slug]})
+                    paired_tags.append(tag_slug)
+                    _drop_category(cat_slug)
+                    logger.info(
+                        f"_resolve_tag_category_overlap: tag='{tag_slug}' and category='{cat_slug}' "
+                        f"share a name — searching either (OR)"
+                    )
                 break
 
             if cat_tokens < tag_tokens:
@@ -245,7 +270,7 @@ def _resolve_tag_category_overlap(entities: ExtractedEntities, text: str):
                         f"its words only appear inside the longer tag '{tag_name}'"
                     )
 
-    for tag_slug in paired_tags:
+    for tag_slug in paired_tags + dropped_tags:
         if tag_slug in entities.tag_slugs:
             idx = entities.tag_slugs.index(tag_slug)
             if len(entities.tag_ids) == len(entities.tag_slugs):

@@ -16,7 +16,7 @@ from utils.entity_helpers import (
 from classifier.extractors import ALL_PRICE_PATTERNS
 from typing import Optional
 logger = get_logger("miraq_chat")
-from classifier.utils import create_flexible_pattern
+from classifier.utils import create_flexible_pattern, explicit_kind_near
 # Matches dimension strings like 12x24, 12"x24", 4x8, 2"x2", 12 x 24
 _DIM_RE = re.compile(r'^\d+["\']?\s*[xX×]\s*\d+["\']?$')
 # Matches slugified dimension terms like 12-x-24, 12x24, 12 x 24
@@ -195,7 +195,8 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
 
     for name, matches, pattern in phase1_index:
 
-        if not pattern.search(unmatched_text):
+        _m = pattern.search(unmatched_text)
+        if not _m:
             # if _DIM_RE.match(name.strip()):
             #     logger.debug(f"[DIM_PATTERN_TRACE] NO MATCH for {name!r} against text={unmatched_text!r}")
             continue
@@ -203,6 +204,37 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
             # logger.debug(f"[DIM_PATTERN_TRACE] MATCHED {name!r} | types_matched={[m[0] for m in matches]}")
 
         types_matched = [m[0] for m in matches]
+
+        # ── Tag + category/collection with the same name ("wall", "interior") ──
+        # Previously both were added and ANDed, so a product needed the tag AND
+        # the collection. Now: the word next to the name decides ("wall
+        # collection" → collection only, "interior tag" → tag only); with no
+        # such word the shopper could mean either, so search either (OR pair).
+        if ('tag' in types_matched and 'category' in types_matched
+                and 'attribute' not in types_matched):
+            _kind = explicit_kind_near(unmatched_text, _m.start(), _m.end())
+            if _kind == 'tag':
+                matches = [x for x in matches if x[0] != 'category']
+            elif _kind == 'category':
+                matches = [x for x in matches if x[0] != 'tag']
+            else:
+                _tag_data = next(x[1] for x in matches if x[0] == 'tag')
+                _cat_data = next(x[1] for x in matches if x[0] == 'category')
+                _cat_slugs = getattr(loader, 'category_slugs_by_name', {}).get(
+                    (_cat_data.get("name") or "").lower(), [_cat_data.get("slug")]
+                )
+                entities.attr_tag_or_pairs.append({
+                    "tag_slug":     _tag_data.get("slug"),
+                    "cat_slugs":    list(_cat_slugs),
+                    "display_text": name,
+                })
+                matches = [x for x in matches if x[0] not in ('tag', 'category')]
+            logger.debug(
+                f"[PHASE1_TAG_CAT] name={name!r} kind={_kind!r} -> "
+                f"{'tag only' if _kind == 'tag' else 'collection only' if _kind == 'category' else 'tag OR collection'}"
+            )
+            types_matched = [x[0] for x in matches]
+
         is_tag_attr_collision = 'tag' in types_matched and 'attribute' in types_matched
         is_cat_attr_collision = 'category' in types_matched and 'attribute' in types_matched
 
@@ -425,12 +457,16 @@ def phase2_nlp_merge(
                 for k in keys_to_remove:
                     del entities.attributes[k]
 
-            # Clean up redundant categories
+            # Clean up redundant categories — from category_groups too: the
+            # filter builder reads the groups, so a slug removed only from
+            # target_category_slugs was still ANDed onto the query.
             cat_slugs = pair.get("cat_slugs", [])
             if cat_slugs and hasattr(entities, 'target_category_slugs'):
                 for c_slug in cat_slugs:
-                    if c_slug in entities.target_category_slugs:
-                        entities.target_category_slugs.remove(c_slug)
+                    entities.target_category_slugs.discard(c_slug)
+                    for _g in entities.category_groups:
+                        _g.discard(c_slug)
+                entities.category_groups = [_g for _g in entities.category_groups if _g]
                 if not entities.target_category_slugs:
                     entities.category_name = None
 

@@ -4,6 +4,7 @@ used across the classifier pipeline.
 """
 
 import re
+from typing import Optional
 
 
 def normalize_for_tag_compare(s: str) -> set:
@@ -44,6 +45,32 @@ def label_word_matches(word: str, text: str) -> bool:
         if re.search(rf"\b{re.escape(word[:-1])}\b", text):
             return True
     return False
+
+
+_KIND_TAG_WORD = r'(?:tags?|tagged)'
+_KIND_CAT_WORD = r'(?:collections?|categor(?:y|ies))'
+
+
+def explicit_kind_near(text: str, start: int, end: int) -> Optional[str]:
+    """What the shopper called the name at text[start:end], if they said.
+
+    Returns "tag" for "interior tag" / "tagged interior", "category" for
+    "wall collection" / "wall category", otherwise None. Only the words right
+    next to the name count, so "wall collection with interior tag" gives
+    "category" for wall and "tag" for interior. Used where one name is both a
+    tag and a category/collection in the store.
+    """
+    after = text[end:]
+    before = text[:start]
+    if re.match(rf'\s*{_KIND_TAG_WORD}\b', after, re.IGNORECASE):
+        return "tag"
+    if re.match(rf'\s*{_KIND_CAT_WORD}\b', after, re.IGNORECASE):
+        return "category"
+    if re.search(rf'\b{_KIND_TAG_WORD}(?:\s+(?:as|with))?\s*$', before, re.IGNORECASE):
+        return "tag"
+    if re.search(rf'\b{_KIND_CAT_WORD}\s*$', before, re.IGNORECASE):
+        return "category"
+    return None
 
 
 def create_flexible_pattern(phrase: str) -> str:

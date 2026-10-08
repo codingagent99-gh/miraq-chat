@@ -99,6 +99,7 @@ from handlers.search_refinement import (
     detect_slot_conflicts, active_search_is_fresh,
 )
 from parsers.catalog_parser import _detect_explicit_taxonomy_signal
+from classifier.utils import explicit_kind_near, create_flexible_pattern
 from handlers.refinement_choice_handler import build_refinement_prompt, resolve_refinement_choice
 from handlers.no_results_choice_handler import build_no_results_prompt, resolve_no_results_choice
 from config.store_config import SEMANTIC_AUTO_APPLY_THRESHOLD, ATTRIBUTE_DISAMBIGUATION_GROUPS
@@ -2883,12 +2884,36 @@ def chat():
             # appears in THIS message — otherwise an unrelated category carried
             # forward from an earlier turn gets silently merged in.
             msg_lower = message.lower()
+
+            def _called_a_category(name: str) -> bool:
+                """True when "collection"/"category" sits right next to this
+                name in the message ("wall collection"), not just somewhere
+                else in it."""
+                try:
+                    for _mm in re.finditer(create_flexible_pattern(name), msg_lower):
+                        if explicit_kind_near(msg_lower, _mm.start(), _mm.end()) == 'category':
+                            return True
+                except re.error:
+                    pass
+                return False
+
             collision_cat_slugs = set()
             for op in or_pairs:
+                # A tag-or-collection pair (same name is both a tag and a
+                # collection) was already decided per name by phase 1 /
+                # consolidation: it is an OR pair only because the shopper
+                # did NOT say "collection" next to it. Another name's
+                # "collection" elsewhere in the message ("interior tiles in
+                # the wall collection") must not turn it into a collection
+                # filter. Category-vs-attribute pairs keep the old rule.
+                _tag_cat_pair = bool(op.get('tag_slug')) and not op.get('attr_term')
                 for slug in (op.get('cat_slugs') or []):
                     cat_obj = store_loader.resolve_category(slug) if store_loader else None
                     cat_name = (cat_obj.name if cat_obj else slug.replace('-', ' ')).lower()
-                    if cat_name in msg_lower or slug.replace('-', ' ') in msg_lower:
+                    if _tag_cat_pair:
+                        if _called_a_category(cat_name) or _called_a_category(slug.replace('-', ' ')):
+                            collision_cat_slugs.add(slug)
+                    elif cat_name in msg_lower or slug.replace('-', ' ') in msg_lower:
                         collision_cat_slugs.add(slug)
             _matched_cats = set(getattr(entities, 'target_category_slugs', set())) | collision_cat_slugs
             if _matched_cats:
