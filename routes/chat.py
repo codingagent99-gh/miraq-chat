@@ -1272,7 +1272,12 @@ def _execute_api_calls(intent, api_calls, _resolve_variant):
         for call in shopify_calls:
             try:
                 result = executor.execute_from_body(call.body)
-                api_responses.append({"success": True, "data": result, "call": call})
+                resp = {"success": True, "data": result, "call": call}
+                # Same top-level key woo_client sets, so the bot message can
+                # describe OR pairs ("Pavers: tag OR collection") on Shopify too.
+                if result.get("or_group_breakdown"):
+                    resp["or_group_breakdown"] = result["or_group_breakdown"]
+                api_responses.append(resp)
             except Exception as exc:
                 logger.error(f"ShopifyGraphQLExecutor failed: {exc}", exc_info=True)
                 api_responses.append({"success": False, "error": str(exc), "call": call})

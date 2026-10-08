@@ -454,6 +454,10 @@ def _convert_condition(c: dict) -> Optional[dict]:
 
     if negate:
         node["negate"] = True
+    # Original taxonomy (product_tag / product_cat / pa_finish …), kept so the
+    # OR-group breakdown can report branches in the same shape the Woo plugin
+    # returns. _evaluate() and the Layer 1 helpers ignore it.
+    node["taxonomy"] = taxonomy
     return node
 
 
@@ -691,6 +695,103 @@ def _post_filter(raw_products: list, filter_tree: dict,
             results.append({**product, "variants": matching_variants})
 
     return results
+
+
+# ══════════════════════════════════════════════════════════════
+# OR-group breakdown  (mirrors the Woo plugin's or_group_breakdown)
+# ══════════════════════════════════════════════════════════════
+#
+# The Woo plugin (class-api.php) returns, for every OR group whose branches
+# span more than one taxonomy, a per-branch count:
+#     [[{"taxonomy", "terms", "role", "count", "by_term"?}, ...], ...]
+# response_generator uses it to name the OR group in the bot message
+# ("**Pavers** (Tag: 1 • Category: 4)"). Without it, an OR pair such as
+# "pavers (tag OR collection)" was silently left out of the message on
+# Shopify stores. Same shape here, so chat.py / response_generator need no
+# platform-specific code.
+
+def _branch_role(taxonomy: str) -> str:
+    if taxonomy == "product_cat":
+        return "category"
+    if taxonomy == "product_tag":
+        return "tag"
+    return "attribute"
+
+
+def _node_taxonomy(node: dict) -> str:
+    if node.get("taxonomy"):
+        return node["taxonomy"]
+    t = node.get("type")
+    if t == "tag":
+        return "product_tag"
+    if t == "collection":
+        return "product_cat"
+    return "pa_" + (node.get("key") or "")
+
+
+def _find_or_groups(node: dict, path: tuple = ()) -> list:
+    """(path, group) for every OR group whose children are all plain leaves —
+    the same "flat cross-taxonomy OR" shape the plugin's find_or_groups_php
+    looks for. `path` is the chain of child indexes from the root."""
+    if not isinstance(node, dict) or "type" in node:
+        return []
+    found = []
+    conditions = node.get("conditions", [])
+    if (node.get("relation", "AND").upper() == "OR" and conditions
+            and all("type" in c for c in conditions)):
+        found.append((path, node))
+    for i, c in enumerate(conditions):
+        found.extend(_find_or_groups(c, path + (i,)))
+    return found
+
+
+def _replace_at(node: dict, path: tuple, replacement: dict) -> dict:
+    """Copy of `node` with the sub-node at `path` swapped for `replacement`."""
+    if not path:
+        return replacement
+    conditions = list(node.get("conditions", []))
+    conditions[path[0]] = _replace_at(conditions[path[0]], path[1:], replacement)
+    return {**node, "conditions": conditions}
+
+
+def _build_or_group_breakdown(raw_products: list, filter_tree: dict,
+                              search_f: str, price_f: dict, stock_f: str) -> list:
+    """Per-branch product counts for each cross-taxonomy OR group, with every
+    other filter still applied. `raw_products` must be the Layer 1 set the
+    full query was filtered from — it is always a superset of every branch
+    (an OR group with a collection or a mixed tag/option OR is fetched from
+    the whole catalog, see execute_from_body)."""
+    breakdown = []
+    if not filter_tree:
+        return breakdown
+
+    def _count(tree: dict) -> int:
+        return len(_post_filter(raw_products, tree, search_f, price_f, stock_f))
+
+    for path, group in _find_or_groups(filter_tree):
+        leaves = group["conditions"]
+        if len({_node_taxonomy(leaf) for leaf in leaves}) < 2:
+            continue  # same-taxonomy OR — nothing to break down (same as plugin)
+
+        branches = []
+        for leaf in leaves:
+            taxonomy = _node_taxonomy(leaf)
+            terms = list(leaf.get("values", []))
+            branch = {
+                "taxonomy": taxonomy,
+                "terms":    terms,
+                "role":     _branch_role(taxonomy),
+                "count":    _count(_replace_at(filter_tree, path, leaf)),
+            }
+            if len(terms) > 1:
+                branch["by_term"] = {
+                    term: _count(_replace_at(filter_tree, path, {**leaf, "values": [term]}))
+                    for term in terms
+                }
+            branches.append(branch)
+        breakdown.append(branches)
+
+    return breakdown
 
 
 # ══════════════════════════════════════════════════════════════
@@ -935,6 +1036,17 @@ class ShopifyGraphQLExecutor:
             f"(dropped {len(raw)-len(filtered)})"
         )
 
+        # ── OR-group breakdown (for the bot message) ──────────
+        or_group_breakdown = []
+        try:
+            or_group_breakdown = _build_or_group_breakdown(
+                raw, filter_tree, search_f, price_f, stock_f
+            )
+            if or_group_breakdown:
+                logger.info(f"[ShopifyGQL] or_group_breakdown={or_group_breakdown}")
+        except Exception as exc:  # message detail only — never fail the search
+            logger.warning(f"[ShopifyGQL] or_group_breakdown failed: {exc}")
+
         # ── Convert to Woo-shaped dicts ───────────────────────
         woo_products = [_to_woo_shape(p, domain) for p in filtered]
 
@@ -958,6 +1070,7 @@ class ShopifyGraphQLExecutor:
             "total":    total,
             "pages":    pages,
             "_raw":     {"products": sliced},
+            "or_group_breakdown": or_group_breakdown,
         }
 
     # ── private ──────────────────────────────────────────────
