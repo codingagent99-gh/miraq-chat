@@ -156,8 +156,13 @@ def _resolve_category_or_pair_overlap(entities: ExtractedEntities):
         entities.category_name = None
 
 def consolidate_entities(intent: Intent, entities: ExtractedEntities, text: str):
-    _resolve_product_vs_category(intent, entities)
+    # Series tag first: when a series tag replaces the product, the category
+    # the shopper named must stay. In the other order, product-vs-category
+    # cleared the category before the series rule dropped the product, so
+    # "exterior floor collection with Titan Marbles Series tag" lost
+    # Exterior Floor on the refinement-merge path.
     _resolve_series_tag_conflict(entities, text)
+    _resolve_product_vs_category(intent, entities)
     _resolve_tag_category_overlap(entities, text)
     _deduplicate_or_pairs(entities)
     _resolve_category_attribute_overlap(entities)

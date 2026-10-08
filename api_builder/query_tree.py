@@ -160,17 +160,26 @@ def merge_cross_taxonomy_overlaps(conditions: list) -> list:
     # cross-taxonomy semantic overlap, it just consolidates what should
     # never have been split in the first place (e.g. duplicate catalog
     # slugs producing two separate pa_tile-size conditions).
+    #
+    # Keyed by (taxonomy, base term), not taxonomy alone. Keyed by taxonomy,
+    # two DIFFERENT values were unioned into one OR'd list: "show me tile with
+    # exterior tag" became (tag tile OR tag exterior OR collection tile)
+    # instead of (tag tile OR collection tile) AND tag exterior, and two tags
+    # the shopper wanted together (tag_operator AND → one condition each in
+    # filter_builder) were turned back into "either tag". Duplicate catalog
+    # slugs for one value ("12x24" / "12-x-24") share a base term, so they
+    # still collapse as before.
     by_taxonomy: dict = {}
     order: list = []
     for cond in flattened_in:
-        tax = cond.get("taxonomy", "")
-        if tax not in by_taxonomy:
-            by_taxonomy[tax] = []
-            order.append(tax)
+        key = (cond.get("taxonomy", ""), _normalize_term(cond["terms"][0]))
+        if key not in by_taxonomy:
+            by_taxonomy[key] = []
+            order.append(key)
         for t in cond.get("terms", []):
-            if t not in by_taxonomy[tax]:
-                by_taxonomy[tax].append(t)
-    consolidated = [make_condition(tax, by_taxonomy[tax], "IN") for tax in order]
+            if t not in by_taxonomy[key]:
+                by_taxonomy[key].append(t)
+    consolidated = [make_condition(key[0], by_taxonomy[key], "IN") for key in order]
 
     # STEP B — UNCHANGED original logic: cross-taxonomy overlap detection,
     # still based on the first term only, exactly as conservative as before.

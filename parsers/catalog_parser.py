@@ -215,10 +215,11 @@ def _get_phase1_index(loader, catalog_items):
     return index
 
 
-def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
+def phase1_catalog_match(msg: str, loader, matched_names: Optional[list] = None) -> tuple[ExtractedEntities, str]:
     """
     Run longest-string substring matching against the store catalog.
-    Returns (entities, unmatched_text).
+    Returns (entities, unmatched_text). When `matched_names` is given, every
+    catalog name that matched is appended to it, longest first.
     """
     msg_lower = msg.lower()
     entities = ExtractedEntities()
@@ -241,6 +242,8 @@ def phase1_catalog_match(msg: str, loader) -> tuple[ExtractedEntities, str]:
             # logger.debug(f"[DIM_PATTERN_TRACE] MATCHED {name!r} | types_matched={[m[0] for m in matches]}")
 
         types_matched = [m[0] for m in matches]
+        if matched_names is not None:
+            matched_names.append(name)
 
         # ── Tag + category/collection with the same name ("wall", "interior") ──
         # Previously both were added and ANDed, so a product needed the tag AND
@@ -679,6 +682,54 @@ def resolve_final_intent(
     return resolved_intent, final_confidence
 
 
+def _drop_product_inside_longer_match(
+    nlp_entities: ExtractedEntities,
+    phase1_entities: ExtractedEntities,
+    unmatched_text: str,
+    phase1_names: list,
+) -> None:
+    """
+    The full-text NLP pass matches product names on its own, so in
+    "exterior floor collection with titan marbles series tag" it finds the
+    product "Titan Marbles" — even though phase 1 already claimed those words
+    as part of the longer tag "Titan Marbles Series". Phase 2 then copied
+    that product back in (and chat.py's _merge_phase_entities restores it
+    too), so the first ask searched just that one product, while asking again
+    went through the refinement merge, whose series-tag rule dropped it —
+    1 result, then 2.
+
+    Longest match wins, as everywhere else in phase 1: when phase 1 picked no
+    product itself and the product's name only appears inside a longer name
+    phase 1 matched, the product is not part of the query. Cleared on the
+    NLP result itself, so neither phase 2 nor chat.py can bring it back.
+    """
+    name = (nlp_entities.product_name or "").lower().strip()
+    if not name or not nlp_entities.product_id:
+        return
+    if phase1_entities.product_id or nlp_entities.product_ids:
+        return  # phase 1 matched a product itself / multi-product lookup
+    try:
+        pattern = re.compile(create_flexible_pattern(name))
+    except re.error:
+        return
+    if pattern.search(unmatched_text):
+        return  # the name is still unclaimed text — keep the product
+    longer = next(
+        (n for n in phase1_names if len(n) > len(name) and pattern.search(n.lower())),
+        None,
+    )
+    if not longer:
+        return
+
+    logger.info(
+        f"[PHASE1_PRODUCT] product '{nlp_entities.product_name}' only appears inside "
+        f"the longer match '{longer}' — dropped from the query"
+    )
+    nlp_entities.product_id = None
+    nlp_entities.product_name = None
+    nlp_entities.product_slug = None
+
+
 # ══════════════════════════════════════════════════════════════
 # PUBLIC API — replaces old parse_csv_message()
 # ══════════════════════════════════════════════════════════════
@@ -706,8 +757,10 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
     clean_msg = re.sub(r'\s+', ' ', clean_msg).strip()
 
     # Phase 1: Catalog match
+    phase1_names: list = []
     with timing_logger.stage("phase1_catalog"):
-        entities, unmatched_text = phase1_catalog_match(clean_msg, loader)
+        entities, unmatched_text = phase1_catalog_match(clean_msg, loader, phase1_names)
+    _drop_product_inside_longer_match(original_nlp_result.entities, entities, unmatched_text, phase1_names)
     logger.debug(
         f"[PHASE1_TRACE] attr_tag_or_pairs={entities.attr_tag_or_pairs} | "
         f"attributes={entities.attributes} | "
