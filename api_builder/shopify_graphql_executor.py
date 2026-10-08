@@ -47,6 +47,7 @@ walk store_loader.categories (the raw list) to map slug → GID.
 """
 
 import concurrent.futures
+import re
 from typing import Optional
 
 import requests as http_requests
@@ -561,9 +562,15 @@ def _evaluate(node: dict, product: dict, variant: dict) -> bool:
         negate = bool(node.get("negate"))
 
         def _norm(s: str) -> str:
-            # Normalise both sides: lowercase + replace hyphens with spaces
-            # so "glossy-finish" matches "Glossy Finish" from Shopify GraphQL
-            return s.lower().replace("-", " ").replace("_", " ").strip()
+            # Normalise both sides so a filter slug matches Shopify's raw
+            # name: every run of non-alphanumerics becomes one hyphen.
+            # "glossy-finish" == "Glossy Finish", and "7-16-thick" ==
+            # '7/16" Thick'. The old version only mapped "-"/"_" to spaces,
+            # so any tag or collection with a slash, quote or dot in its
+            # name ('7/16" Thick') never matched here — Shopify's own tag
+            # search found the products in Layer 1 and Layer 2 dropped them
+            # all, giving zero results.
+            return re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-")
 
         if t == "tag":
             rel          = node.get("relation", "OR").upper()
