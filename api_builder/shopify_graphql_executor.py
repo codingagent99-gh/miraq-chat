@@ -920,6 +920,11 @@ class ShopifyGraphQLExecutor:
                     f"slug={collections[0]!r} gid={gid!r}, post-filter enforces rest"
                 )
                 raw = _fetch_from_collection(gid, tag_query, token, domain)
+                # Only the first collection was enforced by the fetch. Without
+                # this, _evaluate treated every other positive collection as
+                # already satisfied, so "Exterior Floor AND Mosaics" returned
+                # every Exterior Floor product.
+                _enforce_collections(filter_tree)
 
         logger.info(f"[ShopifyGQL] Layer1 done | raw_products={len(raw)}")
 

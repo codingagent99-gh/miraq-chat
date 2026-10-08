@@ -108,6 +108,43 @@ def _build_phase1_index(catalog_items):
             grouped_catalog[group_key] = []
         grouped_catalog[group_key].append((match_type, data))
 
+    # ── Tag + category that differ only by plural ("mosaic" tag vs "Mosaics"
+    # collection) ──────────────────────────────────────────────────────────
+    # Grouping above is by exact string, so these stayed two entries. The
+    # longer (plural) one matched first, consumed the word, and the other was
+    # never seen — so phase 1's tag/category collision handling (and the
+    # "mosaic tag" / "mosaics collection" hints) never ran for them. Put the
+    # shorter one's tag or category entries into the longer group: its
+    # pattern is plural-tolerant, so it matches both spellings. Only tag and
+    # category entries move, and only to pair a tag with a category.
+    def _twin_key(n):
+        return " ".join(
+            w[:-1] if (w.endswith('s') and not w.endswith('ss') and len(w) > 3) else w
+            for w in n.replace('-', ' ').split()
+        )
+
+    _twins = {}
+    for _key in grouped_catalog:
+        _twins.setdefault(_twin_key(_key), []).append(_key)
+    for _keys in _twins.values():
+        if len(_keys) < 2:
+            continue
+        _keys = sorted(_keys, key=len, reverse=True)
+        _target = _keys[0]
+        for _src in _keys[1:]:
+            _tgt_types = {t for t, _ in grouped_catalog[_target]}
+            _move = [
+                (t, d) for t, d in grouped_catalog[_src]
+                if (t == 'tag' and 'category' in _tgt_types and 'tag' not in _tgt_types)
+                or (t == 'category' and 'tag' in _tgt_types and 'category' not in _tgt_types)
+            ]
+            if not _move:
+                continue
+            grouped_catalog[_target].extend(_move)
+            grouped_catalog[_src] = [x for x in grouped_catalog[_src] if x not in _move]
+            if not grouped_catalog[_src]:
+                del grouped_catalog[_src]
+
     for name, matches in grouped_catalog.items():
         if len(name) < 3:
             continue
