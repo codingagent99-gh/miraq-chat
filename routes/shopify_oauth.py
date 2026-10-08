@@ -94,10 +94,38 @@ logger = get_logger("miraq_chat")
 
 shopify_oauth_bp = Blueprint("shopify_oauth", __name__)
 
-# Scopes must match shopify.app.*.toml. Shopify compares the granted scope set
-# against what the app declares; a mismatch re-prompts the merchant on every
-# request.
-SHOPIFY_SCOPES = "read_customers,read_orders,read_products,write_draft_orders"
+# Scopes must match [access_scopes] in shopify.app.*.toml EXACTLY. Shopify
+# compares the granted scope set against what the app declares; a mismatch
+# re-prompts the merchant on every request.
+#
+#   read_customers / read_orders / read_products   Admin API (catalog, orders)
+#   customer_read_customers                        Customer Account API — the
+#                                                  channel sign-in reads the
+#                                                  customer's id + email
+#
+# write_draft_orders is deliberately NOT here: reorders go through a cart
+# permalink (shopify_orders_executor.build_reorder_checkout_url), and App Store
+# apps may not create unpaid orders from chat.
+#
+# Public and custom apps share this list, so their tomls must declare the same
+# scopes. SHOPIFY_SCOPES in .env overrides it only for a deploy whose toml
+# genuinely differs — change both together.
+_DEFAULT_SHOPIFY_SCOPES = "read_customers,read_orders,read_products,customer_read_customers"
+SHOPIFY_SCOPES = ",".join(
+    s.strip() for s in os.getenv("SHOPIFY_SCOPES", _DEFAULT_SHOPIFY_SCOPES).split(",") if s.strip()
+)
+
+
+def _scope_set(scopes: str) -> frozenset:
+    return frozenset(s.strip() for s in (scopes or "").split(",") if s.strip())
+
+
+def missing_scopes(granted: str) -> frozenset:
+    """Requested scopes Shopify did not grant (a write scope covers its read)."""
+    have = _scope_set(granted)
+    implied = {"read_" + s[len("write_"):] for s in have if s.startswith("write_")}
+    implied |= {"customer_read_" + s[len("customer_write_"):] for s in have if s.startswith("customer_write_")}
+    return _scope_set(SHOPIFY_SCOPES) - have - implied
 
 # Public base URL of THIS backend, exactly as Shopify sees it — e.g.
 #   SHOPIFY_APP_BASE_URL=https://silfratech.in/chatbot-shopify-multi/api
@@ -342,6 +370,14 @@ def shopify_auth_callback(client_id):
         return jsonify({"error": "token exchange returned no token"}), 502
 
     logger.info(f"shopify callback: token obtained | shop={shop} scope={granted_scope!r}")
+    _missing = missing_scopes(granted_scope)
+    if _missing:
+        # Not fatal: the install still works for what WAS granted. But it means
+        # SHOPIFY_SCOPES and the app's toml have drifted apart again.
+        logger.warning(
+            f"shopify callback: granted scope is missing {sorted(_missing)} | shop={shop} "
+            f"requested={SHOPIFY_SCOPES!r} — check [access_scopes] in the app toml"
+        )
 
     # ── Tenant row: one per shop domain ──────────────────────────────────────
     # Keyed on shopify_domain, not on a UUID the client supplies: the shop

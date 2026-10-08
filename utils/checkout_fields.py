@@ -506,6 +506,13 @@ def _fetch_live_fields(loader=None) -> Optional[dict]:
     failure — a plugin outage must neither break bulk ordering nor disable the
     gate, so callers fall back to the floor.
     """
+    # No MiraQ WordPress plugin to ask: Shopify tenants are built with an empty
+    # custom_api_base (tenant_registry._rehydrate), and ShopifyEndpoints has no
+    # fetch_checkout_fields. Use the floor without logging a failure — the
+    # classifier's rep lookup reaches here on every chat, Shopify included.
+    if loader is not None and not getattr(loader, "custom_api_base", ""):
+        return None
+
     try:
         # Imported lazily: this module is imported from handlers that are
         # themselves imported at request time, and woo_client pulls in app
