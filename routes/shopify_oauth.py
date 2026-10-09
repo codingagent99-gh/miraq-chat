@@ -81,6 +81,8 @@ from routes.provisioning import (
     _start_background_build,
 )
 from tenant_db_provisioner import ensure_tenant_database, TenantDBProvisionError
+import merchant_session
+from routes.instagram_connect import instagram_section_html
 from shopify_apps import (
 
     app_for_install,
@@ -233,6 +235,52 @@ def _generate_shop_token() -> str:
     return "mq_shop_" + secrets.token_urlsafe(24)
 
 
+_ADMIN_OPEN_MAX_AGE_SECONDS = 600
+
+
+def _fresh_admin_open(args) -> bool:
+    """Shopify's signed `timestamp` on an app open is recent (call after the hmac check)."""
+    try:
+        age = time.time() - int(args.get("timestamp", ""))
+    except (TypeError, ValueError):
+        return False
+    return -60 <= age <= _ADMIN_OPEN_MAX_AGE_SECONDS
+
+
+def _install_is_healthy(shop: str, app) -> bool:
+    """
+    True when this store is already fully installed through `app` and needs
+    nothing from OAuth: tenant active, a working token, every scope granted.
+
+    application_url points at /shopify/install, so EVERY time a merchant opens
+    the app from Shopify admin it lands here. Without this check each open went
+    through OAuth (auto-approved), and the callback then re-ran the schema step,
+    set the store to warming and rebuilt the whole catalog. Anything less than
+    healthy still goes through OAuth, which is what repairs it.
+    """
+    tenant = Tenant.query.filter_by(shopify_domain=shop).first()
+    if tenant is None or tenant.status != "active":
+        return False
+    if app_for_shop(shop).client_id != app.client_id:
+        return False
+    token_row = db.session.get(ShopifyToken, shop)
+    if token_row is None or not token_row.refresh_token or token_row.last_error:
+        return False
+    refresh_expires = token_row.refresh_token_expires_at
+    if refresh_expires is not None:
+        if refresh_expires.tzinfo is None:
+            refresh_expires = refresh_expires.replace(tzinfo=timezone.utc)
+        if refresh_expires <= datetime.now(timezone.utc):
+            return False
+    return not missing_scopes(token_row.scope or "")
+
+
+def _app_page_redirect(shop: str):
+    """The app page, carrying a signed owner token (merchant_session.py)."""
+    query = urllib.parse.urlencode({"shop": shop, "t": merchant_session.issue(shop)})
+    return redirect(_app_url(f"installed?{query}"), code=302)
+
+
 def _app_or_error(client_id, shop: str, where: str):
     """(app, None) for the app named by the route, or (None, error response)."""
     app = app_for_install(client_id)
@@ -273,6 +321,13 @@ def shopify_install(client_id):
     if request.args.get("hmac") and not _verify_oauth_hmac(request.args, app.client_secret):
         logger.warning(f"shopify install: hmac present but invalid | shop={shop!r}")
         return jsonify({"error": "invalid signature"}), 401
+
+    # A merchant opening an app that is already installed and working: go
+    # straight to the app page instead of re-running the install.
+    if (request.args.get("hmac") and _fresh_admin_open(request.args)
+            and _install_is_healthy(shop, app)):
+        logger.info(f"shopify install: already installed, opening app page | shop={shop}")
+        return _app_page_redirect(shop)
 
     if not SHOPIFY_APP_BASE_URL:
         logger.warning(
@@ -482,17 +537,38 @@ def shopify_auth_callback(client_id):
         f"shopify callback: ✅ install complete | shop={shop} tenant_id={tenant.tenant_id} "
         f"reinstall={reinstall} api_version={SHOPIFY_API_VERSION}"
     )
-    return redirect(_app_url(f"installed?shop={urllib.parse.quote(shop)}"), code=302)
+    return _app_page_redirect(shop)
 
 
 @shopify_oauth_bp.route("/installed", methods=["GET"])
 def installed():
     """
-    Landing page after install. Exists so application_url resolves to
-    something: this app is not embedded, so there is no admin UI to show.
-    The catalog build is still running when the merchant lands here.
+    The app page: where a merchant lands after installing, and every time
+    they open the app from Shopify admin (via /shopify/install). This app is
+    not embedded, so this backend-rendered page is its only admin UI.
+
+    Store-specific controls (Instagram) appear only with a valid owner token
+    `t` (merchant_session.py). Without one, e.g. a bookmarked or shared link,
+    the page shows the general setup steps only.
     """
     shop = (request.args.get("shop") or "").strip().lower()
+    is_owner = _valid_shop(shop) and merchant_session.verify(request.args.get("t") or "", shop)
+    tenant = Tenant.query.filter_by(shopify_domain=shop).first() if _valid_shop(shop) else None
+    catalog_note = (
+        "<p>MiraQ is running on your store.</p>"
+        if tenant is not None and tenant.status == "active" else
+        "<p>Your catalog is being indexed now. This usually takes a few minutes for "
+        "a small store, longer for a large one.</p>"
+    )
+    if is_owner:
+        instagram_html = instagram_section_html(shop)
+    elif _valid_shop(shop):
+        instagram_html = (
+            "<h2>Instagram</h2><p>To connect Instagram, open <strong>MiraQ</strong> "
+            "from your Shopify admin (<strong>Apps</strong>).</p>"
+        )
+    else:
+        instagram_html = ""
     # App Store 5.1.3: detailed embed setup, ideally a deep link. This one
     # opens the live theme's editor with the MiraQ app embed ALREADY switched
     # on (context=apps&activateAppId=<client_id>/<embed block handle>); the
@@ -516,10 +592,11 @@ def installed():
         "<style>body{font-family:system-ui,sans-serif;max-width:34rem;margin:4rem auto;"
         "padding:0 1rem;line-height:1.6;color:#1a1a1a}"
         ".btn{display:inline-block;background:#1a1a1a;color:#fff;padding:.6rem 1.1rem;"
-        "border-radius:8px;text-decoration:none}li{margin:.3rem 0}</style>"
+        "border-radius:8px;text-decoration:none;border:0;font:inherit;cursor:pointer}"
+        ".btn.secondary{background:#fff;color:#1a1a1a;border:1px solid #c9c9c9}"
+        "li{margin:.3rem 0}</style>"
         "<h1>MiraQ is installed</h1>"
-        "<p>Your catalog is being indexed now. This usually takes a few minutes for "
-        "a small store, longer for a large one.</p>"
+        + catalog_note +
         "<h2>Finish setup: turn on the chat widget</h2>"
         "<ol>"
         "<li>Click <strong>Turn on the MiraQ widget</strong> below. Your theme editor "
@@ -530,4 +607,5 @@ def installed():
         + button +
         "<p>To turn it off later: theme editor → <strong>App embeds</strong> → "
         "switch off <strong>Miraq Shopper Agent</strong> → Save.</p>"
+        + instagram_html
     ), 200

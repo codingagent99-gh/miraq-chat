@@ -95,9 +95,14 @@ _OPTIONAL_TENANT_PATHS = {"/health", "/status"}
 # /dev/shopify/ (routes/dev_shopify.py) creates Shopify tenants for local dev,
 # so like the install routes it runs before the tenant exists. It 404s unless
 # DEV_PROVISIONING_ENABLED is set.
+# /instagram/ (routes/instagram_connect.py) is the merchant's Instagram
+# connect flow. Opened in the owner's browser from the app page, so there is
+# no licence header; each route authenticates with a signed owner token or
+# Facebook Login state carrying the shop (merchant_session.py) and touches
+# only control-plane rows (tenants, channel_connections).
 _EXEMPT_PREFIXES = ("/static/", "/admin/translation/", "/admin/shopify-apps",
                     "/shopify/install/", "/shopify/auth/callback/",
-                    "/dev/shopify/")
+                    "/dev/shopify/", "/instagram/")
 
 _tenant_registry = None
 _engine_registry = None
