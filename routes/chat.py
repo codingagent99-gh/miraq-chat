@@ -19,7 +19,7 @@ from models import db, Conversation, Message, Intent
 from sqlalchemy.orm.attributes import flag_modified
 import sqlalchemy as sa
 import re
-from classifier.consolidation import _resolve_tag_attribute_overlap
+from classifier.consolidation import _resolve_tag_attribute_overlap, _explicit_kinds_in_text
 import json
 from handlers.chat_utils import resolve_session_id
 from classifier.utils import normalize_for_tag_compare
@@ -3260,7 +3260,10 @@ def chat():
                     for _i, _t in enumerate(entities.tag_slugs):
                         _tobj = store_loader.resolve_tag(_t) if store_loader else None
                         _tname = (getattr(_tobj, 'name', '') or _t.replace('-', ' ')).lower()
-                        if _t.lower() not in _cat_names and _tname not in _cat_names:
+                        # Keep it when the message also calls it a tag ("Wall
+                        # category with Wall tag" asks for both, ANDed).
+                        if (_t.lower() not in _cat_names and _tname not in _cat_names) \
+                                or "tag" in _explicit_kinds_in_text(_tname, msg_lower):
                             _keep_idx.append(_i)
                     if len(_keep_idx) != len(entities.tag_slugs):
                         _ids = list(getattr(entities, 'tag_ids', []) or [])
@@ -3295,6 +3298,10 @@ def chat():
             def _cat_collides(slug):
                 _cobj = store_loader.resolve_category(slug) if store_loader else None
                 _cname = (getattr(_cobj, "name", "") or slug.replace("-", " ")).lower()
+                # Not a collision when the message ALSO calls it a collection
+                # ("Wall collection with Wall tag" asks for both, ANDed).
+                if "category" in _explicit_kinds_in_text(_cname, _msg_lower):
+                    return False
                 return slug.lower() in _tag_names or _cname in _tag_names
 
             _colliding = {s for s in getattr(entities, 'target_category_slugs', set()) if _cat_collides(s)}
