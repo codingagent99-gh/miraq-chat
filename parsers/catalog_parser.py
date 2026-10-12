@@ -282,8 +282,23 @@ def phase1_catalog_match(msg: str, loader, matched_names: Optional[list] = None)
             attr_matches = [m[1] for m in matches if m[0] == 'attribute']
             tag_data     = next(m[1] for m in matches if m[0] == 'tag')
             is_dimension = bool(_DIM_RE.match(name.strip()))
+            # The shopper said which one ("glossy finish tag"): search the tag
+            # only, the same rule the tag/collection branch above applies.
+            # Without this the word "tag" was ignored and the query became
+            # (tag OR variant option), returning products that have the option
+            # value but not the tag. Dimensions keep their own handling below.
+            _attr_kind = None if is_dimension else explicit_kind_near(
+                unmatched_text, _m.start(), _m.end()
+            )
 
-            if is_dimension or len(attr_matches) > 1:
+            if _attr_kind == 'tag':
+                entities.tag_slugs.append(tag_data.get("slug"))
+                entities.tag_ids.append(tag_data.get("id"))
+                logger.debug(
+                    f"[PHASE1_TAG_ATTR] name={name!r} kind='tag' -> tag only "
+                    f"(attribute {[a.get('label') for a in attr_matches]} dropped)"
+                )
+            elif is_dimension or len(attr_matches) > 1:
                 # Dimension value (e.g. 12"x24") or multiple attribute taxonomies
                 # sharing the same name (e.g. pa_sample-size + pa_tile-size).
                 # The tag match here is spurious — the tag slug CONTAINS the
@@ -318,6 +333,19 @@ def phase1_catalog_match(msg: str, loader, matched_names: Optional[list] = None)
             cat_slugs = getattr(loader, 'category_slugs_by_name', {}).get(
                 name_lower, [cat_data.get("slug")]
             )
+
+            # "porcelain collection": the shopper said which one — search the
+            # collection only (same rule as the tag/collection branch above),
+            # not (collection OR variant option).
+            if explicit_kind_near(unmatched_text, _m.start(), _m.end()) == 'category':
+                entities.add_category_group(list(cat_slugs))
+                append_category_name(entities, cat_data.get("name") or "")
+                logger.debug(
+                    f"[PHASE1_CAT_ATTR] name={name!r} kind='category' -> collection only "
+                    f"(attribute {[a.get('label') for a in attr_matches]} dropped)"
+                )
+                unmatched_text = pattern.sub(" ", unmatched_text)
+                continue
 
             if not hasattr(entities, 'attr_tag_or_pairs'):
                 entities.attr_tag_or_pairs = []

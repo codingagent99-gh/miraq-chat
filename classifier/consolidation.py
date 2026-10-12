@@ -23,7 +23,24 @@ PRODUCT_SPECIFIC_INTENTS = {
     Intent.PLACE_ORDER, Intent.ORDER_ITEM,
 }
 
-def _resolve_tag_attribute_overlap(entities: ExtractedEntities):
+def _explicit_kind_in_text(name: str, text_l: str):
+    """What the shopper called `name` in the (lowercased) message — "tag",
+    "category" or None — checked at every place the name occurs. Same test
+    _resolve_tag_category_overlap uses (explicit_kind_near)."""
+    if not name or not text_l:
+        return None
+    try:
+        spans = [m.span() for m in re.finditer(create_flexible_pattern(name.lower()), text_l)]
+    except re.error:
+        return None
+    for start, end in spans:
+        kind = explicit_kind_near(text_l, start, end)
+        if kind:
+            return kind
+    return None
+
+
+def _resolve_tag_attribute_overlap(entities: ExtractedEntities, text: str = ""):
     """
     extract_tag and extract_attributes run independently on separately-masked
     text in classify(), with no cross-checking — so the same input can set
@@ -39,11 +56,17 @@ def _resolve_tag_attribute_overlap(entities: ExtractedEntities):
     Either shape gets merged into a single OR pair so the query becomes
     (product_tag=X OR pa_X=value) instead of silently using only one of
     the two taxonomies.
+
+    Unless the shopper named it a tag ("glossy finish tag"): then only the
+    tag is searched and the overlapping attribute is dropped — the same rule
+    _resolve_tag_category_overlap applies to a tag/collection pair. Needs the
+    raw message for that, so callers without it (text="") keep the OR pair.
     """
     if not (entities.tag_slugs and entities.attributes):
         return
 
     loader = get_store_loader()
+    text_l = (text or "").lower()
 
     for tag_slug in list(entities.tag_slugs):
         tag_tokens = normalize_for_tag_compare(tag_slug.replace("-", " "))
@@ -69,6 +92,17 @@ def _resolve_tag_attribute_overlap(entities: ExtractedEntities):
 
             if not (label_matches_tag or value_matches_tag):
                 continue
+
+            if text_l:
+                tag_obj = loader.resolve_tag(tag_slug) if (loader and hasattr(loader, "resolve_tag")) else None
+                tag_name = getattr(tag_obj, "name", "") or tag_slug.replace("-", " ")
+                if _explicit_kind_in_text(tag_name, text_l) == "tag":
+                    del entities.attributes[attr_label]
+                    logger.info(
+                        f"_resolve_tag_attribute_overlap: '{tag_name}' called a tag — "
+                        f"kept tag='{tag_slug}' only, dropped attr='{attr_label}:{attr_value}'"
+                    )
+                    break
 
             actual_tax = ""
             if loader and loader.all_attributes_raw:
@@ -165,8 +199,8 @@ def consolidate_entities(intent: Intent, entities: ExtractedEntities, text: str)
     _resolve_product_vs_category(intent, entities)
     _resolve_tag_category_overlap(entities, text)
     _deduplicate_or_pairs(entities)
-    _resolve_category_attribute_overlap(entities)
-    _resolve_tag_attribute_overlap(entities)
+    _resolve_category_attribute_overlap(entities, text)
+    _resolve_tag_attribute_overlap(entities, text)
     _resolve_category_or_pair_overlap(entities)
     _prune_tag_covered_attrs(entities)
     _prune_redundant_attributes(entities)
@@ -348,18 +382,27 @@ def _deduplicate_or_pairs(entities: ExtractedEntities):
         entities.clear_categories()
 
 
-def _resolve_category_attribute_overlap(entities: ExtractedEntities):
-    """Convert overlapping category + attribute into an OR pair."""
+def _resolve_category_attribute_overlap(entities: ExtractedEntities, text: str = ""):
+    """Convert overlapping category + attribute into an OR pair.
+
+    Unless the shopper named it a collection/category ("porcelain
+    collection"): then only the collection is searched and the overlapping
+    attribute is dropped. Needs the raw message for that, so callers without
+    it (text="") keep the OR pair.
+    """
     if not (getattr(entities, 'target_category_slugs', set()) and entities.attributes):
         return
 
     loader = get_store_loader()
+    text_l = (text or "").lower()
 
     cat_tokens_map = {}
+    cat_names = {}
     for cat_slug in list(entities.target_category_slugs):
         cat_obj = loader.resolve_category(cat_slug) if loader else None
         cat_name = cat_obj.name.lower() if cat_obj else cat_slug.replace("-", " ")
         cat_tokens_map[cat_slug] = normalize_for_tag_compare(cat_name)
+        cat_names[cat_slug] = cat_name
 
     for attr_label, attr_slug in list(entities.attributes.items()):
         attr_tokens = normalize_for_tag_compare(attr_slug.replace("-", " "))
@@ -371,6 +414,17 @@ def _resolve_category_attribute_overlap(entities: ExtractedEntities):
         ]
 
         if not overlapping_cat_slugs:
+            continue
+
+        if text_l and any(
+            _explicit_kind_in_text(cat_names.get(s, ""), text_l) == "category"
+            for s in overlapping_cat_slugs
+        ):
+            del entities.attributes[attr_label]
+            logger.info(
+                f"_resolve_category_attribute_overlap: {overlapping_cat_slugs} called a "
+                f"collection/category — kept collection only, dropped attr='{attr_label}:{attr_slug}'"
+            )
             continue
 
         actual_tax = ""
