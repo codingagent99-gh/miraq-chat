@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify, g
 from models import db, Conversation, Message, Intent
 from sqlalchemy.orm.attributes import flag_modified
+import sqlalchemy as sa
 import re
 from classifier.consolidation import _resolve_tag_attribute_overlap
 import json
@@ -977,52 +978,7 @@ def get_chat_history():
 
         messages_query.reverse()
 
-        history = []
-        for msg in messages_query:
-            # Translated turns (translation/turn.py): replay what the customer
-            # saw/typed, not the English the pipeline stored.
-            _i18n = (msg.metadata_json or {}).get("i18n") or {}
-            item = {
-                "role":      msg.role,
-                # Structured picks are stored verbatim so the flow handlers can
-                # re-read them, but the raw "__SENTINEL__{json}" is not what the
-                # user typed and must never surface in a replayed transcript.
-                # The live path masks these in the widget; this covers reload.
-                "message":   (
-                    _i18n.get("original") or _display_message(msg.content)
-                    if msg.role == "user"
-                    else _i18n.get("bot_message") or msg.content
-                ),
-                "intent":    msg.intent,
-                "timestamp": msg.created_at.isoformat(),
-            }
-            if msg.role == "bot" and msg.metadata_json:
-                item["products"]    = msg.metadata_json.get("products", [])
-                item["categories"]  = msg.metadata_json.get("categories", [])
-                item["suggestions"] = _i18n.get("suggestions") or msg.metadata_json.get("suggestions", [])
-                item["actions"]     = msg.metadata_json.get("actions", [])
-                # Top-level on a live response, so they must be top-level here
-                # too — mapHistoryEntryToMessage reads m.orders, not
-                # m.metadata.orders. Only emitted when the turn actually had
-                # an order list, so ordinary messages are unchanged.
-                _orders = msg.metadata_json.get("orders")
-                if _orders:
-                    item["orders"] = _orders
-                    _opg = msg.metadata_json.get("order_pagination")
-                    if _opg:
-                        item["order_pagination"] = _opg
-                # Product-list pagination, top-level like on a live response
-                # (mapHistoryEntryToMessage reads m.pagination).
-                _ppg = msg.metadata_json.get("pagination")
-                if _ppg and item.get("products"):
-                    item["pagination"] = _ppg
-                item["metadata"]    = {
-                    k: v for k, v in msg.metadata_json.items()
-                    if k not in ("products", "categories", "suggestions",
-                                 "actions", "orders", "order_pagination",
-                                 "pagination", "i18n")
-                }
-            history.append(item)
+        history = [_serialize_history_message(msg) for msg in messages_query]
 
         return jsonify({
             "messages":  history,
@@ -1032,6 +988,341 @@ def get_chat_history():
 
     except ValueError:
         return jsonify({"messages": [], "has_more": False}), 200
+
+
+def _serialize_history_message(msg) -> dict:
+    """One `messages` row as the widget's HistoryEntry. Shared by /chat/history
+    and /chat/history/window so a message renders the same whichever route
+    loaded it. `id` lets the widget page by cursor and find a search hit."""
+    # Translated turns (translation/turn.py): replay what the customer
+    # saw/typed, not the English the pipeline stored.
+    _i18n = (msg.metadata_json or {}).get("i18n") or {}
+    item = {
+        "id":        msg.id,
+        "role":      msg.role,
+        # Structured picks are stored verbatim so the flow handlers can
+        # re-read them, but the raw "__SENTINEL__{json}" is not what the
+        # user typed and must never surface in a replayed transcript.
+        # The live path masks these in the widget; this covers reload.
+        "message":   _history_display_text(msg, _i18n),
+        "intent":    msg.intent,
+        "timestamp": msg.created_at.isoformat(),
+    }
+    if msg.role == "bot" and msg.metadata_json:
+        item["products"]    = msg.metadata_json.get("products", [])
+        item["categories"]  = msg.metadata_json.get("categories", [])
+        item["suggestions"] = _i18n.get("suggestions") or msg.metadata_json.get("suggestions", [])
+        item["actions"]     = msg.metadata_json.get("actions", [])
+        # Top-level on a live response, so they must be top-level here
+        # too — mapHistoryEntryToMessage reads m.orders, not
+        # m.metadata.orders. Only emitted when the turn actually had
+        # an order list, so ordinary messages are unchanged.
+        _orders = msg.metadata_json.get("orders")
+        if _orders:
+            item["orders"] = _orders
+            _opg = msg.metadata_json.get("order_pagination")
+            if _opg:
+                item["order_pagination"] = _opg
+        # Product-list pagination, top-level like on a live response
+        # (mapHistoryEntryToMessage reads m.pagination).
+        _ppg = msg.metadata_json.get("pagination")
+        if _ppg and item.get("products"):
+            item["pagination"] = _ppg
+        item["metadata"]    = {
+            k: v for k, v in msg.metadata_json.items()
+            if k not in ("products", "categories", "suggestions",
+                         "actions", "orders", "order_pagination",
+                         "pagination", "i18n")
+        }
+    return item
+
+
+def _history_display_text(msg, i18n: dict) -> str:
+    """The text the customer saw for this message (see _serialize_history_message)."""
+    if msg.role == "user":
+        return i18n.get("original") or _display_message(msg.content)
+    return i18n.get("bot_message") or msg.content
+
+
+# ══════════════════════════════════════════════════════════════
+# ─── HISTORY SEARCH & WINDOW ROUTES ───
+# ══════════════════════════════════════════════════════════════
+# Search: find a past message by text, product name or order number.
+# Window: load the messages around a hit (and page older/newer from there)
+# so the widget can jump straight to it instead of scrolling back 20 rows
+# at a time through /chat/history.
+
+_HISTORY_SEARCH_MIN_LEN = 2
+_HISTORY_SEARCH_MAX_LEN = 100
+_HISTORY_SEARCH_LIMIT   = 30
+_HISTORY_WINDOW_DEFAULT = 20
+_HISTORY_WINDOW_MAX     = 50
+_SNIPPET_RADIUS         = 50
+
+# One predicate for everything a search can hit. Raw SQL because the JSONB
+# array walks have no clean ORM spelling. Every jsonb_array_elements input is
+# guarded by jsonb_typeof: older rows can hold null or a non-array there, and
+# jsonb_array_elements raises on those, failing the whole search.
+# User rows starting "__" are structured-card sentinels ("__DATE_RANGE__{json}")
+# — their raw JSON is never shown, so it must not produce hits either.
+_HISTORY_MATCH_SQL = sa.text("""(
+    (
+        (messages.role <> 'user' OR left(messages.content, 2) <> '__')
+        AND messages.content ILIKE :hs_pat ESCAPE '!'
+    )
+    OR (messages.metadata_json -> 'i18n' ->> 'original')    ILIKE :hs_pat ESCAPE '!'
+    OR (messages.metadata_json -> 'i18n' ->> 'bot_message') ILIKE :hs_pat ESCAPE '!'
+    OR EXISTS (
+        SELECT 1 FROM jsonb_array_elements(
+            CASE WHEN jsonb_typeof(messages.metadata_json -> 'products') = 'array'
+                 THEN messages.metadata_json -> 'products' ELSE '[]'::jsonb END
+        ) AS hs_p
+        WHERE hs_p ->> 'name' ILIKE :hs_pat ESCAPE '!'
+    )
+    OR EXISTS (
+        SELECT 1 FROM jsonb_array_elements(
+            CASE WHEN jsonb_typeof(messages.metadata_json -> 'orders') = 'array'
+                 THEN messages.metadata_json -> 'orders' ELSE '[]'::jsonb END
+        ) AS hs_o
+        WHERE hs_o ->> 'order_number' ILIKE :hs_pat ESCAPE '!'
+           OR EXISTS (
+                SELECT 1 FROM jsonb_array_elements(
+                    CASE WHEN jsonb_typeof(hs_o -> 'items') = 'array'
+                         THEN hs_o -> 'items' ELSE '[]'::jsonb END
+                ) AS hs_li
+                WHERE hs_li ->> 'name' ILIKE :hs_pat ESCAPE '!'
+           )
+    )
+)""")
+
+
+def _history_scope_filter():
+    """SQL filter for the conversations the caller may read, or None for none.
+
+    Logged in: every conversation bound to their VERIFIED customer_id — the
+    same ownership rule /chat/history applies, widened from one session to all
+    of them (other devices, cleared browser storage).
+
+    Guest: only the session they present, and only while it is still a guest
+    session. All guests share customer_id NULL, so scoping a guest by
+    customer_id would hand every guest every other guest's transcripts.
+    """
+    ident = current_identity()
+    if ident.customer_id:
+        return Conversation.customer_id == ident.customer_id
+    try:
+        sid = uuid.UUID(request.headers.get("X-MiraQ-Session") or "")
+    except ValueError:
+        return None
+    return sa.and_(
+        Conversation.id == sid,
+        sa.or_(Conversation.customer_id.is_(None), Conversation.customer_id == ""),
+    )
+
+
+def _int_arg(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        return max(lo, min(hi, int(request.args.get(name, default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _current_session_id():
+    try:
+        return uuid.UUID(request.headers.get("X-MiraQ-Session") or "")
+    except ValueError:
+        return None
+
+
+def _make_snippet(text: str, needle: str) -> str | None:
+    """~100 chars of `text` centred on the first case-insensitive `needle`
+    hit, or None when it isn't in there."""
+    if not text:
+        return None
+    flat = " ".join(str(text).split())
+    pos = flat.lower().find(needle.lower())
+    if pos < 0:
+        return None
+    start = max(0, pos - _SNIPPET_RADIUS)
+    end = min(len(flat), pos + len(needle) + _SNIPPET_RADIUS)
+    return ("…" if start > 0 else "") + flat[start:end] + ("…" if end < len(flat) else "")
+
+
+def _describe_hit(msg, needle: str) -> tuple[str, str]:
+    """(matched_in, snippet) for a row the SQL predicate already matched.
+
+    Looks in the same places in the same order of usefulness: what the
+    customer saw, then the stored English (a translated turn matched on it),
+    then product names, then orders. SQL ILIKE and Python lower() can
+    disagree on exotic case mappings, so a row that matched in SQL but not
+    here still gets a snippet — the start of its text — rather than vanishing.
+    """
+    meta = msg.metadata_json or {}
+    i18n = meta.get("i18n") or {}
+    shown = _history_display_text(msg, i18n)
+
+    snip = _make_snippet(shown, needle)
+    if snip:
+        return "text", snip
+    if not (msg.role == "user" and (msg.content or "").startswith("__")):
+        snip = _make_snippet(msg.content, needle)
+        if snip:
+            return "text", snip
+
+    products = meta.get("products") if isinstance(meta.get("products"), list) else []
+    for p in products:
+        name = (p or {}).get("name") if isinstance(p, dict) else None
+        if name and needle.lower() in str(name).lower():
+            return "product", str(name)
+
+    orders = meta.get("orders") if isinstance(meta.get("orders"), list) else []
+    for o in orders:
+        if not isinstance(o, dict):
+            continue
+        number = str(o.get("order_number") or "")
+        if number and needle.lower() in number.lower():
+            return "order", f"Order #{number}"
+        items = o.get("items") if isinstance(o.get("items"), list) else []
+        for li in items:
+            name = li.get("name") if isinstance(li, dict) else None
+            if name and needle.lower() in str(name).lower():
+                return "order", f"Order #{number}: {name}" if number else str(name)
+
+    flat = " ".join(str(shown or "").split())
+    return "text", flat[: 2 * _SNIPPET_RADIUS] + ("…" if len(flat) > 2 * _SNIPPET_RADIUS else "")
+
+
+@chat_bp.route("/chat/history/search", methods=["GET"])
+def search_chat_history():
+    """Search the caller's own past messages. Newest hits first."""
+    empty = {"results": [], "has_more": False}
+
+    q = " ".join((request.args.get("q") or "").split())[:_HISTORY_SEARCH_MAX_LEN]
+    if len(q) < _HISTORY_SEARCH_MIN_LEN:
+        return jsonify(empty), 200
+
+    scope = _history_scope_filter()
+    if scope is None:
+        return jsonify(empty), 200
+
+    # The query is literal text, not a pattern: escape LIKE's own wildcards
+    # so "50%" or "a_b" mean what the customer typed. "!" is the escape
+    # character (see ESCAPE '!' in _HISTORY_MATCH_SQL) rather than backslash,
+    # whose meaning inside a SQL literal depends on standard_conforming_strings.
+    escaped = q.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+    pattern = f"%{escaped}%"
+
+    rows = (
+        db.session.query(Message)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .filter(scope)
+        .filter(_HISTORY_MATCH_SQL.bindparams(hs_pat=pattern))
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .limit(_HISTORY_SEARCH_LIMIT + 1)
+        .all()
+    )
+    has_more = len(rows) > _HISTORY_SEARCH_LIMIT
+    rows = rows[:_HISTORY_SEARCH_LIMIT]
+
+    current_sid = _current_session_id()
+    results = []
+    for msg in rows:
+        matched_in, snippet = _describe_hit(msg, q)
+        results.append({
+            "message_id":         msg.id,
+            "conversation_id":    str(msg.conversation_id),
+            "is_current_session": msg.conversation_id == current_sid,
+            "role":               msg.role,
+            "matched_in":         matched_in,
+            "snippet":            snippet,
+            "timestamp":          msg.created_at.isoformat() if msg.created_at else None,
+        })
+
+    logger.info(
+        f"history search | q_len={len(q)} | hits={len(results)}"
+        f"{'+' if has_more else ''} | customer={current_identity().customer_id or 'guest'}"
+    )
+    return jsonify({"results": results, "has_more": has_more}), 200
+
+
+@chat_bp.route("/chat/history/window", methods=["GET"])
+def get_chat_history_window():
+    """A slice of one conversation, by message-id cursor.
+
+      ?conversation_id=<uuid>&around=<id>  — the hit plus ~limit/2 either side
+      ?conversation_id=<uuid>&before=<id>  — `limit` messages older than <id>
+      ?conversation_id=<uuid>&after=<id>   — `limit` messages newer than <id>
+
+    Ordered by (created_at, id) — the same order /chat/history pages in, with
+    id as the tiebreak so two rows sharing a timestamp are never skipped or
+    repeated across a page boundary. has_more_after is only reported for
+    `around` and `after`; a `before` page says nothing about the newer end.
+    """
+    empty = {"messages": [], "has_more_before": False, "has_more_after": False}
+
+    scope = _history_scope_filter()
+    if scope is None:
+        return jsonify(empty), 200
+    try:
+        conv_id = uuid.UUID(request.args.get("conversation_id") or "")
+    except ValueError:
+        return jsonify(empty), 200
+
+    # Same ownership rule as search; a conversation outside it looks exactly
+    # like one that doesn't exist.
+    if not Conversation.query.filter(Conversation.id == conv_id, scope).first():
+        return jsonify(empty), 200
+
+    limit = _int_arg("limit", _HISTORY_WINDOW_DEFAULT, 1, _HISTORY_WINDOW_MAX)
+    around = _int_arg("around", 0, 0, 2**31 - 1)
+    before = _int_arg("before", 0, 0, 2**31 - 1)
+    after  = _int_arg("after", 0, 0, 2**31 - 1)
+
+    base = Message.query.filter(Message.conversation_id == conv_id)
+    key = sa.tuple_(Message.created_at, Message.id)
+
+    def _anchor(mid: int):
+        return base.filter(Message.id == mid).first() if mid else None
+
+    def _older(anchor, n):
+        rows = (base.filter(key < sa.tuple_(anchor.created_at, anchor.id))
+                .order_by(Message.created_at.desc(), Message.id.desc())
+                .limit(n + 1).all())
+        return list(reversed(rows[:n])), len(rows) > n
+
+    def _newer(anchor, n):
+        rows = (base.filter(key > sa.tuple_(anchor.created_at, anchor.id))
+                .order_by(Message.created_at.asc(), Message.id.asc())
+                .limit(n + 1).all())
+        return rows[:n], len(rows) > n
+
+    body = {"conversation_id": str(conv_id)}
+    if around:
+        anchor = _anchor(around)
+        if not anchor:
+            return jsonify(empty), 200
+        n_before = limit // 2
+        older, more_before = _older(anchor, n_before)
+        newer, more_after = _newer(anchor, max(0, limit - n_before - 1))
+        rows = older + [anchor] + newer
+        body.update(has_more_before=more_before, has_more_after=more_after)
+    elif before:
+        anchor = _anchor(before)
+        if not anchor:
+            return jsonify(empty), 200
+        rows, more_before = _older(anchor, limit)
+        body.update(has_more_before=more_before)
+    elif after:
+        anchor = _anchor(after)
+        if not anchor:
+            return jsonify(empty), 200
+        rows, more_after = _newer(anchor, limit)
+        body.update(has_more_after=more_after)
+    else:
+        return jsonify(empty), 200
+
+    body["messages"] = [_serialize_history_message(m) for m in rows]
+    return jsonify(body), 200
 
 
 # ══════════════════════════════════════════════════════════════
