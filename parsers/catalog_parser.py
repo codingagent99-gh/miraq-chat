@@ -245,6 +245,16 @@ def phase1_catalog_match(msg: str, loader, matched_names: Optional[list] = None)
         if matched_names is not None:
             matched_names.append(name)
 
+        # How the shopper named this match: "tag" / "category" at EVERY place
+        # it occurs, not just the first. pattern.sub() below blanks all of
+        # them at once, so a second mention ("Wall collection with Wall tag")
+        # is never seen again after this iteration.
+        _kinds = {
+            k for k in (explicit_kind_near(unmatched_text, mm.start(), mm.end())
+                        for mm in pattern.finditer(unmatched_text))
+            if k
+        }
+
         # ── Tag + category/collection with the same name ("wall", "interior") ──
         # Previously both were added and ANDed, so a product needed the tag AND
         # the collection. Now: the word next to the name decides ("wall
@@ -252,12 +262,16 @@ def phase1_catalog_match(msg: str, loader, matched_names: Optional[list] = None)
         # such word the shopper could mean either, so search either (OR pair).
         if ('tag' in types_matched and 'category' in types_matched
                 and 'attribute' not in types_matched):
-            _kind = explicit_kind_near(unmatched_text, _m.start(), _m.end())
-            if _kind == 'tag':
+            if {'tag', 'category'} <= _kinds:
+                _kind = 'both'   # named both ways → keep tag AND collection
+            elif 'tag' in _kinds:
+                _kind = 'tag'
                 matches = [x for x in matches if x[0] != 'category']
-            elif _kind == 'category':
+            elif 'category' in _kinds:
+                _kind = 'category'
                 matches = [x for x in matches if x[0] != 'tag']
             else:
+                _kind = None
                 _tag_data = next(x[1] for x in matches if x[0] == 'tag')
                 _cat_data = next(x[1] for x in matches if x[0] == 'category')
                 _cat_slugs = getattr(loader, 'category_slugs_by_name', {}).get(
@@ -271,7 +285,7 @@ def phase1_catalog_match(msg: str, loader, matched_names: Optional[list] = None)
                 matches = [x for x in matches if x[0] not in ('tag', 'category')]
             logger.debug(
                 f"[PHASE1_TAG_CAT] name={name!r} kind={_kind!r} -> "
-                f"{'tag only' if _kind == 'tag' else 'collection only' if _kind == 'category' else 'tag OR collection'}"
+                f"{'tag only' if _kind == 'tag' else 'collection only' if _kind == 'category' else 'tag AND collection' if _kind == 'both' else 'tag OR collection'}"
             )
             types_matched = [x[0] for x in matches]
 
@@ -287,9 +301,7 @@ def phase1_catalog_match(msg: str, loader, matched_names: Optional[list] = None)
             # Without this the word "tag" was ignored and the query became
             # (tag OR variant option), returning products that have the option
             # value but not the tag. Dimensions keep their own handling below.
-            _attr_kind = None if is_dimension else explicit_kind_near(
-                unmatched_text, _m.start(), _m.end()
-            )
+            _attr_kind = 'tag' if (not is_dimension and 'tag' in _kinds) else None
 
             if _attr_kind == 'tag':
                 entities.tag_slugs.append(tag_data.get("slug"))
@@ -337,7 +349,7 @@ def phase1_catalog_match(msg: str, loader, matched_names: Optional[list] = None)
             # "porcelain collection": the shopper said which one — search the
             # collection only (same rule as the tag/collection branch above),
             # not (collection OR variant option).
-            if explicit_kind_near(unmatched_text, _m.start(), _m.end()) == 'category':
+            if 'category' in _kinds:
                 entities.add_category_group(list(cat_slugs))
                 append_category_name(entities, cat_data.get("name") or "")
                 logger.debug(

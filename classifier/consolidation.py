@@ -23,21 +23,20 @@ PRODUCT_SPECIFIC_INTENTS = {
     Intent.PLACE_ORDER, Intent.ORDER_ITEM,
 }
 
-def _explicit_kind_in_text(name: str, text_l: str):
-    """What the shopper called `name` in the (lowercased) message — "tag",
-    "category" or None — checked at every place the name occurs. Same test
-    _resolve_tag_category_overlap uses (explicit_kind_near)."""
+def _explicit_kinds_in_text(name: str, text_l: str) -> set:
+    """Every way the shopper named `name` in the (lowercased) message: a set
+    of "tag" / "category", one per mention that says which (explicit_kind_near).
+
+    All mentions count, not just the first: "Wall collection with Wall tag"
+    names Wall twice, as both, and gives {"category", "tag"}.
+    """
     if not name or not text_l:
-        return None
+        return set()
     try:
         spans = [m.span() for m in re.finditer(create_flexible_pattern(name.lower()), text_l)]
     except re.error:
-        return None
-    for start, end in spans:
-        kind = explicit_kind_near(text_l, start, end)
-        if kind:
-            return kind
-    return None
+        return set()
+    return {k for k in (explicit_kind_near(text_l, s, e) for s, e in spans) if k}
 
 
 def _resolve_tag_attribute_overlap(entities: ExtractedEntities, text: str = ""):
@@ -96,7 +95,7 @@ def _resolve_tag_attribute_overlap(entities: ExtractedEntities, text: str = ""):
             if text_l:
                 tag_obj = loader.resolve_tag(tag_slug) if (loader and hasattr(loader, "resolve_tag")) else None
                 tag_name = getattr(tag_obj, "name", "") or tag_slug.replace("-", " ")
-                if _explicit_kind_in_text(tag_name, text_l) == "tag":
+                if "tag" in _explicit_kinds_in_text(tag_name, text_l):
                     del entities.attributes[attr_label]
                     logger.info(
                         f"_resolve_tag_attribute_overlap: '{tag_name}' called a tag — "
@@ -247,13 +246,6 @@ def _resolve_tag_category_overlap(entities: ExtractedEntities, text: str):
         for group in entities.category_groups:
             group.discard(slug)
 
-    def _kind_for(name: str):
-        for span in _spans(name):
-            kind = explicit_kind_near(text_l, span[0], span[1])
-            if kind:
-                return kind
-        return None
-
     paired_tags = []
     dropped_tags = []
     for tag_slug in list(entities.tag_slugs):
@@ -271,14 +263,22 @@ def _resolve_tag_category_overlap(entities: ExtractedEntities, text: str):
                 continue
 
             if cat_tokens == tag_tokens:
-                kind = _kind_for(tag_name) or _kind_for(cat_name)
-                if kind == "tag":
+                # Every mention counts, not just the first: "Wall collection
+                # with Wall tag" names both, so both are kept (AND).
+                kinds = (_explicit_kinds_in_text(tag_name, text_l)
+                         | _explicit_kinds_in_text(cat_name, text_l))
+                if {"tag", "category"} <= kinds:
+                    logger.info(
+                        f"_resolve_tag_category_overlap: '{tag_name}' called both a tag and a "
+                        f"collection — keeping tag='{tag_slug}' AND category='{cat_slug}'"
+                    )
+                elif "tag" in kinds:
                     _drop_category(cat_slug)
                     logger.info(
                         f"_resolve_tag_category_overlap: '{tag_name}' called a tag — "
                         f"dropped same-named category='{cat_slug}'"
                     )
-                elif kind == "category":
+                elif "category" in kinds:
                     dropped_tags.append(tag_slug)
                     logger.info(
                         f"_resolve_tag_category_overlap: '{cat_name}' called a collection/category — "
@@ -417,7 +417,7 @@ def _resolve_category_attribute_overlap(entities: ExtractedEntities, text: str =
             continue
 
         if text_l and any(
-            _explicit_kind_in_text(cat_names.get(s, ""), text_l) == "category"
+            "category" in _explicit_kinds_in_text(cat_names.get(s, ""), text_l)
             for s in overlapping_cat_slugs
         ):
             del entities.attributes[attr_label]
@@ -471,8 +471,12 @@ def _prune_tag_covered_attrs(entities: ExtractedEntities):
     if entities.attr_tag_or_pairs:
         valid = []
         for pair in entities.attr_tag_or_pairs:
-            attr_tokens = normalize_for_tag_compare(pair.get("attr_term", "").replace("-", " "))
-            if not any(attr_tokens <= et for et in exact_tag_tokens):
+            attr_tokens = normalize_for_tag_compare((pair.get("attr_term") or "").replace("-", " "))
+            # A tag/collection pair ("tile": tag OR collection) has no
+            # attr_term. Its empty token set is a subset of every tag, so it
+            # was pruned whenever the message also had an exact tag — "wall
+            # tiles with wall tag" lost "tiles". Only pairs with a term qualify.
+            if not attr_tokens or not any(attr_tokens <= et for et in exact_tag_tokens):
                 valid.append(pair)
         entities.attr_tag_or_pairs = valid
 
