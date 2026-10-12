@@ -54,6 +54,7 @@ import requests as http_requests
 
 from chat_logger import get_logger
 from models.shopify_token import ShopifyToken
+from api_builder import shopify_search_diag
 
 logger = get_logger("miraq_chat")
 
@@ -556,6 +557,12 @@ def _collection_relation(node: dict) -> Optional[str]:
 # Layer 2 — Python post-filter  (ported from shopify_products.py verbatim)
 # ══════════════════════════════════════════════════════════════
 
+def _norm_label(s: str) -> str:
+    """Tag/collection name normalisation used by _evaluate (and by
+    shopify_search_diag, which must match tags exactly the way Layer 2 does)."""
+    return re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-")
+
+
 def _evaluate(node: dict, product: dict, variant: dict) -> bool:
     if "type" in node:
         t      = node["type"]
@@ -570,7 +577,7 @@ def _evaluate(node: dict, product: dict, variant: dict) -> bool:
             # name ('7/16" Thick') never matched here — Shopify's own tag
             # search found the products in Layer 1 and Layer 2 dropped them
             # all, giving zero results.
-            return re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-")
+            return _norm_label(s)
 
         if t == "tag":
             rel          = node.get("relation", "OR").upper()
@@ -969,9 +976,11 @@ class ShopifyGraphQLExecutor:
                     f"catalog ({len(loader_products)} products), membership checked in Layer2"
                 )
                 raw = [_loader_product_to_gql_shape(p) for p in loader_products]
+                layer1_source = "memory:catalog(collection-in-OR)"
             else:
                 logger.info("[ShopifyGQL] Layer1: collection inside an OR — querying full catalog")
                 raw = _fetch_products("", token, domain)
+                layer1_source = "live:full-catalog(collection-in-OR)"
 
         elif not collections:
             loader_products = getattr(self._loader, "products", None) if self._loader else None
@@ -987,14 +996,17 @@ class ShopifyGraphQLExecutor:
                     f"catalog ({len(loader_products)} products, no fetch cap)"
                 )
                 raw = [_loader_product_to_gql_shape(p) for p in loader_products]
+                layer1_source = "memory:catalog(no-narrowing)"
             else:
                 logger.info("[ShopifyGQL] Layer1: no collection filter — querying full catalog")
                 raw = _fetch_products(tag_query, token, domain)
+                layer1_source = f"live:products-search({tag_query or 'all'})"
 
         elif len(collections) == 1:
             gid = self._slug_to_gid(collections[0])
             logger.info(f"[ShopifyGQL] Layer1: single collection slug={collections[0]!r} gid={gid!r}")
             raw = _fetch_from_collection(gid, tag_query, token, domain)
+            layer1_source = f"live:collection({collections[0]})"
 
         else:
             col_rel = _collection_relation(filter_tree) or "AND"
@@ -1021,6 +1033,7 @@ class ShopifyGraphQLExecutor:
                         [f.result() for f in concurrent.futures.as_completed(futures)]
                     )
                 logger.info(f"[ShopifyGQL] Layer1: parallel fetch + dedup → {len(raw)} products")
+                layer1_source = f"live:collections-OR({','.join(collections)})"
             else:
                 gid = self._slug_to_gid(collections[0])
                 logger.info(
@@ -1028,6 +1041,7 @@ class ShopifyGraphQLExecutor:
                     f"slug={collections[0]!r} gid={gid!r}, post-filter enforces rest"
                 )
                 raw = _fetch_from_collection(gid, tag_query, token, domain)
+                layer1_source = f"live:collection({collections[0]})+AND-post-filter"
                 # Only the first collection was enforced by the fetch. Without
                 # this, _evaluate treated every other positive collection as
                 # already satisfied, so "Exterior Floor AND Mosaics" returned
@@ -1042,6 +1056,19 @@ class ShopifyGraphQLExecutor:
             f"[ShopifyGQL] Layer2 done | after_filter={len(filtered)} "
             f"(dropped {len(raw)-len(filtered)})"
         )
+
+        # ── Opt-in diagnostics (SHOPIFY_SEARCH_DIAG=1) ────────
+        # Read-only evidence for count mismatches against Shopify; never
+        # changes the result, and its own failure never fails the search.
+        if shopify_search_diag.enabled():
+            try:
+                shopify_search_diag.run(
+                    raw=raw, filtered=filtered, filter_tree=filter_tree,
+                    search_f=search_f, price_f=price_f, stock_f=stock_f,
+                    token=token, domain=domain, layer1_source=layer1_source,
+                )
+            except Exception as exc:
+                logger.warning(f"[ShopifyDiag] diagnostics failed — search unaffected: {exc}")
 
         # ── OR-group breakdown (for the bot message) ──────────
         or_group_breakdown = []
