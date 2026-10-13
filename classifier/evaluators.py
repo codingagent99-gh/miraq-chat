@@ -11,7 +11,7 @@ from models import Intent, ExtractedEntities
 from store_registry import get_store_loader
 from config.store_config import PRODUCT_TYPE_TERMS, GENERIC_NOISE_WORDS
 from chat_logger import get_logger
-from classifier.utils import label_word_matches
+from classifier.utils import label_word_matches, explicit_kind_near, create_flexible_pattern
 
 logger = get_logger("miraq_chat")
 
@@ -192,10 +192,46 @@ class DiscountEvaluator(IntentEvaluator):
             return Intent.COUPON_INQUIRY, 0.91
         if re.search(r"\bbulk\s*discount\b", text):
             return Intent.BULK_DISCOUNT, 0.92
-        if re.search(r"\b(clearance|discount|sale|deals?|promotions?)\b", text):
+        # A discount word the shopper called a tag or collection is a catalog
+        # filter, not a discount question: "Mosaics Tile Wall collection with
+        # Sale tag" wants products tagged Sale in that collection, not the
+        # store's on-sale list. Only when every discount word is used that
+        # way does this step aside — "sale items in the Sale collection"
+        # still asks about sales.
+        if any(not self._named_as_tag_or_collection(text, m)
+               for m in self._DISCOUNT_WORD_RE.finditer(text)):
             entities.on_sale = True
             return Intent.DISCOUNT_INQUIRY, 0.91
         return None, 0.0
+
+    _DISCOUNT_WORD_RE = re.compile(r"\b(clearance|discount|sale|deals?|promotions?)\b")
+
+    @staticmethod
+    def _named_as_tag_or_collection(text: str, m: "re.Match") -> bool:
+        """True when the discount word at `m` was called a tag or collection:
+        directly ("sale tag", "tag sale", "clearance collection"), or as part
+        of a longer tag/collection name the shopper called one ("summer sale
+        tag" with a "Summer Sale" tag in the store)."""
+        if explicit_kind_near(text, m.start(), m.end()):
+            return True
+        loader = get_store_loader()
+        if not loader:
+            return False
+        stem = m.group(0).rstrip("s")
+        names = set(getattr(loader, "tag_by_name_lower", {}) or {}) \
+            | set(getattr(loader, "category_by_name_lower", {}) or {})
+        for name in names:
+            if " " not in name or not re.search(rf"\b{re.escape(stem)}", name):
+                continue  # one-word names were covered by the direct check
+            try:
+                spans = re.finditer(create_flexible_pattern(name), text)
+            except re.error:
+                continue
+            for nm in spans:
+                if nm.start() <= m.start() and m.end() <= nm.end() \
+                        and explicit_kind_near(text, nm.start(), nm.end()):
+                    return True
+        return False
 
 
 class ProductDetailEvaluator(IntentEvaluator):
