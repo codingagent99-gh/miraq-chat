@@ -2181,17 +2181,25 @@ def chat():
     ident = current_identity()
     if (conversation.customer_id or "") != ident.customer_id:
         if conversation.customer_id:
-            # A session that belonged to someone else (logged out on a shared
-            # device, or a replayed session id): drop its state rather than
-            # let the new caller inherit that person's cart, pending order or
-            # order-for customer.
+            # A conversation that belongs to another customer (logged out on
+            # a shared device, or a replayed session id) is never handed over:
+            # taking ownership would let /chat/history return that person's
+            # earlier messages — orders, addresses — to the new caller. Start
+            # the caller on a fresh conversation instead; the response carries
+            # its id and the widget adopts it. The original stays untouched
+            # with its owner.
+            old_id = session_id
+            session_id = uuid.uuid4()
+            conversation = Conversation(id=session_id, customer_id=ident.customer_id or None)
+            db.session.add(conversation)
             logger.warning(
-                f"chat: session {session_id} changed hands "
-                f"({conversation.customer_id!r} → {ident.customer_id or 'guest'!r}) — context reset"
+                f"chat: session {old_id} belongs to another customer — "
+                f"started new session {session_id} for {ident.customer_id or 'guest'!r}"
             )
-            conversation.context_data = {}
-            conversation.flow_state = FlowState.IDLE.value
-        conversation.customer_id = ident.customer_id or None
+        else:
+            # A guest conversation becoming the logged-in customer's (they
+            # signed in mid-chat) carries over, as before.
+            conversation.customer_id = ident.customer_id or None
         db.session.commit()
 
     customer_id  = conversation.customer_id
