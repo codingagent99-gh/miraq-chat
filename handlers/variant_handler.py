@@ -552,6 +552,76 @@ def handle_variant_selection(
     }), 200
 
 
+_PROMOTABLE_INTENTS = {Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_SEARCH, Intent.PRODUCT_VARIATIONS}
+
+
+def promote_fully_specified_single_product(intent, entities, all_products_raw) -> bool:
+    """Treat an attribute search as "this product, this variant" when it is one.
+
+    "show me Bravique Ash Stone Block Mosaic / Matte / 12x24" never names the
+    product "Bravique Mosaic" as a phrase (the colour sits between its words),
+    so it runs as an attribute filter. The filter finds exactly that one
+    product, but with no product_id the variant step is skipped: the shopper
+    gets the parent card, whose Order button then sends only
+    "order 3 Bravique Mosaic" and every option is asked again.
+
+    Promoted only when it is unambiguous — exactly one product came back AND
+    the attributes in the message pin exactly one of its variations with EVERY
+    option named. "show me matte tiles" that happens to find one product is
+    left alone (colour and size not named), so browsing still shows the card.
+
+    The attribute half of an OR pair counts: the colour above was paired with
+    the category "stone" (cat OR colour), and only the colour is a variation
+    option. On promotion it is folded into entities.attributes so the variant
+    step matches on it too. Returns True when entities were promoted.
+    """
+    if intent not in _PROMOTABLE_INTENTS or getattr(entities, "product_id", None):
+        return False
+    parents = [p for p in (all_products_raw or []) if isinstance(p, dict) and not p.get("parent_id")]
+    if len(parents) != 1:
+        return False
+    parent = parents[0]
+    variations = parent.get("variations") or []
+    # Woo REST lists variation ids only; the store's products-advanced call
+    # embeds the variation dicts this needs. Without them there is nothing to check.
+    if not variations or not isinstance(variations[0], dict):
+        return False
+
+    def _pair_get(pair, name):
+        return pair.get(name) if isinstance(pair, dict) else getattr(pair, name, None)
+
+    attrs = dict(getattr(entities, "attributes", None) or {})
+    for pair in getattr(entities, "attr_tag_or_pairs", None) or []:
+        key = _pair_get(pair, "attr_key") or (_pair_get(pair, "attr_taxonomy") or "").removeprefix("pa_")
+        term = _pair_get(pair, "attr_term")
+        if key and term and key not in attrs:
+            attrs[key] = term
+    if not attrs:
+        return False
+
+    from api_builder import _normalize_variation_attrs
+    from utils.attr_values import attr_name_matches
+
+    matches, unsatisfied = match_variations_all_attributes(variations, SimpleNamespace(attributes=attrs))
+    if len(matches) != 1 or unsatisfied:
+        return False
+
+    named = [k.replace("-", " ").strip().lower() for k in attrs]
+    for axis, value in _normalize_variation_attrs(matches[0]).items():
+        if value and not any(attr_name_matches(n, axis) for n in named):
+            return False          # an option the shopper didn't name — not a full spec
+
+    logger.info(
+        f"Step 3.6b: attribute search pins one variation of the only result — "
+        f"treating as product '{parent.get('name')}' (id={parent.get('id')}), "
+        f"variation_id={matches[0].get('id')}"
+    )
+    entities.product_id = parent.get("id")
+    entities.product_name = parent.get("name")
+    entities.attributes = attrs
+    return True
+
+
 def _seed_resolved_from_entities(entities, variations: list, store_loader) -> dict:
     """
     Map the attributes the user already stated (entities.attributes) onto the

@@ -89,7 +89,10 @@ from handlers.order_handler import (
     handle_historical_search,
     handle_order_status,
 )
-from handlers.variant_handler import handle_variant_selection, handle_variation_product, handle_quantity_and_variant_check
+from handlers.variant_handler import (
+    handle_variant_selection, handle_variation_product, handle_quantity_and_variant_check,
+    promote_fully_specified_single_product,
+)
 from handlers.search_handler import log_matched_products, handle_empty_results
 from handlers.suggestion_retry_handler import handle_suggestion_retry
 from handlers.filter_clarification_handler import resolve_filter_clarification, apply_semantic_match
@@ -3772,6 +3775,11 @@ def chat():
                 conversation.context_data = user_context
                 flag_modified(conversation, "context_data")
             return _ft(resp)
+
+        # An attribute search that pins one variation of its only result is a
+        # request for that variant: hand it to the variant step as a product.
+        if promote_fully_specified_single_product(intent, entities, all_products_raw):
+            intent = Intent.PRODUCT_VARIATIONS
 
         logger.debug(
             f"[EntityMerge] Passing resolved_attr_values to handle_variation_product = "
