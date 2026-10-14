@@ -1330,6 +1330,27 @@ def get_chat_history_window():
 # ══════════════════════════════════════════════════════════════
 
 # ══════════════════════════════════════════════════════════════
+# ─── Step 5 scope: intents that never ask "which one did you mean?" ───
+# ══════════════════════════════════════════════════════════════
+# Semantic matches are guesses at catalog FILTERS (a colour, a tag). An intent
+# that takes no catalog filter has nothing to clarify, and asking derails it.
+# The cart commands were missing: "View cart" matched the tail word "view"
+# against 20 Colors terms ("DELIA Jolie Gold - Side View" …) and the shopper
+# got "I found multiple matches for 'view'" with 20 colour chips instead of
+# their cart. ADD_TO_CART is deliberately NOT here: "add the gray one to my
+# cart" can need that question to find the product.
+_NO_SEMANTIC_CLARIFICATION_INTENTS = frozenset({
+    Intent.PRODUCT_ATTRIBUTE_INFO, Intent.PRODUCT_VARIATIONS,
+    Intent.QUICK_ORDER, Intent.PLACE_ORDER, Intent.ORDER_ITEM,
+    Intent.BULK_ORDER,
+    Intent.ORDER_STATUS, Intent.ORDER_TRACKING,
+    # Cart commands — no catalog filters involved.
+    Intent.VIEW_CART, Intent.CHECKOUT,
+    Intent.REMOVE_FROM_CART, Intent.UPDATE_CART_QTY,
+})
+
+
+# ══════════════════════════════════════════════════════════════
 # ─── HELPER: Stale flow on resume ───
 # ══════════════════════════════════════════════════════════════
 
@@ -2939,12 +2960,7 @@ def chat():
             entities.semantic_matches
             and not getattr(entities, "lookup_email", None)
             and current_flow_state != FlowState.AWAITING_FILTER_CLARIFICATION
-            and intent not in (
-                Intent.PRODUCT_ATTRIBUTE_INFO, Intent.PRODUCT_VARIATIONS,
-                Intent.QUICK_ORDER, Intent.PLACE_ORDER, Intent.ORDER_ITEM,
-                Intent.BULK_ORDER,
-                Intent.ORDER_STATUS, Intent.ORDER_TRACKING,
-            )
+            and intent not in _NO_SEMANTIC_CLARIFICATION_INTENTS
         ):
             # Prune semantic matches already covered by the two-phase entity
             # merge. e.g. product_quick_ship sets quick-ship:yes in attributes;
