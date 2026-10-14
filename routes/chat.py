@@ -13,7 +13,7 @@ from handlers.handoff_handler import (
     handle_resume_after_handoff,
 )
 from api_builder.store_helpers import attr_slug_for_label
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from flask import Blueprint, request, jsonify, g
 from models import db, Conversation, Message, Intent
 from sqlalchemy.orm.attributes import flag_modified
@@ -1329,6 +1329,65 @@ def get_chat_history_window():
 # ─── HELPER: Wipe stale cart context ───
 # ══════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════
+# ─── HELPER: Stale flow on resume ───
+# ══════════════════════════════════════════════════════════════
+
+# A conversation can be resumed long after it went quiet: Continue on the
+# welcome screen, a history-search jump, another device. If the bot was then
+# waiting for a short answer, the shopper's first new message is read as that
+# answer — AWAITING_CART_CONFIRMATION matches "ok"/"yes" anywhere, so
+# "ok show me matte tiles" days later added the old product to the cart, and
+# AWAITING_REORDER_ID takes any number, so "12x24 tiles" meant reorder #12.
+_STALE_FLOW_AFTER = timedelta(hours=2)
+
+# Only the states that wait for a one-word/one-number answer. Left alone:
+# IDLE / AWAITING_ANYTHING_ELSE / CLOSING (nothing pending), SHOWING_RESULTS
+# (the results are still on screen in the replayed transcript, so "add the
+# second one" should keep working), and the sales-rep / bulk-order states —
+# deliberate multi-step work a rep may come back to, whose handlers own their
+# own cancel.
+_RESETTABLE_FLOW_STATES = frozenset({
+    FlowState.AWAITING_INTENT_CHOICE.value,
+    FlowState.AWAITING_PRODUCT_OR_CATEGORY.value,
+    FlowState.AWAITING_QUANTITY.value,
+    FlowState.AWAITING_VARIANT_SELECTION.value,
+    FlowState.AWAITING_ORDER_DETAIL.value,
+    FlowState.AWAITING_REORDER_ID.value,
+    FlowState.AWAITING_FILTER_CLARIFICATION.value,
+    FlowState.AWAITING_REFINEMENT_CHOICE.value,
+    FlowState.AWAITING_NO_RESULTS_CHOICE.value,
+    FlowState.AWAITING_CART_CONFIRMATION.value,
+})
+
+
+def _reset_stale_flow(conversation, user_context, last_activity) -> bool:
+    """Drop a waiting flow that has gone stale. True if it reset.
+
+    Only flow_state moves. The pending cart keys are then cleared by
+    _wipe_stale_cart, which runs on IDLE later in the same turn, and the
+    search context is kept on purpose so "more like that" still works.
+    """
+    if last_activity is None or conversation.flow_state not in _RESETTABLE_FLOW_STATES:
+        return False
+    if last_activity.tzinfo is None:
+        last_activity = last_activity.replace(tzinfo=timezone.utc)
+    idle_for = datetime.now(timezone.utc) - last_activity
+    if idle_for < _STALE_FLOW_AFTER:
+        return False
+
+    logger.info(
+        f"chat: stale flow reset | session={conversation.id} | "
+        f"was={conversation.flow_state} | idle={int(idle_for.total_seconds() // 60)}m"
+    )
+    conversation.flow_state = FlowState.IDLE.value
+    user_context["flow_state"] = FlowState.IDLE.value
+    user_context.pop("flow_miss", None)
+    conversation.context_data = user_context
+    flag_modified(conversation, "context_data")
+    return True
+
+
 def _wipe_stale_cart(conversation, user_context, current_flow_state):
     """Clear pending cart keys when flow is idle."""
     if current_flow_state not in (FlowState.IDLE, FlowState.AWAITING_ANYTHING_ELSE):
@@ -2173,6 +2232,9 @@ def chat():
         conversation = Conversation(id=session_id)
         db.session.add(conversation)
         db.session.commit()
+    # Read before anything below commits (a guest sign-in adoption does),
+    # which would move updated_at to now and hide how long it sat idle.
+    last_activity = conversation.updated_at
 
     # ── Who is asking: the VERIFIED identity only (identity.py) ──
     # customer_id / role / email in the request body are ignored. They came
@@ -2204,6 +2266,8 @@ def chat():
 
     customer_id  = conversation.customer_id
     user_context = conversation.context_data or {}
+    # A conversation swapped for a fresh one above is new and idle: no-op.
+    _reset_stale_flow(conversation, user_context, last_activity)
 
     # Persist role into user_context so handlers can read it. Always set —
     # never left over from an earlier turn. effective_role(): with this

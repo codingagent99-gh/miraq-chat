@@ -8,8 +8,13 @@ store_registry.register_before_request like every other /chat route; an
 expired WooCommerce identity token is answered with 401 there, before this
 runs, so the widget refreshes it exactly as it does for /chat.
 
-Sections are added one at a time. This version serves What's new; first_name,
-last_conversation and buy_again join the same response in later steps.
+Each section is built independently: one failing hides that section only,
+never the screen (FR-7.2). Sections so far: whats_new, last_conversation.
+first_name and buy_again join the same response in later steps.
+
+Sessions: Continue sends last_conversation.id as X-MiraQ-Session and loads
+/chat/history; New chat drops the stored id and /chat mints a new one. Neither
+needs an endpoint here.
 """
 
 import time
@@ -18,6 +23,7 @@ from flask import Blueprint, g, jsonify
 
 from chat_logger import get_logger
 from identity import current_identity
+from services.last_conversation import last_conversation
 from services.whats_new import record_visit, select_whats_new
 from store_registry import get_store_loader
 
@@ -42,15 +48,24 @@ def get_welcome():
         since = record_visit(tenant, ident.customer_id)
         whats_new, mode = select_whats_new(get_store_loader(), since)
     except Exception as e:
-        # A broken section is hidden, never a broken screen (FR-7.2).
         logger.error(f"/chat/welcome: whats_new failed — section hidden | {e}", exc_info=True)
+
+    last_conv = None
+    try:
+        last_conv = last_conversation(ident.customer_id)
+    except Exception as e:
+        from models import db
+        db.session.rollback()
+        logger.error(f"/chat/welcome: last_conversation failed — section hidden | {e}", exc_info=True)
 
     logger.info(
         f"/chat/welcome | whats_new={len(whats_new)} mode={mode} "
+        f"| last_conversation={'yes' if last_conv else 'no'} "
         f"| {int((time.monotonic() - started) * 1000)}ms"
     )
     return jsonify({
-        "success":        True,
-        "whats_new":      whats_new,
-        "whats_new_mode": mode,
+        "success":           True,
+        "whats_new":         whats_new,
+        "whats_new_mode":    mode,
+        "last_conversation": last_conv,
     }), 200
