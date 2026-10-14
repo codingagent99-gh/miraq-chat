@@ -26,6 +26,7 @@ from models import db, Conversation
 from routes.webhook_routes import webhook_bp
 from routes.shopify_oauth import shopify_oauth_bp
 from routes.chat import chat_bp
+from routes.welcome import welcome_bp
 from routes.admin import admin_bp
 from routes.products import products_bp
 from routes.shopify import shopify_bp
@@ -171,6 +172,7 @@ with app.app_context():
 
 # Register blueprints
 app.register_blueprint(chat_bp)
+app.register_blueprint(welcome_bp)
 app.register_blueprint(admin_bp)
 app.register_blueprint(products_bp)
 app.register_blueprint(shopify_bp)

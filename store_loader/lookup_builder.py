@@ -10,7 +10,8 @@ import re
 import json
 import time
 from collections import Counter
-from typing import Dict, List
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
 
 from chat_logger import get_logger
 from models.catalog import (
@@ -366,6 +367,9 @@ def _build_lookups_into(loader):
         
     logger.debug(f"lookup_builder: product_by_name_lower keys = {list(loader.product_by_name_lower.keys())}")
 
+    # Newest-first index for the welcome screen's "What's new"
+    loader.products_newest_first = build_newest_index(loader.products)
+
     # Longest-match catalog
     loader.longest_match_catalog = build_longest_match_catalog(
         loader.product_by_name_lower,
@@ -393,6 +397,59 @@ def _build_lookups_into(loader):
     build_fuzzy_vocab(loader)
         
         
+# ══════════════════════════════════════════════════════════════
+# NEWEST-FIRST INDEX ("What's new")
+# ══════════════════════════════════════════════════════════════
+
+def product_created_ts(product: dict) -> Optional[float]:
+    """Epoch seconds the product was created/published, or None if unknown.
+
+    Reads date_created_gmt: WooCommerce's REST product has it natively
+    ("2026-10-11T09:12:00", no offset but UTC by definition); the Shopify
+    normaliser fills it from publishedAt/createdAt ("...Z").
+    """
+    raw = product.get("date_created_gmt") or ""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def build_newest_index(products: list) -> list:
+    """(created_ts, raw_product) for shopper-visible products, newest first.
+
+    Same published rule as the product loop above. Products with no usable
+    date are left OUT rather than guessed at: a snapshot or dev cache written
+    before dates were fetched then gives an empty index (section hidden)
+    instead of a "What's new" in arbitrary order. Stock is not checked here —
+    it is checked when the list is served, on the same formatted product the
+    chat cards use.
+    """
+    out = []
+    undated = 0
+    for product in products or []:
+        status = product.get("status")
+        if status is not None and status not in ("active", "publish"):
+            continue
+        # WooCommerce "Catalog visibility: Hidden" — not shown in the shop.
+        if product.get("catalog_visibility") == "hidden":
+            continue
+        ts = product_created_ts(product)
+        if ts is None:
+            undated += 1
+            continue
+        out.append((ts, product))
+    out.sort(key=lambda e: e[0], reverse=True)
+    if undated:
+        logger.info(f"lookup_builder: newest index skipped {undated} product(s) with no creation date")
+    return out
+
+
 # ══════════════════════════════════════════════════════════════
 # FUZZY TYPO-CORRECTION VOCABULARY
 # ══════════════════════════════════════════════════════════════

@@ -173,6 +173,8 @@ query Products($first: Int!, $after: String) {
         vendor
         tags
         status
+        createdAt
+        publishedAt
         totalInventory
         priceRangeV2 {
           minVariantPrice { amount currencyCode }
@@ -512,6 +514,12 @@ def _normalise_product(p: dict, idx: int, store_domain: str = "") -> dict:
         "stock_status":  "instock" if (p.get("totalInventory") or 0) > 0 else "outofstock",
         "in_stock":      (p.get("totalInventory") or 0) > 0,
         "permalink":     f"https://{store_domain}/products/{p.get('handle','')}",
+        # Same key WooCommerce's REST product carries, so the "What's new"
+        # index (lookup_builder.build_newest_index) reads one field for both
+        # backends. publishedAt first: it is when shoppers could first see the
+        # product, which is what "new" means to them; a product created as a
+        # draft weeks ago and published today is new today.
+        "date_created_gmt": p.get("publishedAt") or p.get("createdAt") or "",
         "categories": [
             {
                 # Same GID-derived id the global categories list uses, so a

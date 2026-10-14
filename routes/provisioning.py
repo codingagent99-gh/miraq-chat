@@ -94,6 +94,7 @@ def _per_tenant_tables():
     from models.chat_usage import ChatUsage
     from models.shopify_order_confirmation import ShopifyOrderConfirmation
     from models.channel_link import ChannelLink, ChannelLinkRequest
+    from models.customer_visit import CustomerVisit
 
     return [
         Conversation.__table__,
@@ -102,6 +103,7 @@ def _per_tenant_tables():
         ShopifyOrderConfirmation.__table__,
         ChannelLink.__table__,
         ChannelLinkRequest.__table__,
+        CustomerVisit.__table__,
     ]
 
 

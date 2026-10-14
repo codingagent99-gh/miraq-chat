@@ -134,6 +134,7 @@ class StoreLoader(StoreQueryMixin):
         self.category_keywords: Dict[str, int] = {}
         self._store_generic_terms: set = set()
         self._category_synonyms: Dict[str, str] = self._load_category_synonyms()
+        self.products_newest_first: List[tuple] = []   # (created_ts, product)
         self.product_variation_schema: Dict[int, Dict] = {}
         self.variation_detail_cache = BoundedVariationCache(max_size=200, ttl=3600)
         self.attribute_by_id: Dict[int, Dict] = {}
