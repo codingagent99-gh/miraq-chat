@@ -722,11 +722,40 @@ def resolve_final_intent(
     return resolved_intent, final_confidence
 
 
+def _is_own_option(loader, product_id, name: str) -> bool:
+    """True when `name` is one of this product's OWN attribute options.
+
+    Stores often prefix a product's colour terms with the product name:
+    product "Zyvora", Colors "Zyvora Havana Dune". "show me Zyvora Havana Dune
+    / Matte / 12x12" then names the product's own variant — the product is
+    very much part of the query, unlike "Titan Marbles" inside the unrelated
+    tag "Titan Marbles Series".
+    """
+    if loader is None or not product_id or not name:
+        return False
+    want = name.lower().strip()
+    product = next(
+        (p for p in (getattr(loader, "products", None) or [])
+         if p.get("id") == product_id or p.get("_shopify_gid") == product_id),
+        None,
+    )
+    if not product:
+        return False
+    for attr in product.get("attributes") or []:
+        if not isinstance(attr, dict):
+            continue
+        for opt in attr.get("options") or []:
+            if str(opt).lower().strip() == want:
+                return True
+    return False
+
+
 def _drop_product_inside_longer_match(
     nlp_entities: ExtractedEntities,
     phase1_entities: ExtractedEntities,
     unmatched_text: str,
     phase1_names: list,
+    loader=None,
 ) -> None:
     """
     The full-text NLP pass matches product names on its own, so in
@@ -759,6 +788,17 @@ def _drop_product_inside_longer_match(
         None,
     )
     if not longer:
+        return
+    # The longer match is one of this product's own options (its colour, say):
+    # the shopper named a variant OF the product, so the product stays. Without
+    # this, "show me Zyvora Havana Dune / Matte / 12x12" lost the product, got
+    # the parent card instead of the variant, and its Order button then sent
+    # only "order 2 Zyvora" — asking colour, finish and size all over again.
+    if _is_own_option(loader, nlp_entities.product_id, longer):
+        logger.info(
+            f"[PHASE1_PRODUCT] product '{nlp_entities.product_name}' kept — "
+            f"'{longer}' is one of its own options"
+        )
         return
 
     logger.info(
@@ -800,7 +840,7 @@ def parse_csv_message(msg: str, loader) -> ClassifiedResult | None:
     phase1_names: list = []
     with timing_logger.stage("phase1_catalog"):
         entities, unmatched_text = phase1_catalog_match(clean_msg, loader, phase1_names)
-    _drop_product_inside_longer_match(original_nlp_result.entities, entities, unmatched_text, phase1_names)
+    _drop_product_inside_longer_match(original_nlp_result.entities, entities, unmatched_text, phase1_names, loader)
     logger.debug(
         f"[PHASE1_TRACE] attr_tag_or_pairs={entities.attr_tag_or_pairs} | "
         f"attributes={entities.attributes} | "
