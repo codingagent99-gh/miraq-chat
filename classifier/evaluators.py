@@ -11,7 +11,9 @@ from models import Intent, ExtractedEntities
 from store_registry import get_store_loader
 from config.store_config import PRODUCT_TYPE_TERMS, GENERIC_NOISE_WORDS
 from chat_logger import get_logger
-from classifier.utils import label_word_matches, explicit_kind_near, create_flexible_pattern
+from classifier.utils import (
+    label_word_matches, explicit_kind_near, create_flexible_pattern, message_is_store_name,
+)
 
 logger = get_logger("miraq_chat")
 
@@ -198,6 +200,11 @@ class DiscountEvaluator(IntentEvaluator):
         # store's on-sale list. Only when every discount word is used that
         # way does this step aside — "sale items in the Sale collection"
         # still asks about sales.
+        # The whole message is a store category/tag name ("Sale" from the
+        # category list): the shopper named that category — CatalogSearch
+        # takes it as a category browse.
+        if message_is_store_name(text, get_store_loader()):
+            return None, 0.0
         if any(not self._named_as_tag_or_collection(text, m)
                for m in self._DISCOUNT_WORD_RE.finditer(text)):
             entities.on_sale = True

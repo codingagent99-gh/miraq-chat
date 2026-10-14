@@ -24,6 +24,8 @@ from classifier.utils import (
     normalize_for_tag_compare,
     normalize_dimension,
     create_flexible_pattern,
+    explicit_kind_near,
+    message_is_store_name,
 )
 
 try:
@@ -965,8 +967,16 @@ def extract_stock_status(text: str, entities: ExtractedEntities):
         entities.in_stock = False
     elif _IN_STOCK_RE.search(text):
         entities.in_stock = True
-    if re.search(r"\b(?:on\s+sale|discount(?:ed)?|clearance)\b", text, re.IGNORECASE):
-        entities.on_sale = True
+    # A word the shopper called a category or tag ("Clearance category" from a
+    # category tile) names that category, not an on-sale filter — the same
+    # rule DiscountEvaluator applies. Any other use of the word still counts.
+    # So does a message that is exactly a store category/tag name ("Clearance").
+    if message_is_store_name(text, get_store_loader()):
+        return
+    for _m in re.finditer(r"\b(?:on\s+sale|discount(?:ed)?|clearance)\b", text, re.IGNORECASE):
+        if not explicit_kind_near(text, _m.start(), _m.end()):
+            entities.on_sale = True
+            break
 
 
 # Shared with catalog_parser._mask_resolved_entities, so semantic search

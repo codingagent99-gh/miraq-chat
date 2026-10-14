@@ -73,6 +73,25 @@ def explicit_kind_near(text: str, start: int, end: int) -> Optional[str]:
     return None
 
 
+def message_is_store_name(text: str, loader) -> bool:
+    """True when the WHOLE message is exactly a store category or tag name.
+
+    A bare "Sale" on a store that has a Sale category names that category —
+    it is what a category tile sends, and what a shopper types after seeing
+    the category list. Discount words would otherwise read it as "everything
+    on sale": the Sale tile listed all 20 on-sale products instead of the 8 in
+    the Sale category. Stores without such a category are unaffected.
+    """
+    if not text or loader is None:
+        return False
+    norm = re.sub(r"\s+", " ", re.sub(r"[^\w\s/&-]+", " ", text.lower())).strip()
+    if not norm:
+        return False
+    names = set(getattr(loader, "category_by_name_lower", None) or {}) \
+        | set(getattr(loader, "tag_by_name_lower", None) or {})
+    return norm in names
+
+
 def create_flexible_pattern(phrase: str) -> str:
     """Create a regex pattern that handles optional plurals for each word."""
     parts = []
