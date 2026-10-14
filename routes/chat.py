@@ -2763,6 +2763,24 @@ def chat():
                 }), 200))
             if flow_result and flow_result.get("override_message"):
                 message = flow_result["override_message"]
+            # A new "order <qty> <product>" arrived while a cart confirmation
+            # was pending (conversation_flow): the old offer is replaced, not
+            # answered. Drop its pending item and continue this turn as idle,
+            # so the new order is classified fresh and can't inherit the
+            # previous product, variant or quantity.
+            if flow_result and flow_result.get("replace_pending_order"):
+                for _k in ("pending_product_id", "pending_product_name", "pending_quantity",
+                           "pending_variation_id", "resolved_attributes"):
+                    user_context.pop(_k, None)
+                current_flow_state         = FlowState.IDLE
+                conversation.flow_state    = FlowState.IDLE.value
+                user_context["flow_state"] = FlowState.IDLE.value
+                conversation.context_data  = user_context
+                flag_modified(conversation, "context_data")
+                logger.info(
+                    f"Cart confirmation replaced by a new order request | "
+                    f"session={conversation.id} | message={message!r}"
+                )
 
         if flow_result:
             _persistent_keys = [

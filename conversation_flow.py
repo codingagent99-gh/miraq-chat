@@ -7,6 +7,7 @@ Manages multi-turn flows like:
   - Quantity confirmation → order creation
 """
 
+import re
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
@@ -119,6 +120,11 @@ _TOPIC_CHANGE_KEYWORDS = {
 def is_order_flow(state: FlowState) -> bool:
     """True when state is an active order/transaction flow (not search refinement)."""
     return state in _ORDER_FLOW_STATES
+
+
+# "order 4 Zyvora …", "buy 2 …", "add 3 … to cart": a verb, a quantity, then a
+# product. Requires all three, so "ok", "yes add it" or a bare "order" never match.
+_NEW_ORDER_COMMAND_RE = re.compile(r"^(?:order|buy|add)\s+\d+\s*(?:x\s+)?\S")
 
 
 def _is_topic_change(text: str) -> bool:
@@ -310,6 +316,21 @@ def handle_flow_state(
     
     if state == FlowState.AWAITING_CART_CONFIRMATION:
         text = message.lower().strip()
+
+        # A fresh "order <qty> <product>" is a new request, not an answer to
+        # the pending yes/no — it is exactly what every product card's Order
+        # button sends, e.g. "order 4 Zyvora - Zyvora Havana Dune / Matte /
+        # 12"x12"" right after the bot offered that variant ×1. It was being
+        # re-prompted ("Please reply Yes…") and the order never ran. Checked
+        # BEFORE yes/no so a product name containing "no" or "ok" can't be
+        # read as an answer. routes/chat.py drops the old pending item and
+        # sends the message through normal classification.
+        if _NEW_ORDER_COMMAND_RE.match(text):
+            return {
+                "flow_state": FlowState.IDLE.value,
+                "pass_through": True,
+                "replace_pending_order": True,
+            }
 
         _yes = re.search(
             r'\b(yes|yeah|yep|sure|okay|ok|go\s+ahead|add\s+it|add\s+to\s+cart)\b',
