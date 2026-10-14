@@ -1358,6 +1358,8 @@ _NO_SEMANTIC_CLARIFICATION_INTENTS = frozenset({
     Intent.REMOVE_FROM_CART, Intent.UPDATE_CART_QTY,
     # Account and small talk — no catalog filters involved.
     Intent.FETCH_CUSTOMER, Intent.UPDATE_CUSTOMER, Intent.GREETING,
+    # Listing the store's categories takes no filter either ("View categories").
+    Intent.CATEGORY_LIST,
 }) | (frozenset(ORDER_INTENTS) - {Intent.HISTORICAL_SEARCH})
 
 

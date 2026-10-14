@@ -777,9 +777,9 @@ class PopularityEvaluator(IntentEvaluator):
 
 class CatalogSearchEvaluator(IntentEvaluator):
     KEYWORDS = frozenset({
-        "about", "all", "categor", "category", "categories", "cost", "detail",
+        "about", "all", "browse", "categor", "category", "categories", "cost", "detail",
         "get", "how", "info", "list", "more", "much", "price", "products",
-        "see", "show", "specification", "specs", "tell", "what",
+        "see", "show", "specification", "specs", "tell", "view", "what",
     })
     def evaluate(self, text: str, entities: ExtractedEntities) -> Tuple[Optional[Intent], float]:
         if len(entities.product_ids) >= 2:
@@ -804,7 +804,9 @@ class CatalogSearchEvaluator(IntentEvaluator):
             else:
                 return Intent.CATEGORY_BROWSE, 0.94
 
-        if re.search(r"\b(what|list|show|all)\b.*\bcategor(y|ies)\b", text):
+        # "view / browse / see categories" were missing, so they fell through to
+        # the LLM fallback (≈1s per ask) to land on the same answer.
+        if re.search(r"\b(what|list|show|all|view|browse|see)\b.*\bcategor(y|ies)\b", text):
             return Intent.CATEGORY_LIST, 0.91
         if (entities.attributes or getattr(entities, 'attr_tag_or_pairs', [])) and not entities.product_name:
             return Intent.FILTER_BY_ATTRIBUTE, 0.89

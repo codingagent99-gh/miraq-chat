@@ -692,7 +692,14 @@ def _compound_tail_candidates(
             continue
         if product_name_lower and term_name_lower in product_name_lower:
             continue
-        words = term_name_lower.split()
+        # Tails come from the NAME only, not a " - " suffix after it. In
+        # "DELIA Jolie Gold - Side View" the colour is "Jolie Gold"; "Side
+        # View" / "Zoom View" just label a picture. Tailing past the dash made
+        # the bare word "view" stand for 20 such terms, so "View cart", "View
+        # my order" and "View categories" each got 20 "did you mean…" chips.
+        # The full-term pass above still matches the whole name as typed.
+        name_part = re.split(r"\s+[-–—]\s+", term_name_lower, maxsplit=1)[0].strip()
+        words = name_part.split()
         if len(words) < 2:
             continue  # single-word terms already handled by the main pass
 
