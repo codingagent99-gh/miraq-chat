@@ -60,6 +60,7 @@ from models import db, ChannelConnection, Conversation, Message, Tenant
 from store_registry import bind_tenant_db, get_tenant_registry
 from identity import CHANNEL_ENVIRON_KEY
 import channel_link
+import miraq_trace
 
 logger = get_logger("miraq_chat")
 
@@ -163,6 +164,54 @@ def _bind_resident_loader(tenant) -> None:
         g.store_loader = None
         return
     g.store_loader = dict(registry.resident_loaders()).get(str(tenant.tenant_id))
+
+
+# ── Human handoff: a person replies in the same chat ─────────────────────────
+# /chat answers a handoff request the widget's way (a WhatsApp click-to-chat
+# card, or "can't connect you" when that is off). On these channels the
+# merchant's team replies inside the same DM thread, so the turn is replaced
+# with that message instead. MiraQ keeps answering later messages as usual.
+_IN_CHAT_HANDOFF_CHANNELS = {"instagram": "Instagram"}
+# metadata.handoff for a handoff request; "resumed" is the "Continue here" chip.
+_HANDOFF_REQUEST_STATES = frozenset({"whatsapp", "unavailable"})
+
+
+def _is_handoff_request(data: dict) -> bool:
+    return (data.get("intent") == "human_handoff"
+            and (data.get("metadata") or {}).get("handoff") in _HANDOFF_REQUEST_STATES)
+
+
+def _account_handle(connection) -> str:
+    name = str(getattr(connection, "display_name", "") or "").strip()
+    if not name or " " in name:
+        return name
+    return name if name.startswith("@") else f"@{name}"
+
+
+def _support_url(tenant) -> str:
+    """tenant.features["support_url"]; else the Shopify store's contact page."""
+    url = str((tenant.features or {}).get("support_url") or "").strip()
+    if url.lower().startswith(("https://", "http://")):
+        return url
+    domain = str(tenant.shopify_domain or "").strip().strip("/")
+    return f"https://{domain}/pages/contact" if domain else ""
+
+
+def _in_chat_handoff(data: dict, channel: str, connection, tenant) -> dict:
+    handle = _account_handle(connection)
+    url = _support_url(tenant)
+    text = (f"Got it, transferring you to our human support team{f' for {handle}' if handle else ''}. "
+            f"A human agent will reply to you here in this same {_IN_CHAT_HANDOFF_CHANNELS[channel]} chat shortly.")
+    if url:
+        text += f" For additional support details, you can also visit: {url}"
+    return {
+        **data,
+        "bot_message": text,
+        "products":    [],
+        "actions":     [],
+        "suggestions": [],
+        "metadata":    {**(data.get("metadata") or {}), "handoff": "in_chat"},
+    }
 
 
 # ── Payload logging ──────────────────────────────────────────────────────────
@@ -317,8 +366,14 @@ def _channel_chat():
 
     chat_body = {"message": message, "page": page, "user_context": user_context}
 
+    miraq_trace.received(channel, user_id, session_id,
+                         tenant.site_domain or tenant.shopify_domain, message, link is not None)
+
     status, data = _dispatch_chat(chat_body, session_id, tenant.license_id,
                                   channel, user_id, link.customer_id if link else "")
+
+    if channel in _IN_CHAT_HANDOFF_CHANNELS and status < 400 and _is_handoff_request(data):
+        data = _in_chat_handoff(data, channel, connection, tenant)
 
     # First message after signing in: confirm who they're signed in as, once.
     if link is not None and link.notice_pending and status < 400:
@@ -339,6 +394,8 @@ def _channel_chat():
     messages = RENDERERS[channel](turn, user_id)
 
     elapsed = round((time.time() - start_time) * 1000)
+    miraq_trace.replied(channel, session_id, status, data.get("intent"), messages, turn,
+                        data.get("bot_message"), elapsed)
     logger.info(
         f"POST /chat/channel | tenant={tenant.tenant_id} | {channel}:{account_id} | "
         f"session={session_id} | status={status} | intent={data.get('intent')} | "

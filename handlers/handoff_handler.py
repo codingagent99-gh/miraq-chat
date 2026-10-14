@@ -51,6 +51,16 @@ _HUMAN_HANDOFF_RE = re.compile(
     r"customer\s+(?:service|support|care))\b"
 )
 
+# "I want human support", "need a live agent", "human agent please". Every
+# alternative names a human/agent, so product words never trigger it.
+_HUMAN_SUPPORT_RE = re.compile(
+    r"(?i)\b(?:want|need|request|transfer\s+(?:me\s+)?to|connect\s+me\s+to)\s+"
+    r"(?:a|an|the|some|to)?\s*"
+    r"(?:human|real\s+person|live\s+(?:agent|person|support)|agent|"
+    r"human\s+(?:support|agent|help|being))\b"
+    r"|^\s*(?:human|live|real)\s+(?:support|agent|help|person)(?:\s+please)?\s*[.!?]*\s*$"
+)
+
 
 def is_human_handoff_request(message: str) -> bool:
     """True when the shopper explicitly asked for a person."""
@@ -59,7 +69,7 @@ def is_human_handoff_request(message: str) -> bool:
     text = message.strip()
     if text == HUMAN_HANDOFF_SENTINEL:
         return True
-    return bool(_HUMAN_HANDOFF_RE.search(text))
+    return bool(_HUMAN_HANDOFF_RE.search(text) or _HUMAN_SUPPORT_RE.search(text))
 
 # Anchored to the exact phrase. "Continue anyway" (bulk company confirmation)
 # and "Continue shopping" (post-add-to-cart) are existing chips, and this
