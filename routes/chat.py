@@ -21,6 +21,8 @@ import sqlalchemy as sa
 import re
 from classifier.consolidation import _resolve_tag_attribute_overlap, _explicit_kinds_in_text
 import json
+
+import miraq_trace
 from handlers.chat_utils import resolve_session_id
 from classifier.utils import normalize_for_tag_compare
 from config.store_config import ATTRIBUTE_DISAMBIGUATION_GROUPS
@@ -2883,6 +2885,7 @@ def chat():
         # ── Step 4: LLM fallback ──
         session_history = [{"role": m.role, "message": m.content} for m in conversation.messages[-4:-1]]
 
+        _trace_used_llm = False
         if not _resolve_variant and not _clarification_resolved:
             logger.debug(
                 f"[STEP1.5_GATE_TRACE] intent={intent} | confidence={confidence} | "
@@ -2907,6 +2910,7 @@ def chat():
                         return _ft(llm_outcome)
                 if isinstance(llm_outcome, tuple) and len(llm_outcome) == 4:
                     intent, entities, confidence, result = llm_outcome
+                    _trace_used_llm = True
         # ── Human handoff (LLM-resolved) ──
         # The regex intercept above catches the common phrasings before we ever
         # spend a token. This catches the ones it missed, now that human_handoff
@@ -3512,6 +3516,8 @@ def chat():
             all_products_raw, order_data, api_responses, api_calls_to_execute = [], [], [], []
         else:
             logger.info(f"build_api_calls: role={role}, customer_id={customer_id}")
+            miraq_trace.understood(conversation.id, intent, confidence, entities,
+                                   _trace_used_llm, (time.time() - start_time) * 1000)
             api_calls = build_api_calls(
                 result, page, user_message=message,
                 session_id=str(conversation.id), customer_id=customer_id, role=role,
@@ -3594,9 +3600,12 @@ def chat():
             )
             # ──────────────────────────────────────────────────────────────────
 
+            _trace_search_t0 = time.time()
             all_products_raw, order_data, api_responses, api_calls_to_execute = (
                 _execute_api_calls(intent, api_calls, _resolve_variant)
             )
+            miraq_trace.searched(conversation.id, api_calls_to_execute, api_responses,
+                                 all_products_raw, (time.time() - _trace_search_t0) * 1000)
             order_data = _only_own_orders(order_data, intent, role, customer_id)
 
             # ── Store unreachable: say so instead of "no results" ────────────
