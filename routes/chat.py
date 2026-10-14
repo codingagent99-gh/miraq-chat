@@ -1339,15 +1339,23 @@ def get_chat_history_window():
 # got "I found multiple matches for 'view'" with 20 colour chips instead of
 # their cart. ADD_TO_CART is deliberately NOT here: "add the gray one to my
 # cart" can need that question to find the product.
+#
+# "View My Order" then hit the same wall as ORDER_HISTORY, which the list
+# also lacked. So the order and account intents now come from the shared
+# groups rather than one name at a time: every ORDER_INTENTS member answers
+# from the shopper's orders, never from catalog filters — except
+# HISTORICAL_SEARCH, which DOES filter past orders by attribute ("my past
+# orders in gold") and so keeps the question.
 _NO_SEMANTIC_CLARIFICATION_INTENTS = frozenset({
     Intent.PRODUCT_ATTRIBUTE_INFO, Intent.PRODUCT_VARIATIONS,
     Intent.QUICK_ORDER, Intent.PLACE_ORDER, Intent.ORDER_ITEM,
     Intent.BULK_ORDER,
-    Intent.ORDER_STATUS, Intent.ORDER_TRACKING,
     # Cart commands — no catalog filters involved.
     Intent.VIEW_CART, Intent.CHECKOUT,
     Intent.REMOVE_FROM_CART, Intent.UPDATE_CART_QTY,
-})
+    # Account and small talk — no catalog filters involved.
+    Intent.FETCH_CUSTOMER, Intent.UPDATE_CUSTOMER, Intent.GREETING,
+}) | (frozenset(ORDER_INTENTS) - {Intent.HISTORICAL_SEARCH})
 
 
 # ══════════════════════════════════════════════════════════════
