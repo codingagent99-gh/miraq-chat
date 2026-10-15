@@ -127,6 +127,28 @@ def is_order_flow(state: FlowState) -> bool:
 _NEW_ORDER_COMMAND_RE = re.compile(r"^(?:order|buy|add)\s+\d+\s*(?:x\s+)?\S")
 
 
+# A new browse/search request typed while the bot waits for Yes/No on the cart
+# ("Exterior category", "show me matte tiles", "browse categories"). Word
+# boundaries, so "showroom" or "listing" don't count.
+_NEW_SEARCH_REQUEST_RE = re.compile(
+    r"\b(?:show|search|find|browse|display|list|categor(?:y|ies)|collections?|"
+    r"what\s+do\s+you\s+have)\b"
+)
+
+
+def _is_new_search_request(text: str) -> bool:
+    """True when a cart-confirmation reply is really a new search: a search
+    word, or the whole message naming a store category/tag ("Exterior")."""
+    if _NEW_SEARCH_REQUEST_RE.search(text):
+        return True
+    try:
+        from classifier.utils import message_is_store_name
+        from store_registry import get_store_loader
+        return message_is_store_name(text, get_store_loader())
+    except Exception:
+        return False
+
+
 def _is_topic_change(text: str) -> bool:
     """True if the message looks like the user wants to do something different."""
     return any(kw in text for kw in _TOPIC_CHANGE_KEYWORDS)
@@ -340,6 +362,19 @@ def handle_flow_state(
             r'\b(no|nope|cancel|skip|not\s+now|continue\s+shopping)\b',
             text
         )
+
+        # A new search ("Exterior category") isn't an answer either: it was
+        # re-prompted ("Please reply Yes…"), and after "No thanks" the search
+        # was gone and had to be typed again. Treated as "no, show me this
+        # instead": the pending item is dropped and the message classified
+        # fresh. A "yes" still wins ("yes add it and show me more"), and this
+        # runs before the "no" check so "show me no-slip tiles" isn't a decline.
+        if not _yes and _is_new_search_request(text):
+            return {
+                "flow_state": FlowState.IDLE.value,
+                "pass_through": True,
+                "replace_pending_order": True,
+            }
 
         if _yes:
             return {

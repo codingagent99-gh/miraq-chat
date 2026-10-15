@@ -790,15 +790,31 @@ def _no_variation_combination_response(
         # 8"x48" before 10"x63": compare the numbers as numbers, not text.
         return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(opt))]
 
-    def _values(val):
-        return ", ".join(
-            v.strip().replace("-", " ")
-            for v in str(val).split(",") if v.strip()
-        )
+    def _values(key, val):
+        # The store's own names, once each. The request carries slugs, and a
+        # size merges every spelling the catalog has ("12-x-24,12x24,12x24-3"),
+        # which was printed as "12 x 24, 12x24, 12x24 3" instead of 12"x24".
+        shown, seen = [], set()
+        for raw in str(val).split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            name = None
+            try:
+                term = _sl.resolve_attribute_term(key, raw) if _sl else None
+                name = getattr(term, "name", None)
+            except Exception:
+                name = None
+            name = str(name or raw.replace("-", " ")).strip()
+            dedup = re.sub(r"[^a-z0-9]", "", name.lower())
+            if dedup and dedup not in seen:
+                seen.add(dedup)
+                shown.append(name)
+        return ", ".join(shown)
 
     missing_bits, have_bits = [], []
     for key, val in (entities.attributes or {}).items():
-        bit = f"**{_label(key)}:** {_values(val)}"
+        bit = f"**{_label(key)}:** {_values(key, val)}"
         (missing_bits if key in unsatisfied else have_bits).append(bit)
 
     product_name = parent_raw.get("name") or "This product"
@@ -816,7 +832,7 @@ def _no_variation_combination_response(
         _shim = SimpleNamespace(attributes=_satisfied_attrs)
         _partial, _ = match_variations_all_attributes(variations_raw, _shim)
 
-    lines = [f"**{product_name}** doesn't come in that combination."]
+    lines = ["Sorry, this product is unavailable. Please choose a different combination or a different product."]
     if have_bits:
         lines.append("")
         lines.append(f"Available: {' · '.join(have_bits)}")
