@@ -828,29 +828,39 @@ def _no_variation_combination_response(
         if k not in unsatisfied
     }
     _partial = []
-    if _satisfied_attrs:
+    if not unsatisfied:
+        # Each option exists, just not together: show the closest variants
+        # (the ones sharing the most of the request) instead of claiming
+        # every option is "Available".
+        _partial = match_variation_to_entities(variations_raw, entities)
+        have_bits = []
+    elif _satisfied_attrs:
         _shim = SimpleNamespace(attributes=_satisfied_attrs)
         _partial, _ = match_variations_all_attributes(variations_raw, _shim)
 
-    lines = ["Sorry, this product is unavailable. Please choose a different combination or a different product."]
+    # WooCommerce's own wording for a combination no variant has.
+    lines = ["Sorry, no products matched your selection. Please choose a different combination or a different product."]
     if have_bits:
         lines.append("")
         lines.append(f"Available: {' · '.join(have_bits)}")
     if missing_bits:
         lines.append(f"Not available: {' · '.join(missing_bits)}")
 
-    if _partial:
+    if _partial and not unsatisfied:
+        lines.append("")
+        lines.append(f"Closest available option{'' if len(_partial) == 1 else 's'}:")
+    elif _partial:
         _have_desc = " · ".join(have_bits) or "your other filters"
         lines.append("")
         lines.append(
             f"Here {'is' if len(_partial) == 1 else 'are'} the "
             f"**{len(_partial)}** matching {_have_desc}:"
         )
-        for _v in _partial[:12]:
-            _lbl = " / ".join(
-                o for o in _get_safe_options(_v.get("attributes", []), _sl).values() if o
-            )
-            lines.append(f"• **{_lbl}**")
+    for _v in _partial[:12]:
+        _lbl = " / ".join(
+            o for o in _get_safe_options(_v.get("attributes", []), _sl).values() if o
+        )
+        lines.append(f"• **{_lbl}**")
 
     # What the product DOES offer on the failed dimensions, so the shopper has
     # somewhere to go rather than just a dead end.
@@ -1024,9 +1034,15 @@ def handle_variation_product(
             _strict, _unsatisfied = match_variations_all_attributes(
                 variations_raw, entities
             )
-            if _unsatisfied:
+            # Every option exists on some variant but never all together
+            # (Kavrion Ivory Vein comes only in Matte, the shopper asked for
+            # Polished). The best-score fallback used to list the 7 variants
+            # sharing two of the three as "matching". It is the same answer
+            # as a missing option: that combination is unavailable.
+            if _unsatisfied or not _strict:
                 logger.info(
-                    f"Step 3.7: no variation satisfies {_unsatisfied} for "
+                    f"Step 3.7: no variation satisfies "
+                    f"{_unsatisfied or 'the combination'} for "
                     f"product {parent_product_raw.get('id')} — reporting the gap"
                 )
                 return _no_variation_combination_response(
