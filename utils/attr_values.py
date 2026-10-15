@@ -81,6 +81,16 @@ def attr_values_equal(attr_name, requested, actual) -> bool:
     a, b = normalize_attr_value(requested), normalize_attr_value(actual)
     if a == b:
         return True
-    if a and b and is_size_attr(attr_name):
+    if not (a and b):
+        return False
+    # A term's slug against its own display name: the classifier hands over
+    # the WooCommerce slug ("elqora-2-0-ivory-vein-hexagon-mosaic") while the
+    # variant carries the name ("Elqora 2.0 Ivory Vein Hexagon Mosaic"), so a
+    # "." (or "&", "/", ...) in the name failed every variant. Compared word
+    # by word, the way the slug was made: "2.0" -> "2 0" still differs from
+    # "20". Two terms in one attribute can't share a slug.
+    if _NON_ALNUM.sub(" ", a).split() == _NON_ALNUM.sub(" ", b).split():
+        return True
+    if is_size_attr(attr_name):
         return _NON_ALNUM.sub("", a) == _NON_ALNUM.sub("", b)
     return False

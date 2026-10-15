@@ -400,6 +400,9 @@ def _collection_and_tag_words(loader, entities: ExtractedEntities) -> set:
     return words
 
 
+_DIMENSIONAL_LABEL_WORDS = ('size', 'thickness', 'weight', 'width', 'length', 'depth', 'dimension')
+
+
 def extract_attributes(text: str, entities: ExtractedEntities) -> str:
     """Extract WooCommerce product attributes from text."""
     loader = get_store_loader()
@@ -426,6 +429,37 @@ def extract_attributes(text: str, entities: ExtractedEntities) -> str:
     _full_terms = []
     _deferred_tails = []
 
+    # Where whole non-size option names (a colour, a finish...) appear in the
+    # text. A size/thickness number that sits INSIDE one of them belongs to
+    # that name, not to a size request: "Elqora 2.0 Ivory Vein Hexagon Mosaic"
+    # is a colour, and its "2.0" read as thickness 2cm failed every variant.
+    # Needed across taxonomies because Thickness can come before Colors in
+    # loader order. Built only when a size term actually matches.
+    _named_spans = None
+
+    def _named_option_spans():
+        spans = []
+        for _attr in loader.all_attributes_raw:
+            _label = (_attr.get("attribute_label") or "").lower()
+            if any(kw in _label for kw in _DIMENSIONAL_LABEL_WORDS):
+                continue
+            for _t in _attr.get("terms") or []:
+                _n = (_t.get("name") or "").lower().strip()
+                if len(_n) < 3 or _n not in masked_text_lower:
+                    continue
+                for _m in re.finditer(rf"(?<![\w-]){re.escape(_n)}(?![\w-])", masked_text_lower):
+                    spans.append(_m.span())
+        return spans
+
+    def _dim_only_inside_names(pattern: str) -> bool:
+        nonlocal _named_spans
+        hits = [m.span() for m in re.finditer(pattern, masked_text, re.IGNORECASE)]
+        if not hits:
+            return False
+        if _named_spans is None:
+            _named_spans = _named_option_spans()
+        return all(any(s <= a and b <= e for s, e in _named_spans) for a, b in hits)
+
     for attr in loader.all_attributes_raw:
         label = attr.get("attribute_label", "").lower().strip()
         taxonomy = attr.get("taxonomy", "")
@@ -433,7 +467,7 @@ def extract_attributes(text: str, entities: ExtractedEntities) -> str:
         if not label or not taxonomy or not terms:
             continue
 
-        is_dimensional = any(kw in label for kw in ['size', 'thickness', 'weight', 'width', 'length', 'depth', 'dimension'])
+        is_dimensional = any(kw in label for kw in _DIMENSIONAL_LABEL_WORDS)
 
         # Origin keyword handling
         if "origin" in label:
@@ -458,6 +492,12 @@ def extract_attributes(text: str, entities: ExtractedEntities) -> str:
                     masked_text, term_name_lower, is_dimensional, masked_text_lower
                 )
                 if not matched_pattern:
+                    continue
+                if is_dimensional and _dim_only_inside_names(matched_pattern):
+                    logger.debug(
+                        f"[DimInsideName] {taxonomy} term {term_name_lower!r} ignored — "
+                        f"only appears inside a named option value"
+                    )
                     continue
 
                 _resolve_attribute_or_tag(
@@ -620,7 +660,9 @@ def _match_term_in_text(text: str, term_lower: str, is_dimensional: bool,
             escaped_dim = re.escape(term_dim)
             if 'x' in escaped_dim:
                 escaped_dim = escaped_dim.replace('x', r'\s*"?\s*(?:x|by|×)\s*')
-            dim_pattern = rf"(?<!\d){escaped_dim}\s*(?:\"|'|mm|cm|inch(?:es)?|in\.?|thick|lbs?|oz|kg|g)?(?!\d)"
+            # Not part of a decimal: "2.0" in "Elqora 2.0 Ivory Vein" or the
+            # product "Zorvane 2.0" is a version number, not thickness "2cm".
+            dim_pattern = rf"(?<![\d.]){escaped_dim}\s*(?:\"|'|mm|cm|inch(?:es)?|in\.?|thick|lbs?|oz|kg|g)?(?!\.?\d)"
             match = re.search(dim_pattern, text, re.IGNORECASE)
             if match:
                 if 'x' not in term_dim:
