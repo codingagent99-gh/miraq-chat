@@ -590,6 +590,16 @@ def generate_bot_message(
             
         has_attributes = bool(entities.attributes)
         has_stock_filter = getattr(entities, 'in_stock', None) is not None
+
+        # A variable product the store returns with no variants at all (e.g.
+        # Marqivo: variations [], not purchasable) can't be bought in any
+        # combination. Same wording as the product page shows for it.
+        if (
+            not variations
+            and parent.get("type") == "variable"
+            and not parent.get("variations")
+        ):
+            return "This product is currently out of stock and unavailable."
         
         def _get_var_label(v):
             """Safely build a variation label from either standard or custom API formats."""
