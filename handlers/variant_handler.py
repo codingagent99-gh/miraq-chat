@@ -356,6 +356,21 @@ def handle_variant_selection(
 
     is_fully_resolved = len(missing_required) == 0
 
+    if len(matched) > 1 and is_fully_resolved:
+        # Several fit (e.g. two "Any size" Porcelain / Ribbed rows, 8263 $23
+        # and 8265 $567). Prefer the variant naming the most options, then the
+        # store's own variant order — not whatever order the API listed.
+        def _named_options(v):
+            attrs = v.get("attributes") or []
+            if isinstance(attrs, dict):
+                return sum(1 for x in attrs.values() if x)
+            return sum(1 for a in attrs if isinstance(a, dict) and a.get("option"))
+
+        matched = sorted(
+            matched,
+            key=lambda v: (-_named_options(v), v.get("menu_order") or 0, v.get("id") or 0),
+        )
+
     if len(matched) >= 1 and is_fully_resolved:
         _resolved_variation = matched[0]
         _resolved_variation_id = _resolved_variation["id"]
@@ -623,7 +638,7 @@ def promote_fully_specified_single_product(intent, entities, all_products_raw) -
     return True
 
 
-def _seed_resolved_from_entities(entities, variations: list, store_loader) -> dict:
+def _seed_resolved_from_entities(entities, variations: list, store_loader, parent_attributes=None) -> dict:
     """
     Map the attributes the user already stated (entities.attributes) onto the
     variation axis they belong to, by matching VALUES against each axis's
@@ -666,6 +681,20 @@ def _seed_resolved_from_entities(entities, variations: list, store_loader) -> di
                 if req and (req in opt_norm or opt_norm in req):
                     seeded[axis_name] = opt_display
                     break
+
+    # An axis every variant leaves on "Any" never shows its values on the
+    # variants (Tavriq's sample sizes 3"x3" / 6"x6" exist only as product
+    # options). Seed it from the product's own options — exact value only.
+    for pattr in parent_attributes or []:
+        if not (isinstance(pattr, dict) and pattr.get("variation")):
+            continue
+        axis_name = _attribute_display_name(pattr.get("name", ""), store_loader)
+        if not axis_name or axis_name in seeded:
+            continue
+        for opt in pattr.get("options") or []:
+            if _norm(opt) and _norm(opt) in requested:
+                seeded[axis_name] = str(opt)
+                break
     return seeded
 
 
@@ -691,22 +720,35 @@ def _variations_matching_resolved(variations: list, resolved: dict, store_loader
     if not resolved_norm:
         return []
 
-    matches = []
-    for var in variations:
+    # A blank/absent axis is WooCommerce's "Any": the variant takes whatever
+    # value the shopper picks (Tavriq Porcelain / Ribbed has "Any" sample
+    # size). It matches, but ranks below a variant naming the value exactly.
+    scored = []
+    for pos, var in enumerate(variations):
         if not isinstance(var, dict):
             continue
         opts = _get_safe_options(var.get("attributes", []), store_loader)
         opts_norm = {_slugify(k): _slugify(v) for k, v in opts.items() if v}
-        # .get() returns None for a blank/absent axis → wildcards never match
-        if all(opts_norm.get(axis) == val for axis, val in resolved_norm.items()):
-            matches.append(var)
+        exact = 0
+        ok = True
+        for axis, val in resolved_norm.items():
+            have = opts_norm.get(axis)
+            if have == val:
+                exact += 1
+            elif have:              # a different, named value
+                ok = False
+                break
+        if ok:
+            scored.append((var, exact, pos))
+    if not scored:
+        return []
 
-    in_stock = [
-        v for v in matches
-        if v.get("stock_status") != "outofstock" and v.get("in_stock") is not False
-    ]
-    in_stock_ids = {id(v) for v in in_stock}
-    return in_stock + [v for v in matches if id(v) not in in_stock_ids]
+    def _rank(item):
+        var, exact, pos = item
+        out = var.get("stock_status") == "outofstock" or var.get("in_stock") is False
+        return (-exact, out, var.get("menu_order") or 0, pos)
+
+    return [var for var, _, _ in sorted(scored, key=_rank)]
 
 
 def _fully_resolved_variation(
@@ -1356,6 +1398,25 @@ def handle_variation_product(
                 else:
                     _not_offered = _ek
                 break
+        # Show the chosen "Any" value on the card too, so its Order button
+        # sends the full spec ("… / Tavriq Porcelain / 3"x3"") and the order
+        # flow doesn't have to ask for the size again.
+        _filled = [
+            (k, v) for k, v in var_attrs.items()
+            if k not in _get_safe_options(resolved_variation.get("attributes", []), _sl)
+        ]
+        if _filled and not _not_offered:
+            for _card in variation_products or []:
+                if _card.get("id") != resolved_variation.get("id"):
+                    continue
+                _card["attributes"] = list(_card.get("attributes") or []) + [
+                    {"name": k, "option": v} for k, v in _filled
+                ]
+                _lbl = _card.get("variation_label") or ""
+                _extra = " / ".join(v for _, v in _filled)
+                _card["variation_label"] = f"{_lbl} / {_extra}" if _lbl else _extra
+                _card["name"] = f"{parent_formatted.get('name', '')} - {_card['variation_label']}"
+
         if _not_offered:
             logger.info(
                 f"Step 3.7: '{_not_offered}' value not offered by product "
@@ -1738,7 +1799,9 @@ def handle_quantity_and_variant_check(
                         "pagination": default_pagination(page),
                     }), 200
             _variant_options = _compute_variant_options(_raw_for_prompt, getattr(entities, 'attributes', {}), _variations_for_cache, display_to_slug)
-            _seeded = _seed_resolved_from_entities(entities, _variations_for_cache, _sl)
+            _seeded = _seed_resolved_from_entities(
+                entities, _variations_for_cache, _sl, (_raw_for_prompt or {}).get("attributes")
+            )
             if _seeded:
                 logger.info(f"Step 5.5 (variant prompt): Seeded resolved axes from user input → {_seeded}")
                 # The user named a specific axis (e.g. a colour) — show that
@@ -1905,7 +1968,9 @@ def handle_quantity_and_variant_check(
         # Axes the user already stated (e.g. "Adams Beige" → Colors). Returned in
         # metadata so the caller persists them; this keeps the stated color from
         # being re-asked after the remaining axes (Finish/Sample Size) are answered.
-        _seeded = _seed_resolved_from_entities(entities, _variations_for_cache, _sl)
+        _seeded = _seed_resolved_from_entities(
+            entities, _variations_for_cache, _sl, (_raw_for_prompt or {}).get("attributes")
+        )
         if _seeded:
             logger.info(f"Step 3.7 (quick): Seeded resolved axes from user input → {_seeded}")
 
@@ -1932,7 +1997,12 @@ def handle_quantity_and_variant_check(
                     "pagination": default_pagination(page),
                 }), 200
 
-            _var_label = " / ".join(_get_safe_options(_exact_var.get("attributes", []), _sl).values())
+            _var_opts = _get_safe_options(_exact_var.get("attributes", []), _sl)
+            # An "Any" axis has no value on the variant — show the one chosen.
+            _var_label = " / ".join(
+                list(_var_opts.values())
+                + [v for k, v in _seeded.items() if k not in _var_opts and v]
+            )
             _variant_suffix = f" ({_var_label})" if _var_label else ""
             _variant_images = _variation_images_for_resolved(_variations_for_cache, _seeded, _sl)
             if _variant_images:
