@@ -393,6 +393,9 @@ LLM_API_BASE_URL: str = _resolve_llm_api_base_url()
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "500"))
 LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "10"))
+# Reasoning models (e.g. mistral-large-4) think by default. Set to "none" to skip
+# the thinking step (fewer tokens, lower latency). Empty = parameter not sent.
+LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "").strip()
 
 # Feature flags
 LLM_FALLBACK_ENABLED = os.getenv("LLM_FALLBACK_ENABLED", "true").lower() == "true"

@@ -27,6 +27,7 @@ from app_config import (
     LLM_TEMPERATURE,
     LLM_MAX_TOKENS,
     LLM_TIMEOUT_SECONDS,
+    LLM_REASONING_EFFORT,
     LLM_COST_PER_1K_INPUT,
     LLM_COST_PER_1K_OUTPUT,
 )
@@ -463,6 +464,8 @@ class LLMClient:
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
         }
+        if LLM_REASONING_EFFORT:
+            payload["reasoning_effort"] = LLM_REASONING_EFFORT
         
         response = requests.post(
             self.api_url,
@@ -476,6 +479,14 @@ class LLMClient:
         
         # Extract response
         content = data["choices"][0]["message"]["content"]
+        # Reasoning models (mistral-large-4) return a list of chunks:
+        # [{"type": "thinking", ...}, {"type": "text", "text": "..."}].
+        # Keep only the answer text; the thinking is never shown or parsed.
+        if isinstance(content, list):
+            content = "".join(
+                c.get("text", "") for c in content
+                if isinstance(c, dict) and c.get("type") == "text"
+            )
         usage = data.get("usage", {})
         
         return {
