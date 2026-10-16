@@ -475,6 +475,40 @@ def extract_attributes(text: str, entities: ExtractedEntities) -> str:
             _named_spans = _named_option_spans()
         return all(any(s <= a and b <= e for s, e in _named_spans) for a, b in hits)
 
+    # Store tag / category names present in the text. An option value seen
+    # only inside a longer one of these is part of that name, not a filter:
+    # "Titan Marbles Series tag" also read "marble" as Visual = Marble, and
+    # the tag AND that attribute dropped the tag's products that aren't
+    # marked Marble. Built only when an option value matches.
+    _store_name_spans = None
+
+    def _only_inside_store_names(pattern: str, term_lower: str) -> bool:
+        nonlocal _store_name_spans
+        hits = [m.span() for m in re.finditer(pattern, masked_text, re.IGNORECASE)]
+        if not hits:
+            return False
+        if _store_name_spans is None:
+            _store_name_spans = []
+            _names = list((getattr(loader, "tag_by_name_lower", None) or {}).items())
+            _names += [
+                (getattr(c, "name", "").lower().strip(), {"count": getattr(c, "count", 0)})
+                for c in (getattr(loader, "category_by_key", None) or {}).values()
+            ]
+            for _n, _entry in _names:
+                if len(_n) < 4 or not (_entry or {}).get("count", 0):
+                    continue
+                if _n[:-1] not in masked_text_lower:   # fast reject, plural-tolerant
+                    continue
+                try:
+                    for _m in re.finditer(create_flexible_pattern(_n), masked_text_lower):
+                        _store_name_spans.append((_m.span(), _n))
+                except re.error:
+                    pass
+        return all(
+            any(s <= a and b <= e and len(_n) > len(term_lower) for (s, e), _n in _store_name_spans)
+            for a, b in hits
+        )
+
     for attr in loader.all_attributes_raw:
         label = attr.get("attribute_label", "").lower().strip()
         taxonomy = attr.get("taxonomy", "")
@@ -512,6 +546,12 @@ def extract_attributes(text: str, entities: ExtractedEntities) -> str:
                     logger.debug(
                         f"[DimInsideName] {taxonomy} term {term_name_lower!r} ignored — "
                         f"only appears inside a named option value"
+                    )
+                    continue
+                if not is_dimensional and _only_inside_store_names(matched_pattern, term_name_lower):
+                    logger.debug(
+                        f"[TermInsideStoreName] {taxonomy} term {term_name_lower!r} ignored — "
+                        f"only appears inside a store tag/category name"
                     )
                     continue
 
