@@ -1811,7 +1811,15 @@ def _build_final_response(
 
     if intent in (Intent.CATEGORY_LIST, Intent.PRODUCT_CATALOG):
         seen_names = set()
-        for cat in all_products_raw:
+        # Same-name categories show once; the tile stands for the top-level
+        # one (that is what its click resolves to), so list it — and its
+        # count — rather than whichever sub-category sorted first.
+        _cats = sorted(all_products_raw, key=lambda c: 1 if c.get("parent") else 0)
+        _order = {id(c): i for i, c in enumerate(all_products_raw)}
+        _first = {}
+        for cat in _cats:
+            _first.setdefault(cat.get("name", ""), cat)
+        for cat in sorted(_first.values(), key=lambda c: _order[id(c)]):
             name = cat.get("name", "")
             if name and name not in seen_names:
                 seen_names.add(name)

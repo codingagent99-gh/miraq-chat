@@ -350,6 +350,21 @@ def extract_category(text: str, entities: ExtractedEntities) -> str:
     if not hasattr(entities, 'target_category_slugs'):
         entities.target_category_slugs = set()
 
+    if not linked_children:
+        # One name, several categories: the store has a top-level "Wall" plus
+        # "Wall" under Exterior and under Interior. A bare "Wall category"
+        # (what the Wall tile sends) means the top-level one — it was
+        # returning all three. Naming the parent ("exterior wall", "Wall
+        # (Interior)") is handled by linked_children above.
+        _by_name = {}
+        for cat in extracted_cats:
+            _by_name.setdefault(cat.get("name", "").lower().strip(), []).append(cat)
+        _kept = []
+        for _group in _by_name.values():
+            _top = [c for c in _group if not c.get("parent")]
+            _kept.extend(_top if len(_group) > 1 and _top else _group)
+        extracted_cats = _kept
+
     if linked_children:
         for child in linked_children:
             entities.target_category_slugs.add(_resolve_category_key_with_fallback(loader, child.get("slug")))
