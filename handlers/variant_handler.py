@@ -30,6 +30,7 @@ from handlers.chat_utils import (
     _TOKENIZE_RE,
 )
 from api_builder import match_variation_to_entities, match_variations_all_attributes
+from utils.attr_values import normalize_attr_value, attr_name_matches, attr_values_equal
 from datetime import datetime, timezone
 from sqlalchemy.orm.attributes import flag_modified
 from store_registry import get_store_loader
@@ -761,6 +762,81 @@ def _variation_images_for_resolved(variations: list, resolved: dict, store_loade
     return []
 
 
+# WooCommerce's own wording, so the chat says what the product page says.
+_UNAVAILABLE_TEXT = (
+    "Sorry, this product is unavailable. Please choose a different combination "
+    "or a different product."
+)
+_NO_MATCH_TEXT = (
+    "Sorry, no products matched your selection. Please choose a different "
+    "combination or a different product."
+)
+
+
+def _variation_buyable(variation) -> bool:
+    """Has a price and isn't out of stock (backorders count as buyable)."""
+    if not variation or str(variation.get("price") or "").strip() == "":
+        return False
+    status = str(variation.get("stock_status") or "").lower()
+    if status:
+        return status != "outofstock"
+    return variation.get("in_stock") is not False
+
+
+def _wildcard_covering_variation(variations_raw, entities):
+    """A variant left on "Any" for some option that still fits the request.
+
+    WooCommerce matches the shopper's selection to such a variant (Quavelle's
+    blank variant 8611 is "Any" for everything), so the product page says
+    "unavailable" — not "no products matched" — when that variant can't be
+    bought. Returns the first such variant, or None.
+    """
+    from api_builder import _normalize_variation_attrs
+    dims = []
+    for label, val in (getattr(entities, "attributes", None) or {}).items():
+        vals = [normalize_attr_value(x) for x in str(val).split(",") if x.strip()]
+        if vals:
+            dims.append((label.replace("-", " ").strip().lower(), vals))
+    if not dims:
+        return None
+    for v in variations_raw or []:
+        attrs = _normalize_variation_attrs(v)
+        wildcard, covered = False, True
+        for ent_k, vals in dims:
+            hit = False
+            for k, vv in attrs.items():
+                if not attr_name_matches(ent_k, k):
+                    continue
+                if not vv:
+                    hit = wildcard = True
+                elif any(vv == x or attr_values_equal(ent_k, x, vv) for x in vals):
+                    hit = True
+                break
+            if not hit:
+                covered = False
+                break
+        if covered and wildcard:
+            return v
+    return None
+
+
+def _variation_unavailable_response(parent_formatted, conversation, page, start_time):
+    """The requested variant exists but can't be bought (out of stock / no price)."""
+    elapsed = round((time.time() - start_time) * 1000)
+    return jsonify({
+        "success": True,
+        "bot_message": _UNAVAILABLE_TEXT,
+        "intent": "product_variations",
+        "products": [parent_formatted],
+        "actions": [],
+        "suggestions": [],
+        "session_id": str(conversation.id),
+        "metadata": {"variant_unavailable": True, "response_time_ms": elapsed},
+        "flow_state": conversation.flow_state,
+        "pagination": default_pagination(page),
+    }), 200
+
+
 def _no_variation_combination_response(
     parent_raw, parent_formatted, entities, unsatisfied,
     variations_raw, conversation, page, start_time,
@@ -838,8 +914,10 @@ def _no_variation_combination_response(
         _shim = SimpleNamespace(attributes=_satisfied_attrs)
         _partial, _ = match_variations_all_attributes(variations_raw, _shim)
 
-    # WooCommerce's own wording for a combination no variant has.
-    lines = ["Sorry, no products matched your selection. Please choose a different combination or a different product."]
+    # Same wording as the product page: an "Any" variant that fits but can't
+    # be bought makes it "unavailable"; otherwise no variant has the combination.
+    _wild = _wildcard_covering_variation(variations_raw, entities)
+    lines = [_UNAVAILABLE_TEXT if _wild is not None and not _variation_buyable(_wild) else _NO_MATCH_TEXT]
     if have_bits:
         lines.append("")
         lines.append(f"Available: {' · '.join(have_bits)}")
@@ -1215,6 +1293,20 @@ def handle_variation_product(
             next_flow_state = FlowState.AWAITING_VARIANT_SELECTION.value
             suggestions = ["Cancel"]
         # Browsing intent — show all variations, remain IDLE
+
+    # The exact variant asked for exists but can't be bought: say so, as the
+    # product page does, instead of offering to add it to the cart.
+    if (
+        resolved_variation is not None
+        and conversation is not None
+        and intent in (Intent.PRODUCT_VARIATIONS, Intent.PRODUCT_DETAIL, Intent.PRODUCT_SEARCH)
+        and not _variation_buyable(resolved_variation)
+    ):
+        logger.info(
+            f"Step 3.7: variation {resolved_variation.get('id')} matched but is not "
+            f"buyable (stock/price) — reporting unavailable"
+        )
+        return _variation_unavailable_response(parent_formatted, conversation, page, start_time)
 
     if resolved_variation and user_context is not None and conversation is not None:
 
