@@ -442,6 +442,11 @@ def _normalise_product(p: dict, idx: int, store_domain: str = "") -> dict:
     images   = [edge["node"] for edge in (p.get("images")   or {}).get("edges", [])]
     cat_edges = (p.get("collections") or {}).get("edges", [])
 
+    _product_available = (
+        any(bool(v.get("availableForSale")) for v in variants)
+        or (p.get("totalInventory") or 0) > 0
+    )
+
     # Variants → Woo-shaped variation dicts
     variation_dicts = []
     any_variant_on_sale = False
@@ -511,8 +516,11 @@ def _normalise_product(p: dict, idx: int, store_domain: str = "") -> dict:
         # SALE badge without inventing a parent price that does not exist.
         "sale_price":    "",
         "on_sale":       any_variant_on_sale,
-        "stock_status":  "instock" if (p.get("totalInventory") or 0) > 0 else "outofstock",
-        "in_stock":      (p.get("totalInventory") or 0) > 0,
+        # Shopify's own "can be bought" flag. totalInventory alone is 0 for a
+        # product that doesn't track quantity, or sells on when out of stock,
+        # so those were shown as out of stock (and left out of "What's new").
+        "stock_status":  "instock" if _product_available else "outofstock",
+        "in_stock":      _product_available,
         "permalink":     f"https://{store_domain}/products/{p.get('handle','')}",
         # Same key WooCommerce's REST product carries, so the "What's new"
         # index (lookup_builder.build_newest_index) reads one field for both
@@ -645,6 +653,8 @@ query Product($id: ID!) {
     vendor
     tags
     status
+    createdAt
+    publishedAt
     totalInventory
     priceRangeV2 {
       minVariantPrice { amount currencyCode }
