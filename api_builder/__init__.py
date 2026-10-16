@@ -107,9 +107,16 @@ def match_variations_all_attributes(variations: list, entities):
 
     def _dimension_hit(var_attrs, ent_k, ent_values):
         for v_k, v_v in var_attrs.items():
-            if not v_v:
+            if not attr_name_matches(ent_k, v_k):
                 continue
-            if attr_name_matches(ent_k, v_k):
+            if not v_v:
+                # "Any" in WooCommerce: the variant takes whichever value the
+                # shopper picks (Tavriq Charcoal Mist / Matte is "Any" sample
+                # size, and the product page sells it in 3"x3"). Exact
+                # matches still win below; the handler checks the value is
+                # one the product actually offers.
+                return True
+            if v_v:
                 for ent_v in ent_values:
                     if ent_v == v_v or ent_v in v_v or v_v in ent_v:
                         return True
@@ -158,6 +165,18 @@ def match_variations_all_attributes(variations: list, entities):
                     exact.append(variation)
             if exact:
                 matches = exact
+
+    # Identical variants (same options, e.g. two "Matte / Charcoal Mist /
+    # Any size" rows at different prices) are one choice to the shopper.
+    # WooCommerce sells the first one in the product's variant order.
+    if len(matches) > 1:
+        _seen, _kept = set(), []
+        for variation in matches:
+            _key = tuple(sorted(_normalize_variation_attrs(variation).items()))
+            if _key not in _seen:
+                _seen.add(_key)
+                _kept.append(variation)
+        matches = _kept
 
     unsatisfied = [label for label, ok in satisfied_anywhere.items() if not ok]
     return matches, unsatisfied

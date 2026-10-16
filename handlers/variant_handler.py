@@ -938,7 +938,8 @@ def _no_variation_combination_response(
         _lbl = " / ".join(
             o for o in _get_safe_options(_v.get("attributes", []), _sl).values() if o
         )
-        lines.append(f"• **{_lbl}**")
+        if _lbl:
+            lines.append(f"• **{_lbl}**")
 
     # What the product DOES offer on the failed dimensions, so the shopper has
     # somewhere to go rather than just a dead end.
@@ -1329,6 +1330,42 @@ def handle_variation_product(
                 )
 
         var_attrs = _get_safe_options(resolved_variation.get("attributes", []), _sl)
+
+        # An "Any" option on the matched variant takes the value the shopper
+        # asked for — if the product offers it (Tavriq Charcoal Mist / Matte
+        # has "Any" sample size; 3"x3" is one of the product's sizes). The
+        # value goes into resolved_attributes so the cart add carries it.
+        _not_offered = None
+        for _pattr in parent_product_raw.get("attributes", []):
+            if not (isinstance(_pattr, dict) and _pattr.get("variation")):
+                continue
+            _axis = _attribute_display_name(_pattr.get("name", ""), _sl)
+            if _axis in var_attrs:
+                continue
+            for _ek, _ev in (getattr(entities, "attributes", None) or {}).items():
+                if not attr_name_matches(_ek, _pattr.get("name", "")):
+                    continue
+                _wanted = [w for w in str(_ev).split(",") if w.strip()]
+                _opt = next(
+                    (o for o in (_pattr.get("options") or [])
+                     if any(attr_values_equal(_ek, w, o) for w in _wanted)),
+                    None,
+                )
+                if _opt:
+                    var_attrs[_axis] = _opt
+                else:
+                    _not_offered = _ek
+                break
+        if _not_offered:
+            logger.info(
+                f"Step 3.7: '{_not_offered}' value not offered by product "
+                f"{parent_product_raw.get('id')} — reporting the gap"
+            )
+            return _no_variation_combination_response(
+                parent_product_raw, parent_formatted, entities, [_not_offered],
+                variations_raw, conversation, page, start_time,
+            )
+
         all_variation_axes = {
             _attribute_display_name(attr.get("name", ""), _sl)
             for attr in parent_product_raw.get("attributes", [])
