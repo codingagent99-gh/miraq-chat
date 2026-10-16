@@ -1816,18 +1816,26 @@ def _build_final_response(
         # count — rather than whichever sub-category sorted first.
         _cats = sorted(all_products_raw, key=lambda c: 1 if c.get("parent") else 0)
         _order = {id(c): i for i, c in enumerate(all_products_raw)}
+        # PRODUCT_CATALOG lists tags too. Categories carry "parent" (Woo and
+        # the Shopify loader both); tags never do. The type goes to the widget
+        # so a tag tile asks for "X tag", not "X category" — "Glossy Finish
+        # category" named no category and returned the wrong products.
+        def _kind(c):
+            return "category" if "parent" in c else "tag"
+
         _first = {}
         for cat in _cats:
-            _first.setdefault(cat.get("name", ""), cat)
+            _first.setdefault((_kind(cat), cat.get("name", "")), cat)
         for cat in sorted(_first.values(), key=lambda c: _order[id(c)]):
             name = cat.get("name", "")
-            if name and name not in seen_names:
-                seen_names.add(name)
+            if name and (_kind(cat), name) not in seen_names:
+                seen_names.add((_kind(cat), name))
                 categories.append({
                     "id":    cat.get("id"),
                     "name":  name.replace("&amp;", "&"),
                     "slug":  cat.get("slug", ""),
                     "count": cat.get("count", 0),
+                    "type":  _kind(cat),
                 })
     else:
         for p in all_products_raw:
@@ -1850,7 +1858,11 @@ def _build_final_response(
             break
 
     if intent in (Intent.CATEGORY_LIST, Intent.PRODUCT_CATALOG):
-        bot_message      = "Here are our top categories to help you get started!"
+        bot_message      = (
+            "Here's our catalog — browse by category or tag:"
+            if any(c.get("type") == "tag" for c in categories)
+            else "Here are our top categories to help you get started!"
+        )
         suggestions_list = ["Cancel"]
     else:
         import timing_logger
