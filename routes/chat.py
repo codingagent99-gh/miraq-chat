@@ -83,7 +83,7 @@ from models.usage_guard import enforce_daily_limit
 
 from handlers.chat_utils import default_pagination, build_pagination, format_order_for_frontend
 from handlers.flow_handler import handle_flow
-from handlers.llm_handler import run_llm_fallback
+from handlers.llm_handler import run_llm_fallback, history_for_llm
 from handlers.order_handler import (
     handle_reorder,
     handle_order_detail,
@@ -2903,7 +2903,7 @@ def chat():
             confidence            = 1.0
 
         # ── Step 4: LLM fallback ──
-        session_history = [{"role": m.role, "message": m.content} for m in conversation.messages[-4:-1]]
+        session_history = history_for_llm(conversation.messages[-4:-1])
 
         _trace_used_llm = False
         if not _resolve_variant and not _clarification_resolved:

@@ -293,7 +293,7 @@ class ExtractedEntities:
     order_count: Optional[int] = None
     order_item_name: Optional[str] = None
     explicit_last_order: bool = False
-    lookup_email: Optional[str] = None
+    lookup_email: Optional[str] = field(default=None, metadata={"llm_exclude": "pii"})
 
     # ──── Attribute info query ────
     target_attribute: Optional[str] = None

@@ -8,6 +8,7 @@ or a Flask response directly for conversational/disambiguation cases.
 
 from flask import jsonify
 import dataclasses
+import re
 from models import Intent, ExtractedEntities, ClassifiedResult
 from conversation_flow import FlowState
 from app_config import (
@@ -58,8 +59,55 @@ def _build_entities_summary(entities: ExtractedEntities) -> dict:
             continue
         if isinstance(value, (list, set, dict)) and not value:
             continue
-        summary[f.name] = sorted(value) if isinstance(value, set) else value
+        summary[f.name] = _mask_emails(sorted(value) if isinstance(value, set) else value)
     return summary
+
+
+# Entities are extracted from the shopper's raw message, so a free-text field
+# (search term, product name...) can still hold an email address they typed.
+# Shopper emails must never reach the LLM provider.
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+
+
+def _mask_emails(value):
+    if isinstance(value, str):
+        return _EMAIL_RE.sub("[EMAIL]", value)
+    if isinstance(value, dict):
+        return {k: _mask_emails(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_mask_emails(v) for v in value]
+    return value
+
+
+# Bot replies on these topics are product browsing only. Anything else (orders,
+# customer details, addresses, account...) can contain a shopper's personal
+# data, so its text is replaced before the history goes to the LLM provider.
+_LLM_SAFE_REPLY_PREFIXES = (
+    "product", "category", "filter", "most_popular", "related", "discount",
+    "bulk_discount", "clearance", "promotion", "coupon", "greeting",
+    "disambiguation", "conversational", "unknown",
+)
+_OMITTED_REPLY = "[reply omitted]"
+
+
+def history_for_llm(messages) -> list:
+    """Recent messages as {"role", "message"} dicts for the LLM prompt.
+
+    Shopper messages pass through (llm_fallback sanitises emails/phones in
+    them). A bot reply is kept only when its stored intent is product
+    browsing; every other bot reply is replaced with a placeholder.
+    """
+    out = []
+    for m in messages:
+        content = m.content
+        if m.role != "user":
+            intent = (m.intent or "").lower()
+            if not intent.startswith(_LLM_SAFE_REPLY_PREFIXES):
+                content = _OMITTED_REPLY
+        out.append({"role": m.role, "message": content})
+    return out
+
+
 def run_llm_fallback(
     message: str,
     intent: Intent,
