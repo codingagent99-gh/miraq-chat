@@ -9,8 +9,8 @@ file without any new logging machinery:
 
 Two lines per request:
 
-    [2026-09-09 09:50:00.127] START | req=a1b2c3d4 | caller=127.0.0.1 | session=fcd7e7f3 | message="12x24 tiles"
-    [2026-09-09 09:50:04.302] DONE  | req=a1b2c3d4 | caller=127.0.0.1 | session=fcd7e7f3 | message="12x24 tiles" | duration=4.17s | status=200
+    [2026-09-09 09:50:00.127] START | req=a1b2c3d4 | caller=127.0.0.1 | session=fcd7e7f3 | msg_len=12
+    [2026-09-09 09:50:04.302] DONE  | req=a1b2c3d4 | caller=127.0.0.0 | session=fcd7e7f3 | msg_len=12 | duration=4.17s | status=200
 
 req is a short id, unique per request. Needed because caller + session alone
 can't tell apart two concurrent identical messages from the SAME user/session
@@ -100,8 +100,19 @@ def _format_buckets():
     return f" | {rendered} other={other:.2f}s" if rendered else f" | other={other:.2f}s"
 
 
+def _mask_ip(ip):
+    """Last IPv4 octet zeroed / IPv6 truncated to its first 48 bits, so the log
+    shows where load came from without identifying a visitor."""
+    if not ip:
+        return ""
+    if ":" in ip:
+        return ":".join(ip.split(":")[:3]) + "::"
+    parts = ip.split(".")
+    return ".".join(parts[:3] + ["0"]) if len(parts) == 4 else ""
+
+
 def _caller_and_session(body):
-    caller = request.remote_addr or ""
+    caller = _mask_ip(request.remote_addr or "")
     session = (
         request.headers.get("X-MiraQ-Session")
         or (body.get("session_id") if isinstance(body, dict) else None)
@@ -117,20 +128,21 @@ def start_request():
     g._t0 = time.perf_counter()
     g._t_req_id = uuid.uuid4().hex[:8]
 
-    message = ""
+    # Only the LENGTH of the shopper's message is recorded, never its text.
+    msg_len = 0
     try:
         body = request.get_json(silent=True) or {}
-        message = str(body.get("message", ""))[:120].replace("\n", " ")
+        msg_len = len(str(body.get("message", "")))
     except Exception:
         body = {}
-    g._t_message = message
+    g._t_msg_len = msg_len
 
     caller, session = _caller_and_session(body if isinstance(body, dict) else {})
     g._t_caller = caller
     g._t_session = session
 
     get_timing_logger().info(
-        f'START | req={g._t_req_id} | caller={caller} | session={session} | message="{message}"'
+        f'START | req={g._t_req_id} | caller={caller} | session={session} | msg_len={msg_len}'
     )
 
 
@@ -151,7 +163,7 @@ def end_request(response):
 
     get_timing_logger().info(
         f'DONE  | req={getattr(g, "_t_req_id", "")} | caller={getattr(g, "_t_caller", "")} | '
-        f'session={getattr(g, "_t_session", "")} | message="{getattr(g, "_t_message", "")}" | '
+        f'session={getattr(g, "_t_session", "")} | msg_len={getattr(g, "_t_msg_len", 0)} | '
         f'duration={duration} | status={response.status_code}{_format_buckets()}{_pool_stats()}'
     )
     return response
@@ -170,7 +182,7 @@ def teardown(exc=None):
 
     get_timing_logger().info(
         f'DONE  | req={getattr(g, "_t_req_id", "")} | caller={getattr(g, "_t_caller", "")} | '
-        f'session={getattr(g, "_t_session", "")} | message="{getattr(g, "_t_message", "")}" | '
+        f'session={getattr(g, "_t_session", "")} | msg_len={getattr(g, "_t_msg_len", 0)} | '
         f'duration={duration} | status=EXCEPTION{_format_buckets()}{_pool_stats()}'
     )
 

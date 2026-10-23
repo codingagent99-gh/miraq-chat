@@ -4,6 +4,7 @@ WooCommerce API client for executing API calls.
 
 from typing import List
 import json as _json
+import re as _re
 import threading as _threading
 import time as _health_time
 import requests as http_requests
@@ -17,6 +18,31 @@ from chat_logger import get_logger, get_api_logger, get_order_logger, sanitize_u
 logger = get_logger("miraq_chat")
 api_logger = get_api_logger()
 order_logger = get_order_logger()
+
+# ── Log redaction ────────────────────────────────────────────────────────────
+# api.txt / orders.txt / chat.txt must not hold shoppers' contact or delivery
+# details (Privacy Policy, Technical Logs). Keys below are replaced wholesale;
+# any email address left in a string value is masked too.
+_LOG_REDACT_KEYS = frozenset({
+    "email", "phone", "billing", "shipping", "first_name", "last_name",
+    "address_1", "address_2", "address", "city", "postcode", "postal_code",
+    "zip", "customer_note", "order_notes",
+})
+_LOG_EMAIL_RE = _re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+
+
+def _redact_for_log(value):
+    """Copy of `value` that is safe to write to a log file."""
+    if isinstance(value, dict):
+        return {
+            k: ("***" if str(k).lower() in _LOG_REDACT_KEYS else _redact_for_log(v))
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_for_log(v) for v in value]
+    if isinstance(value, str):
+        return _LOG_EMAIL_RE.sub("***@***", value)
+    return value
 
 # ══════════════════════════════════════════════════════════════════════
 # Upstream (WooCommerce/WordPress) health, observed from real traffic.
@@ -296,20 +322,27 @@ class WooClient:
         # ── Logging ───────────────────────────────────────────────────────────
         sanitized_endpoint = sanitize_url(endpoint)
         endpoint_short     = sanitized_endpoint.split("/")[-1]
-        safe_params        = {k: v for k, v in params.items()
-                              if k not in ("consumer_key", "consumer_secret")}
+        safe_params        = _redact_for_log(
+            {k: v for k, v in params.items()
+             if k not in ("consumer_key", "consumer_secret")}
+        )
 
         context = ""
         if api_call.session_id or api_call.user_message:
-            context = f" | session={api_call.session_id} | q={api_call.user_message!r}"
+            context = (
+                f" | session={api_call.session_id}"
+                f" | q={_redact_for_log(api_call.user_message)!r}"
+            )
 
         if api_call.method == "GET":
             _api_log.info(f"REQUEST GET {sanitized_endpoint} | params={safe_params}{context}")
         else:
             try:
-                body_str = _json.dumps(api_call.body, separators=(",", ":"))
+                body_str = _json.dumps(
+                    _redact_for_log(api_call.body), separators=(",", ":")
+                )
             except Exception:
-                body_str = str(api_call.body)
+                body_str = "<unserializable body>"
             _api_log.info(f"REQUEST {api_call.method} {sanitized_endpoint} | body={body_str}{context}")
 
         # The body matters as much as the params on POST endpoints — a
@@ -463,6 +496,7 @@ class WooClient:
                     )
                 except Exception:
                     pass
+            body_preview = _redact_for_log(body_preview)
             _elapsed_ms = round((_time.time() - _req_start) * 1000)
             _record_upstream("failed", endpoint_short, str(e), tenant_key=loader.tenant_id)
             _api_log.error(

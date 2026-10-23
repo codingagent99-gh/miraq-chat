@@ -327,8 +327,6 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
     source_order = order_data[0]
     
     logger.debug(f"[DEBUG] source_order keys: {list(source_order.keys())}")
-    logger.debug(f"[DEBUG] source_order shipping: {source_order.get('shipping')}")
-    logger.debug(f"[DEBUG] source_order billing: {source_order.get('billing')}")
         
     # Security check to ensure they own the order they are trying to reorder!
     def _extract_id(val) -> str:

@@ -444,7 +444,7 @@ def _resolve_rep_clause(raw: str):
     hits = exact or partial
     if len(hits) == 1:
         name, email = hits[0]
-        logger.info(f"[FieldClause] rep '{raw}' → {name} <{email}>")
+        logger.info(f"[FieldClause] rep '{raw}' → {name}")
         return email, ""
     if len(hits) > 1:
         names = ", ".join(sorted(n for n, _ in hits))
@@ -1915,7 +1915,7 @@ def parse_bulk_order_utterance(
 
         customers = result.get("data", [])
         if not result.get("success") or not isinstance(customers, list) or not customers:
-            logger.debug(f"bulk_parser | email '{email}' → not found")
+            logger.debug("bulk_parser | email lookup → not found")
             email_resolution_cache[email] = None
             continue
 
@@ -1930,7 +1930,7 @@ def parse_bulk_order_utterance(
             "billing": customer.get("billing", {}),
             "shipping": customer.get("shipping", {}),
         }
-        logger.debug(f"bulk_parser | email '{email}' → id={customer['id']} display='{display}'")
+        logger.debug(f"bulk_parser | email lookup → id={customer['id']} display='{display}'")
 
     # Stamp customer_id onto pre_lines so Step 5 (reorder) can use it
     for pl in pre_lines:

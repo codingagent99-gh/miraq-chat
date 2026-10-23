@@ -77,8 +77,15 @@ class _DailyDirectoryHandler(logging.FileHandler):
         super().__init__(log_file, encoding="utf-8", **kwargs)
 
     def _make_log_file(self, date_str: str) -> Path:
+        self._log_base_dir.mkdir(parents=True, exist_ok=True)
         log_dir = self._log_base_dir / date_str
-        log_dir.mkdir(parents=True, exist_ok=True)
+        log_dir.mkdir(exist_ok=True)
+        # Logs can hold shopper messages and order identifiers: owner-only.
+        for d in (self._log_base_dir, log_dir):
+            try:
+                os.chmod(d, 0o700)
+            except OSError:
+                pass
         return log_dir / self._filename
 
     def emit(self, record):
