@@ -238,6 +238,11 @@ def teardown_tenant(tenant, *, log_prefix: str = "teardown") -> dict:
     try:
         tenant.status = "archived"
         tenant.archived_at = datetime.now(timezone.utc)
+        # The store's WooCommerce API key is deleted on its side at uninstall,
+        # so our copy is dead. Do not keep it. Re-activation (/activate-free,
+        # /provision-tenant) sends a freshly minted key and stores it again.
+        tenant.woo_key = None
+        tenant.woo_secret_encrypted = None
         db.session.commit()
         logger.info(f"{log_prefix}: archived — database {db_name} kept for the grace period | {label}")
     except Exception as e:
