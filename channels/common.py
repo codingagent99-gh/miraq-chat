@@ -239,7 +239,12 @@ def _product_card(p: dict, symbol: str) -> Optional[ProductCard]:
         stock = "In stock"
     price_line = " · ".join(x for x in (price, stock) if x)
     images = p.get("images") or []
-    image = images[0] if images and isinstance(images[0], str) else ""
+    first = images[0] if images else ""
+    # Variation cards fall back to the parent's RAW images, which on Shopify
+    # are dicts ({"src": ...}), not URL strings (formatters.format_variation).
+    if isinstance(first, dict):
+        first = first.get("src") or first.get("url") or ""
+    image = first if isinstance(first, str) else ""
     return ProductCard(
         name=name,
         price_line=price_line,
