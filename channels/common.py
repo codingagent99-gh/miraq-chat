@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from app_config import get_currency_symbol
+from channels import cart as cart_mod
 
 SUPPORTED_CHANNELS = frozenset({"whatsapp", "instagram"})
 
@@ -288,7 +289,14 @@ def _short_channel_label(channel) -> str:
     return f"Chat on {name}" if name else "Chat with us"
 
 
-def build_turn(data: dict, max_products: int) -> ChannelTurn:
+def build_turn(data: dict, max_products: int, store_url: str = "",
+               cart: Optional["cart_mod.ChannelCart"] = None,
+               session_id: str = "") -> ChannelTurn:
+    """
+    store_url + cart switch on the Shopify cart buttons (channels/cart.py).
+    Either missing (WooCommerce store, cart state unavailable) leaves cart
+    actions ignored, exactly as before.
+    """
     symbol = get_currency_symbol()
     extra_text: List[str] = []
     suggestion_texts: List[str] = list(data.get("suggestions") or [])
@@ -327,7 +335,34 @@ def build_turn(data: dict, max_products: int) -> ChannelTurn:
             if orders:
                 extra_text.append(f"You've ordered this before ({len(orders)} recent order(s)).")
 
-    text = "\n\n".join(x for x in [data.get("bot_message") or ""] + extra_text if x)
+    bot_message = data.get("bot_message") or ""
+    action_types = {(a or {}).get("type") for a in data.get("actions") or []}
+
+    if store_url and cart is not None:
+        if action_types & cart_mod.CART_ACTIONS:
+            # Both "view cart" and "checkout" arrive as OPEN_CART_PANEL; the
+            # intent tells them apart (the widget needs them identical).
+            checkout = data.get("intent") == "checkout" or "OPEN_CHECKOUT_PANEL" in action_types
+            url = cart_mod.cart_url(store_url, cart.lines, checkout=checkout, session_id=session_id)
+            if url:
+                label, short = (("Review and pay at checkout", "Checkout") if checkout
+                                else ("Open your cart", "View cart"))
+                links.append(LinkButton(label=label, url=url, short_label=short))
+                bot_message = (cart_mod.CHECKOUT_TEXT if checkout else
+                               "Your cart:\n" + cart_mod.cart_summary(cart.lines) +
+                               "\n\nTap below to open it.")
+            else:
+                bot_message = cart_mod.EMPTY_CART_TEXT
+            # "Clear cart" edits a browser cart this chat does not have.
+            suggestion_texts = [s for s in suggestion_texts if str(s).strip().lower() != "clear cart"]
+        elif cart_mod.ADD_ACTION in action_types:
+            # The add itself happens when the shopper opens the cart link.
+            bot_message = cart_mod.added_text(data.get("actions")) or bot_message
+            if cart.rejected:
+                bot_message += "\n" + cart_mod.CART_FULL_TEXT.format(
+                    max=cart_mod.MAX_LINES, names=", ".join(cart.rejected))
+
+    text = "\n\n".join(x for x in [bot_message] + extra_text if x)
     # A link that is also sent as a button would show twice; keep the button.
     button_urls = {l.url for l in links}
     if button_urls:

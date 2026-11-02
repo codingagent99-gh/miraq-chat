@@ -51,9 +51,11 @@ import time
 import uuid
 
 from flask import Blueprint, current_app, g, jsonify, request
+from sqlalchemy.orm.attributes import flag_modified
 
 from app_config import CHANNEL_API_KEY, CHANNEL_MAX_PRODUCT_CARDS
 from channels import RENDERERS, SUPPORTED_CHANNELS, decode_reply_id
+from channels import cart as cart_mod
 from channels.common import build_turn
 from chat_logger import get_logger
 from models import db, ChannelConnection, Conversation, Message, Tenant
@@ -164,6 +166,45 @@ def _bind_resident_loader(tenant) -> None:
         g.store_loader = None
         return
     g.store_loader = dict(registry.resident_loaders()).get(str(tenant.tenant_id))
+
+
+# ── Shopify cart buttons ─────────────────────────────────────────────────────
+# The widget's cart actions run in a browser cart a channel user does not have
+# (see channels/cart.py), so the lines are kept in the conversation's
+# context_data and handed to Shopify in a cart link.
+
+def _store_url(tenant) -> str:
+    """Storefront base URL for Shopify tenants; "" otherwise (no cart buttons)."""
+    if (tenant.ecommerce_backend or "") != "shopify":
+        return ""
+    domain = str(tenant.shopify_domain or "").strip().strip("/")
+    return f"https://{domain}" if domain else ""
+
+
+def _sync_cart(session_id: uuid.UUID, actions):
+    """
+    Record this turn's SHOPIFY_ADD_TO_CART actions and return the shopper's
+    ChannelCart, or None when it cannot be read or saved (the renderer then
+    ignores cart actions rather than send a link for the wrong items).
+    """
+    try:
+        conv = db.session.get(Conversation, session_id)
+        if conv is None:
+            return None
+        # The inner turn committed from its own session; drop our stale copy.
+        db.session.refresh(conv)
+        ctx = dict(conv.context_data or {})
+        lines = cart_mod.normalize(ctx.get(cart_mod.CART_CONTEXT_KEY))
+        changed, rejected = cart_mod.add_lines(lines, actions)
+        if changed:
+            conv.context_data = {**ctx, cart_mod.CART_CONTEXT_KEY: lines}
+            flag_modified(conv, "context_data")
+            db.session.commit()
+        return cart_mod.ChannelCart(lines=lines, rejected=rejected)
+    except Exception:
+        db.session.rollback()
+        logger.error("POST /chat/channel | cart sync failed", exc_info=True)
+        return None
 
 
 # ── Human handoff: a person replies in the same chat ─────────────────────────
@@ -390,7 +431,10 @@ def _channel_chat():
         data = {"bot_message": ERROR_TEXT, "intent": "error"}
 
     _bind_resident_loader(tenant)
-    turn = build_turn(data, max_products=CHANNEL_MAX_PRODUCT_CARDS)
+    store_url = _store_url(tenant)
+    cart = _sync_cart(session_id, data.get("actions")) if store_url and status < 400 else None
+    turn = build_turn(data, max_products=CHANNEL_MAX_PRODUCT_CARDS,
+                      store_url=store_url, cart=cart, session_id=str(session_id))
     messages = RENDERERS[channel](turn, user_id)
 
     elapsed = round((time.time() - start_time) * 1000)
