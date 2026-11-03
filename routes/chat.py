@@ -84,6 +84,7 @@ from models.usage_guard import enforce_daily_limit
 from handlers.chat_utils import default_pagination, build_pagination, format_order_for_frontend
 from handlers.flow_handler import handle_flow
 from handlers.llm_handler import run_llm_fallback, history_for_llm
+from handlers.account_handler import handle_customer_update
 from handlers.order_handler import (
     handle_reorder,
     handle_order_detail,
@@ -2038,7 +2039,11 @@ def _handle_customer_intents(
     intent, entities, confidence, order_data, api_calls_to_execute, api_responses,
     conversation, page, start_time,
 ):
-    """Handle FETCH_CUSTOMER and UPDATE_CUSTOMER intents. Returns response or None."""
+    """Handle FETCH_CUSTOMER. Returns response or None.
+
+    UPDATE_CUSTOMER never reaches here: it is answered before any store call
+    is built (handlers/account_handler.py).
+    """
     if intent == Intent.FETCH_CUSTOMER:
         elapsed      = int((time.time() - start_time) * 1000)
         customer_raw = order_data[0] if order_data else {}
@@ -2063,35 +2068,6 @@ def _handle_customer_intents(
             "suggestions": [],
             "session_id":  str(conversation.id),
             "metadata":    {"confidence": round(confidence, 2), "response_time_ms": elapsed},
-            "pagination":  default_pagination(page),
-            "flow_state":  FlowState.IDLE.value,
-        }))
-
-    if intent == Intent.UPDATE_CUSTOMER:
-        elapsed        = int((time.time() - start_time) * 1000)
-        update_success = False
-        for _api_call, _api_resp in zip(api_calls_to_execute, api_responses):
-            if _api_call.method == "PUT" and "/customers/" in _api_call.endpoint:
-                update_success = _api_resp.get("success", False)
-                break
-        _update_signal = [{"success": update_success}]
-
-        return _finalize_turn(conversation, jsonify({
-            "success":     update_success,
-            "bot_message": generate_bot_message(intent, entities, [], confidence, _update_signal),
-            "intent":      intent.value,
-            "products":    [],
-            "suggestions": generate_suggestions(intent, entities, []),
-            "session_id":  str(conversation.id),
-            "metadata": {
-                "confidence":       round(confidence, 2),
-                "products_count":   0,
-                "provider":         CLASSIFIER_PROVIDER_TAG,
-                "timestamp":        datetime.now(timezone.utc).isoformat(),
-                "response_time_ms": elapsed,
-                "intent_raw":       intent.value,
-                "entities":         _entities_to_dict(entities),
-            },
             "pagination":  default_pagination(page),
             "flow_state":  FlowState.IDLE.value,
         }))
@@ -3527,6 +3503,13 @@ def chat():
         _sign_in = _channel_sign_in_prompt(intent, conversation, page)
         if _sign_in is not None:
             return _ft(_sign_in)
+
+        # ── Account changes: never written from chat ──────────────────────
+        # "Change my address / email / name" is answered before any store
+        # call is built: WooCommerce shoppers get My Account links, Shopify
+        # keeps its "not available here" answer. Nothing is sent to the store.
+        if intent == Intent.UPDATE_CUSTOMER:
+            return _ft(handle_customer_update(intent, conversation, page, start_time))
 
         if _resolve_variant or intent == Intent.BULK_ORDER:
             # Variant resolution uses session-cached variations — no API calls needed.

@@ -1,7 +1,9 @@
 """
 handlers/order_handler.py — Steps 3.5, 3.5b, 3.6: Order handling.
 
-Step 3.5  — REORDER: create new order from last order's line items.
+Step 3.5  — REORDER: put the last order's line items back in the shopper's cart
+            (WooCommerce, Store API in the browser) or hand Shopify a checkout
+            link. The backend never creates the order.
 Step 3.5b — AWAITING_ORDER_DETAIL: fetch and display a specific order.
 Step 3.6  — QUICK_ORDER/ORDER_ITEM/PLACE_ORDER: create order from matched product.
 
@@ -13,10 +15,8 @@ import time
 from flask import jsonify
 
 from app_config import (
-    DEFAULT_PAYMENT_METHOD,
-    DEFAULT_PAYMENT_METHOD_TITLE,
     DEFAULT_PER_PAGE,
-    DEFAULT_ORDER_PER_PAGE
+    DEFAULT_ORDER_PER_PAGE,
 )
 
 from models import Intent, WooAPICall
@@ -296,7 +296,7 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
     }), 200
     
 def handle_reorder(intent, entities, order_data, customer_id, session_id, page, start_time):
-    """Step 3.5: Create a new order from the last order's line items."""
+    """Step 3.5: Reorder the last order's line items (Woo: cart, Shopify: checkout link)."""
     if intent != Intent.REORDER:
         return None
 
@@ -433,17 +433,7 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
 
 
     # ─── Standard Reorder Logic (Only executes if everything is in stock) ───
-    new_line_items = [
-        {
-            "product_id": item["product_id"],
-            "quantity": item.get("quantity", 1),
-            **({"variation_id": item["variation_id"]} if item.get("variation_id") else {}),
-        }
-        for item in source_line_items
-        if item.get("product_id")
-    ]
-    
-    if not new_line_items:
+    if not any(item.get("product_id") for item in source_line_items):
         return None
 
     if current_backend()== "shopify":
@@ -491,51 +481,138 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
             "flow_state": FlowState.IDLE.value,
             "pagination": default_pagination(page),
         }), 200
-    else:
-        reorder_call = endpoints.create_order(
-            payload={
-                "status": "processing",
-                "customer_id": customer_id,
-                "payment_method": DEFAULT_PAYMENT_METHOD,
-                "payment_method_title": DEFAULT_PAYMENT_METHOD_TITLE,
-                "set_paid": False,
-                "line_items": new_line_items,
-            },
-            description="Create reorder from last order line items",
-        )
-        reorder_resp = woo_client.execute(reorder_call)
-    
-    elapsed = time.time() - start_time
-    if reorder_resp.get("success") and isinstance(reorder_resp.get("data"), dict):
-        new_order = reorder_resp["data"]
-        logger.info(f"Step 3.5: Reorder created successfully | order_id={new_order.get('id')} | order_number={new_order.get('number')}")
-        bot_message = (
-            f"🔄 **Reorder placed!** (new order #{new_order.get('number') or new_order.get('id')})\n\n"
-            + "\n".join(f"  • {i.get('name','Item')} × {i.get('quantity',1)}" for i in source_line_items if i.get("product_id"))
-            + "\n\nYour order has been created and is being processed. ✅"
-        )
-        suggestions = ["Show my orders", "Track my order"]
-    else:
-        error_msg = sanitize_log_string(str(reorder_resp.get('error', 'Unknown')))
-        logger.warning(f"Step 3.5: Reorder creation failed | error={error_msg}")
-        bot_message = (
-            f"🔄 **Items identified** (from order #{source_order.get('number') or source_order.get('id')})\n\n"
-            + "\n".join(f"  • {i.get('name','Item')} × {i.get('quantity',1)}" for i in source_line_items if i.get("product_id"))
-            + "\n\n⚠️ The new order could not be created automatically. Please place the order manually or contact support."
-        )
-        suggestions = ["Show my orders", "Browse products", "Contact support"]
 
-    return jsonify({
-        "success": True,
-        "bot_message": bot_message,
-        "intent": intent.value,
-        "products": [],
-        "suggestions": suggestions,
-        "session_id": session_id,
-        "metadata": {"flow_state": FlowState.IDLE.value, "response_time_ms": round(elapsed * 1000)},
-        "flow_state": FlowState.IDLE.value,
-        "pagination": default_pagination(page),
-    }), 200
+    # WooCommerce: the items go back into the shopper's own cart through the
+    # Store API in their browser. The backend never creates the order.
+    return _reorder_via_cart(
+        intent, source_order, source_line_items, session_id, page, start_time,
+    )
+
+def _reorder_via_cart(intent, source_order, source_line_items, session_id, page, start_time):
+    """
+    WooCommerce reorder without a write: return one ADD_TO_CART action per line
+    of the previous order, then open the cart so the shopper can review it and
+    check out. The browser adds the items through the Store API with the
+    shopper's own cart session, so the backend needs no write access and no
+    order exists until the shopper pays.
+
+    A line whose variation cannot be rebuilt into the attributes the Store API
+    demands is NOT added: it is named in the reply instead, because adding it
+    blind would either fail in the browser with nothing in our log or put the
+    wrong variant in the cart.
+    """
+    from store_registry import get_store_loader
+    from ecommerce.cart_actions import build_cart_add_action, UNRESOLVED_VARIANT
+    from core.actions import build_open_cart_panel
+    from identity import current_identity
+
+    source_ref = source_order.get("number") or source_order.get("id")
+    elapsed_ms = lambda: round((time.time() - (start_time or time.time())) * 1000)
+
+    def _reply(bot_message, suggestions, actions=None, extra=None):
+        return jsonify({
+            "success": True,
+            "bot_message": bot_message,
+            "intent": intent.value,
+            "products": [],
+            "suggestions": suggestions,
+            "actions": actions or [],
+            "session_id": session_id,
+            "metadata": {
+                "flow_state": FlowState.IDLE.value,
+                "response_time_ms": elapsed_ms(),
+                **(extra or {}),
+            },
+            "flow_state": FlowState.IDLE.value,
+            "pagination": default_pagination(page),
+        }), 200
+
+    # A cart lives in a browser. A channel chat (Instagram, WhatsApp) has none,
+    # so the adds would go nowhere while the reply claimed otherwise.
+    if current_identity().source == "channel":
+        logger.info(f"Step 3.5: Woo reorder from a channel — no browser cart | source_order={source_ref}")
+        return _reply(
+            "I can only put a reorder in your cart from the store's website. "
+            "Please open the store and ask me again there.",
+            ["Show my orders", "Browse products"],
+        )
+
+    store_loader = get_store_loader()
+    actions, added, failed = [], [], []
+
+    for item in source_line_items:
+        product_id = item.get("product_id")
+        if not product_id:
+            continue
+        name = item.get("name") or "Item"
+        try:
+            qty = max(1, int(item.get("quantity") or 1))
+        except (TypeError, ValueError):
+            qty = 1
+        variation_id = item.get("variation_id") or None
+
+        action, err = build_cart_add_action(
+            product_id=product_id,
+            quantity=qty,
+            name=name,
+            variation_id=variation_id,
+            resolved_attrs={},
+            store_loader=store_loader,
+            # The variation fetch is what turns "variation 123" into the
+            # attribute/value pairs the Store API requires.
+            build_variation_payload=True,
+            # The reply below itemises everything; a per-line confirmation from
+            # the widget would repeat it. Failures are still reported by the widget.
+            suppress_result=True,
+        )
+
+        # A variation that came back with no attributes (variation deleted since
+        # the order, or the fetch failed) would be refused by the Store API.
+        if action is not None and variation_id and not action["payload"].get("variation"):
+            action, err = None, UNRESOLVED_VARIANT
+
+        if action is None:
+            logger.warning(
+                f"Step 3.5: Woo reorder line skipped | source_order={source_ref} | "
+                f"product_id={product_id} | variation_id={variation_id} | reason={err}"
+            )
+            failed.append(name)
+            continue
+
+        actions.append(action)
+        added.append(f"  • {name} × {qty}")
+
+    if not actions:
+        logger.warning(f"Step 3.5: Woo reorder produced no addable lines | source_order={source_ref}")
+        return _reply(
+            f"🔄 I couldn't add the items from order #{source_ref} to your cart "
+            f"({', '.join(failed)}). Search for them and pick the options you want.",
+            ["Show my orders", "Browse products", "Contact support"],
+        )
+
+    bot_message = (
+        f"🛒 **Reorder added to your cart** (items from order #{source_ref})\n\n"
+        + "\n".join(added)
+    )
+    if failed:
+        bot_message += (
+            f"\n\nI couldn't add {', '.join(failed)}. The options on that item "
+            "need to be picked again, so search for it and choose the one you want."
+        )
+    bot_message += "\n\nReview your cart, then check out when you're ready."
+
+    actions.append(build_open_cart_panel())
+    logger.info(
+        f"Step 3.5: Woo reorder → cart actions | source_order={source_ref} | "
+        f"added={len(added)} | skipped={len(failed)}"
+    )
+    return _reply(
+        bot_message,
+        ["Checkout", "Show my orders", "Browse products"],
+        actions=actions,
+        extra={"reorder_source_order": source_ref, "reorder_mode": "cart"},
+    )
+
 
 def handle_order_status(intent, entities, order_data, customer_id, session_id, page, start_time,
                         role=None):

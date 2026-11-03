@@ -339,16 +339,6 @@ def generate_bot_message(
     # otherwise fall back to the number of products on this page.
     count = total_items if total_items is not None else page_count
 
-    # ── Customer update intent ──
-    if intent == Intent.UPDATE_CUSTOMER:
-        update_ok = True
-        if order_data and isinstance(order_data[0], dict):
-            update_ok = order_data[0].get("success", True)
-        if update_ok:
-            return "Your account details have been updated successfully."
-        else:
-            return "Sorry, I wasn't able to update your details. Please try again or contact support."
-
     # ── Greeting intent ──
     if intent == Intent.GREETING:
         return (
@@ -821,8 +811,6 @@ def generate_suggestions(
         suggestions.append("Browse Products")
         suggestions.append("View my orders")
         
-    elif intent == Intent.UPDATE_CUSTOMER:
-        return ["Browse Products", "View my orders"]
     elif intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.ORDER_STATUS, Intent.ORDER_TRACKING):
         suggestions.append("Reorder my last order")
         suggestions.append("Show me my recent orders")

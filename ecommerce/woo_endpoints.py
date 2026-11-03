@@ -943,24 +943,6 @@ class WooEndpoints:
             requires_resolution=requires_resolution or [],
         )
 
-    def update_customer(
-        self,
-        customer_id: int,
-        payload: dict,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """Row 6.3 — Update a customer's profile."""
-        return WooAPICall(
-            method="PUT",
-            endpoint=f"/customers/{customer_id}",
-            params={},
-            body=payload,
-            surface="admin",
-            description=description or f"Update customer id={customer_id}",
-            requires_resolution=requires_resolution or [],
-        )
-
     # ── Additional (not in CSV mapping; present in codebase) ────────────────
 
     def list_coupons(

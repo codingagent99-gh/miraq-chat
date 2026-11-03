@@ -340,15 +340,6 @@ class ShopifyEndpoints:
                      description=description or f"Fetch Shopify customer id={customer_id}",
                      requires_resolution=requires_resolution)
 
-    def update_customer(
-        self, customer_id: int, payload: dict, description: str = "",
-        requires_resolution: Optional[List[str]] = None
-    ) -> WooAPICall:
-        return _stub("PUT", f"/customers/{customer_id}",
-                     body=payload,
-                     description=description or f"Update Shopify customer id={customer_id}",
-                     requires_resolution=requires_resolution)
-
     # ── Additional ────────────────────────────────────────────────────────────
 
     def list_coupons(

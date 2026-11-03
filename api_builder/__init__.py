@@ -249,17 +249,13 @@ def build_api_calls(
         Intent.ORDER_TRACKING:        _build_order_tracking,
         Intent.ORDER_STATUS:          _build_order_tracking,  # same logic
         Intent.PLACE_ORDER:           _build_place_order,
-        Intent.UPDATE_CUSTOMER:       _build_update_customer,
         Intent.CHECKOUT:              _build_checkout,
     }
 
     builder = _BUILDERS.get(intent)
     if builder:
         # Builders that need customer_id or user_message get them via kwargs
-        if intent == Intent.UPDATE_CUSTOMER:
-            calls = builder(e, page, customer_id=customer_id)
-        # in build_api_calls dispatcher:
-        elif intent in (Intent.PRODUCT_SEARCH, Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_DETAIL):
+        if intent in (Intent.PRODUCT_SEARCH, Intent.FILTER_BY_ATTRIBUTE, Intent.PRODUCT_DETAIL):
             calls = builder(e, page, user_message=user_message)
         elif intent in (Intent.LAST_ORDER, Intent.ORDER_HISTORY, Intent.HISTORICAL_SEARCH,
                 Intent.REORDER, Intent.ORDER_TRACKING, Intent.ORDER_STATUS,
@@ -1169,28 +1165,6 @@ def _build_place_order(e, page) -> list:
     )]
 
 
-def _build_update_customer(e, page, customer_id: Optional[int] = None) -> list:
-    if not customer_id:
-        logger.warning("api_builder: UPDATE_CUSTOMER intent but no customer_id resolved")
-        return []
-    payload = {}
-    for field_key, value in (e.customer_updates or {}).items():
-        if field_key not in ("role", "email", "password"):
-            payload[field_key] = value
-    if e.billing_updates:
-        payload["billing"] = dict(e.billing_updates)
-    if e.shipping_updates:
-        payload["shipping"] = dict(e.shipping_updates)
-    if not payload:
-        logger.warning("api_builder: UPDATE_CUSTOMER payload empty after field filtering")
-        return []
-    logger.debug(f"api_builder: UPDATE_CUSTOMER | customer_id={customer_id} | keys={list(payload.keys())}")
-    return [endpoints.update_customer(
-        customer_id=customer_id,
-        payload=payload,
-        description=f"Update customer id={customer_id} | fields={list(payload.keys())}",
-    )]
-    
 def _build_checkout(e, page) -> list:
     """
     Build a WooCommerce order creation call from the in-memory cart.

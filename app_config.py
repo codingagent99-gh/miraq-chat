@@ -123,6 +123,11 @@ MAX_DISPLAYED_ITEMS = 3  # Maximum number of items to show before truncating wit
 DEFAULT_PAYMENT_METHOD = "cod"
 DEFAULT_PAYMENT_METHOD_TITLE = "Cash on Delivery"
 
+# WooCommerce My Account pages the chat links to. The chat never edits an
+# account itself; these are WooCommerce's stock paths under the WordPress root.
+WOO_EDIT_ADDRESS_PATH = "/my-account/edit-address/"
+WOO_EDIT_ACCOUNT_PATH = "/my-account/edit-account/"
+
 # ═══════════════════════════════════════════════════════════════
 # ECOMMERCE BACKEND
 # ═══════════════════════════════════════════════════════════════

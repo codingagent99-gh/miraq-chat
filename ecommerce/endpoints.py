@@ -250,16 +250,6 @@ class EcommerceEndpoints(Protocol):
         """Rows 6.1 & 6.2 — Fetch a customer by ID."""
         ...
 
-    def update_customer(
-        self,
-        customer_id: int,
-        payload: dict,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """Row 6.3 — Update a customer's profile."""
-        ...
-        
     def fetch_saved_addresses(
         self,
         requesting_customer_id,
