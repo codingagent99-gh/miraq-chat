@@ -42,14 +42,6 @@ class EcommerceEndpoints(Protocol):
         """Row 2.2 — Fetch all product attributes and their terms (custom-plugin surface)."""
         ...
 
-    def fetch_checkout_fields(
-        self,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """Fetch WC checkout field definitions (custom-plugin surface)."""
-        ...
-
     def list_categories(
         self,
         page: int,
@@ -221,15 +213,6 @@ class EcommerceEndpoints(Protocol):
         """Row 5.3 — Check stock status for a list of product IDs (custom_plugin surface)."""
         ...
 
-    def create_order(
-        self,
-        payload: dict,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """Row 5.4 — Create a new order."""
-        ...
-
     def historical_product_search(
         self,
         body: dict,
@@ -241,91 +224,9 @@ class EcommerceEndpoints(Protocol):
 
     # ── Customers ───────────────────────────────────────────────────────────
 
-    def fetch_customer(
-        self,
-        customer_id: int,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """Rows 6.1 & 6.2 — Fetch a customer by ID."""
-        ...
-
-    def fetch_saved_addresses(
-        self,
-        requesting_customer_id,
-        target_customer_id=None,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """GET /saved-addresses — THWMA multi-address book (custom-api/v1)."""
-        ...
-
-    def fetch_company_order_addresses(
-        self,
-        company_name: str,
-        limit: int = 100,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """GET /company-order-addresses — shipping destinations from order history."""
-        ...
-
-    def search_customers_by_company(
-        self,
-        company_name: str,
-        per_page: int = 20,
-        page: int = 1,
-        requesting_customer_id=None,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """Search customers by billing company name (custom-api/v1 endpoint).
-
-        `page` is required to read past the plugin's per-page ceiling; see
-        the implementation in woo_endpoints.py.
-        """
-        ...
-        
-    def search_customers_by_email(
-        self,
-        email: str,
-        per_page: int = 1,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """Exact customer lookup by email address."""
-        ...
-        
-    def search_orders_by_product(
-        self,
-        product_id: int,
-        per_page: int = 3,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """Recent orders containing a specific product — GET /orders?product=<id>."""
-        ...
-
     # ── Additional (not in CSV mapping; present in codebase) ────────────────
 
-    def list_coupons(
-        self,
-        page: int,
-        per_page: int,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """List available coupon codes (COUPON_INQUIRY intent)."""
-        ...
 
-    def fetch_wishlist(
-        self,
-        customer_id,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """Fetch customer wishlist (SAVE_FOR_LATER / WISHLIST intent)."""
-        ...
 
     def list_products_on_sale(
         self,
@@ -356,15 +257,6 @@ class EcommerceEndpoints(Protocol):
         requires_resolution: Optional[List[str]] = None,
     ) -> WooAPICall:
         """Text search fallback for products (QUICK_ORDER / PRODUCT_SEARCH intents)."""
-        ...
-
-    def list_cs_orders(
-        self,
-        body: dict,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """List orders via custom plugin (CS-rep role path; custom_plugin surface)."""
         ...
 
     # ── Response parsers ────────────────────────────────────────────────────

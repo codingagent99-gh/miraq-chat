@@ -51,15 +51,19 @@ def _start_buy_again(loader, customer_id: str):
 
     A worker thread has no request context, and copy_current_request_context
     would give it a fresh, empty g. So it gets its own app context with only
-    what the order fetch reads bound explicitly — the same approach
+    what the order fetch reads (the loader and the identity) bound explicitly — the same approach
     woo_client.execute_all() takes for its workers. The Shopify token row is
     control-plane, which the routing session reads from the default bind.
     """
     app = current_app._get_current_object()
+    # The order fetch forwards the shopper's identity token to the plugin,
+    # which reads it from g.identity.
+    identity = current_identity()
 
     def run():
         with app.app_context():
             g.store_loader = loader
+            g.identity = identity
             return buy_again(loader, customer_id)
 
     return _buy_again_pool.submit(run)

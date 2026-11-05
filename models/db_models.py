@@ -128,8 +128,11 @@ class Tenant(db.Model):
     """
     Control-plane row, one per licensed store. Lives in the MAIN miraq_chat DB
     (NOT in the per-tenant databases). Resolved on every request by license_id.
-    woo_secret_encrypted holds a Fernet token (tenant_crypto.py); plaintext
-    secret is never persisted.
+    The store's identity is its site PUBLIC key, in features["site_key"]
+    (site_key.py). woo_key / woo_secret_encrypted are the pre-1.0.8
+    WooCommerce key (a Fernet token, tenant_crypto.py), kept only until the
+    store registers its site key, which wipes them — LEGACY BRIDGE; drop both
+    columns once every store has registered.
 
     ecommerce_backend and shopify_domain exist from Stage 1 onward (all Woo
     tenants at first) so Stage 2 only has to populate them and wire up

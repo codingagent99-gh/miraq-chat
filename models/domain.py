@@ -69,18 +69,14 @@ class Intent(Enum):
     # Attribute Filtering
     FILTER_BY_ATTRIBUTE    = "filter_by_attribute"
     MOST_POPULAR           = "most_popular"
-    ORDER_STATS_BY_REP     = "order_stats_by_rep"
 
     # Discounts & Promotions
     DISCOUNT_INQUIRY       = "discount_inquiry"
     BULK_DISCOUNT          = "bulk_discount"
     CLEARANCE_PRODUCTS     = "clearance_products"
     PROMOTIONS             = "promotions"
-    COUPON_INQUIRY         = "coupon_inquiry"
 
     # Account & Ordering
-    SAVE_FOR_LATER         = "save_for_later"
-    WISHLIST               = "wishlist"
     ORDER_TRACKING         = "order_tracking"
     ORDER_STATUS           = "order_status"
     PLACE_ORDER            = "place_order"
@@ -224,64 +220,6 @@ class ExtractedEntities:
     # "best sellers" / etc. Only "popularity" is supported today (ranks by
     # WooCommerce's all-time `total_sales` meta) — no time-boxed window.
     sort_by: Optional[str] = None
-
-    # ──── Order reporting ────
-    # Rep named in an order-stats query ("how many samples did <name> order").
-    # Free text as the user typed it — the plugin resolves name → email and
-    # refuses ambiguous matches rather than guessing.
-    #
-    # Kept as the FIRST name in target_rep_names, not a separate answer.
-    # Everything downstream that reads a single rep still works unchanged, and
-    # nothing can drift between the two: OrderStatsEvaluator sets both from one
-    # extraction.
-    target_rep_name: Optional[str] = None
-
-    # Every rep named in the query, in the order the user typed them.
-    # "orders for cs_rep 1, cs_rep 2, cs_rep 3" → all three.
-    #
-    # A single-rep query fills this with one entry, so callers can read this
-    # field alone; target_rep_name exists for the paths that predate it.
-    # Before this field, the name capture stopped at the first comma and the
-    # admin got a confident report for ONE rep with no sign the others had
-    # been dropped.
-    target_rep_names: List[str] = field(default_factory=list)
-
-    # Which SENSE of a named person the report is about: "rep" (orders
-    # credited to them via _billing_project_rep) or "customer" (orders they
-    # placed, plus orders shipped to them). None means "not yet decided" and
-    # the handler tries rep first, then customer.
-    #
-    # Exists because one name can be both, and the two answer different
-    # questions over different order sets. When the admin resolves that with
-    # the picker, this field is what carries their choice through the re-run —
-    # without it the re-run would rediscover the same ambiguity and ask again.
-    target_person_kind: Optional[str] = None
-
-    # True when the question is about the caller's TEAM ("my team", "my
-    # reports"). Routes the report to /order-stats-by-team instead of
-    # /order-stats-by-rep, which scopes it to the caller's direct reports.
-    #
-    # Only meaningful for a role in MANAGER_ROLES; ignored otherwise, so an
-    # unscoped question from anyone else keeps its existing behaviour. Names in
-    # target_rep_names still travel alongside this — with it set they are read
-    # as team MEMBERS and checked for membership, not as arbitrary reps.
-    team_scope: bool = False
-
-    # "count" (a number/summary answer) or "list" (actual order cards). Set by
-    # OrderStatsEvaluator. "order list for Jennifer" is list; "how many did
-    # Jennifer order" is count even when list-shaped words are also present —
-    # see OrderStatsEvaluator's precedence rule.
-    mode: Optional[str] = None
-
-    # "self" / "person" / "all" — who an ADMIN's order-history question is
-    # about. Only meaningful for the admin role; every other role is always
-    # self-scoped regardless of this value. Set by OrderActionEvaluator for
-    # plain ORDER_HISTORY phrasing ("my orders" vs "all orders") and by
-    # OrderStatsEvaluator (scope="person", alongside target_rep_name) when a
-    # named rep is present — the two evaluators set the same field even
-    # though "person" currently routes through a different handler than
-    # "self"/"all" (see api_builder._build_order_history vs order_stats_handler).
-    scope: Optional[str] = None
 
     # ──── Ordering ────
     order_id: Optional[int] = None

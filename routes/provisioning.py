@@ -9,8 +9,18 @@ POST /activate-free — self-serve free-tier activation, unauthenticated by
 design for now (see its own docstring for the accepted risk and the
 hardening path).
 
-Both are exempt from tenant resolution (see store_registry._EXEMPT_PATHS) —
-they create the very tenant row that resolution would otherwise need.
+POST /register-site-key — LEGACY BRIDGE: a store set up before plugin 1.0.8
+registers its site key once, authenticating with the old WooCommerce key,
+which is then wiped (see site_key.py).
+
+Activation carries the store's Ed25519 site PUBLIC key (site_public_key),
+never a WooCommerce key. The backend checks it against the key the site
+itself serves (site_key.check_site_key_matches) and stores only that public
+key.
+
+All three are exempt from tenant resolution (see store_registry._EXEMPT_PATHS)
+— the first two create the very tenant row that resolution would otherwise
+need.
 """
 
 import hashlib
@@ -22,8 +32,8 @@ from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify, current_app
 
 from chat_logger import get_logger
+import site_key
 from models import db, Tenant
-from tenant_crypto import encrypt_secret
 from license_verifier import verify_license_payload, LicenseVerificationError
 from tenant_db_provisioner import ensure_tenant_database, TenantDBProvisionError
 
@@ -186,23 +196,21 @@ def provision_tenant():
     signature_b64 = body.get("signature")
     site_domain   = (body.get("site_domain") or "").strip()
     wp_base_url   = (body.get("wp_base_url") or "").strip().rstrip("/")
-    woo_key       = (body.get("woo_key") or "").strip()
-    woo_secret    = body.get("woo_secret") or ""
+    public_key    = site_key.normalize_public_key(body.get("site_public_key") or "")
     tenant_uuid_raw = (body.get("tenant_uuid") or "").strip()
 
     logger.info(
         f"provision-tenant: received request | "
         f"site_domain={site_domain!r} wp_base_url={wp_base_url!r} "
-        f"woo_key={'present' if woo_key else 'MISSING'} "
-        f"woo_secret={'present' if woo_secret else 'MISSING'} "
+        f"site_public_key={'present' if public_key else 'MISSING/INVALID'} "
         f"raw_payload={'present' if raw_payload else 'MISSING'} "
         f"signature={'present' if signature_b64 else 'MISSING'}"
     )
 
     if not raw_payload or not signature_b64:
         return jsonify({"success": False, "error": "missing raw_payload/signature"}), 400
-    if not woo_key or not woo_secret:
-        return jsonify({"success": False, "error": "missing woo credentials"}), 400
+    if not public_key:
+        return jsonify({"success": False, "error": "missing or invalid site_public_key"}), 400
 
     try:
         claims = verify_license_payload(raw_payload, signature_b64)
@@ -215,6 +223,10 @@ def provision_tenant():
         return jsonify({"success": False, "error": "payload missing licenseId"}), 400
 
     logger.info(f"provision-tenant: license_id={license_id}")
+
+    allowed, _why = site_key.check_site_key_matches(wp_base_url, public_key, label=f"license_id={license_id}")
+    if not allowed:
+        return jsonify({"success": False, "error": "site key does not match the key this site serves"}), 403
 
     license_expires_at = _parse_expiry(claims.get("expiresAt") or claims.get("expires_at"))
 
@@ -276,8 +288,7 @@ def provision_tenant():
     tenant.status      = "active"
     tenant.site_domain = site_domain or tenant.site_domain
     tenant.wp_base_url = wp_base_url or tenant.wp_base_url
-    tenant.woo_key = woo_key
-    tenant.woo_secret_encrypted = encrypt_secret(woo_secret)
+    site_key.store_public_key(tenant, public_key)
     if license_expires_at is not None:
         tenant.license_expires_at = license_expires_at
 
@@ -336,27 +347,29 @@ def activate_free():
     tenant_uuid_raw = (body.get("tenant_uuid") or "").strip()
     site_domain     = (body.get("site_domain") or "").strip()
     wp_base_url     = (body.get("wp_base_url") or "").strip().rstrip("/")
-    woo_key         = (body.get("woo_key") or "").strip()
-    woo_secret      = body.get("woo_secret") or ""
+    public_key      = site_key.normalize_public_key(body.get("site_public_key") or "")
 
     logger.info(
         f"activate-free: received request | "
         f"tenant_uuid={tenant_uuid_raw!r} site_domain={site_domain!r} wp_base_url={wp_base_url!r} "
-        f"woo_key={'present' if woo_key else 'MISSING'} "
-        f"woo_secret={'present' if woo_secret else 'MISSING'}"
+        f"site_public_key={'present' if public_key else 'MISSING/INVALID'}"
     )
 
     if not tenant_uuid_raw:
         return jsonify({"success": False, "error": "missing tenant_uuid"}), 400
     if not wp_base_url:
         return jsonify({"success": False, "error": "missing wp_base_url"}), 400
-    if not woo_key or not woo_secret:
-        return jsonify({"success": False, "error": "missing woo credentials"}), 400
+    if not public_key:
+        return jsonify({"success": False, "error": "missing or invalid site_public_key"}), 400
 
     try:
         tenant_uuid = uuid.UUID(tenant_uuid_raw)
     except (ValueError, AttributeError, TypeError):
         return jsonify({"success": False, "error": "tenant_uuid is not a valid UUID"}), 400
+
+    allowed, _why = site_key.check_site_key_matches(wp_base_url, public_key, label=f"tenant_uuid={tenant_uuid}")
+    if not allowed:
+        return jsonify({"success": False, "error": "site key does not match the key this site serves"}), 403
 
     tenant = Tenant.query.get(tenant_uuid)
     if tenant is None:
@@ -382,8 +395,7 @@ def activate_free():
 
     tenant.site_domain  = site_domain or tenant.site_domain
     tenant.wp_base_url  = wp_base_url or tenant.wp_base_url
-    tenant.woo_key = woo_key
-    tenant.woo_secret_encrypted = encrypt_secret(woo_secret)
+    site_key.store_public_key(tenant, public_key)
     # license_expires_at stays NULL — free tenants never expire (Tenant.is_active
     # already treats NULL expiry as "never expires", see models/db_models.py).
 
@@ -430,6 +442,51 @@ def activate_free():
     }), 200
 
 
+@provisioning_bp.route("/register-site-key", methods=["POST"])
+def register_site_key():
+    """LEGACY BRIDGE — a store set up before plugin 1.0.8 registers its site key.
+
+    The plugin calls this once after updating, with
+      body:    {"license_id": <miraq_license_id>, "site_public_key": <base64>}
+      headers: its old X-Consumer-Key / X-Consumer-Secret, and a signature of
+               this request made with the new site key.
+    The old WooCommerce key authenticates the FIRST call and is then wiped.
+    A retry (the plugin never saw the first answer) authenticates with the
+    signature instead, and only succeeds for the key already registered.
+
+    Unknown store and wrong credentials get the same 401, so this cannot be
+    used to test which licence ids exist.
+    """
+    body = request.get_json(silent=True) or {}
+    license_id = (body.get("license_id") or "").strip()
+    public_key = site_key.normalize_public_key(body.get("site_public_key") or "")
+    if not license_id or not public_key:
+        return jsonify({"success": False, "error": "missing license_id or valid site_public_key"}), 400
+
+    tenant = Tenant.query.filter_by(license_id=license_id).first()
+    if tenant is None:
+        logger.warning(f"register-site-key: rejected | license_id={license_id!r}")
+        return jsonify({"success": False, "error": "unauthorized"}), 401
+
+    already = site_key.public_key_b64(tenant) == public_key
+    signed_ok = site_key.verify_signed_request(tenant, "register-site-key", public_key_b64_override=public_key)
+    if already and signed_ok:
+        logger.info(f"register-site-key: already registered | license_id={license_id!r}")
+        return jsonify({"success": True, "status": "registered"}), 200
+    if not (signed_ok and site_key.verify_legacy_credentials(tenant)):
+        logger.warning(f"register-site-key: rejected | license_id={license_id!r}")
+        return jsonify({"success": False, "error": "unauthorized"}), 401
+
+    allowed, _why = site_key.check_site_key_matches(tenant.wp_base_url, public_key, label=f"license_id={license_id}")
+    if not allowed:
+        return jsonify({"success": False, "error": "site key does not match the key this site serves"}), 403
+
+    site_key.store_public_key(tenant, public_key)
+    db.session.commit()
+    logger.info(f"register-site-key: site key registered, WooCommerce key wiped | license_id={license_id!r}")
+    return jsonify({"success": True, "status": "registered"}), 200
+
+
 def _select_http_profile(tenant, tenant_registry, app) -> None:
     """Probe the store with each header profile and store the first that its
     firewall lets through in tenant.features["http_profile"].
@@ -444,7 +501,6 @@ def _select_http_profile(tenant, tenant_registry, app) -> None:
         return
 
     from http_profiles import HttpProfileState, probe_profiles
-    from tenant_crypto import decrypt_secret
 
     wp_base = (tenant.wp_base_url or "").rstrip("/")
     if not wp_base:
@@ -456,10 +512,7 @@ def _select_http_profile(tenant, tenant_registry, app) -> None:
     )
     result = probe_profiles(
         state=state,
-        wc_base=f"{wp_base}/wp-json/wc/v3",
         custom_api_base=f"{wp_base}/wp-json/custom-api/v1",
-        consumer_key=tenant.woo_key or "",
-        consumer_secret=decrypt_secret(tenant.woo_secret_encrypted or ""),
     )
 
     if result.chosen:
@@ -537,8 +590,7 @@ def _start_background_build(tenant_id, app):
                     f"_start_background_build: starting build | "
                     f"tenant_id={tenant_id} | "
                     f"wp_base_url={tenant.wp_base_url!r} | "
-                    f"woo_key={'present' if tenant.woo_key else 'MISSING'} | "
-                    f"woo_secret={'present' if tenant.woo_secret_encrypted else 'MISSING'}"
+                    f"site_key={'present' if site_key.public_key_b64(tenant) else 'MISSING'}"
                 )
 
                 # ── NOTE: do NOT wrap this in get_build_lock() ──────────────────

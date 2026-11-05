@@ -58,8 +58,6 @@ class StoreLoader(StoreQueryMixin):
         self.wp_base_url      = config.wp_base_url
         self.base             = config.woo_base_url
         self.custom_api_base  = config.custom_api_base_url
-        self.consumer_key     = config.woo_key
-        self.consumer_secret  = config.woo_secret
         self.timeout          = REQUEST_TIMEOUT
         self.shopify_domain   = config.shopify_domain
 
@@ -215,8 +213,7 @@ class StoreLoader(StoreQueryMixin):
                 self._loaded_from_cache = True
             else:
                 data = load_from_live_api(
-                    self.session, self.base, self.custom_api_base,
-                    self.consumer_key, self.consumer_secret, self.timeout,
+                    self.session, self.base, self.custom_api_base, self.timeout,
                     http=self.http,
                 )
                 self._loaded_from_cache = False
@@ -351,7 +348,6 @@ class StoreLoader(StoreQueryMixin):
         if self.ecommerce_backend != "shopify":
             version = fetch_catalog_version(
                 self.session, self.custom_api_base,
-                self.consumer_key, self.consumer_secret,
                 http=self.http,
             )
             if version and version != self._catalog_version:

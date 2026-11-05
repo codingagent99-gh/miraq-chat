@@ -12,10 +12,10 @@ roles of whichever customer_id the backend passes, so a spoofed id is enough.
 Identity now comes only from sources a browser cannot forge:
 
   WooCommerce  X-MiraQ-Identity header — a token the WordPress plugin signs
-               when it renders the page (includes/class-identity.php). Signing
-               key: HMAC-SHA256(consumer_secret, "miraq-identity-v1"), i.e.
-               derived from the store's Woo consumer secret, which only the
-               plugin and this backend hold. No token → guest.
+               when it renders the page (includes/class-identity.php) with the
+               store's own Ed25519 site key. The backend holds only the public
+               key (site_key.py), so it can check tokens but never make one.
+               No token → guest.
 
   Shopify      logged_in_customer_id from the App Proxy query, which Shopify
                signs. Also checks the signed `shop` matches this tenant, so a
@@ -30,9 +30,14 @@ Identity now comes only from sources a browser cannot forge:
                cannot be set by an HTTP client, so this cannot be spoofed.
 
 Token format (WooCommerce): base64url(json payload) + "." + base64url(sig)
-  payload: {"v": 1, "lid": license_id, "cid": wp_user_id, "role": str,
+  payload: {"v": 2, "lid": license_id, "cid": wp_user_id, "role": str,
             "email": str, "iat": unix, "exp": unix}
-  sig:     HMAC-SHA256(signing_key, <payload part as ASCII>)
+  sig:     Ed25519(site private key, <payload part as ASCII>)
+
+  v1 (plugin before 1.0.8) signed with HMAC-SHA256 under a key derived from
+  the WooCommerce consumer secret. It is accepted only while the store still
+  has that secret on record (site_key.py, LEGACY BRIDGE). Without it a v1
+  token is answered as expired, so the widget fetches a fresh v2 one.
 """
 
 from __future__ import annotations
@@ -42,7 +47,7 @@ import hashlib
 import hmac
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from flask import g, request
@@ -55,7 +60,8 @@ IDENTITY_HEADER = "X-MiraQ-Identity"
 CHANNEL_ENVIRON_KEY = "miraq.channel_identity"
 
 _KEY_CONTEXT = b"miraq-identity-v1"
-_TOKEN_VERSION = 1
+_TOKEN_V1 = 1   # HMAC, legacy — see the module docstring
+_TOKEN_V2 = 2   # Ed25519 site key
 # Tolerance for clock differences between the WordPress host and this server.
 _CLOCK_SKEW_S = 120
 
@@ -69,6 +75,10 @@ class Identity:
     # Channel requests only: who is writing, so a guest can be sent a sign-in link.
     channel: str = ""
     channel_user_id: str = ""
+    # The verified WooCommerce token itself, forwarded to the plugin's
+    # shopper-data routes (/my-orders), which check it again and return only
+    # this shopper's orders. Never logged or shown.
+    token: str = field(default="", repr=False, compare=False)
 
     @property
     def is_guest(self) -> bool:
@@ -94,42 +104,80 @@ def _b64url_decode(text: str) -> bytes:
 
 
 def _signing_key(consumer_secret: str) -> bytes:
+    # v1 only.
     # Matches PHP: hash_hmac('sha256', 'miraq-identity-v1', $secret, true)
     return hmac.new(consumer_secret.encode("utf-8"), _KEY_CONTEXT, hashlib.sha256).digest()
 
 
 def sign_woo_identity(payload: dict, consumer_secret: str) -> str:
-    """Build a token. The plugin does this in PHP; kept here for tests and so
-    the two implementations can be checked against each other."""
+    """Build a v1 (legacy HMAC) token. Kept for tests of the legacy bridge."""
     body = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     sig = hmac.new(_signing_key(consumer_secret), body.encode("ascii"), hashlib.sha256).digest()
     return f"{body}.{_b64url_encode(sig)}"
 
 
-def verify_woo_identity(token: str, *, consumer_secret: str, license_id: str,
-                        now: Optional[float] = None) -> Identity:
+def sign_woo_identity_v2(payload: dict, private_key) -> str:
+    """Build a v2 token with an Ed25519 private key. The plugin does this in
+    PHP; kept here for tests and so the two implementations can be checked
+    against each other."""
+    body = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    return f"{body}.{_b64url_encode(private_key.sign(body.encode('ascii')))}"
+
+
+def verify_woo_identity(token: str, *, license_id: str, public_key=None,
+                        consumer_secret: str = "", now: Optional[float] = None) -> Identity:
     """Verified identity from a plugin-signed token.
 
+    public_key: the store's Ed25519 site key (v2 tokens).
+    consumer_secret: the store's legacy WooCommerce secret, while it still has
+    one (v1 tokens).
+
     Returns GUEST for anything that fails verification (logged — a forged or
-    foreign token is worth seeing). Raises IdentityExpired only for a token
-    that is genuine but past its lifetime, so the widget can refresh it.
+    foreign token is worth seeing). Raises IdentityExpired for a token that is
+    genuine but past its lifetime, and for a v1 token the store can no longer
+    verify, so the widget fetches a fresh one.
     """
-    if not token or not consumer_secret:
+    if not token:
         return GUEST
     try:
         body, sig = token.split(".", 1)
-        expected = hmac.new(_signing_key(consumer_secret), body.encode("ascii"), hashlib.sha256).digest()
-        if not hmac.compare_digest(expected, _b64url_decode(sig)):
-            logger.warning("identity: token signature mismatch — treating as guest")
-            return GUEST
-        payload = json.loads(_b64url_decode(body))
+        # Read only to pick the algorithm; nothing in it is trusted until the
+        # signature for that algorithm checks out below.
+        version = json.loads(_b64url_decode(body)).get("v")
     except Exception as e:
         logger.warning(f"identity: malformed token ({type(e).__name__}) — treating as guest")
         return GUEST
 
-    if payload.get("v") != _TOKEN_VERSION:
-        logger.warning(f"identity: unsupported token version {payload.get('v')!r} — treating as guest")
+    if version == _TOKEN_V2:
+        from site_key import verify as _verify_site_signature
+        if public_key is None:
+            logger.warning("identity: v2 token but no site key registered for this store — treating as guest")
+            return GUEST
+        if not _verify_site_signature(public_key, body.encode("ascii"), sig):
+            logger.warning("identity: token signature mismatch — treating as guest")
+            return GUEST
+    elif version == _TOKEN_V1:
+        if not consumer_secret:
+            # The store has moved to its site key; the widget refreshes.
+            logger.info("identity: v1 token after the store moved to its site key — asking the widget to refresh")
+            raise IdentityExpired()
+        try:
+            expected = hmac.new(_signing_key(consumer_secret), body.encode("ascii"), hashlib.sha256).digest()
+            if not hmac.compare_digest(expected, _b64url_decode(sig)):
+                logger.warning("identity: token signature mismatch — treating as guest")
+                return GUEST
+        except Exception as e:
+            logger.warning(f"identity: malformed token ({type(e).__name__}) — treating as guest")
+            return GUEST
+    else:
+        logger.warning(f"identity: unsupported token version {version!r} — treating as guest")
         return GUEST
+
+    try:
+        payload = json.loads(_b64url_decode(body))
+    except Exception:
+        return GUEST
+
     # Bound to one store: a token from store A must not work on store B, even
     # if both happened to share a secret.
     if str(payload.get("lid") or "") != str(license_id or ""):
@@ -156,23 +204,11 @@ def verify_woo_identity(token: str, *, consumer_secret: str, license_id: str,
         role=str(payload.get("role") or "customer"),
         email=str(payload.get("email") or ""),
         source="wp_token",
+        token=token,
     )
 
 
 # ── per-request resolution ───────────────────────────────────────────────────
-
-def _woo_consumer_secret(tenant) -> str:
-    loader = g.__dict__.get("store_loader")
-    secret = getattr(loader, "consumer_secret", "") if loader is not None else ""
-    if secret:
-        return secret
-    from tenant_crypto import decrypt_secret
-    try:
-        return decrypt_secret(tenant.woo_secret_encrypted or "")
-    except Exception:
-        logger.error(f"identity: cannot decrypt consumer secret | license_id={tenant.license_id!r}")
-        return ""
-
 
 def _claimed_customer_id() -> str:
     """The customer id the widget says it is (POST /chat's user_context)."""
@@ -248,8 +284,12 @@ def resolve_identity(tenant) -> Identity:
     token = request.headers.get(IDENTITY_HEADER, "").strip()
     if not token:
         return GUEST
+    import site_key
     return verify_woo_identity(
-        token, consumer_secret=_woo_consumer_secret(tenant), license_id=tenant.license_id,
+        token,
+        license_id=tenant.license_id,
+        public_key=site_key.public_key_for(tenant),
+        consumer_secret=site_key.legacy_consumer_secret(tenant),
     )
 
 

@@ -23,68 +23,28 @@ class FlowState(Enum):
     AWAITING_ANYTHING_ELSE = "awaiting_anything_else"  # MQ asked: anything else?
     CLOSING = "closing"                     # User said no, chat closing
     AWAITING_VARIANT_SELECTION = "awaiting_variant_selection"  # MQ asked: which variant?
-    AWAITING_ORDER_DETAIL = "awaiting_order_detail"            # User asked for order detail / clicked an order
     AWAITING_REORDER_ID = "awaiting_reorder_id"
     AWAITING_FILTER_CLARIFICATION = "awaiting_filter_clarification"
     AWAITING_REFINEMENT_CHOICE    = "awaiting_refinement_choice"
     AWAITING_NO_RESULTS_CHOICE    = "awaiting_no_results_choice"
     AWAITING_CART_CONFIRMATION = "awaiting_cart_confirmation"
     
-    # ── Sales rep flows ──────────────────────────────────────────────
-    # No longer email-based (see handlers/sales_rep_handler.py) — the value
-    # changed along with the name, deliberately, so nothing new is ever
-    # persisted under the old string. A session already sitting in the old
-    # "awaiting_order_for_email" state is handled by _LEGACY_FLOW_STATE_ALIASES
-    # in routes/chat.py, which maps the old string onto this member at the
-    # point a request is parsed — not here, since Enum values must be unique
-    # and constant.
-    AWAITING_ORDER_FOR_CUSTOMER       = "awaiting_order_for_customer"
+    # ── Bulk order (shopper's own, into the cart) ──────────────────────
+    # A stored state that no longer exists (the removed company/recipient/
+    # address/confirmation steps) falls back to IDLE in routes/chat.py.
     AWAITING_BULK_ORDER_INPUT         = "awaiting_bulk_order_input"
-    AWAITING_BULK_ORDER_CONFIRMATION  = "awaiting_bulk_order_confirmation"
-    AWAITING_BULK_ADDRESS_CONFIRMATION = "awaiting_bulk_address_confirmation"
     AWAITING_BULK_VARIANT_SELECTION   = "awaiting_bulk_variant_selection"
-    AWAITING_BULK_EMAIL               = "awaiting_bulk_email"
-    AWAITING_BULK_COMPANY             = "awaiting_bulk_company"
-    AWAITING_BULK_RECIPIENT           = "awaiting_bulk_recipient"
-    AWAITING_BULK_RECIPIENT_MODE      = "awaiting_bulk_recipient_mode"
-    AWAITING_BULK_ADDRESS_CHOICE      = "awaiting_bulk_address_choice"
     AWAITING_BULK_PRODUCT             = "awaiting_bulk_product"
     AWAITING_BULK_QUANTITY = "awaiting_bulk_quantity"
-
-    # Admin picking between several reps who match a name in an order report
-    AWAITING_REP_CHOICE = "awaiting_rep_choice"
-
-    # Admin choosing the date window for an order report, when the question
-    # named no period at all. Reporting blocks here rather than defaulting to
-    # all-time: a total silently covering a different window than the asker had
-    # in mind is a wrong answer that looks like a right one.
-    AWAITING_DATE_RANGE = "awaiting_date_range"
-
-    # Rep picking which COMPANY a bulk order is for, when a fuzzy company
-    # lookup matched more than one business. Always resolved BEFORE the
-    # recipient question, so the person list never mixes two companies.
-    AWAITING_BULK_COMPANY_CHOICE = "awaiting_bulk_company_choice"
 
 _ORDER_FLOW_STATES = {
     FlowState.AWAITING_QUANTITY,
     FlowState.AWAITING_CART_CONFIRMATION,
-    FlowState.AWAITING_ORDER_DETAIL,
     FlowState.AWAITING_REORDER_ID,
-    FlowState.AWAITING_ORDER_FOR_CUSTOMER,
     FlowState.AWAITING_BULK_ORDER_INPUT,
-    FlowState.AWAITING_BULK_ORDER_CONFIRMATION,
-    FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION,
     FlowState.AWAITING_BULK_VARIANT_SELECTION,
-    FlowState.AWAITING_BULK_EMAIL,
-    FlowState.AWAITING_BULK_COMPANY,
-    FlowState.AWAITING_BULK_RECIPIENT,
-    FlowState.AWAITING_BULK_RECIPIENT_MODE,
-    FlowState.AWAITING_BULK_ADDRESS_CHOICE,
     FlowState.AWAITING_BULK_PRODUCT,
     FlowState.AWAITING_BULK_QUANTITY,
-    FlowState.AWAITING_BULK_COMPANY_CHOICE,
-    FlowState.AWAITING_REP_CHOICE,
-    FlowState.AWAITING_DATE_RANGE,
 }
 
 # Bare exit vocabulary. Shared by the in-flow escape hatch below and by the
@@ -160,21 +120,10 @@ def _flow_context_message(state: FlowState) -> dict:
         FlowState.AWAITING_QUANTITY:                "Please enter a quantity (e.g. **5**)",
         FlowState.AWAITING_VARIANT_SELECTION:       "Please select a variant from the options above",
         FlowState.AWAITING_CART_CONFIRMATION:       "Please reply **Yes** to add to cart or **No** to skip",
-        FlowState.AWAITING_BULK_EMAIL:              "Please provide a valid customer email address",
-        FlowState.AWAITING_BULK_COMPANY:           "Please provide the company name for this order",
-        FlowState.AWAITING_BULK_RECIPIENT:         "Please tell me who this order is for",
-        FlowState.AWAITING_REP_CHOICE:             "Please pick which rep you meant",
-        FlowState.AWAITING_DATE_RANGE:             "Please pick a date range, or choose **All time**",
-        FlowState.AWAITING_BULK_COMPANY_CHOICE:    "Please pick which company this order is for",
-        FlowState.AWAITING_BULK_RECIPIENT_MODE:    "Please say whether these are for the same person or different people",
-        FlowState.AWAITING_BULK_ADDRESS_CHOICE:    "Please pick which address to ship to",
         FlowState.AWAITING_BULK_PRODUCT:            "Please enter a product name",
         FlowState.AWAITING_BULK_QUANTITY:           "Please enter a quantity",
         FlowState.AWAITING_BULK_ORDER_INPUT:        "Please enter your order lines",
-        FlowState.AWAITING_BULK_ORDER_CONFIRMATION: "Please reply **Yes** to confirm or **No** to cancel",
-        FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION:"Please reply **Yes**, **Change**, or **Skip**",
         FlowState.AWAITING_BULK_VARIANT_SELECTION:  "Please select a variant from the options above",
-        FlowState.AWAITING_ORDER_FOR_CUSTOMER:         "Please tell me the customer's name and company",
     }
     hint = _hints.get(state, "Please complete the current step")
     return {
@@ -196,7 +145,6 @@ def _flow_context_message(state: FlowState) -> dict:
 # scrolled past the original buttons had nothing to tap but an exit.
 _REPROMPT_SUGGESTIONS = {
     FlowState.AWAITING_CART_CONFIRMATION:       ["Yes, add it", "No thanks"],
-    FlowState.AWAITING_BULK_ORDER_CONFIRMATION: ["Yes", "No", "Cancel"],
 }
 
 # How many consecutive unrecognised replies before the recap replaces the nudge.
@@ -563,77 +511,6 @@ def handle_flow_state(
         if any(ph in text for ph in _topic_change_phrases) or _is_topic_change(text) or text.strip() in ("hello", "hi"):
             return _flow_context_message(FlowState.AWAITING_VARIANT_SELECTION)
         
-    # ── State: Awaiting bulk order confirmation (Yes/No) ──
-    if state == FlowState.AWAITING_BULK_ORDER_CONFIRMATION:
-        _yes = re.search(r'\b(yes|yeah|yep|sure|confirm|ok|okay|go\s+ahead|proceed)\b', text)
-        _no  = re.search(r'\b(no|nope|abort|never\s+mind)\b', text)
-        if _yes:
-            return {
-                "action": "confirm_bulk_order",
-                "flow_state": FlowState.AWAITING_BULK_ORDER_CONFIRMATION.value,
-                "pass_through": False,
-            }
-        elif _no:
-            return {
-                "action": "cancel_bulk_order",
-                "flow_state": FlowState.IDLE.value,
-                "pass_through": False,
-            }
-        else:
-            return {
-                "action": "bulk_confirmation_unclear",
-                "flow_state": FlowState.AWAITING_BULK_ORDER_CONFIRMATION.value,
-                "pass_through": False,
-            }
-
-    # ── State: Awaiting bulk address confirmation ──
-    if state == FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION:
-        # Structured save from the inline edit panel: message is
-        # "__BULK_ADDR__<json>" carrying edited billing + shipping blocks.
-        # Check the RAW message (not lowercased text) so the prefix and the
-        # JSON payload are preserved exactly.
-        if message.strip().startswith("__BULK_ADDR__"):
-            return {
-                "action": "bulk_address_override_structured",
-                "flow_state": FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value,
-                "pass_through": False,
-            }
-        # Sub-state: user was prompted to type a new address (legacy text path)
-        if entities.get("bulk_awaiting_address_text"):
-            return {
-                "action": "bulk_address_override_text",
-                "flow_state": FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value,
-                "pass_through": False,
-            }
-        _yes    = re.search(r'\b(yes|yeah|yep|sure|confirm|ok|okay|use|correct)\b', text)
-        _change = re.search(r'\b(change|update|different|new|edit|modify|type)\b', text)
-        _skip   = re.search(r'\b(skip|next|later)\b', text)
-        if _yes:
-            return {
-                "action": "bulk_address_confirmed",
-                "flow_state": FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value,
-                "pass_through": False,
-            }
-        elif _change:
-            return {
-                "action": "bulk_address_change",
-                "flow_state": FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value,
-                "pass_through": False,
-            }
-        elif _skip:
-            return {
-                "action": "bulk_address_skip",
-                "flow_state": FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value,
-                "pass_through": False,
-            }
-        else:
-            return {
-                "bot_message": "Please reply **Yes** to use the address on file, **Change** to type a new one, or **Skip** to proceed without an override.",
-                "suggestions": ["Yes, use it", "Change address", "Skip"],
-                "flow_state": FlowState.AWAITING_BULK_ADDRESS_CONFIRMATION.value,
-                "pass_through": False,
-            }
-
     # ── State: Awaiting bulk variant selection ──
     if state == FlowState.AWAITING_BULK_VARIANT_SELECTION:
         if _is_topic_change(text):
@@ -644,116 +521,6 @@ def handle_flow_state(
             "pass_through": False,
         }
         
-    # ── State: Awaiting customer name+company for order-for flow (rep only) ──
-    if state == FlowState.AWAITING_ORDER_FOR_CUSTOMER:
-        return {
-            "action":     "resolve_order_for_email",
-            "flow_state": FlowState.AWAITING_ORDER_FOR_CUSTOMER.value,
-            "pass_through": False,
-        }
-    
-    # ── State: Awaiting which of a person's addresses to ship to ──
-    if state == FlowState.AWAITING_BULK_ADDRESS_CHOICE:
-        if not message.strip():
-            return _flow_context_message(FlowState.AWAITING_BULK_ADDRESS_CHOICE)
-        return {
-            "action": "process_bulk_address_choice_reply",
-            "flow_state": FlowState.AWAITING_BULK_ADDRESS_CHOICE.value,
-            "pass_through": False,
-        }
-
-    # ── State: Awaiting "same person" vs "different people" for unnamed lines ──
-    if state == FlowState.AWAITING_BULK_RECIPIENT_MODE:
-        if not message.strip():
-            return _flow_context_message(FlowState.AWAITING_BULK_RECIPIENT_MODE)
-        return {
-            "action": "process_bulk_recipient_mode_reply",
-            "flow_state": FlowState.AWAITING_BULK_RECIPIENT_MODE.value,
-            "pass_through": False,
-        }
-
-    # ── State: Awaiting the person this bulk order ships to ──
-    if state == FlowState.AWAITING_BULK_RECIPIENT:
-        if not message.strip():
-            return _flow_context_message(FlowState.AWAITING_BULK_RECIPIENT)
-        return {
-            "action": "process_bulk_recipient_reply",
-            "flow_state": FlowState.AWAITING_BULK_RECIPIENT.value,
-            "pass_through": False,
-        }
-
-    # ── State: Rep choosing which matching company the bulk order is for ──
-    if state == FlowState.AWAITING_BULK_COMPANY_CHOICE:
-        if not message.strip():
-            return _flow_context_message(FlowState.AWAITING_BULK_COMPANY_CHOICE)
-        return {
-            "action": "process_bulk_company_choice_reply",
-            "flow_state": FlowState.AWAITING_BULK_COMPANY_CHOICE.value,
-            "pass_through": False,
-        }
-
-    # ── State: Admin choosing the date window for an order report ──
-    if state == FlowState.AWAITING_DATE_RANGE:
-        # Structured pick from the date-range card: "__DATE_RANGE__<json>".
-        # Checked against the RAW message, not the lowercased `text`, so the
-        # prefix and the JSON payload survive intact — same reason the bulk
-        # address branch does it.
-        if message.strip().startswith("__DATE_RANGE__"):
-            return {
-                "action": "process_date_range_reply",
-                "flow_state": FlowState.AWAITING_DATE_RANGE.value,
-                "pass_through": False,
-            }
-        if not message.strip():
-            return _flow_context_message(FlowState.AWAITING_DATE_RANGE)
-        # Anything else is treated as a typed window ("last quarter",
-        # "01/02/2026 to 03/15/2026"). It still routes to the same handler,
-        # which re-runs the extractor over it — typing a range must work
-        # exactly as well as clicking one.
-        return {
-            "action": "process_date_range_reply",
-            "flow_state": FlowState.AWAITING_DATE_RANGE.value,
-            "pass_through": False,
-        }
-
-    # ── State: Admin choosing which of several matching reps to report on ──
-    if state == FlowState.AWAITING_REP_CHOICE:
-        if not message.strip():
-            return _flow_context_message(FlowState.AWAITING_REP_CHOICE)
-        return {
-            "action": "process_rep_choice_reply",
-            "flow_state": FlowState.AWAITING_REP_CHOICE.value,
-            "pass_through": False,
-        }
-
-    # ── State: Awaiting company name for bulk order scope resolution ──
-    if state == FlowState.AWAITING_BULK_COMPANY:
-        if not message.strip():
-            return _flow_context_message(FlowState.AWAITING_BULK_COMPANY)
-        return {
-            "action": "process_bulk_company_reply",
-            "flow_state": FlowState.AWAITING_BULK_COMPANY.value,
-            "pass_through": False,
-        }
-
-    # ── State: Awaiting email address for bulk order customer resolution ──
-    if state == FlowState.AWAITING_BULK_EMAIL:
-        import re as _re
-        _EMAIL_RE = _re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', _re.I)
-        emails = _EMAIL_RE.findall(message)
-        if emails:
-            return {
-                "action": "process_bulk_email_reply",
-                "flow_state": FlowState.AWAITING_BULK_EMAIL.value,
-                "pass_through": False,
-            }
-        else:
-            return {
-                "bot_message": "Please provide a valid email address to look up the customer.",
-                "suggestions": [],
-                "flow_state": FlowState.AWAITING_BULK_EMAIL.value,
-                "pass_through": False,
-            }
     # ── State: Awaiting product name for bulk order line ──
     if state == FlowState.AWAITING_BULK_PRODUCT:
         # Any non-empty reply is treated as a product + optional quantity description.

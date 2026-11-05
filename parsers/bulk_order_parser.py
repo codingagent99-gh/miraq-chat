@@ -5,7 +5,7 @@ resolved BulkOrderLine objects.
 No Flask. WooCommerce API calls only (via woo_client / endpoints).
 
 Public API:
-    parse_bulk_order_utterance(text, store_loader, role, self_customer_id)
+    parse_bulk_order_utterance(text, store_loader, self_customer_id)
         → List[BulkOrderLine]
 """
 
@@ -17,7 +17,6 @@ from typing import Optional, List
 from woo_client import woo_client
 from ecommerce import endpoints
 from chat_logger import get_logger
-from app_config import BULK_ORDER_FULL_SCOPE_ROLES, BULK_ORDER_ROLES
 from platform_config import current_backend
 from handlers.chat_utils import normalize_spelling_variants, _attribute_display_name, variation_declares_self_contained_term, _normalize_term_key
 from models import ExtractedEntities
@@ -26,15 +25,6 @@ from api_builder.store_helpers import resolve_attr_filters
 from api_builder.filter_builder import build_advanced_filter_call
 
 logger = get_logger("miraq_chat")
-
-# ── Company roster pagination ────────────────────────────────────────────────
-# The plugin hard-caps per_page at 20 (min(20, ...) in
-# get_customers_by_company), so a company's full membership can only be read
-# by paging. MAX_ROSTER_PAGES bounds that walk: 5 pages × 20 = up to 100
-# contacts per company. Past that we stop and mark the roster truncated
-# rather than silently treating a partial list as complete.
-ROSTER_PAGE_SIZE = 20
-MAX_ROSTER_PAGES = 5
 
 EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', re.I)
 # ══════════════════════════════════════════════════════════════
@@ -153,39 +143,15 @@ class _PreLine:
 # PUBLIC FUNCTION
 # ══════════════════════════════════════════════════════════════
 
-class MultipleCompaniesError(ValueError):
-    """Raised when one utterance names more than one company.
-
-    The requirement restricts a bulk order to a single company per
-    transaction, so this is rejected outright rather than partially applied.
-    """
-
-    def __init__(self, companies):
-        self.companies = companies
-        super().__init__(f"multiple companies in one request: {companies}")
-
-
-# "for company Beck LTD" — the explicit, unambiguous form.
-_FOR_COMPANY_RE = re.compile(
-    r'\bfor\s+company\s+([^,]+)'        # "for company Gensler"
-    r'|\bfor\s+([^,]+?)\s+company\b',   # "for Gensler company"
-    re.I,
-)
-
-# Both orderings are in live use. Only the keyword-first one was recognised,
-# so "order allspice chipcard for gensler company" carried no company scope at
-# all — the tail was stripped as noise and the rep was then asked who the order
-# was for, having just said so in the message.
-
 # Text that names a company EXPLICITLY — a scope marker plus the word
 # "company", or a trailing "at <name>". Deliberately excludes a bare
 # "for <name>" tail: that is genuinely ambiguous between a person and a
 # company, and is resolved later against the roster rather than guessed at
 # classification time.
 #
-# BulkOrderEvaluator imports this. Same single-source-of-truth reason as
-# COMPANY_SCOPE_TAIL_RE below: a marker added here must not need a second
-# edit somewhere else to take effect.
+# routes/chat.py imports this for the typo guard (_is_inline_bulk_order).
+# The parser itself no longer reads company names: a bulk order is always the
+# shopper's own and goes to their cart.
 EXPLICIT_COMPANY_SCOPE_RE = re.compile(
     r'\bfor\s+company\s+[^,]+'
     r'|\bfor\s+[^,]+?\s+company\b'
@@ -220,12 +186,6 @@ _WORD_NUMERALS = {
 # copies is what let "at Beck" get silently corrected to "at back" after "at"
 # was added here but not there — every marker added below is protected from
 # typo correction automatically.
-COMPANY_SCOPE_MARKERS = ("for", "at")
-
-# "at" tails, anchored to the fragment end — this marks a company only in
-# trailing position ("Adams Grey at Beck"), never mid-fragment.
-_AT_COMPANY_RE = re.compile(r'\bat\s+([^,]+)$', re.I)
-
 # Any scope tail, used ONLY for typo-guard token extraction (not for parsing).
 # Unanchored so it catches "for ram" mid-fragment as well as trailing tails.
 COMPANY_SCOPE_TAIL_RE = re.compile(
@@ -233,54 +193,11 @@ COMPANY_SCOPE_TAIL_RE = re.compile(
 )
 
 
-def _extract_company_scope(text: str):
-    """
-    Pull the transaction-wide company out of the raw utterance.
-
-    Handles the explicit forms only ("... for company Beck LTD" and
-    "... for Beck LTD company"); the implicit trailing form ("Order A, B, C
-    for Beck LTD") is resolved later, once the text has been split into
-    fragments and we can tell a lone trailing "for" from per-line recipients.
-
-    Returns (company_name, cleaned_text).
-    Raises MultipleCompaniesError if two different companies are named.
-    """
-    names = []
-    # Two alternatives, so findall yields a tuple per match — exactly one
-    # group is non-empty.
-    for groups in _FOR_COMPANY_RE.findall(text):
-        raw = next((g for g in groups if g), "")
-        name = raw.strip().strip(' ,.')
-        if name and not any(name.lower() == seen.lower() for seen in names):
-            names.append(name)
-
-    if len(names) > 1:
-        raise MultipleCompaniesError(names)
-
-    if names:
-        cleaned = _FOR_COMPANY_RE.sub('', text).strip().strip(' ,.')
-        return names[0], cleaned
-
-    return "", text
-
-
-# ── Optional checkout-field clauses ("rep X", "order type Y", ...) ──────────
-# Keyword-introduced clauses that may appear ANYWHERE in a bulk order message
-# and in any order:
-#
-#   Order 1 each allspice, adams for Andrew Gazda at Gensler,
-#           rep John Smith, order type new deal
-#
-# They MUST be stripped before Step 1 splits on commas. That split turns every
-# comma-separated chunk into an order fragment, so ", rep John Smith" would
-# otherwise be resolved as a product line. Removing the clauses first is also
-# exactly what makes them position-independent: what remains is the plain
-# product/recipient text the existing parser already handles.
-#
-# Each clause runs to the next comma or end of string. Comma-only, not
-# "next keyword", deliberately: order-type labels are multi-word ("New Deal",
-# "Presentation/Library") and a project name may legitimately contain a word
-# that also opens a clause.
+# ── Checkout-field clause words ("rep X", "order type Y", "project Z") ──────
+# The parser no longer reads these clauses. The keyword list stays only for
+# routes/chat.py's typo guard (FIELD_CLAUSE_SCOPE_TAIL_RE /
+# FIELD_CLAUSE_MARKER_WORDS below), which keeps the corrector from rewriting
+# the words and the text after them.
 _FIELD_CLAUSE_KEYWORDS = {
     # canonical slot  ->  accepted openers, longest first so "order type"
     #                     wins over a bare "type"
@@ -311,8 +228,8 @@ _FIELD_CLAUSE_OPENERS = sorted(
 )
 
 # Any FIELD-CLAUSE scope tail ("rep John Smith", "order type new deal",
-# "project Midtown Office") — used ONLY for typo-guard token extraction, not
-# for parsing (that's _FIELD_CLAUSE_RE below). Same single-source-of-truth
+# "project Midtown Office") — used ONLY for typo-guard token extraction.
+# Same single-source-of-truth
 # contract as COMPANY_SCOPE_TAIL_RE: routes/chat.py imports this and the
 # marker words, so a keyword added to _FIELD_CLAUSE_KEYWORDS above is
 # protected from typo correction automatically, with no second edit in
@@ -339,178 +256,10 @@ FIELD_CLAUSE_MARKER_WORDS = frozenset(
     if word and word.isalpha()
 )
 
-_FIELD_CLAUSE_RE = re.compile(
-    r"(?:^|,)\s*(?P<kw>"
-    + "|".join(_FIELD_CLAUSE_OPENERS)
-    # A clause value ends at a comma or end of string — but ALSO at a bare
-    # " for "/" at ", because those are the order's own company/recipient
-    # markers. Without this, "order type new deal, rep John Smith for Gensler"
-    # captures "John Smith for Gensler" as the rep name AND silently eats the
-    # company tail, leaving the order unscoped. Same silent-drop shape as the
-    # _FOR_COMPANY_RE over-capture bug.
-    + r")\s+(?P<val>[^,]+?)(?=\s*,|\s*$|\s+(?:for|at)\s+)",
-    re.I,
-)
-
-
-def _slot_for_keyword(kw: str) -> str:
-    norm = re.sub(r"\s+", " ", kw.strip().lower())
-    for slot, patterns in _FIELD_CLAUSE_KEYWORDS.items():
-        for pat in patterns:
-            if re.fullmatch(pat, norm, re.I):
-                return slot
-    return ""
-
-
-def _extract_field_clauses(text: str):
-    """Strip optional checkout-field clauses out of `text`.
-
-    Returns (remaining_text, values, notices) where `values` maps the address
-    block's own field keys (project_rep / billing_field_type) to resolved
-    values, and `notices` carries a human-readable line per clause that could
-    NOT be resolved.
-
-    Nothing here guesses. An unrecognised or ambiguous value is left UNSET and
-    reported — which lands it on the address card's existing missing-field
-    prompt, the same review step a blank field already reaches, rather than
-    writing something the storefront cannot render.
-    """
-    values, notices = {}, []
-    if not text:
-        return text, values, notices
-
-    def _replace(m):
-        slot = _slot_for_keyword(m.group("kw"))
-        raw = (m.group("val") or "").strip(" .;:")
-        if not slot or not raw:
-            return m.group(0)          # not ours — leave the text alone
-
-        if slot == "project_rep":
-            resolved, note = _resolve_rep_clause(raw)
-        elif slot == "billing_field_type":
-            resolved, note = _resolve_order_type_clause(raw)
-        else:
-            resolved, note = _resolve_project_clause(raw)
-
-        if resolved:
-            values[slot] = resolved
-        if note:
-            notices.append(note)
-        # Consume the clause either way: it was clearly a field clause, not an
-        # order line, so leaving it in would make the parser hunt for a product
-        # called "John Smith".
-        return "," if m.group(0).lstrip().startswith(",") else ""
-
-    remaining = _FIELD_CLAUSE_RE.sub(_replace, text)
-    remaining = re.sub(r",\s*,", ",", remaining)
-    remaining = remaining.strip().strip(",").strip()
-    return remaining, values, notices
-
-
-def _resolve_rep_clause(raw: str):
-    """Validate a typed rep name against the project_rep dropdown options.
-
-    Stores the rep's EMAIL, which is what `_billing_project_rep` holds and
-    what the widget's <select> matches on — the label is only what a human
-    types. Unknown or ambiguous returns no value plus a notice.
-    """
-    try:
-        from utils.checkout_fields import rep_directory
-        directory = rep_directory()
-    except Exception:
-        directory = {}
-
-    if not directory:
-        # Options unreachable — fail OPEN rather than blocking the order, same
-        # contract as is_known_rep(). Nothing is stored: an unvalidated email
-        # guess here would be exactly the blank-<select> bug.
-        logger.warning(f"[FieldClause] rep options unavailable — '{raw}' not applied")
-        return "", (
-            f"⚠️ Couldn't check the rep list right now, so **{raw}** wasn't "
-            f"applied. You can set the rep on the review step below."
-        )
-
-    needle = re.sub(r"[^a-z0-9]+", " ", raw.lower()).strip()
-    exact, partial = [], []
-    for email, name in directory.items():
-        n = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
-        if not n:
-            continue
-        if n == needle:
-            exact.append((name, email))
-        elif needle and (n.startswith(needle) or needle in n):
-            partial.append((name, email))
-
-    hits = exact or partial
-    if len(hits) == 1:
-        name, email = hits[0]
-        logger.info(f"[FieldClause] rep '{raw}' → {name}")
-        return email, ""
-    if len(hits) > 1:
-        names = ", ".join(sorted(n for n, _ in hits))
-        return "", (
-            f"⚠️ **{raw}** matches more than one rep ({names}). "
-            f"Pick the right one on the review step below."
-        )
-    return "", (
-        f"⚠️ **{raw}** isn't one of the reps on file. "
-        f"Choose a rep on the review step below."
-    )
-
-
-def _resolve_project_clause(raw: str):
-    """Pass a typed project name straight through.
-
-    No validation, deliberately: billing_project is a plain <input> on the
-    checkout form, not a <select>, so there is no option list to check against
-    and whatever the user types IS the value. The other two clause slots are
-    selects, where an unrecognised value must be left unset or it renders
-    blank in the widget while still satisfying the required-field gate.
-    """
-    cleaned = str(raw or "").strip(" .;:,-")
-    if not cleaned:
-        return "", ""
-    logger.info(f"[FieldClause] project → {cleaned!r}")
-    return cleaned, ""
-
-
-def _resolve_order_type_clause(raw: str):
-    """Validate a typed order type and translate label → stored value."""
-    try:
-        from utils.checkout_fields import match_order_type
-        res = match_order_type(raw)
-    except Exception as exc:
-        logger.warning(f"[FieldClause] order type check failed: {exc}")
-        return "", (
-            f"⚠️ Couldn't check the order types right now, so **{raw}** "
-            f"wasn't applied. You can set it on the review step below."
-        )
-
-    status = res.get("status")
-    if status == "matched":
-        logger.info(f"[FieldClause] order type '{raw}' → {res['value']} ({res['label']})")
-        return res["value"], ""
-    if status == "unvalidated":
-        logger.warning(f"[FieldClause] order type '{raw}' stored unvalidated")
-        return res["value"], ""
-    if status == "ambiguous":
-        opts = ", ".join(res.get("candidates") or [])
-        return "", (
-            f"⚠️ **{raw}** matches more than one order type ({opts}). "
-            f"Pick one on the review step below."
-        )
-    opts = ", ".join(res.get("candidates") or [])
-    return "", (
-        f"⚠️ **{raw}** isn't a valid order type"
-        + (f". Valid options: {opts}." if opts else ".")
-        + " Set it on the review step below."
-    )
-
 
 def parse_bulk_order_utterance(
     text: str,
     store_loader,
-    role: str = "",
     self_customer_id: Optional[str] = None,
     meta_out: Optional[dict] = None,
 ) -> List[BulkOrderLine]:
@@ -521,67 +270,11 @@ def parse_bulk_order_utterance(
       1. Split into fragments (comma / " and <digit>")
       2. Per-fragment extraction (qty, company, product, reorder flag)
       3. Product resolution (store_loader, no API call)
-      4. Company resolution (one API call per unique company, batched; rep only)
-      5. Reorder resolution (API call per reorder line with resolved customer)
-      6. Assemble final BulkOrderLine objects
+      4. Assemble final BulkOrderLine objects
+
+    Every line is the shopper's own order (it goes to their cart), so nothing
+    here looks up companies, recipients or other customers.
     """
-    # Company/recipient-scoped resolution for the bulk-order flow: reps (and
-    # cs/pm roles) plus "customer" — a customer bulk-ordering to a named
-    # recipient/company still goes through real resolution, not just
-    # self-scoped cart behavior. See BULK_ORDER_FULL_SCOPE_ROLES. This governs
-    # whether the company/recipient PARSING machinery below (Steps 0/1.5/1.6/2)
-    # runs at all — it must run for "customer" too, so a customer's "for
-    # Ashlynn at Beck LTD" gets parsed the same way a rep's does.
-    _is_rep = role in BULK_ORDER_FULL_SCOPE_ROLES
-    # _is_true_rep: the ORIGINAL rep-tier roles only (unchanged set). These
-    # roles have no self-order fallback — they must always resolve to a named
-    # company/recipient, exactly as before this change. "customer" is
-    # deliberately NOT in this set: a customer who names nothing at all
-    # (no company, no recipient, no email) is ordering for themselves, same
-    # as their pre-existing self-checkout behavior — see the self-fallback in
-    # Step 6 below, gated on `not _is_true_rep`.
-    _is_true_rep = role in BULK_ORDER_ROLES
-
-    # Shopify has no company/recipient-roster backend at all — ShopifyEndpoints
-    # implements neither search_customers_by_company nor
-    # search_customers_by_email (the DynamicEndpointsRouter would raise
-    # AttributeError trying to dispatch either). True rep roles never reach
-    # this deployment (the widget can only send role="customer"/"guest" — see
-    # the backstop in routes/chat.py), so this was never exercised before.
-    # "customer" now being in BULK_ORDER_FULL_SCOPE_ROLES changes that: force
-    # full self-scoped behavior on Shopify for every role EXCEPT a true rep,
-    # so a Shopify customer's "for Ashlynn at Beck LTD" is silently ignored
-    # (stripped as noise, same as any other unrecognised text) exactly as it
-    # already was before this change, instead of crashing. True reps are left
-    # alone here since that path is unreachable in practice today.
-    if _is_rep and not _is_true_rep and current_backend()== "shopify":
-        _is_rep = False
-
-    # ── Step -0.5: Optional checkout-field clauses ("rep X", "order type Y") ─
-    # Runs BEFORE company scope and before the comma split. Company extraction
-    # scans trailing "for"/"at" tails and the split turns commas into order
-    # fragments, so a trailing ", rep John Smith" would otherwise be read as
-    # either a company tail or a product line. Stripping the clauses first is
-    # what makes them order-independent.
-    text, _field_clause_values, _field_clause_notices = _extract_field_clauses(text)
-    if _field_clause_values or _field_clause_notices:
-        logger.info(
-            f"bulk_parser | field clauses | values={_field_clause_values} "
-            f"| notices={len(_field_clause_notices)}"
-        )
-    if meta_out is not None:
-        # The handler stamps these onto the address block and surfaces the
-        # notices on the address card. Always set (even when empty) so the
-        # handler can distinguish "parsed, nothing given" from "key absent".
-        meta_out["field_clause_values"] = dict(_field_clause_values)
-        meta_out["field_clause_notices"] = list(_field_clause_notices)
-
-    # ── Step 0: Transaction-wide company scope ("... for company Beck LTD") ──
-    # Bulk orders are scoped to ONE company; naming two raises immediately.
-    company_scope = ""
-    if _is_rep:
-        company_scope, text = _extract_company_scope(text)
-
     # ── Step 1: Split into fragments ─────────────────────────────────────────
     _catalog_names = {
         p["name"].lower() for p in (store_loader.products or []) if p.get("name")
@@ -697,110 +390,8 @@ def parse_bulk_order_utterance(
 
     final_fragments = _anchored
 
-    # ── Step 1.5: Implicit trailing company ──────────────────────────────────
-    # Three shapes reach here, all without the explicit "for company" keyword:
-    #
-    #   (a) "Order A, B, C for Beck LTD."
-    #       Only the LAST fragment has a "for" tail, so it scopes the whole
-    #       order rather than naming a recipient for C alone.
-    #
-    #   (b) "Order A for ram, B for sovan for Abel Design Group"
-    #       The last fragment has TWO "for" tails — the first names the
-    #       recipient, the LAST names the company.
-    #
-    #   (c) "Order A for Ashlynn, B for Claire at Abel Design Group"
-    #       "at" separates person from company. This reads most naturally to
-    #       a rep and was previously swallowed whole into the recipient
-    #       ("Claire at Abel Design Group"), so no company was ever detected.
-    if _is_rep and not company_scope:
-        # (c) first — an explicit "at" marker is less ambiguous than counting
-        # "for" tails, so it wins when present.
-        _at_hits = []
-        for i, frag in enumerate(final_fragments):
-            _m = _AT_COMPANY_RE.search(frag)
-            if not _m:
-                continue
-            _name = _m.group(1).strip().strip(' ,.')
-            if _name:
-                _at_hits.append((i, _m.start(), _name))
-
-        _distinct_at = []
-        for _, _, _name in _at_hits:
-            if not any(_name.lower() == seen.lower() for seen in _distinct_at):
-                _distinct_at.append(_name)
-        if len(_distinct_at) > 1:
-            raise MultipleCompaniesError(_distinct_at)
-
-        if _at_hits:
-            company_scope = _distinct_at[0]
-            # Strip the "at <company>" tail from every fragment carrying it.
-            for i, start, _ in _at_hits:
-                final_fragments[i] = final_fragments[i][:start].strip().strip(' ,.')
-            logger.debug(
-                f"bulk_parser | scope-marker company → '{company_scope}'"
-            )
-
-    if _is_rep and not company_scope:
-        _last = final_fragments[-1] if final_fragments else ""
-        _for_positions = [m.start() for m in re.finditer(r'\bfor\b', _last, re.I)]
-        _for_idx = [
-            i for i, f in enumerate(final_fragments)
-            if _FOR_TAIL_RE.search(f)
-        ]
-
-        _split_at = None
-        if len(_for_positions) >= 2:
-            # (b) last "for" in the final fragment starts the company scope
-            _split_at = _for_positions[-1]
-        elif len(_for_idx) == 1 and _for_idx[0] == len(final_fragments) - 1:
-            # (a) the lone "for" tail across the whole utterance
-            _split_at = _for_positions[0] if _for_positions else None
-
-        if _split_at is not None:
-            _tail = _last[_split_at:]
-            _m = _FOR_TAIL_RE.search(_tail)
-            if _m:
-                _cand = EMAIL_RE.sub('', _m.group(1)).strip().strip(' ,.')
-                # An email tail identifies a person, not a company.
-                if _cand and not EMAIL_RE.search(_m.group(1)):
-                    company_scope = _cand
-                    final_fragments[-1] = _last[:_split_at].strip()
-                    logger.debug(
-                        f"bulk_parser | trailing company scope → '{company_scope}'"
-                    )
-
-    # ── Step 1.6: Transaction-wide RECIPIENT and "each" quantity ─────────────
-    # "Order 1 chip card each of Harmony, Adams, Marigold, Lager for Kiki at
-    # Gensler" means all four go to Kiki, one each. But the "for" tail and the
-    # quantity both sit on single fragments — the tail on the last, the number
-    # on the first — so per-fragment extraction gave Kiki only the Lager and
-    # left three lines with no recipient and no quantity. A live order split
-    # 3/1 between the wrong person and the right one because of this.
-    #
-    # Company scope already works transaction-wide (Step 0/1.5); these are the
-    # same idea for the other two shared values.
-    recipient_scope = ""
+    # ── Step 1.6: Transaction-wide "each" quantity ─────────────────────────
     each_quantity = None
-    if _is_rep and len(final_fragments) > 1:
-        _tails = [
-            i for i, f in enumerate(final_fragments)
-            if _FOR_TAIL_RE.search(f or "")
-        ]
-        # ONLY when the last fragment is the sole one carrying a "for" tail.
-        # If several fragments name their own people ("Harmony for ram, Adams
-        # for sovan"), each tail is that line's own recipient and nothing is
-        # shared — that is the documented multi-recipient shape and must not
-        # be collapsed onto one person.
-        if len(_tails) == 1 and _tails[0] == len(final_fragments) - 1:
-            _m = _FOR_TAIL_RE.search(final_fragments[-1])
-            _cand = EMAIL_RE.sub('', _m.group(1)).strip().strip(' ,.')
-            if _cand:
-                recipient_scope = _cand
-                logger.debug(
-                    f"bulk_parser | shared recipient scope → '{recipient_scope}' "
-                    f"(applied to {len(final_fragments)} lines)"
-                )
-
     # "N <unit> each of A, B, C" — the count distributes over every line rather
     # than belonging to the fragment that happens to carry the digits. Scanned
     # on the ORIGINAL text, since by now the number sits in fragment 0 only.
@@ -870,28 +461,6 @@ def parse_bulk_order_utterance(
             re.search(r'\b(reorder|re-order|last\s+week[\'s]*|previous)\b', fragment, re.I)
         )
 
-        # ── Email extraction (rep only — non-rep orders on their own account) ──
-        email = ""
-        if _is_rep:
-            email_match = EMAIL_RE.search(fragment)
-            if email_match:
-                email = email_match.group(0).strip()
-
-        # ── Recipient: the "for <person>" tail, minus any email ──────────────
-        # The company is transaction-wide (Step 0/1.5), so anything left after
-        # "for" on an individual fragment names the PERSON the line ships to.
-        recipient_name = ""
-        if _is_rep:
-            for_match = _FOR_TAIL_RE.search(fragment)
-            if for_match:
-                candidate = EMAIL_RE.sub('', for_match.group(1)).strip().strip(', ')
-                if candidate:
-                    recipient_name = candidate
-            # A trailing "for <person>" on the LAST fragment covers the whole
-            # order (Step 1.6) — apply it to fragments that named nobody.
-            if not recipient_name and recipient_scope:
-                recipient_name = recipient_scope
-
         # ── Product: strip quantity, email addresses, and "for …" tail ──
         # If a catalog product name was pre-claimed above, leave the fragment
         # intact instead — slicing at qty_match.end() here could cut into or
@@ -917,9 +486,9 @@ def parse_bulk_order_utterance(
 
         pre_lines.append(_PreLine(
             raw_fragment=fragment,
-            company_name=company_scope,
-            recipient_name=recipient_name,
-            email=email,
+            company_name="",
+            recipient_name="",
+            email="",
             # Captured from THIS fragment's own text, before any shared-count
             # distribution below can overwrite quantity_explicitly_set.
             quantity_self_declared=(qty_match is not None),
@@ -1254,8 +823,9 @@ def parse_bulk_order_utterance(
                 if remainder:
                     _for_match = re.match(r'^for\s+(.+)$', remainder, re.I)
                     if _for_match:
-                        # "for <Name>" in remainder names the RECIPIENT; the
-                        # company is transaction-wide and set in Step 0/1.5.
+                        # "for <Name>" in the remainder is not a variant
+                        # hint. Bulk orders are always the shopper's own, so
+                        # it is kept on the line but not used.
                         if not pl.recipient_name:
                             candidate = EMAIL_RE.sub('', _for_match.group(1)).strip().strip(', ')
                             if candidate:
@@ -1898,419 +1468,20 @@ def parse_bulk_order_utterance(
                     f"for product_id={pl.product_id}"
                 )
 
-    # ── Step 4: Customer resolution by email (rep only, batched) ──────────────
-    # Non-rep users have no email values, so unique_emails is empty
-    # and this step is a no-op for them.
-    email_resolution_cache: dict = {}   # email -> resolved dict | None
-
-    unique_emails = list({pl.email for pl in pre_lines if pl.email})
-
-    for email in unique_emails:
-        call = endpoints.search_customers_by_email(
-            email=email,
-            per_page=1,
-            description=f"Bulk order email lookup: '{email}'",
-        )
-        result = woo_client.execute(call)
-
-        customers = result.get("data", [])
-        if not result.get("success") or not isinstance(customers, list) or not customers:
-            logger.debug("bulk_parser | email lookup → not found")
-            email_resolution_cache[email] = None
-            continue
-
-        customer = customers[0]
-        company_field = customer.get("company") or customer.get("billing", {}).get("company", "")
-        full_name = f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip()
-        display = company_field or full_name or f"Customer #{customer['id']}"
-
-        email_resolution_cache[email] = {
-            "id": str(customer["id"]),
-            "display": display,
-            "billing": customer.get("billing", {}),
-            "shipping": customer.get("shipping", {}),
-        }
-        logger.debug(f"bulk_parser | email lookup → id={customer['id']} display='{display}'")
-
-    # Stamp customer_id onto pre_lines so Step 5 (reorder) can use it
-    for pl in pre_lines:
-        if not pl.email:
-            continue
-        resolution = email_resolution_cache.get(pl.email)
-        if resolution:
-            pl.customer_id = resolution["id"]
-
-    # ── Step 4b: Company roster resolution (rep only, one API call) ───────────
-    # The company scopes the whole transaction, so one lookup serves every
-    # line. Each line's recipient is then matched WITHIN that roster.
-    company_roster: List[dict] = []
-    company_lookup_done = False
-    # True when we stopped paging with more records still possibly unread, so
-    # downstream code must NOT assert that a missing name is absent from the
-    # company — it is only absent from what we actually looked at.
-    roster_truncated = False
-
-    if _is_rep and company_scope:
-        _seen_ids = set()
-        for _page in range(1, MAX_ROSTER_PAGES + 1):
-            call = endpoints.search_customers_by_company(
-                company_name=company_scope,
-                per_page=ROSTER_PAGE_SIZE,
-                page=_page,
-                requesting_customer_id=self_customer_id,
-                description=f"Bulk order company lookup: '{company_scope}' (page {_page})",
-            )
-            result = woo_client.execute(call)
-            company_lookup_done = True
-
-            _raw_data = result.get("data", [])
-            customers = _raw_data
-            if isinstance(customers, dict):
-                customers = customers.get("results", []) or customers.get("customers", [])
-            if not (result.get("success") and isinstance(customers, list)):
-                # A failed page mid-walk means the roster is incomplete —
-                # flag it rather than treating what we have as the whole list.
-                if _page > 1:
-                    roster_truncated = True
-                else:
-                    logger.warning(
-                        f"bulk_parser | company lookup failed for '{company_scope}' "
-                        f"on page {_page}"
-                    )
-                break
-
-            # The plugin returns a {_diagnostic: {...}} envelope rather than a
-            # bare [] when nothing matched, so "no such company" can be told
-            # apart from an out-of-date plugin build without server access.
-            if isinstance(_raw_data, dict) and _raw_data.get("_diagnostic"):
-                # The plugin returns this envelope for "no rows on this page",
-                # which is also what the page AFTER a full page looks like. Only
-                # the first page having no rows means the company is unknown;
-                # later pages just mark the end of the roster, and warning there
-                # made a successful lookup read as a failure in the logs.
-                if company_roster:
-                    logger.debug(
-                        f"bulk_parser | company lookup end of roster at page "
-                        f"{_page} | {len(company_roster)} customer(s) so far"
-                    )
-                else:
-                    logger.warning(
-                        f"bulk_parser | company lookup NO MATCHES | "
-                        f"diagnostic={_raw_data['_diagnostic']}"
-                    )
-                break
-
-            _page_rows = [c for c in customers if isinstance(c, dict) and c.get("id")]
-            if _page_rows and _page == 1:
-                logger.info(
-                    f"bulk_parser | roster page 1 | lookup_version="
-                    f"{_page_rows[0].get('lookup_version', 'MISSING -> OLD PLUGIN BUILD')}"
-                    f" | companies={[r.get('company') for r in _page_rows[:5]]}"
-                )
-            for c in _page_rows:
-                # Defensive dedupe: an unstable server-side sort could repeat a
-                # row across pages, which would read as a false "two people
-                # with this name" and trigger a bogus disambiguation prompt.
-                if c["id"] not in _seen_ids:
-                    _seen_ids.add(c["id"])
-                    company_roster.append(c)
-
-            # A short page means we reached the end of the result set.
-            if len(customers) < ROSTER_PAGE_SIZE:
-                break
-            # Walked the full allowance and the last page was still full —
-            # there are probably more customers we never fetched.
-            if _page == MAX_ROSTER_PAGES:
-                roster_truncated = True
-
-        logger.info(
-            f"bulk_parser | company '{company_scope}' → "
-            f"{len(company_roster)} customer(s)"
-            + (
-                f" (TRUNCATED at {MAX_ROSTER_PAGES} pages — more may exist)"
-                if roster_truncated else ""
-            )
-        )
-
-    def _roster_entry_to_resolution(customer: dict) -> dict:
-        full_name = (
-            f"{customer.get('first_name', '')} {customer.get('last_name', '')}".strip()
-        )
-        # Some accounts carry a junk name where first and last are the same word
-        # (Andrew_Gazda@gensler.com is stored as "Gazda Gazda"), which showed the
-        # rep a name nobody recognises. Billing usually holds the real one.
-        #
-        # This is deliberately narrow: billing is NOT a better source in general —
-        # eleanor_baker@gensler.com bills as "Jennifer McKinney", and preferring
-        # billing outright would rename her in the picker. Only a degenerate or
-        # empty account name falls back, and only to a billing name that is
-        # actually different and non-empty.
-        _first = str(customer.get("first_name", "") or "").strip()
-        _last = str(customer.get("last_name", "") or "").strip()
-        if not full_name or (_first and _first.casefold() == _last.casefold()):
-            _bill = customer.get("billing", {}) or {}
-            _bill_name = (
-                f"{_bill.get('first_name', '')} {_bill.get('last_name', '')}".strip()
-            )
-            if _bill_name and _bill_name.casefold() != full_name.casefold():
-                logger.debug(
-                    f"bulk_parser | customer {customer.get('id')} account name "
-                    f"'{full_name}' looks degenerate — using billing name "
-                    f"'{_bill_name}'"
-                )
-                full_name = _bill_name
-        display = full_name or customer.get("email") or f"Customer #{customer['id']}"
-        _ship = customer.get("shipping", {}) or {}
-        _bill = customer.get("billing", {}) or {}
-        _addr = _ship if _ship.get("address_1") else _bill
-        return {
-            "id": str(customer["id"]),
-            "display": display,
-            # Two people can share a name inside one company — these are what
-            # tell them apart in the picker.
-            "email": customer.get("email", "") or "",
-            "city": _addr.get("city", "") or "",
-            "state": _addr.get("state", "") or "",
-            "address_1": _addr.get("address_1", "") or "",
-            "billing": _bill,
-            "shipping": _ship,
-        }
-
-    def _match_recipient(name: str):
-        """Match a person name against the company roster.
-
-        Returns (resolution | None, match_count).
-
-        Resolves ONLY on a unique match. Zero matches and several matches both
-        return None — the caller tells them apart by match_count, and several
-        becomes an "ambiguous" prompt rather than a silent first-match pick.
-        """
-        if not name or not company_roster:
-            return None, 0
-        needle = re.sub(r'[^a-z0-9]+', ' ', name.lower()).strip()
-        if not needle:
-            return None, 0
-
-        # Haystacks must be normalised the SAME WAY as the needle. They were
-        # only .lower()'d before, which failed on this store's real data:
-        # Andrew_Gazda@gensler.com gives an email local part of
-        # "andrew_gazda", and the needle "Andrew Gazda" normalises to
-        # "andrew gazda" — the underscore alone defeated both passes below,
-        # since a multi-word needle can never be an element of h.split()
-        # either. Same class of failure for any separator (dots in
-        # first.last@, hyphens in double-barrelled surnames).
-        _norm = lambda s: re.sub(r'[^a-z0-9]+', ' ', str(s or "").lower()).strip()
-
-        matches = []
-        for c in company_roster:
-            first = _norm(c.get("first_name", ""))
-            last = _norm(c.get("last_name", ""))
-            full = f"{first} {last}".strip()
-            email_local = _norm(str(c.get("email", "") or "").split("@")[0])
-            # Billing name as an ADDITIONAL haystack, never a replacement:
-            # some accounts carry a degenerate account name (this store has
-            # "Gazda Gazda") where billing holds the real one. The existing
-            # repair for that lives in _roster_entry_to_resolution(), which
-            # runs for DISPLAY only and AFTER matching — so it never helped
-            # the lookup itself. Added here rather than moved, because
-            # billing is NOT a better source in general (eleanor_baker@
-            # bills as "Jennifer McKinney"); matching on either is right,
-            # preferring billing outright is not.
-            _bill = c.get("billing", {}) or {}
-            bill_first = _norm(_bill.get("first_name", ""))
-            bill_last = _norm(_bill.get("last_name", ""))
-            bill_full = f"{bill_first} {bill_last}".strip()
-            haystacks = {
-                h for h in (
-                    first, last, full, email_local,
-                    bill_first, bill_last, bill_full,
-                ) if h
-            }
-            if any(needle == h for h in haystacks) or any(
-                needle in h.split() for h in haystacks
-            ):
-                matches.append(c)
-
-        if not matches:
-            return None, 0
-        if len(matches) > 1:
-            # Same name, two records — e.g. one person on file at two of the
-            # company's sites, each with its own address. Picking the first
-            # would silently ship to the wrong one, so refuse to guess and let
-            # the handler disambiguate.
-            logger.info(
-                f"bulk_parser | recipient '{name}' matches {len(matches)} "
-                f"records at '{company_scope}' — ambiguous, will ask"
-            )
-            return None, len(matches)
-        return _roster_entry_to_resolution(matches[0]), 1
-
-    # Stamp company-resolved customers onto pre_lines (email still wins if given)
-    for pl in pre_lines:
-        if not _is_rep or pl.customer_id:
-            continue
-        if pl.recipient_name:
-            resolution, _count = _match_recipient(pl.recipient_name)
-            if resolution:
-                pl.customer_id = resolution["id"]
-        elif len(company_roster) == 1 and not roster_truncated:
-            # No person named and the company has exactly one contact —
-            # unambiguous, so use them (example query 1). Gated on a COMPLETE
-            # roster: "exactly one" read off a partial list is not a fact
-            # about the company, and silently shipping to that person would
-            # be the worst possible failure here.
-            pl.customer_id = _roster_entry_to_resolution(company_roster[0])["id"]
-
-    if meta_out is not None:
-        # The caller needs the roster to build a recipient picker; re-querying
-        # it in the handler would cost a second identical API round trip.
-        meta_out["company_scope"] = company_scope
-        meta_out["company_roster"] = [
-            _roster_entry_to_resolution(c) for c in company_roster
-        ]
-        # Lets the handler soften "I couldn't find X" into "not in the first N"
-        # instead of asserting an absence it cannot actually vouch for.
-        meta_out["company_roster_truncated"] = roster_truncated
-
-    # ── Step 5: Reorder resolution ────────────────────────────────────────────
-    for pl in pre_lines:
-        if not pl.is_reorder or not pl.customer_id:
-            continue
-
-        call = endpoints.list_rep_orders(
-            body={"customer_id": pl.customer_id, "per_page": 3},
-            description="Fetch recent orders for reorder resolution",
-        )
-        result = woo_client.execute(call)
-
-        orders = result.get("data", [])
-        if isinstance(orders, dict):
-            orders = orders.get("orders", [])
-
-        source_order_id = None
-        for order in orders:
-            for item in order.get("line_items", []):
-                pid_match = (
-                    pl.product_id and item.get("product_id") == pl.product_id
-                )
-                name_match = (
-                    pl.product_name.lower() in item.get("name", "").lower()
-                )
-                if pid_match or name_match:
-                    source_order_id = order["id"]
-                    # Backfill product_id from order history if still unresolved
-                    if not pl.product_id:
-                        pl.product_id = item.get("product_id")
-                    break
-            if source_order_id:
-                break
-
-        pl.reorder_source_order_id = source_order_id
-        logger.debug(
-            f"bulk_parser | reorder for customer_id={pl.customer_id} "
-            f"product='{pl.product_name}' → source_order_id={source_order_id}"
-        )
-
     # ── Step 6: Assemble final BulkOrderLine objects ──────────────────────────
     result_lines: List[BulkOrderLine] = []
 
     for pl in pre_lines:
-        _recipient_matches = 0
-        # A "customer" (full-scope but not a true rep — see _is_true_rep)
-        # who named nothing at all for THIS line — no email, no
-        # transaction-wide company scope, no per-line recipient — is
-        # ordering for themselves, exactly as before "customer" was added to
-        # BULK_ORDER_FULL_SCOPE_ROLES. True reps get no such fallback: they
-        # must always resolve to a named company/recipient (unchanged). The
-        # moment a customer names ANY of those three signals, they fall
-        # through to the same real resolution a rep gets — that's the whole
-        # point of this expansion.
-        #
-        # ALSO gated on line count: the self-order cart route is only taken
-        # for a SINGLE line. Two or more lines is a bulk order, so a customer
-        # gets the same company -> recipient -> address flow a rep gets, even
-        # when they named nobody. Without this the lines resolve to the
-        # customer themselves, `unresolved_reason` is None, and every asking
-        # gate downstream (Step 4.55 company, 4.56 recipient, 4.57 address)
-        # finds an empty list and silently falls through to the cart — which
-        # is why a rep could complete this order and a customer could not.
-        # Counted in LINES, not units: 5x of one product is still one line.
-        _customer_self_fallback = (
-            _is_rep and not _is_true_rep
-            and len(pre_lines) <= 1
-            and not pl.email and not company_scope and not pl.recipient_name
-        )
-        if _is_rep and not _customer_self_fallback:
-            resolution = email_resolution_cache.get(pl.email) if pl.email else None
+        # Every line is the shopper's own order.
+        customer_id = self_customer_id
+        customer_display_name = "Order"
+        is_self_order = True
+        shipping_address = None
+        billing_address = None
 
-            # Fall back to the company roster when no email was given.
-            if not resolution and company_roster:
-                if pl.recipient_name:
-                    resolution, _recipient_matches = _match_recipient(pl.recipient_name)
-                    # _recipient_matches > 1 means several people share the
-                    # name — handled as "ambiguous", not "not found".
-                elif len(company_roster) == 1:
-                    resolution = _roster_entry_to_resolution(company_roster[0])
-
-            if resolution:
-                customer_id = resolution["id"]
-                customer_display_name = resolution["display"]
-                is_self_order = False
-                shipping_address = resolution.get("shipping") or {}
-                billing_address = resolution.get("billing") or {}
-                if not shipping_address.get("address_1"):
-                    shipping_address = billing_address
-            else:
-                customer_id = None
-                is_self_order = False
-                shipping_address = None
-                billing_address = None
-                if pl.email:
-                    customer_display_name = "⚠️ Not found"
-                elif not company_scope:
-                    customer_display_name = "⚠️ Company required"
-                elif not company_roster:
-                    customer_display_name = f"⚠️ No customers for {company_scope}"
-                elif pl.recipient_name and _recipient_matches > 1:
-                    customer_display_name = (
-                        f"⚠️ {_recipient_matches} people named {pl.recipient_name}"
-                    )
-                elif pl.recipient_name and roster_truncated:
-                    # We only read part of the company — say so rather than
-                    # claiming this person isn't there.
-                    customer_display_name = (
-                        f"⚠️ {pl.recipient_name} not in first {len(company_roster)}"
-                    )
-                elif pl.recipient_name:
-                    customer_display_name = f"⚠️ {pl.recipient_name} not found"
-                else:
-                    customer_display_name = "⚠️ Recipient required"
-        else:
-            # Either a non-full-scope role (guest, etc.) or a full-scope
-            # customer line that fell back to self-ordering above.
-            customer_id = self_customer_id
-            customer_display_name = "Order"
-            is_self_order = True
-            shipping_address = None
-            billing_address = None
-
-        # Unresolved reason — now distinguishes "not provided" from "not found"
         _customer_unresolved = customer_id is None
         _product_unresolved = pl.product_id is None
-
-        if _is_rep and _customer_unresolved and not pl.email:
-            if not company_scope:
-                _customer_reason = "company_not_provided"
-            elif not company_roster:
-                _customer_reason = "company_not_found"
-            elif pl.recipient_name and _recipient_matches > 1:
-                _customer_reason = "recipient_ambiguous"
-            elif pl.recipient_name:
-                _customer_reason = "recipient_not_found"
-            else:
-                _customer_reason = "recipient_required"
-        else:
-            _customer_reason = "email_not_provided" if (_is_rep and not pl.email) else "email_not_found"
+        _customer_reason = "email_not_found"
 
         if _product_unresolved and _customer_unresolved:
             unresolved = True

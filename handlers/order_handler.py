@@ -1,10 +1,9 @@
 """
-handlers/order_handler.py — Steps 3.5, 3.5b, 3.6: Order handling.
+handlers/order_handler.py — Steps 3.5, 3.6: Order handling.
 
 Step 3.5  — REORDER: put the last order's line items back in the shopper's cart
             (WooCommerce, Store API in the browser) or hand Shopify a checkout
             link. The backend never creates the order.
-Step 3.5b — AWAITING_ORDER_DETAIL: fetch and display a specific order.
 Step 3.6  — QUICK_ORDER/ORDER_ITEM/PLACE_ORDER: create order from matched product.
 
 Each public function returns a Flask response or None to fall through.
@@ -22,7 +21,6 @@ from app_config import (
 from models import Intent, WooAPICall
 from woo_client import woo_client
 from formatters import format_product
-from response_generator import format_order_detail
 from conversation_flow import FlowState
 from chat_logger import get_logger, sanitize_log_string
 from handlers.chat_utils import (
@@ -33,6 +31,9 @@ from handlers.chat_utils import (
 from ecommerce import endpoints
 from platform_config import current_backend
 logger = get_logger("miraq_chat")
+
+# Products per reorder stock-check request; the search endpoint's page limit.
+_STOCK_CHECK_BATCH = 100
 
 def handle_historical_search(intent, entities, order_data, customer_id, session_id, page, start_time):
     """Step 3.5c: Filter past orders by specific attributes or tags."""
@@ -243,35 +244,6 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
         "has_more": page < total_pages_calc
     }
 
-    # ── Product order history card ──────────────────────────────────────────
-    # handle_historical_search returns its own response and bypasses
-    # _build_final_response, which is where the rep-features block lives.
-    # The SHOW_PRODUCT_RECENT_ORDERS action must therefore be built HERE.
-    from app_config import CUSTOM_ORDER_ROLES, ORDER_REPORT_ADMIN_ROLES
-    _actions = []
-    _product_id = getattr(entities, "product_id", None)
-    _role = ""
-    try:
-        # Verified identity only — never the request body's role.
-        from identity import current_identity
-        from store_registry import effective_role
-        _role = effective_role(current_identity().role)
-    except Exception:
-        pass
-    _can_view = CUSTOM_ORDER_ROLES | ORDER_REPORT_ADMIN_ROLES
-    if _product_id and _role in _can_view:
-        try:
-            from utils.rep_utils import fetch_product_order_history, format_product_orders_for_action
-            _hist = fetch_product_order_history(_product_id, _role)
-            if _hist:
-                _actions.append({
-                    "type": "SHOW_PRODUCT_RECENT_ORDERS",
-                    "payload": {"orders": format_product_orders_for_action(_hist)},
-                })
-                logger.info(f"HISTORICAL_SEARCH | SHOW_PRODUCT_RECENT_ORDERS emitted with {len(_hist)} order(s)")
-        except Exception as _e:
-            logger.warning(f"HISTORICAL_SEARCH | order history card failed: {_e}")
-
     elapsed = time.time() - start_time
     logger.info(f"Step 10: Response sent | intent={intent.value} | products_count={len(formatted_products)} | response_time_ms={round(elapsed * 1000)} | flow_state=idle")
 
@@ -279,12 +251,8 @@ def handle_historical_search(intent, entities, order_data, customer_id, session_
         "success": True,
         "bot_message": bot_message,
         "intent": intent.value,
-        # Product cards are suppressed when showing order history — the user
-        # asked for their past orders, not to browse the product. The order
-        # items in the SHOW_PRODUCT_RECENT_ORDERS action already name the
-        # product, so the card adds nothing and clutters the response.
-        "products": [] if _actions else formatted_products,
-        "actions": _actions,
+        "products": formatted_products,
+        "actions": [],
         "suggestions": suggestions,
         "session_id": session_id,
         "metadata": {
@@ -386,23 +354,30 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
             )
 
     if product_ids and current_backend()!= "shopify":
-        stock_call = endpoints.check_stock(
-            product_ids=product_ids,
-            description="Check stock status for reorder items",
-        )
-        stock_resp = woo_client.execute(stock_call)
-
-        if stock_resp.get("success"):
+        # The search endpoint returns at most 100 products per request, so
+        # large orders are checked in batches; every item is still checked.
+        unique_ids = list(dict.fromkeys(product_ids))
+        stock_map = {}
+        any_success = False
+        for start in range(0, len(unique_ids), _STOCK_CHECK_BATCH):
+            stock_call = endpoints.check_stock(
+                product_ids=unique_ids[start:start + _STOCK_CHECK_BATCH],
+                description="Check stock status for reorder items",
+            )
+            stock_resp = woo_client.execute(stock_call)
+            if not stock_resp.get("success"):
+                continue
+            any_success = True
             data = stock_resp.get("data", {})
             current_products = data.get("products", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-            
+
             # Map product AND variation IDs to their current live stock status
-            stock_map = {}
             for p in current_products:
                 stock_map[p["id"]] = p.get("stock_status", "instock")
                 for var in p.get("variations", []):
                     stock_map[var["id"]] = var.get("stock_status", "instock")
-                    
+
+        if any_success:
             # Check every item in the past order against the live stock map
             for item in source_line_items:
                 check_id = item.get("variation_id") or item.get("product_id")
@@ -488,6 +463,38 @@ def handle_reorder(intent, entities, order_data, customer_id, session_id, page, 
         intent, source_order, source_line_items, session_id, page, start_time,
     )
 
+def _saved_variation(item, product_id, store_loader):
+    """
+    The options recorded on an old order line, as Store API variation pairs
+    ([{"attribute": "pa_colors", "value": "red"}]), or None.
+
+    WooCommerce stores each chosen option on the order line as meta_data
+    (key = attribute taxonomy, value = term slug), including options left as
+    "Any" on the variation. The Store API needs a value for EVERY attribute
+    the parent product varies on, so this returns pairs only when the order
+    covers all of them; otherwise None and the caller uses the variation
+    lookup instead. Never guesses a value.
+    """
+    pairs = {}
+    for meta in item.get("meta_data") or []:
+        if not isinstance(meta, dict):
+            continue
+        key = str(meta.get("key") or "").strip()
+        value = meta.get("value")
+        if not key or key.startswith("_") or not isinstance(value, str) or not value.strip():
+            continue
+        pairs[key] = value.strip()
+    if not pairs:
+        return None
+    try:
+        required = endpoints.product_variation_taxonomies(product_id, store_loader)
+    except Exception:
+        required = None
+    if not required or not set(required) <= set(pairs):
+        return None
+    return [{"attribute": tax, "value": pairs[tax]} for tax in sorted(required)]
+
+
 def _reorder_via_cart(intent, source_order, source_line_items, session_id, page, start_time):
     """
     WooCommerce reorder without a write: return one ADD_TO_CART action per line
@@ -503,7 +510,7 @@ def _reorder_via_cart(intent, source_order, source_line_items, session_id, page,
     """
     from store_registry import get_store_loader
     from ecommerce.cart_actions import build_cart_add_action, UNRESOLVED_VARIANT
-    from core.actions import build_open_cart_panel
+    from core.actions import build_add_to_cart, build_open_cart_panel
     from identity import current_identity
 
     source_ref = source_order.get("number") or source_order.get("id")
@@ -551,25 +558,39 @@ def _reorder_via_cart(intent, source_order, source_line_items, session_id, page,
             qty = 1
         variation_id = item.get("variation_id") or None
 
-        action, err = build_cart_add_action(
-            product_id=product_id,
-            quantity=qty,
-            name=name,
-            variation_id=variation_id,
-            resolved_attrs={},
-            store_loader=store_loader,
-            # The variation fetch is what turns "variation 123" into the
-            # attribute/value pairs the Store API requires.
-            build_variation_payload=True,
-            # The reply below itemises everything; a per-line confirmation from
-            # the widget would repeat it. Failures are still reported by the widget.
-            suppress_result=True,
-        )
+        # First choice: the options the customer actually picked, as recorded
+        # on the old order. This covers "Any" attributes (which the variation
+        # itself does not store) and needs no per-line store call.
+        saved = _saved_variation(item, product_id, store_loader) if variation_id else None
+        if saved:
+            action, err = build_add_to_cart(
+                product_id=product_id,
+                quantity=qty,
+                name=name,
+                variation_id=variation_id,
+                variation=saved,
+                suppress_result=True,
+            ), None
+        else:
+            action, err = build_cart_add_action(
+                product_id=product_id,
+                quantity=qty,
+                name=name,
+                variation_id=variation_id,
+                resolved_attrs={},
+                store_loader=store_loader,
+                # The variation fetch is what turns "variation 123" into the
+                # attribute/value pairs the Store API requires.
+                build_variation_payload=True,
+                # The reply below itemises everything; a per-line confirmation from
+                # the widget would repeat it. Failures are still reported by the widget.
+                suppress_result=True,
+            )
 
-        # A variation that came back with no attributes (variation deleted since
-        # the order, or the fetch failed) would be refused by the Store API.
-        if action is not None and variation_id and not action["payload"].get("variation"):
-            action, err = None, UNRESOLVED_VARIANT
+            # A variation that came back with no attributes (variation deleted since
+            # the order, or the fetch failed) would be refused by the Store API.
+            if action is not None and variation_id and not action["payload"].get("variation"):
+                action, err = None, UNRESOLVED_VARIANT
 
         if action is None:
             logger.warning(
@@ -624,8 +645,8 @@ def handle_order_status(intent, entities, order_data, customer_id, session_id, p
     sent to a specific recipient). This handler interprets the resulting list:
       - 0 results → clear no-match message, naming the email/period searched
       - 1 result  → return None so _build_final_response calls format_order_detail
-      - 2+ results → tappable order cards, AWAITING_ORDER_DETAIL (tap re-enters
-                     as "show me order #N" and resolves to a single detail)
+      - 2+ results → tappable order cards (tap re-enters as "show me order #N"
+                     and resolves to a single detail)
     """
     if intent not in (Intent.ORDER_STATUS, Intent.ORDER_TRACKING):
         return None
@@ -695,7 +716,6 @@ def handle_order_status(intent, entities, order_data, customer_id, session_id, p
         bot_msg = f"I found {len(order_data)} recent orders. Tap one to see its status."
 
     from handlers.chat_utils import format_order_for_frontend
-    from app_config import is_order_report_admin
     return jsonify({
         "success": True,
         "bot_message": bot_msg,
@@ -709,53 +729,9 @@ def handle_order_status(intent, entities, order_data, customer_id, session_id, p
         "metadata": {
             "flow_state": FlowState.IDLE.value,
             "response_time_ms": round(elapsed * 1000),
-            # Decided here, not in the widget: the export carries customer
-            # names, emails and addresses, and the browser has no basis to
-            # authorise that. The plugin re-checks capabilities on the fetch
-            # itself, so this only governs whether the control is OFFERED.
-            "allow_order_download": is_order_report_admin(role),
         },
         "pagination": default_pagination(page),
         "flow_state": FlowState.IDLE.value,
-    }), 200
-
-def handle_order_detail(current_flow_state, customer_id, user_context, session_id, page, start_time):
-    """Step 3.5b: Fetch and display a specific order's details."""
-    if not (current_flow_state == FlowState.AWAITING_ORDER_DETAIL and customer_id):
-        return None
-
-    _detail_order_id = user_context.get("pending_order_id")
-    logger.info(f"Step 3.5b: Fetching order detail | order_id={_detail_order_id}")
-    if not _detail_order_id:
-        return None
-
-    detail_call = endpoints.fetch_order(
-        order_id=_detail_order_id,
-        description=f"Fetch order #{_detail_order_id} detail",
-    )
-    detail_resp = woo_client.execute(detail_call)
-    elapsed = time.time() - start_time
-
-    if detail_resp.get("success") and isinstance(detail_resp.get("data"), dict):
-        bot_message = format_order_detail(detail_resp["data"])
-        logger.info(f"Step 3.5b: Order detail fetched | order_id={_detail_order_id}")
-    else:
-        bot_message = f"Sorry, I couldn't find details for order #{_detail_order_id}. Please try again."
-        logger.warning(f"Step 3.5b: Failed to fetch order detail | order_id={_detail_order_id}")
-
-    return jsonify({
-        "success": True,
-        "bot_message": bot_message,
-        "intent": "order_detail",
-        "products": [],
-        "suggestions": ["Show my orders", "Place a new order", "No, that's all"],
-        "session_id": session_id,
-        "metadata": {
-            "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
-            "response_time_ms": round(elapsed * 1000),
-        },
-        "flow_state": FlowState.AWAITING_ANYTHING_ELSE.value,
-        "pagination": default_pagination(page),
     }), 200
 
 

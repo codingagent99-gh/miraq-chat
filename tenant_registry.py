@@ -40,7 +40,6 @@ from typing import Optional, List, Tuple
 
 from chat_logger import get_logger
 from tenant_config import TenantConfig
-from tenant_crypto import decrypt_secret
 from store_loader import StoreLoader
 
 logger = get_logger("miraq_chat")
@@ -209,8 +208,6 @@ class TenantRegistry:
                 woo_base_url="",
                 woo_store_api_url="",
                 custom_api_base_url="",
-                woo_key="",
-                woo_secret="",
                 ecommerce_backend="shopify",
                 license_id=tenant_row.license_id,
                 tenant_id=str(tenant_row.tenant_id),
@@ -249,8 +246,6 @@ class TenantRegistry:
                 woo_base_url=f"{_wp_base}/wp-json/wc/v3",
                 woo_store_api_url=f"{_wp_base}/wp-json/wc/store/v1",
                 custom_api_base_url=plugin_api_base(_wp_base, _plugin_ns),
-                woo_key=tenant_row.woo_key or "",
-                woo_secret=decrypt_secret(tenant_row.woo_secret_encrypted or ""),
                 ecommerce_backend=tenant_row.ecommerce_backend,
                 license_id=tenant_row.license_id,
                 tenant_id=str(tenant_row.tenant_id),
@@ -258,8 +253,6 @@ class TenantRegistry:
                 http_profile_pinned=bool(_features.get("http_profile_pinned")),
                 http_extra_headers=_features.get("http_extra_headers") or {},
             )
-            logger.info(f"TenantRegistry: woo_key={'present' if config.woo_key else 'MISSING'} | tenant={tenant_row.license_id}")
-            logger.info(f"TenantRegistry: woo_secret={'present' if config.woo_secret else 'MISSING'} | tenant={tenant_row.license_id}")
             logger.info(
                 f"TenantRegistry: http_profile={config.http_profile or '<default>'} | "
                 f"pinned={config.http_profile_pinned} | tenant={tenant_row.license_id}"

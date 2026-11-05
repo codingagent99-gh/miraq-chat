@@ -29,22 +29,26 @@ from store_registry import get_store_loader
 logger = get_logger("miraq_chat")
 
 
-def account_page_url(wp_base_url, path):
+def account_page_url(wp_base_url, path, endpoint=""):
     """A My Account page on this store, or "" when the site URL is unusable.
 
     ``wp_base_url`` is the WordPress root and may include a sub-directory
-    (https://example.com/shop).
+    (https://example.com/shop). ``path`` is WooCommerce's default location.
+    ``endpoint`` adds ?miraq_account=<endpoint>: the plugin (1.0.7+) redirects
+    that to the store's real page even if My Account was renamed; an older
+    plugin ignores it and the default path loads as before.
     """
     base = str(wp_base_url or "").strip().rstrip("/")
     if not base.lower().startswith(("http://", "https://")):
         return ""
     tail = str(path or "").strip().strip("/")
-    return f"{base}/{tail}/" if tail else f"{base}/"
+    url = f"{base}/{tail}/" if tail else f"{base}/"
+    return f"{url}?miraq_account={endpoint}" if endpoint else url
 
 
 def _woo_message(wp_base_url):
-    address_url = account_page_url(wp_base_url, WOO_EDIT_ADDRESS_PATH)
-    account_url = account_page_url(wp_base_url, WOO_EDIT_ACCOUNT_PATH)
+    address_url = account_page_url(wp_base_url, WOO_EDIT_ADDRESS_PATH, "edit-address")
+    account_url = account_page_url(wp_base_url, WOO_EDIT_ACCOUNT_PATH, "edit-account")
     if not (address_url and account_url):
         return (
             "I can't change your account details from chat. You can update them "

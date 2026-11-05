@@ -84,7 +84,7 @@ def _mask_emails(value):
 # data, so its text is replaced before the history goes to the LLM provider.
 _LLM_SAFE_REPLY_PREFIXES = (
     "product", "category", "filter", "most_popular", "related", "discount",
-    "bulk_discount", "clearance", "promotion", "coupon", "greeting",
+    "bulk_discount", "clearance", "promotion", "greeting",
     "disambiguation", "conversational", "unknown",
 )
 _OMITTED_REPLY = "[reply omitted]"

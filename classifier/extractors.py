@@ -1241,34 +1241,6 @@ def _parse_explicit_date(token: str) -> Optional[datetime]:
     return None
 
 
-def extract_order_scope(text: str, entities: ExtractedEntities):
-    """Who an order-history question is about: "self", "all", or unset.
-
-    Runs as an EXTRACTOR, not inside an evaluator, and that placement is the
-    whole point. An earlier version set this from OrderActionEvaluator, which
-    only runs when that evaluator claims the message. "my orders this month"
-    is claimed by no evaluator — it reaches Intent.ORDER_HISTORY through the
-    LLM fallback, which returns an intent label and never entities. Scope was
-    therefore None on exactly the phrasing that states it most plainly, and an
-    admin asking for "my orders" was shown the entire store.
-
-    Extractors run before evaluation on every message, so scope now survives
-    any route to ORDER_HISTORY — local evaluator, LLM fallback, or a resume.
-
-    Only consulted for the admin role; every other role is self-scoped by
-    _build_order_history regardless of what this sets. A named person is a
-    separate case set later by OrderStatsEvaluator (scope="person"), which
-    runs after extraction and deliberately overrides whatever is set here.
-    """
-    t = text.lower()
-    # "my" wins over "all" — "show me all my orders" is still self-scoped, and
-    # reading the "all" there as store-wide is the bug this ordering prevents.
-    if re.search(r'\bmy\b', t):
-        entities.scope = "self"
-    elif re.search(r'\ball\b', t):
-        entities.scope = "all"
-
-
 # ── Vocabulary extract_time_range() keys off ────────────────────────────────
 # Declared here, next to the function that owns it, and unioned into the
 # typo corrector's protected set by classifier/keywords.py — exactly the way

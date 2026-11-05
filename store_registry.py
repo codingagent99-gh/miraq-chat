@@ -51,7 +51,7 @@ _LICENSE_HEADER = "X-MiraQ-License-Id"
 # reach stores outside our own Partner organisation, which is why a
 # distributable app needs this authorization-code callback at all.
 _EXEMPT_PATHS = {
-    "/provision-tenant", "/activate-free", "/deactivate-tenant",
+    "/provision-tenant", "/activate-free", "/deactivate-tenant", "/register-site-key",
     "/customer-addresses", "/events/product-update", "/events/order-paid",
     "/events/app-uninstalled",
     # Shopify's mandatory privacy webhooks (routes/shopify.py). Signed with
@@ -142,35 +142,17 @@ def get_tenant_features() -> dict:
     return {}
 
 
-# ── Sales tools (store-specific: rep ordering, bulk orders, order reporting) ──
-# Built for one store's workflow — its custom checkout fields (Order Type,
-# Project Name, Your Rep), orders credited to reps via _billing_project_rep,
-# and "every product is a sample" counting. Off unless the tenant row opts in:
-#   UPDATE tenants SET features = features || '{"sales_tools": true}'::jsonb
-#   WHERE license_id = '<that store>';
-# Off means: no bulk-order / order-report routing, and staff roles are served
-# as a customer (see effective_role), so no store gets another store's flows.
-
+# ── Roles ──
+# The chat has no staff features: staff roles (administrator, shop manager,
+# sales rep, ...) are served as a customer. Their WordPress role is untouched.
 _CUSTOMER_ROLES = frozenset({"", "customer", "guest"})
 
 
-def sales_tools_enabled() -> bool:
-    return bool(get_tenant_features().get("sales_tools"))
-
-
 def effective_role(role) -> str:
-    """The role the chat should act on for this tenant.
-
-    With sales tools off, any staff role (administrator, sales_rep, cs_rep, …)
-    is served as "customer": every rep/admin chat flow — ordering on behalf of
-    someone, store-wide order lists, reports — belongs to those tools. The
-    person's real WordPress role is untouched; this only decides which chat
-    features they get.
-    """
+    """The role the chat acts on: customer and guest as they are, any staff
+    role as "customer"."""
     role = (role or "").strip()
-    if role in _CUSTOMER_ROLES or sales_tools_enabled():
-        return role
-    return "customer"
+    return role if role in _CUSTOMER_ROLES else "customer"
 
 
 def init_registries(tenant_registry, engine_registry) -> None:

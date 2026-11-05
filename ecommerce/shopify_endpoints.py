@@ -312,15 +312,6 @@ class ShopifyEndpoints:
                      description=description or "Check Shopify stock status",
                      requires_resolution=requires_resolution)
 
-    def create_order(
-        self, payload: dict, description: str = "",
-        requires_resolution: Optional[List[str]] = None
-    ) -> WooAPICall:
-        return _stub("POST", "/orders",
-                     body=payload,
-                     description=description or "Create Shopify order",
-                     requires_resolution=requires_resolution)
-
     def historical_product_search(
         self, body: dict, description: str = "",
         requires_resolution: Optional[List[str]] = None
@@ -332,33 +323,9 @@ class ShopifyEndpoints:
 
     # ── Customers ─────────────────────────────────────────────────────────────
 
-    def fetch_customer(
-        self, customer_id: int, description: str = "",
-        requires_resolution: Optional[List[str]] = None
-    ) -> WooAPICall:
-        return _stub("GET", f"/customers/{customer_id}",
-                     description=description or f"Fetch Shopify customer id={customer_id}",
-                     requires_resolution=requires_resolution)
-
     # ── Additional ────────────────────────────────────────────────────────────
 
-    def list_coupons(
-        self, page: int, per_page: int, description: str = "",
-        requires_resolution: Optional[List[str]] = None
-    ) -> WooAPICall:
-        return _stub("GET", "/discount_codes",
-                     params={"first": per_page},
-                     description=description or "List Shopify discount codes",
-                     requires_resolution=requires_resolution)
 
-    def fetch_wishlist(
-        self, customer_id, description: str = "",
-        requires_resolution: Optional[List[str]] = None
-    ) -> WooAPICall:
-        # Shopify has no native wishlist — typically a customer metafield or app.
-        return _stub("GET", f"/customers/{customer_id}/wishlist",
-                     description=description or "Fetch Shopify wishlist (metafield)",
-                     requires_resolution=requires_resolution)
 
     def list_products_on_sale(
         self, page: int, per_page: int, description: str = "",
@@ -384,15 +351,6 @@ class ShopifyEndpoints:
         return _stub("GET", "/products/search",
                      params={"query": search_term, "first": per_page},
                      description=description or f"Shopify text search for '{search_term}'",
-                     requires_resolution=requires_resolution)
-
-    def list_cs_orders(
-        self, body: dict, description: str = "",
-        requires_resolution: Optional[List[str]] = None
-    ) -> WooAPICall:
-        return _stub("POST", "/orders/cs-list",
-                     body=body,
-                     description=description or "CS rep Shopify order list",
                      requires_resolution=requires_resolution)
 
     # ── Response parsers ──────────────────────────────────────────────────────

@@ -31,18 +31,23 @@ Examples
 --------
   # free activation, then watch the build
   python dev_provision.py free --site-domain shop.test \
-      --wp-base-url https://shop.test --woo-key ck_x --woo-secret cs_x
+      --wp-base-url https://shop.test
   python dev_provision.py wait --tenant-uuid <uuid printed above>
 
   # paid activation reusing that same tenant (the upgrade path)
   python dev_provision.py provision --license-id dev-001 --tenant-uuid <uuid> \
-      --site-domain shop.test --wp-base-url https://shop.test \
-      --woo-key ck_x --woo-secret cs_x
+      --site-domain shop.test --wp-base-url https://shop.test
 
   # free-tier teardown, then confirm the DB is kept for the grace period
-  python dev_provision.py deactivate --tenant-uuid <uuid> \
-      --woo-key ck_x --woo-secret cs_x
+  python dev_provision.py deactivate --tenant-uuid <uuid>
   python dev_provision.py status
+
+Site key: provision/free send the PUBLIC half of an Ed25519 site key, as the
+plugin does, and deactivate signs its request with the private half. The key
+lives in --site-key-file (default .dev_site_key.pem) and is created on first
+use. If wp_base_url is a real WordPress site running the plugin, the backend
+compares this key with the one the site serves and refuses a mismatch — use
+that site's own activation instead, or a wp_base_url the backend cannot reach.
 """
 
 import argparse
@@ -59,15 +64,46 @@ DEFAULT_BACKEND = os.environ.get("MIRAQ_DEV_BACKEND", "http://localhost:5000")
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def _post(backend: str, path: str, body: dict, headers: dict | None = None) -> int:
+def _site_private_key(path: str):
+    """The dev site key from `path`, created (and saved) on first use."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return serialization.load_pem_private_key(f.read(), password=None)
+    key = Ed25519PrivateKey.generate()
+    with open(path, "wb") as f:
+        f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                  serialization.NoEncryption()))
+    print(f"  (new dev site key saved to {path})")
+    return key
+
+
+def _site_public_key_b64(path: str) -> str:
+    import base64
+    from cryptography.hazmat.primitives import serialization
+    raw = _site_private_key(path).public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _post(backend: str, path: str, body: dict, headers: dict | None = None,
+          sign_with=None, purpose: str = "") -> int:
     url = f"{backend.rstrip('/')}{path}"
+    raw = json.dumps(body).encode("utf-8")
+    headers = dict(headers or {})
+    if sign_with is not None:
+        import site_key
+        headers.update(site_key.sign_request(sign_with, purpose, raw))
     print(f"\n→ POST {url}")
     print(f"  body    : {json.dumps(_redact(body))}")
     if headers:
         print(f"  headers : {json.dumps(_redact(headers))}")
 
     try:
-        resp = requests.post(url, json=body, headers=headers or {}, timeout=60)
+        resp = requests.post(url, data=raw, headers={"Content-Type": "application/json", **headers},
+                             timeout=60)
     except requests.RequestException as e:
         print(f"✗ request failed: {type(e).__name__}: {e}")
         print("  Is the backend running, and is --backend pointing at it?")
@@ -190,8 +226,7 @@ def cmd_provision(args) -> int:
         "signature":   signature,
         "site_domain": args.site_domain,
         "wp_base_url": args.wp_base_url,
-        "woo_key":     args.woo_key,
-        "woo_secret":  args.woo_secret,
+        "site_public_key": _site_public_key_b64(args.site_key_file),
     }
     # Optional, and the whole point of the upgrade test: with it, the backend
     # reuses the existing (free) tenant row and database instead of creating a
@@ -210,18 +245,18 @@ def cmd_free(args) -> int:
         "tenant_uuid": tenant_uuid,
         "site_domain": args.site_domain,
         "wp_base_url": args.wp_base_url,
-        "woo_key":     args.woo_key,
-        "woo_secret":  args.woo_secret,
+        "site_public_key": _site_public_key_b64(args.site_key_file),
     })
 
 
 def cmd_deactivate(args) -> int:
-    """Credential path — what a free install's uninstall.php sends."""
+    """Site-key path — what a free install's uninstall.php sends."""
     return _post(
         args.backend,
         "/deactivate-tenant",
         {"tenant_uuid": args.tenant_uuid},
-        {"X-Consumer-Key": args.woo_key, "X-Consumer-Secret": args.woo_secret},
+        sign_with=_site_private_key(args.site_key_file),
+        purpose="deactivate-tenant",
     )
 
 
@@ -488,9 +523,8 @@ def main() -> int:
         sp.add_argument("--tenant-uuid", default=None)
         sp.add_argument("--site-domain", required=True)
         sp.add_argument("--wp-base-url", required=True)
-        sp.add_argument("--woo-key", required=True)
-        sp.add_argument("--woo-secret", default=os.environ.get("WOO_SECRET"),
-                        help="or set WOO_SECRET")
+        sp.add_argument("--site-key-file", default=".dev_site_key.pem",
+                        help="Ed25519 site key (PEM), created if missing")
 
     sp = sub.add_parser("provision", help="paid activation")
     store_args(sp, need_license=True)
@@ -500,10 +534,9 @@ def main() -> int:
     store_args(sp)
     sp.set_defaults(func=cmd_free)
 
-    sp = sub.add_parser("deactivate", help="teardown via store credentials")
+    sp = sub.add_parser("deactivate", help="teardown via the site key")
     sp.add_argument("--tenant-uuid", required=True)
-    sp.add_argument("--woo-key", required=True)
-    sp.add_argument("--woo-secret", default=os.environ.get("WOO_SECRET"))
+    sp.add_argument("--site-key-file", default=".dev_site_key.pem")
     sp.set_defaults(func=cmd_deactivate)
 
     sp = sub.add_parser("revoke", help="teardown via signed licence")
@@ -539,10 +572,6 @@ def main() -> int:
     sp.set_defaults(func=cmd_wait)
 
     args = p.parse_args()
-
-    if getattr(args, "woo_secret", "sentinel") is None:
-        raise SystemExit("Provide --woo-secret or set WOO_SECRET")
-
     return args.func(args)
 
 

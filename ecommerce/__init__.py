@@ -19,7 +19,7 @@ class DynamicEndpointsRouter:
     def _determine_backend(self, *args, **kwargs) -> str:
         # A Shopify GID in the arguments is positive evidence, so it still
         # wins. Note this only ever fires for STRING args: a plain int id
-        # (e.g. endpoints.fetch_customer(customer_id=int(rep_id))) cannot
+        # (e.g. endpoints.fetch_order(order_id=int(order_id))) cannot
         
         for arg in args:
             if isinstance(arg, str) and arg.startswith("gid://"):

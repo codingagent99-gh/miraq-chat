@@ -176,7 +176,6 @@ def format_product(raw: dict) -> dict:
         "attributes":    _format_attributes(raw.get("attributes", [])),
         "raw_attributes": _format_attributes(raw.get("attributes", []), include_hidden=True),
         "variations":    raw.get("variations", []),
-        "total_sales":   raw.get("total_sales", 0),
         # The store's currency, so the widget's product cards stop assuming $.
         "currency_symbol": _store_currency_symbol(),
     }
@@ -247,7 +246,6 @@ def format_custom_product(raw: dict) -> dict:
         "images":        image_urls,
         "attributes":    attributes,
         "variations":    raw.get("variations", []),
-        "total_sales":   raw.get("total_sales", 0),
         # The store's currency, so the widget's product cards stop assuming $.
         "currency_symbol": _store_currency_symbol(),
     }

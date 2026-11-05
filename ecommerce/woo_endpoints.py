@@ -18,7 +18,7 @@ access any Woo-specific field that has not yet been normalized.
 """
 
 import re
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 
 from chat_logger import get_logger
 from models import WooAPICall
@@ -70,9 +70,9 @@ class WooEndpoints:
         """Row 2.1 — GET /data/currencies/current"""
         return WooAPICall(
             method="GET",
-            endpoint="/data/currencies/current",
+            endpoint="/catalog/currency",
             params={},
-            surface="admin",
+            surface="custom_plugin",
             description=description or "Fetch active currency",
             requires_resolution=requires_resolution or [],
         )
@@ -89,55 +89,6 @@ class WooEndpoints:
             params={},
             surface="custom_plugin",
             description=description or "Fetch all product attributes and terms",
-            requires_resolution=requires_resolution or [],
-        )
-
-    def fetch_checkout_fields(
-        self,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """GET /checkout-fields — WC checkout field definitions (custom_plugin surface).
-
-        Returns the checkout fields grouped by "billing" / "shipping" / "order",
-        each field carrying label / required / type / priority. Consumed by
-        utils/checkout_fields.get_required_fields() to enrich (never shrink) the
-        static required-field floor.
-        """
-        return WooAPICall(
-            method="GET",
-            endpoint="/checkout-fields",
-            params={},
-            surface="custom_plugin",
-            description=description or "Fetch checkout field definitions",
-            requires_resolution=requires_resolution or [],
-        )
-
-    def fetch_order_types(
-        self,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """GET /order-types — options for the billing_field_type select.
-
-        Returns [{value, label}, ...] e.g. {"value": "new_deal",
-        "label": "New Deal"}. NOTE the value and the label differ: the order
-        meta `_billing_field_type` stores the VALUE ("new_deal"), while a user
-        types the label ("New Deal"). Anything that accepts this field from
-        free text must translate label → value here, or it writes a string the
-        storefront's <select> cannot render and the required-field gate still
-        passes — see utils/checkout_fields.match_order_type().
-
-        Separate from /checkout-fields on purpose: THWCFE stores these options
-        outside the standard WC checkout-fields filter, so the plugin reads
-        them from its own option row (with a hardcoded fallback list).
-        """
-        return WooAPICall(
-            method="GET",
-            endpoint="/order-types",
-            params={},
-            surface="custom_plugin",
-            description=description or "Fetch order type (billing_field_type) options",
             requires_resolution=requires_resolution or [],
         )
 
@@ -158,9 +109,9 @@ class WooEndpoints:
         }
         return WooAPICall(
             method="GET",
-            endpoint="/products/categories",
+            endpoint="/catalog/categories",
             params=params,
-            surface="admin",
+            surface="custom_plugin",
             description=description or "List product categories",
             requires_resolution=requires_resolution or [],
         )
@@ -182,9 +133,9 @@ class WooEndpoints:
         }
         return WooAPICall(
             method="GET",
-            endpoint="/products/tags",
+            endpoint="/catalog/tags",
             params=params,
-            surface="admin",
+            surface="custom_plugin",
             description=description or "List product tags",
             requires_resolution=requires_resolution or [],
         )
@@ -199,9 +150,9 @@ class WooEndpoints:
         """Row 2.5 — GET /products?status=publish"""
         return WooAPICall(
             method="GET",
-            endpoint="/products",
+            endpoint="/catalog/products",
             params={"status": "publish", "per_page": per_page, "page": page},
-            surface="admin",
+            surface="custom_plugin",
             description=description or "List all published products",
             requires_resolution=requires_resolution or [],
         )
@@ -217,9 +168,9 @@ class WooEndpoints:
         """Row 4.1 — GET /products/{product_id}"""
         return WooAPICall(
             method="GET",
-            endpoint=f"/products/{product_id}",
+            endpoint=f"/catalog/products/{product_id}",
             params={},
-            surface="admin",
+            surface="custom_plugin",
             description=description or f"Fetch product id={product_id}",
             requires_resolution=requires_resolution or [],
         )
@@ -234,9 +185,9 @@ class WooEndpoints:
         """Row 4.2 — GET /products/{product_id}/variations/{variant_id}"""
         return WooAPICall(
             method="GET",
-            endpoint=f"/products/{product_id}/variations/{variant_id}",
+            endpoint=f"/catalog/products/{product_id}/variations/{variant_id}",
             params={},
-            surface="admin",
+            surface="custom_plugin",
             description=description or f"Fetch variant product_id={product_id} variant_id={variant_id}",
             requires_resolution=requires_resolution or [],
         )
@@ -254,9 +205,9 @@ class WooEndpoints:
         params = {"per_page": per_page, "page": page, **extra_params}
         return WooAPICall(
             method="GET",
-            endpoint=f"/products/{product_id}/variations",
+            endpoint=f"/catalog/products/{product_id}/variations",
             params=params,
-            surface="admin",
+            surface="custom_plugin",
             description=description or f"List variants for product_id={product_id}",
             requires_resolution=requires_resolution or [],
         )
@@ -573,58 +524,24 @@ class WooEndpoints:
         requires_resolution: Optional[List[str]] = None,
         **filters,
     ) -> WooAPICall:
-        """Row 5.1 — GET /orders"""
-        params = {
-            "customer": customer_id,
-            "per_page": per_page,
-            "page": page,
-            "orderby": "date",
-            "order": "desc",
-            **filters,
-        }
-        return WooAPICall(
-            method="GET",
-            endpoint="/orders",
-            params=params,
-            surface="admin",
-            description=description or f"List orders for customer {customer_id}",
-            requires_resolution=requires_resolution or [],
-        )
+        """Row 5.1 — GET miraq/v1/my-orders
 
-    def list_all_orders(
-        self,
-        page: int,
-        per_page: int = 20,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-        **filters,
-    ) -> WooAPICall:
-        """Row 5.1b — GET /orders with NO customer filter (admin only).
-
-        Identical to list_customer_orders minus the `customer` param.
-
-        Enforcement is Python-only: this call goes straight to `wc/v3` with
-        the store's own consumer key/secret (see woo_client.py), which is
-        NOT the requesting user's credential and has no per-user capability
-        of its own to check. The plugin is never in this call's path, so it
-        cannot re-check anything here. `is_order_report_admin(role)` on the
-        caller — reading a role out of the request payload — is the only
-        gate. Accepted as-is for now; if that role field ever becomes
-        spoofable from the client, this is the call it protects.
+        The plugin returns only the orders of the shopper whose identity token
+        woo_client forwards, newest first, in the same JSON as /wc/v3/orders.
+        customer_id is kept for the description and the CURRENT_USER_ID
+        resolution step; the plugin does not read it.
         """
         params = {
             "per_page": per_page,
             "page": page,
-            "orderby": "date",
-            "order": "desc",
             **filters,
         }
         return WooAPICall(
             method="GET",
-            endpoint="/orders",
+            endpoint="/my-orders",
             params=params,
-            surface="admin",
-            description=description or "List all store orders",
+            surface="custom_plugin",
+            description=description or f"List orders for customer {customer_id}",
             requires_resolution=requires_resolution or [],
         )
 
@@ -634,12 +551,16 @@ class WooEndpoints:
         description: str = "",
         requires_resolution: Optional[List[str]] = None,
     ) -> WooAPICall:
-        """Row 5.2 — GET /orders/{order_id}"""
+        """Row 5.2 — GET miraq/v1/my-orders/{order_id}
+
+        404 unless the order belongs to the shopper whose identity token
+        woo_client forwards.
+        """
         return WooAPICall(
             method="GET",
-            endpoint=f"/orders/{order_id}",
+            endpoint=f"/my-orders/{order_id}",
             params={},
-            surface="admin",
+            surface="custom_plugin",
             description=description or f"Fetch order id={order_id}",
             requires_resolution=requires_resolution or [],
         )
@@ -654,23 +575,6 @@ class WooEndpoints:
         return self.products_advanced(
             body={"ids": product_ids, "per_page": len(product_ids)},
             description=description or "Check stock status for product IDs",
-            requires_resolution=requires_resolution or [],
-        )
-
-    def create_order(
-        self,
-        payload: dict,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """Row 5.4 — POST /orders"""
-        return WooAPICall(
-            method="POST",
-            endpoint="/orders",
-            params={},
-            body=payload,
-            surface="admin",
-            description=description or "Create order",
             requires_resolution=requires_resolution or [],
         )
 
@@ -689,294 +593,9 @@ class WooEndpoints:
 
     # ── Customers ───────────────────────────────────────────────────────────
 
-    def fetch_customer(
-        self,
-        customer_id: int,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """Rows 6.1 & 6.2 — GET /customers/{customer_id}"""
-        return WooAPICall(
-            method="GET",
-            endpoint=f"/customers/{customer_id}",
-            params={},
-            surface="admin",
-            description=description or f"Fetch customer id={customer_id}",
-            requires_resolution=requires_resolution or [],
-        )
-
-    def list_customers_search(
-        self,
-        search: str,
-        role: str = "all",
-        per_page: int = 5,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """Search customers by name/email/company — GET /customers?search=..."""
-        return WooAPICall(
-            method="GET",
-            endpoint="/customers",
-            params={"search": search, "role": role, "per_page": per_page},
-            surface="admin",
-            description=description or f"Search customers: '{search}'",
-            requires_resolution=requires_resolution or [],
-        )
-
-    def order_stats_by_rep(
-        self,
-        requesting_customer_id,
-        date_after: Optional[str] = None,
-        date_before: Optional[str] = None,
-        rep: Optional[Union[str, List[str]]] = None,
-        statuses: Optional[List[str]] = None,
-        include_orders: bool = False,
-        page: int = 1,
-        per_page: Optional[int] = None,
-        check_collision: bool = False,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """GET /order-stats-by-rep — sample/order counts grouped by credited rep.
-
-        Aggregates on `_billing_project_rep` (credited orders) UNION orders
-        the rep placed for herself, the same merge `get_user_orders` uses —
-        so counts and, when `include_orders` is set, the order rows returned
-        alongside them never disagree about which orders belong to a rep.
-
-        `rep` accepts an email OR a display name; the plugin resolves it and
-        returns 404/409 rather than guessing between two similarly-named reps.
-
-        `include_orders` only does anything when `rep` is also set — the
-        no-rep breakdown is a SQL GROUP BY with no order objects behind it.
-        When set, the response carries an `orders` array (raw WC REST order
-        shape) for the requested `page` ONLY, plus `page`/`per_page`/
-        `total_pages`. Paging does not affect the totals: those always cover
-        the whole window, scanned up to the same 2,000-order cap.
-
-        Admin-gated for cross-rep figures; a rep gets their own only.
-        Response carries `truncated` and `counted_statuses` — surface both
-        rather than presenting the totals bare.
-        """
-        params = {"customer_id": requesting_customer_id}
-        if date_after:
-            params["after"] = date_after
-        if date_before:
-            params["before"] = date_before
-        if rep:
-            # A list rides as one comma-separated `rep` param — the plugin
-            # resolves each name and runs ONE merged query, so the combined
-            # list can be paged and deduped. Sending a request per rep would
-            # give N result sets that cannot be paged together.
-            if isinstance(rep, (list, tuple, set)):
-                _reps = [str(r).strip() for r in rep if str(r).strip()]
-            else:
-                _reps = [str(rep).strip()] if str(rep).strip() else []
-            if _reps:
-                params["rep"] = ",".join(_reps)
-        if statuses:
-            params["status"] = ",".join(statuses)
-        if include_orders:
-            params["list"] = "1"
-            # Paging applies to the ROWS only. The totals in the response are
-            # always computed over the whole window, so page 3 of a 4-page
-            # list still reports the same total_orders as page 1.
-            params["page"] = page
-            if per_page:
-                params["per_page"] = per_page
-        if check_collision:
-            # Opt-in: ask the plugin to stop and hand back a `role_collision`
-            # payload when the ONE name given matches a rep AND some other
-            # account. Off by default so multi-rep reporting — which is
-            # live-tested — behaves exactly as before.
-            params["check_collision"] = "1"
-
-        return WooAPICall(
-            method="GET",
-            endpoint="/order-stats-by-rep",
-            params=params,
-            surface="custom_plugin",
-            description=description or "Order/sample counts by rep",
-            requires_resolution=requires_resolution or [],
-        )
-
-    def order_stats_by_team(
-        self,
-        requesting_customer_id,
-        date_after: Optional[str] = None,
-        date_before: Optional[str] = None,
-        member: Optional[Union[str, List[str]]] = None,
-        statuses: Optional[List[str]] = None,
-        include_orders: bool = False,
-        page: int = 1,
-        per_page: Optional[int] = None,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """GET /order-stats-by-team — the rep report, scoped to the caller's team.
-
-        Same response shape as `order_stats_by_rep` (the plugin delegates to
-        it), plus `scope: "team"`, `manager_email`, `team` and `team_size`.
-        Members named who are not on the caller's team come back in
-        `unresolved_reps` with reason `not_on_your_team`.
-
-        `member` names people to narrow to; omit it for the whole team. It
-        rides as the `rep` param because the plugin forwards it to the rep
-        report after checking membership — the caller never sends a team.
-
-        The TEAM ITSELF IS NEVER SENT. It is derived in the plugin from the
-        requesting user's own WP account, so nothing here can widen the scope.
-        A caller who is not a manager in the org chart gets a 403, and an empty
-        `member` list means "my whole team", never "everyone".
-        """
-        params = {"customer_id": requesting_customer_id}
-        if date_after:
-            params["after"] = date_after
-        if date_before:
-            params["before"] = date_before
-        if member:
-            if isinstance(member, (list, tuple, set)):
-                _m = [str(m).strip() for m in member if str(m).strip()]
-            else:
-                _m = [str(member).strip()] if str(member).strip() else []
-            if _m:
-                params["rep"] = ",".join(_m)
-        if statuses:
-            params["status"] = ",".join(statuses)
-        if include_orders:
-            params["list"] = "1"
-            params["page"] = page
-            if per_page:
-                params["per_page"] = per_page
-
-        return WooAPICall(
-            method="GET",
-            endpoint="/order-stats-by-team",
-            params=params,
-            surface="custom_plugin",
-            description=description or "Order/sample counts for the caller's team",
-            requires_resolution=requires_resolution or [],
-        )
-
-    def order_stats_by_customer(
-        self,
-        requesting_customer_id,
-        customer: Optional[Union[str, List[str]]] = None,
-        date_after: Optional[str] = None,
-        date_before: Optional[str] = None,
-        statuses: Optional[List[str]] = None,
-        include_orders: bool = False,
-        page: int = 1,
-        per_page: Optional[int] = None,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """GET /order-stats-by-customer — order counts for named CUSTOMERS.
-
-        The customer counterpart to order_stats_by_rep. A rep owns orders via
-        `_billing_project_rep`; a customer owns them in two different senses
-        that this endpoint reports SEPARATELY rather than merging:
-
-          placed  — they are the WooCommerce customer on the order
-          shipped — they are the recipient (`_shipping_email`, or the shipping
-                    first+last name)
-
-        Both are needed because bulk orders record the PLACER as customer_id
-        and the recipient only in the shipping block, so a colleague ordered
-        for by a rep owns none of those orders under the first sense.
-
-        `customer` accepts an email OR a display name, one or several (they
-        ride as one comma-separated param, same as `rep` above, so the merged
-        list can be paged and deduped honestly). The plugin returns an
-        `ambiguous_customer` payload rather than guessing between two
-        similarly-named accounts.
-
-        Admin-gated on the plugin side — this reads another person's order
-        history.
-
-        Response carries `truncated` and `counted_statuses`; surface both
-        rather than presenting the totals bare.
-        """
-        params = {"customer_id": requesting_customer_id}
-        if date_after:
-            params["after"] = date_after
-        if date_before:
-            params["before"] = date_before
-        if customer:
-            if isinstance(customer, (list, tuple, set)):
-                _names = [str(c).strip() for c in customer if str(c).strip()]
-            else:
-                _names = [str(customer).strip()] if str(customer).strip() else []
-            if _names:
-                params["customer"] = ",".join(_names)
-        if statuses:
-            params["status"] = ",".join(statuses)
-        if include_orders:
-            params["list"] = "1"
-            params["page"] = page
-            if per_page:
-                params["per_page"] = per_page
-
-        return WooAPICall(
-            method="GET",
-            endpoint="/order-stats-by-customer",
-            params=params,
-            surface="custom_plugin",
-            description=description or "Order counts by customer",
-            requires_resolution=requires_resolution or [],
-        )
-
-    def list_rep_orders(
-        self,
-        body: dict,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """List orders assigned to/placed for a rep's customer — POST /orders (custom_plugin)"""
-        return WooAPICall(
-            method="POST",
-            endpoint="/orders",
-            params={},
-            body=body,
-            surface="custom_plugin",
-            description=description or "Rep-assigned order list",
-            requires_resolution=requires_resolution or [],
-        )
-
     # ── Additional (not in CSV mapping; present in codebase) ────────────────
 
-    def list_coupons(
-        self,
-        page: int,
-        per_page: int,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """List available coupon codes — GET /coupons"""
-        return WooAPICall(
-            method="GET",
-            endpoint="/coupons",
-            params={"per_page": per_page, "page": page},
-            surface="admin",
-            description=description or "List available coupon codes",
-            requires_resolution=requires_resolution or [],
-        )
 
-    def fetch_wishlist(
-        self,
-        customer_id,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """Fetch customer wishlist — POST /wishlist"""
-        return WooAPICall(
-            method="POST",
-            endpoint="/wishlist",
-            params={"customer_id": customer_id},
-            surface="admin",
-            description=description or "Get customer wishlist",
-            requires_resolution=requires_resolution or [],
-        )
 
     def list_products_on_sale(
         self,
@@ -988,9 +607,9 @@ class WooEndpoints:
         """List products on sale — GET /products?on_sale=true"""
         return WooAPICall(
             method="GET",
-            endpoint="/products",
+            endpoint="/catalog/products",
             params={"on_sale": "true", "per_page": per_page, "page": page, "status": "publish"},
-            surface="admin",
+            surface="custom_plugin",
             description=description or "List products on sale",
             requires_resolution=requires_resolution or [],
         )
@@ -1004,9 +623,9 @@ class WooEndpoints:
         """List terms for a product attribute — GET /products/attributes/{id}/terms"""
         return WooAPICall(
             method="GET",
-            endpoint=f"/products/attributes/{attribute_id}/terms",
+            endpoint=f"/catalog/attributes/{attribute_id}/terms",
             params={"per_page": 100},
-            surface="admin",
+            surface="custom_plugin",
             description=description or f"List terms for attribute id={attribute_id}",
             requires_resolution=requires_resolution or [],
         )
@@ -1023,182 +642,13 @@ class WooEndpoints:
         """Text search for products — GET /products?search=..."""
         return WooAPICall(
             method="GET",
-            endpoint="/products",
+            endpoint="/catalog/products",
             params={"search": search_term, "per_page": per_page, "page": page, "status": status},
-            surface="admin",
+            surface="custom_plugin",
             description=description or f"Text search for '{search_term}'",
             requires_resolution=requires_resolution or [],
         )
 
-    def list_cs_orders(
-        self,
-        body: dict,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """List orders via custom plugin (CS-rep role) — POST /orders (custom_plugin surface)"""
-        return WooAPICall(
-            method="POST",
-            endpoint="/orders",
-            params={},
-            body=body,
-            surface="custom_plugin",
-            description=description or "CS rep order list",
-            requires_resolution=requires_resolution or [],
-        )
-    
-    def fetch_saved_addresses(
-        self,
-        requesting_customer_id,
-        target_customer_id=None,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """GET /saved-addresses (custom_plugin surface)
-
-        THWMA lets one customer keep several shipping addresses
-        (`thwma_custom_address` → shipping → address_0, address_1, ...), which
-        vanilla WooCommerce cannot represent — its customer record has exactly
-        one shipping block.
-
-        target_customer_id reads ANOTHER customer's address book — what the
-        bulk flow needs, since the recipient comes from a company roster rather
-        than from whoever holds the session. Omit it to read the requester's
-        own list.
-
-        requesting_customer_id is REQUIRED and carries authorization: these
-        calls have no WP session, so the plugin cannot use get_current_user_id()
-        and gates on this param instead — same convention as
-        search_customers_by_company.
-        """
-        params = {"customer_id": requesting_customer_id}
-        if target_customer_id:
-            params["target_customer_id"] = target_customer_id
-        return WooAPICall(
-            method="GET",
-            endpoint="/saved-addresses",
-            params=params,
-            surface="custom_plugin",
-            description=description or f"Fetch saved addresses for customer {target_customer_id or 'self'}",
-            requires_resolution=requires_resolution or [],
-        )
-
-    def fetch_company_order_addresses(
-        self,
-        company_name: str,
-        limit: int = 100,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """GET /company-order-addresses (custom_plugin surface)
-
-        Shipping destinations a company has actually had goods sent to, taken
-        from order history — the same source the storefront's company address
-        picker uses.
-
-        This is the ONLY source that shows several addresses for one person:
-        `/customers/by-company` returns a customer's single account address,
-        and the THWMA address book is empty on this store. Rows carry
-        customer_id (0 on guest orders), so a chosen address can still be tied
-        to an account.
-
-        Addresses come from past checkouts, so they include whatever was typed
-        at the time. Offer them as suggestions, not as validated data.
-        """
-        return WooAPICall(
-            method="GET",
-            endpoint="/company-order-addresses",
-            params={"company": company_name, "limit": limit},
-            surface="custom_plugin",
-            description=description or f"Order-history addresses for '{company_name}'",
-            requires_resolution=requires_resolution or [],
-        )
-
-    def search_customers_by_company(
-        self,
-        company_name: str,
-        per_page: int = 20,
-        page: int = 1,
-        requesting_customer_id=None,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """GET /customers/by-company?name=<company>&page=<n> (custom_plugin surface)
-
-        per_page defaults to 20 — the plugin's own ceiling
-        (`min(20, ...)` in get_customers_by_company). The old default of 3
-        silently truncated a company's contact list, so a named recipient
-        could be reported "not found" purely because they sat 4th.
-
-        That ceiling is per PAGE, not per company: 20 was still a hard stop
-        because the endpoint had no offset. Callers that need the full
-        membership must page through with `page` until a short page comes
-        back — see the roster loop in parsers/bulk_order_parser.py, which
-        also caps how far it will walk.
-
-        requesting_customer_id is REQUIRED by the plugin: it role-gates on
-        the caller and returns 403 without it.
-        """
-        params = {"name": company_name, "per_page": per_page, "page": page}
-        if requesting_customer_id:
-            params["customer_id"] = requesting_customer_id
-        return WooAPICall(
-            method="GET",
-            endpoint="/customers/by-company",
-            params=params,
-            surface="custom_plugin",
-            description=description or f"Search customers by company '{company_name}'",
-            requires_resolution=requires_resolution or [],
-        )
-        
-    def search_customers_by_email(
-        self,
-        email: str,
-        per_page: int = 1,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """Exact customer lookup by email — GET /customers?email=<email> (admin surface).
-
-        WooCommerce treats email as a unique key, so this always returns 0 or 1 results.
-        Prefer this over list_customers_search for email-based resolution — the ?email=
-        param is an exact match, while ?search= is a fuzzy text scan across name/email/company.
-        """
-        return WooAPICall(
-            method="GET",
-            endpoint="/customers",
-            params={"email": email, "per_page": per_page},
-            surface="admin",
-            description=description or f"Lookup customer by email '{email}'",
-            requires_resolution=requires_resolution or [],
-        )
-
-    def search_orders_by_product(
-        self,
-        product_id: int,
-        per_page: int = 3,
-        description: str = "",
-        requires_resolution: Optional[List[str]] = None,
-    ) -> WooAPICall:
-        """GET /orders?product=<id>&orderby=date&order=desc (admin surface).
-
-        Returns recent orders that contain this product, regardless of which
-        customer placed them — used to surface rep-facing order history on
-        product search results.
-        """
-        return WooAPICall(
-            method="GET",
-            endpoint="/orders",
-            params={
-                "product":  product_id,
-                "per_page": per_page,
-                "orderby":  "date",
-                "order":    "desc",
-            },
-            surface="admin",
-            description=description or f"Recent orders for product_id={product_id}",
-            requires_resolution=requires_resolution or [],
-        )
     # ── Response parsers ────────────────────────────────────────────────────
     # Each parser takes the raw ``woo_client.execute(...).get("data")`` dict
     # (or list) and returns a backend-neutral dict (or list of dicts).

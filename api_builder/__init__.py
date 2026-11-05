@@ -11,10 +11,8 @@ from typing import List, Optional
 
 from models import Intent, ClassifiedResult, WooAPICall, ExtractedEntities
 from app_config import (
-    CUSTOM_ORDER_ROLES,
     DEFAULT_PER_PAGE,
     DEFAULT_ORDER_PER_PAGE,
-    is_order_report_admin,
     MOST_POPULAR_TOP_N,
     MOST_POPULAR_WINDOW_DAYS,
     MOST_POPULAR_MAX_GROUPS,
@@ -244,12 +242,9 @@ def build_api_calls(
         Intent.PRODUCT_VARIATIONS:    _build_product_variations,
         Intent.DISCOUNT_INQUIRY:      _build_discount_inquiry,
         Intent.BULK_DISCOUNT:         _build_bulk_discount,
-        Intent.COUPON_INQUIRY:        _build_coupon_inquiry,
-        Intent.SAVE_FOR_LATER:        _build_save_for_later,
         Intent.ORDER_TRACKING:        _build_order_tracking,
         Intent.ORDER_STATUS:          _build_order_tracking,  # same logic
         Intent.PLACE_ORDER:           _build_place_order,
-        Intent.CHECKOUT:              _build_checkout,
     }
 
     builder = _BUILDERS.get(intent)
@@ -289,13 +284,6 @@ def _build_greeting(e, page) -> list:
 # ─── Orders ───
 
 def _build_last_order(e, page, customer_id=None, role=None) -> list:
-    if role in CUSTOM_ORDER_ROLES:
-        return [endpoints.list_cs_orders(
-            body={"customer_id": "CURRENT_USER_ID", "page": 1, "per_page": 1},
-            description="CS rep last order",
-            requires_resolution=["customer_id"],
-        )]
-
     if current_backend() == "shopify":
         from api_builder.shopify_order_calls import build_last_order_call
         return [build_last_order_call(
@@ -312,73 +300,8 @@ def _build_last_order(e, page, customer_id=None, role=None) -> list:
     )]
 
 
-# How many orders an admin's order list pulls per page — both the store-wide
-# list and the admin's own ("my orders") list, which is the same kind of
-# report and so uses the same page size. Higher than the shopper default
-# because the admin view is a report, not a "your recent orders" glance — but
-# still capped, since the whole page is serialised into the chat payload and
-# then into a CSV in the browser. Pagination beyond page 1 is handled by
-# build_pagination() off WooCommerce's total_pages header.
-ADMIN_ORDER_PER_PAGE = 50
-
-
 def _build_order_history(e, page, customer_id=None, role=None) -> list:
-    # ── Admin: three-way scope — self / person / all ────────────────────────
-    # Checked BEFORE the customer-scoped branches below, which would otherwise
-    # unconditionally pin an administrator to customer_id=CURRENT_USER_ID.
-    #
-    # `scope` comes from OrderActionEvaluator ("my orders" -> self, "all
-    # orders" -> all) or is None when neither wording was present. A named
-    # person ("orders by Jennifer") is intercepted earlier by
-    # OrderStatsEvaluator -> Intent.ORDER_STATS_BY_REP and never reaches this
-    # function; scope == "person" here would mean that routing broke, so it
-    # is treated the same as the no-wording default (all) rather than being
-    # silently mis-scoped to a single customer.
-    if is_order_report_admin(role):
-        scope = getattr(e, "scope", None)
-
-        # scope == "self": exactly the call every non-admin already uses
-        # below. Do NOT special-case it here — fall through to the shared
-        # customer-scoped branch at the bottom of this function so there is
-        # one call site for "my orders", not two that can drift apart.
-        if scope != "self":
-            extra = {}
-            if getattr(e, "date_after", None):
-                extra["after"] = e.date_after
-            if getattr(e, "date_before", None):
-                extra["before"] = e.date_before
-            return [endpoints.list_all_orders(
-                page=page,
-                per_page=e.order_count or ADMIN_ORDER_PER_PAGE,
-                description="Admin: all store orders",
-                **extra,
-            )]
-        # scope == "self" falls through to the customer-scoped branch below.
-
-    elif role in CUSTOM_ORDER_ROLES:
-        body = {"customer_id": "CURRENT_USER_ID", "page": page, "per_page": e.order_count or DEFAULT_ORDER_PER_PAGE}
-        if getattr(e, "date_after", None): body["after"] = e.date_after
-        if getattr(e, "date_before", None): body["before"] = e.date_before
-        return [endpoints.list_cs_orders(
-            body=body,
-            description="CS rep order history",
-            requires_resolution=["customer_id"],
-        )]
-
-    # Page size follows the ROLE, not the branch. This is the shared tail
-    # used by customers, and now also by an admin whose scope resolved to
-    # "self" — but those are different jobs: a shopper glancing at recent
-    # orders wants a handful, an admin pulling their own orders for a named
-    # period is running the same kind of report as "view all orders" and was
-    # getting 5 rows where the store-wide list gives 50.
-    #
-    # per_page feeds build_pagination(), which reads it back off the call and
-    # pairs it with WooCommerce's total/total_pages headers — so raising it
-    # here also fixes has_more/total_pages for this branch rather than just
-    # returning a longer first page.
-    count = e.order_count or (
-        ADMIN_ORDER_PER_PAGE if is_order_report_admin(role) else DEFAULT_ORDER_PER_PAGE
-    )
+    count = e.order_count or DEFAULT_ORDER_PER_PAGE
 
     if current_backend() == "shopify":
         from api_builder.shopify_order_calls import build_order_history_call
@@ -435,22 +358,6 @@ def _build_reorder(e, page, customer_id=None, role=None) -> list:
     )]
 
 def _build_historical_search(e, page, customer_id=None, role=None) -> list:
-    if role in CUSTOM_ORDER_ROLES:
-        body = {
-            "customer_id": "CURRENT_USER_ID",
-            "page":        page,
-            "per_page":    e.order_count or 20,
-        }
-        if getattr(e, "date_after", None):
-            body["after"] = e.date_after
-        if getattr(e, "date_before", None):
-            body["before"] = e.date_before
-        return [endpoints.list_cs_orders(
-            body=body,
-            description="CS rep order history",
-            requires_resolution=["customer_id"],
-        )]
-
     per_page = e.order_count if getattr(e, "order_count", None) else 20
     include_ids = [e.order_id] if getattr(e, "order_id", None) else None
 
@@ -1074,45 +981,9 @@ def _build_bulk_discount(e, page) -> list:
     )]
 
 
-def _build_coupon_inquiry(e, page) -> list:
-    return [endpoints.list_coupons(
-        page=page,
-        per_page=DEFAULT_PER_PAGE,
-        description="List available coupon codes",
-    )]
 
-
-def _build_save_for_later(e, page) -> list:
-    return [endpoints.fetch_wishlist(
-        customer_id="CURRENT_USER",
-        description="Get customer wishlist",
-    )]
 
 def _build_order_tracking(e, page, customer_id=None, role=None) -> list:
-    if role in CUSTOM_ORDER_ROLES:
-        if getattr(e, "order_id", None):
-            return [endpoints.fetch_order(
-                order_id=e.order_id,
-                description=f"Get order #{e.order_id} details",
-            )]
-        # No order_id — list orders. Widen the net when we'll filter client-side
-        # (email lookup or date range) so the target isn't missed beyond page 1.
-        _will_filter = bool(getattr(e, "lookup_email", None) or getattr(e, "date_after", None))
-        body = {
-            "customer_id": "CURRENT_USER_ID",
-            "page": page,
-            "per_page": 50 if _will_filter else DEFAULT_ORDER_PER_PAGE,
-        }
-        if getattr(e, "date_after", None):
-            body["after"] = e.date_after
-        if getattr(e, "date_before", None):
-            body["before"] = e.date_before
-        return [endpoints.list_cs_orders(
-            body=body,
-            description="CS rep: list orders (no order ID provided)",
-            requires_resolution=["customer_id"],
-        )]
-
     if current_backend() == "shopify":
         from api_builder.shopify_order_calls import build_fetch_order_call, build_order_history_call
         if getattr(e, "order_id", None):
@@ -1162,51 +1033,6 @@ def _build_place_order(e, page) -> list:
         or_pairs=list(e.attr_tag_or_pairs) if e.attr_tag_or_pairs else None,
         page=1,
         description=f"Find product '{search_term}' for order placement",
-    )]
-
-
-def _build_checkout(e, page) -> list:
-    """
-    Build a WooCommerce order creation call from the in-memory cart.
-    cart_items is stamped into entities by chat.py before this is called.
-    """
-    if not e.cart_items:
-        logger.warning("api_builder: CHECKOUT called but entities.cart_items is empty")
-        return []
-
-    line_items = [
-        {
-            "product_id": item["product_id"],
-            **({"variation_id": item["variation_id"]} if item.get("variation_id") else {}),
-            "quantity": item["qty"],
-        }
-        for item in e.cart_items
-    ]
-
-    shipping = (
-        e.shipping_updates
-        or {k: v for k, v in e.billing_updates.items()}
-        or {}
-    )
-
-    payload = {
-        "payment_method": "cod",           # default; frontend can override
-        "payment_method_title": "Cash on Delivery",
-        "set_paid": False,
-        "customer_id": "CURRENT_USER_ID",  # resolved by _resolve_user_placeholders
-        "line_items": line_items,
-    }
-
-    if shipping:
-        payload["shipping"] = shipping
-        payload["billing"] = shipping      # mirror shipping to billing if not split
-
-    logger.debug(f"api_builder: _build_checkout | {len(line_items)} line items")
-
-    return [endpoints.create_order(
-        payload=payload,
-        description=f"Create order for {len(line_items)} cart item(s)",
-        requires_resolution=["customer_id"],
     )]
 
 

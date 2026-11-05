@@ -16,24 +16,23 @@ load_dotenv()
 # BASE URLs — REMOVED (Phase 2)
 # ═══════════════════════════════════════════
 #
-# _WP_BASE / WOO_BASE_URL / WOO_STORE_API_URL / CUSTOM_API_BASE_URL /
-# WOO_CONSUMER_KEY / WOO_CONSUMER_SECRET used to live here as single-store
-# globals read from the environment at import.
+# _WP_BASE / WOO_BASE_URL / WOO_STORE_API_URL / CUSTOM_API_BASE_URL used to
+# live here as single-store globals read from the environment at import (and
+# WOO_CONSUMER_KEY / WOO_CONSUMER_SECRET, before the backend stopped using a
+# WooCommerce key at all).
 #
 # They are now per-tenant: resolved from the tenants table into TenantConfig
 # by tenant_registry._rehydrate(), carried on the request-scoped StoreLoader,
-# and read at call time via get_store_loader() — see woo_client.execute() and
-# utils/checkout_fields.py. A module-level global cannot express "whichever
+# and read at call time via get_store_loader() — see woo_client.execute().
+# A module-level global cannot express "whichever
 # store this request belongs to", so keeping them would only invite a call
-# site to silently use the wrong tenant's credentials.
+# site to silently use the wrong tenant's settings.
 #
 # Equivalents on the loader:
 #   _WP_BASE            -> loader.wp_base_url
 #   WOO_BASE_URL        -> loader.base
 #   WOO_STORE_API_URL   -> loader.store_api_base
 #   CUSTOM_API_BASE_URL -> loader.custom_api_base
-#   WOO_CONSUMER_KEY    -> loader.consumer_key
-#   WOO_CONSUMER_SECRET -> loader.consumer_secret
 #
 # seed_tenant_one.py still needs the pre-migration single-store values to
 # create tenant #1; it reads os.environ directly rather than importing from
@@ -265,129 +264,12 @@ def _resolve_llm_api_base_url() -> str:
 
     return raw
 
-# Roles that use the custom orders API (POST /custom-api/v1/orders)
-# instead of the standard WooCommerce GET /wc/v3/orders endpoint.
-# Override via env var CUSTOM_ORDER_ROLES_JSON (JSON array).
-import json as _json
-
-def _load_custom_order_roles() -> frozenset:
-    raw = os.getenv("CUSTOM_ORDER_ROLES_JSON", "")
-    if raw:
-        try:
-            parsed = _json.loads(raw)
-            if isinstance(parsed, list):
-                return frozenset(parsed)
-        except Exception:
-            pass
-    return frozenset({"cs_rep", "project_manager", "cs_project_manager"})
-
-CUSTOM_ORDER_ROLES: frozenset = _load_custom_order_roles()
-# BULK_ORDER_ROLES: frozenset = CUSTOM_ORDER_ROLES | frozenset({"sales_rep"})
-BULK_ORDER_ROLES: frozenset = CUSTOM_ORDER_ROLES | frozenset({"sales_rep", "administrator"})
-# BULK_ORDER_FULL_SCOPE_ROLES: roles allowed to use company/recipient-scoped
-# resolution in the *bulk order* flow specifically (i.e. bulk-order to a
-# resolved company/recipient, not just to themselves). This is
-# BULK_ORDER_ROLES plus "customer" — deliberately kept as its own constant
-# rather than folded into BULK_ORDER_ROLES so nothing else that reads
-# BULK_ORDER_ROLES (order-for identity flow, order reporting, the custom
-# order API surface) is affected by this expansion. Orders remain billed to
-# whoever is placing them — this does not grant account impersonation, and
-# project_rep still must resolve against the real rep list (see
-# is_known_rep in utils/rep_utils.py), validated at submission time.
-BULK_ORDER_FULL_SCOPE_ROLES: frozenset = BULK_ORDER_ROLES | frozenset({"customer"})
-# ── Order reporting (rep sample counts, order lists by date range) ───────────
-# Roles allowed to see reporting ACROSS reps/customers. The rep roles above are
-# scoped to their own book; this tier is not. Override with ORDER_REPORT_ADMIN_ROLES_JSON.
-def _load_admin_roles() -> frozenset:
-    raw = os.getenv("ORDER_REPORT_ADMIN_ROLES_JSON", "")
-    if raw:
-        try:
-            parsed = _json.loads(raw)
-            if isinstance(parsed, list):
-                return frozenset(parsed)
-        except Exception:
-            pass
-    return frozenset({"administrator"})
-
-ORDER_REPORT_ADMIN_ROLES: frozenset = _load_admin_roles()
-
-
-# Which order statuses count toward reported totals. Cancelled/refunded/failed
-# are excluded so they can't inflate a rep's sample count; on-hold IS counted
-# it counted, so a number is never unexplained.
-# ── Team (manager) reporting ─────────────────────────────────────────────────
-# Roles that may run a TEAM-scoped order report — a manager seeing their own
-# direct reports and no one else.
-#
-# Deliberately its own constant rather than an addition to
-# ORDER_REPORT_ADMIN_ROLES: that set also unlocks the store-wide all-orders
-# list, CSV download of every order, and the admin page size. A manager gets
-# none of those — only the team report.
-#
-# Membership here is NECESSARY but not SUFFICIENT. The actual team comes from
-# the plugin's org chart, resolved from the caller's own WP account, so this
-# constant only decides what the chat offers; the plugin decides what it
-# serves. A manager who is not in the org chart is refused there.
-#
-# CAPABILITY DEPENDENCY — read before adding a role here. /order-stats-by-team
-# delegates to /order-stats-by-rep, which runs require_admin(). That passes for
-# shop_manager because the role holds `manage_woocommerce`. A role WITHOUT that
-# capability (cs_project_manager may well be one — it is a custom role) reaches
-# the team endpoint, passes the org-chart check, and then gets a 403 from the
-# delegated call. The symptom is a manager who is correctly recognised but
-# whose report comes back forbidden.
-def _load_manager_roles() -> frozenset:
-    raw = os.getenv("MANAGER_ROLES_JSON", "")
-    if raw:
-        try:
-            parsed = _json.loads(raw)
-            if isinstance(parsed, list):
-                return frozenset(parsed)
-        except Exception:
-            pass
-    return frozenset({"shop_manager", "cs_project_manager"})
-
-MANAGER_ROLES: frozenset = _load_manager_roles()
-
-
-def is_team_manager(role) -> bool:
-    """True when this role may run a team-scoped report.
-
-    Unlike is_order_report_admin(), this grants NO cross-team visibility on
-    its own — the plugin intersects the request with the caller's own team.
-    """
-    return bool(role) and role in MANAGER_ROLES
-
-
-def _load_counted_statuses() -> tuple:
-    raw = os.getenv("ORDER_REPORT_STATUSES_JSON", "")
-    if raw:
-        try:
-            parsed = _json.loads(raw)
-            if isinstance(parsed, list) and parsed:
-                return tuple(parsed)
-        except Exception:
-            pass
-    return ("completed", "pending", "processing")
-
-ORDER_REPORT_STATUSES: tuple = _load_counted_statuses()
-
 # First month of the fiscal year (1 = January = calendar quarters). Drives what
 # "Q1" and "this quarter" mean. Set FISCAL_YEAR_START_MONTH to e.g. 4 for an
 # April-start fiscal year.
 # NOTE: pending Diya's confirmation — defaults to CALENDAR quarters.
 FISCAL_YEAR_START_MONTH: int = max(1, min(12, int(os.getenv("FISCAL_YEAR_START_MONTH", "1"))))
 
-
-def is_order_report_admin(role) -> bool:
-    """True when this role may run reporting ACROSS reps and customers.
-
-    Mirrors WC_Chat_Security::is_admin() in the plugin. The plugin is the
-    real enforcement point (it holds the WP session/capabilities); this is
-    the client-side check that decides what to OFFER, so the two must agree
-    or a user gets shown a report the API then refuses.
-    """
-    return bool(role) and role in ORDER_REPORT_ADMIN_ROLES
 
 # "Most popular" ranking window and size (Shopify orders-based path).
 MOST_POPULAR_TOP_N = int(os.getenv("MOST_POPULAR_TOP_N", "5"))

@@ -95,7 +95,7 @@ def build_fetch_order_call(
 ) -> WooAPICall:
     """
     Build a call to fetch a single order by NAME (e.g. "1001") or GID.
-    Used by ORDER_TRACKING, ORDER_STATUS, and handle_order_detail.
+    Used by ORDER_TRACKING and ORDER_STATUS.
 
     customer_id is REQUIRED for the order to be returned: the executor only
     releases order contents when the order belongs to that customer. Passing

@@ -15,40 +15,31 @@ freshness otherwise.
 Tenant resolution rides the normal middleware (X-MiraQ-License-Id), so
 g.tenant is already set and validated. The <license_id> path segment must
 match that header — otherwise a caller holding tenant A's credentials could
-post to tenant B's URL and have it silently applied to A. Auth then reuses
-the tenant's own X-Consumer-Key / X-Consumer-Secret, compared timing-safe,
-so no new secret has to be provisioned or synced.
+post to tenant B's URL and have it silently applied to A. Auth: the request
+is signed with the store's own site key (site_key.py, purpose
+"branding-push"), or — LEGACY BRIDGE, a store set up before plugin 1.0.8 that
+has not registered its site key yet — carries its old X-Consumer-Key /
+X-Consumer-Secret.
 """
-
-import hmac
 
 from flask import Blueprint, g, jsonify, request
 
+import site_key
 from chat_logger import get_logger
 from models import db
-from tenant_crypto import decrypt_secret
 
 logger = get_logger("miraq_chat")
 
 webhook_bp = Blueprint("webhooks", __name__)
 
-def _verify_credentials(tenant_row) -> bool:
-    """Timing-safe check against the tenant's stored WooCommerce key/secret."""
-    key = request.headers.get("X-Consumer-Key", "")
-    secret = request.headers.get("X-Consumer-Secret", "")
-    if not key or not secret:
-        return False
-
-    expected_key = tenant_row.woo_key or ""
-    expected_secret = decrypt_secret(tenant_row.woo_secret_encrypted or "")
-    if not expected_key or not expected_secret:
-        return False
-
-    # Evaluate both comparisons (no short-circuit) so timing does not reveal
-    # which half matched.
-    key_ok = hmac.compare_digest(key, expected_key)
-    secret_ok = hmac.compare_digest(secret, expected_secret)
-    return key_ok and secret_ok
+def _verify_store(tenant_row) -> bool:
+    if site_key.verify_signed_request(tenant_row, "branding-push"):
+        logger.info(f"BrandingPush: authenticated with the site key | tenant={tenant_row.license_id}")
+        return True
+    if site_key.verify_legacy_credentials(tenant_row):
+        logger.info(f"BrandingPush: authenticated with the old WooCommerce key | tenant={tenant_row.license_id}")
+        return True
+    return False
 
 
 @webhook_bp.route("/webhooks/woocommerce/<license_id>/branding-push", methods=["POST"])
@@ -65,7 +56,7 @@ def woocommerce_branding_push(license_id):
         )
         return jsonify({"error": "tenant mismatch"}), 400
 
-    if not _verify_credentials(tenant_row):
+    if not _verify_store(tenant_row):
         logger.warning(f"BrandingPush: invalid credentials | tenant={license_id}")
         return jsonify({"error": "unauthorized"}), 401
 

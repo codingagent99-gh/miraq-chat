@@ -6,10 +6,9 @@ first, each with the exact cart-add the widget should perform for the same
 variant they bought, quantity 1.
 
 Ownership (FR-5.6), same rules the chat's order lookups follow:
-  - WooCommerce: GET wc/v3/orders?customer=<verified id>, then every order is
-    re-checked against that id (_only_own_orders in routes/chat.py does the
-    same) — the call uses the store's admin keys, so the filter is the only
-    thing scoping it.
+  - WooCommerce: GET miraq/v1/my-orders with the shopper's identity token;
+    the plugin returns only that shopper's orders. Every order is re-checked
+    against the id here too (_only_own_orders in routes/chat.py does the same).
   - Shopify: orders are read through the customer node
     (ShopifyOrdersExecutor), so only that customer's orders can come back;
     re-checked here too.

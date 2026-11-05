@@ -37,14 +37,11 @@ SHOW_MORE_TITLE = "Show more"
 # Instagram payloads at 1000 — 200 is safe everywhere.
 _MAX_REPLY_ID = 200
 
-# Actions that only make sense inside the widget (rep/bulk flows, cart buttons
+# Actions that only make sense inside the widget (bulk flow, cart buttons
 # wired to widget-side handlers). Dropped silently on channels.
 WIDGET_ONLY_ACTIONS = frozenset({
     "SHOW_BULK_ORDER_BUTTON",
-    "SHOW_BULK_ORDER_CONFIRMATION",
-    "SHOW_BULK_ADDRESS_CONFIRMATION",
     "SHOW_BULK_VARIANT_PROMPT",
-    "SHOW_RECENTLY_ORDERED_BUTTON",
     "PROPOSE_CHECKOUT_ADDRESS",
 })
 
@@ -395,4 +392,4 @@ def build_turn(data: dict, max_products: int, store_url: str = "",
         suggestions=suggestions,
         categories=categories,
         links=links,
-    )
+    )

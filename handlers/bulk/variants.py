@@ -543,16 +543,12 @@ def _ask_for_bulk_variant(
         for opts in attr_axes.values() for opt in opts
     )
 
-    # Deferred import: _line_recipient_display stays in bulk_order_handler,
-    # which imports this module — a top-level import here would be circular.
-    from handlers.bulk_order_handler import _line_recipient_display
-
     # ▼ CHANGED: wrap data inside "payload" key
     action = {
         "type": "SHOW_BULK_VARIANT_PROMPT",
         "payload": {
             "line_index": line_idx,
-            "company": _line_recipient_display(line),
+            "company": line.get("customer_display_name", "") or "",
             "is_self_order": line.get("is_self_order", False),
             "product_name": line.get("product_name", ""),
             "quantity": line.get("quantity", 0),
@@ -567,7 +563,7 @@ def _ask_for_bulk_variant(
     }
 
     _line_label = (
-        f"{_line_recipient_display(line)} × {line.get('quantity', 0) or '?'}"
+        f"{line.get('customer_display_name', '') or ''} × {line.get('quantity', 0) or '?'}"
     )
     if _hint_not_in_catalog:
         _bot_message = (
@@ -654,12 +650,9 @@ def handle_bulk_variant_selection_reply(
     message, stamps the best match as variation_id, then advances.
     Re-prompts via _ask_for_bulk_variant if no match is found.
     """
-    # Deferred imports: both live in bulk_order_handler, which imports this
-    # module — top-level imports here would be circular.
-    from handlers.bulk_order_handler import (
-        _advance_to_next_address_confirmation,
-        _build_bulk_confirmation_response,
-    )
+    # Deferred import: lives in bulk_order_handler, which imports this
+    # module — a top-level import here would be circular.
+    from handlers.bulk_order_handler import _build_bulk_confirmation_response
 
     lines_as_dicts = user_context.get("pending_bulk_lines", [])
     needs_variant_indices = user_context.get("bulk_variant_line_indices", [])
@@ -811,21 +804,7 @@ def handle_bulk_variant_selection_reply(
             conversation, user_context, page, start_time,
         )
 
-    # All variants resolved — collect ADDRESSES next, then show the summary.
-    #
-    # This site returns directly rather than going through
-    # _continue_after_addresses_chosen, so reordering that function alone left
-    # this path unchanged: the rep still saw a "ready to place" table before
-    # any address existed.
-    _resolved = [l for l in lines_as_dicts if not l.get("unresolved")]
-    if _resolved:
-        user_context["bulk_current_line_index"] = 0
-        conversation.context_data = user_context
-        flag_modified(conversation, "context_data")
-        return _advance_to_next_address_confirmation(
-            _resolved, 0, conversation, user_context, page, start_time,
-        )
-
+    # All variants resolved — add everything to the cart.
     return _build_bulk_confirmation_response(
         lines_as_dicts, conversation, user_context, page, start_time
     )

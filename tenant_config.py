@@ -1,5 +1,7 @@
 """
-tenant_config.py — Per-tenant credentials and URL bundle.
+tenant_config.py — Per-tenant URL and settings bundle. It holds no
+WooCommerce credentials: the backend calls only the plugin's public and
+shopper routes (see woo_client.py).
 
 Built per-tenant from the tenants table by tenant_registry.py's
 _rehydrate(). (Phase 1/2 briefly had a from_env() bridge for the
@@ -23,9 +25,6 @@ class TenantConfig:
     woo_store_api_url: str     # .../wp-json/wc/store/v1
     custom_api_base_url: str   # .../wp-json/custom-api/v1
 
-    # WooCommerce credentials
-    woo_key: str
-    woo_secret: str
     license_id: str = ""
     tenant_id: str = ""
 

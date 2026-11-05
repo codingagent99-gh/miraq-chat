@@ -49,11 +49,6 @@ _DEFAULT_SUGGESTIONS = ["Browse products", "Show my orders", "View cart"]
 # Intent → (message, suggestions). Written to be honest about the limitation
 # and immediately useful — every message offers a route the user CAN take.
 _MESSAGES = {
-    Intent.COUPON_INQUIRY: (
-        "I can't look up coupon codes on this store. If you have a discount "
-        "code, you'll be able to enter it at checkout.",
-        ["Browse products", "View cart", "Checkout"],
-    ),
     Intent.DISCOUNT_INQUIRY: (
         "I can't pull up the full list of discounted products on this store. "
         "I can still search the catalogue for you, and any active discount "
@@ -68,16 +63,6 @@ _MESSAGES = {
     Intent.PROMOTIONS: (
         "I can't list current promotions on this store. Any active offer will "
         "still apply at checkout.",
-        ["Browse products", "View cart"],
-    ),
-    Intent.SAVE_FOR_LATER: (
-        "I can't save items to a wishlist on this store. I can add anything "
-        "you like to your cart instead.",
-        ["Browse products", "View cart"],
-    ),
-    Intent.WISHLIST: (
-        "I can't open a wishlist on this store. I can add items to your cart "
-        "instead.",
         ["Browse products", "View cart"],
     ),
     Intent.UPDATE_CUSTOMER: (

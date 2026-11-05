@@ -10,15 +10,13 @@ leave:
   1. Signed licence payload (raw_payload + signature). Paid tenants, as
      before. Resolves the tenant by the licenceId inside the verified claims.
 
-  2. tenant_uuid + the store's own WooCommerce credentials, sent as
-     X-Consumer-Key / X-Consumer-Secret. This is the free-tier path: a free
-     activation never receives a licence, so it has nothing to sign with and
-     previously could not be torn down at all — its row stayed active and its
-     database was never reclaimed. The credentials are the same ones the
-     branding-push webhook already authenticates with, and they are checked
-     the same way (timing-safe, against the stored pair). Paid tenants may use
-     this path too; the plugin falls back to it when a signed call is rejected
-     after a licence rotation.
+  2. tenant_uuid + a request signed with the store's own site key
+     (site_key.py, purpose "deactivate-tenant"). This is the free-tier path: a
+     free activation never receives a licence. Paid tenants may use this path
+     too; the plugin falls back to it when a licence-signed call is rejected
+     after a licence rotation. A store set up before plugin 1.0.8 that has not
+     registered its site key yet may still send its old X-Consumer-Key /
+     X-Consumer-Secret instead (LEGACY BRIDGE).
 
      tenant_uuid ALONE is deliberately not enough. It identifies, it does not
      authorise — it sits in wp_options, travels in site exports, and cannot be
@@ -35,7 +33,6 @@ Lifecycle after this call:
 Idempotent: safe to call twice (already archived = 200, not an error).
 """
 
-import hmac
 from datetime import datetime, timezone
 import json
 import uuid as uuid_mod
@@ -44,37 +41,22 @@ from flask import Blueprint, request, jsonify
 from chat_logger import get_logger
 from models import db, Tenant
 from license_verifier import verify_license_payload, LicenseVerificationError
-from tenant_crypto import decrypt_secret
+import site_key
 
 logger = get_logger("miraq_chat")
 
 deactivation_bp = Blueprint("deactivation", __name__)
 
-def _verify_store_credentials(tenant) -> bool:
-    """
-    Timing-safe check of X-Consumer-Key / X-Consumer-Secret against the
-    tenant's stored WooCommerce credentials. Same check as
-    routes/webhook_routes.py::_verify_credentials — the store proving it is
-    the store, with a credential that CAN be rotated if it leaks.
-    """
-    key = request.headers.get("X-Consumer-Key", "")
-    secret = request.headers.get("X-Consumer-Secret", "")
-    if not key or not secret:
-        return False
-
-    expected_key = tenant.woo_key or ""
-    try:
-        expected_secret = decrypt_secret(tenant.woo_secret_encrypted or "")
-    except Exception as e:
-        logger.error(f"deactivate-tenant: could not decrypt stored secret | tenant_id={tenant.tenant_id} | {e}")
-        return False
-    if not expected_key or not expected_secret:
-        return False
-
-    # Both comparisons always run, so timing cannot reveal which half matched.
-    key_ok = hmac.compare_digest(key, expected_key)
-    secret_ok = hmac.compare_digest(secret, expected_secret)
-    return key_ok and secret_ok
+def _verify_store(tenant) -> bool:
+    """The store proving it is the store: a request signed with its site
+    key, or (LEGACY BRIDGE) its old WooCommerce key while it still has one."""
+    if site_key.verify_signed_request(tenant, "deactivate-tenant"):
+        logger.info(f"deactivate-tenant: authenticated with the site key | tenant_id={tenant.tenant_id}")
+        return True
+    if site_key.verify_legacy_credentials(tenant):
+        logger.info(f"deactivate-tenant: authenticated with the old WooCommerce key | tenant_id={tenant.tenant_id}")
+        return True
+    return False
 
 
 
@@ -161,7 +143,7 @@ def _deactivate_by_credentials(tenant_uuid_raw: str):
     # Unknown tenant returns the same 401 as bad credentials, on purpose: a
     # "this UUID exists but your credentials are wrong" answer would turn this
     # endpoint into a way to test whether a given UUID is a real tenant.
-    if tenant is None or not _verify_store_credentials(tenant):
+    if tenant is None or not _verify_store(tenant):
         logger.warning(f"deactivate-tenant: credential auth rejected | tenant_uuid={tenant_uuid_raw}")
         return jsonify({"success": False, "error": "unauthorized"}), 401
 
@@ -238,9 +220,10 @@ def teardown_tenant(tenant, *, log_prefix: str = "teardown") -> dict:
     try:
         tenant.status = "archived"
         tenant.archived_at = datetime.now(timezone.utc)
-        # The store's WooCommerce API key is deleted on its side at uninstall,
-        # so our copy is dead. Do not keep it. Re-activation (/activate-free,
-        # /provision-tenant) sends a freshly minted key and stores it again.
+        # The plugin deletes its site key at uninstall, so our public copy is
+        # dead; so is any pre-1.0.8 WooCommerce key. Keep neither.
+        # Re-activation sends a fresh site key and stores it again.
+        site_key.clear_public_key(tenant)
         tenant.woo_key = None
         tenant.woo_secret_encrypted = None
         db.session.commit()

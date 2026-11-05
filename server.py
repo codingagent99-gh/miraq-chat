@@ -35,7 +35,6 @@ from routes.deactivation import deactivation_bp
 import urllib.parse
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
-from routes.sales_rep import sales_rep_bp
 from routes.channel import channel_bp
 from routes.channel_link import channel_link_bp
 from routes.instagram_connect import instagram_connect_bp
@@ -176,7 +175,6 @@ app.register_blueprint(welcome_bp)
 app.register_blueprint(admin_bp)
 app.register_blueprint(products_bp)
 app.register_blueprint(shopify_bp)
-app.register_blueprint(sales_rep_bp)
 app.register_blueprint(provisioning_bp)
 app.register_blueprint(deactivation_bp)
 app.register_blueprint(webhook_bp)

@@ -20,7 +20,6 @@ from sqlalchemy.orm.attributes import flag_modified
 import sqlalchemy as sa
 import re
 from classifier.consolidation import _resolve_tag_attribute_overlap, _explicit_kinds_in_text
-import json
 
 import miraq_trace
 from handlers.chat_utils import resolve_session_id
@@ -30,11 +29,8 @@ from models import ExtractedEntities, ClassifiedResult, WooAPICall
 from app_config import (
     ORDER_INTENTS,
     CART_INTENTS,
-    is_order_report_admin,
     ORDER_CREATE_INTENTS,
     CLASSIFIER_PROVIDER_TAG,
-    BULK_ORDER_ROLES,
-    BULK_ORDER_FULL_SCOPE_ROLES,
     get_currency_symbol,
     MOST_POPULAR_WINDOW_DAYS
 )
@@ -64,16 +60,10 @@ from conversation_flow import (
 # once enough time has passed that no live conversation could still carry the
 # old string (rows are per-session, not long-lived, so this does not need to
 # stay forever).
-_LEGACY_FLOW_STATE_ALIASES = {
-    # "awaiting_order_for_email" -> AWAITING_ORDER_FOR_CUSTOMER: the order-for
-    # flow stopped using email as the customer identifier (name + company
-    # now), and the state name changed to match.
-    "awaiting_order_for_email": FlowState.AWAITING_ORDER_FOR_CUSTOMER,
-}
+_LEGACY_FLOW_STATE_ALIASES = {}
 from chat_logger import get_logger, sanitize_log_string
 from store_registry import get_store_loader, effective_role
 from identity import current_identity
-from ecommerce import endpoints
 from ecommerce.cart_actions import build_cart_add_action
 from ecommerce.unsupported import (
     find_unsupported_call,
@@ -87,7 +77,6 @@ from handlers.llm_handler import run_llm_fallback, history_for_llm
 from handlers.account_handler import handle_customer_update
 from handlers.order_handler import (
     handle_reorder,
-    handle_order_detail,
     handle_quick_order,
     handle_historical_search,
     handle_order_status,
@@ -114,39 +103,15 @@ from parsers.catalog_parser import parse_csv_message
 from parsers.address_parser import extract_address, address_summary
 from translation.turn import prepare_inbound, translate_reply, user_message_i18n_metadata
 from handlers.cart_handler import handle_cart_intent
-from handlers.order_stats_handler import (
-    handle_order_stats,
-    handle_rep_choice_reply,
-    handle_date_range_reply,
-    prompt_for_order_list_range,
-)
 from core.actions import build_propose_checkout_address
-from utils.rep_utils import (
-    fetch_product_order_history  as _fetch_product_order_history,
-    format_product_orders_for_action as _format_product_orders_for_action,
-)
-# ── Bulk order & sales rep handlers (top-level; no deferred imports needed) ──
+# ── Bulk order handlers (shopper multi-item ordering into the cart) ──
 from handlers.bulk_order_handler import (
     handle_bulk_order_trigger,
     handle_bulk_order_input,
-    handle_bulk_order_confirmation,
-    handle_bulk_address_confirmation_reply,
     handle_bulk_variant_selection_reply,
-    handle_bulk_email_reply,
-    handle_bulk_company_reply,
-    handle_bulk_company_choice_reply,
-    handle_bulk_recipient_reply,
-    handle_bulk_recipient_mode_reply,
-    handle_bulk_address_choice_reply,
     handle_bulk_product_reply,
     handle_bulk_quantity_reply,
     handle_cancel_bulk_order,
-    handle_bulk_confirmation_unclear,
-    handle_product_reorder,
-)
-from handlers.sales_rep_handler import (
-    handle_order_for_email_reply,
-    handle_order_for_prompt,
 )
 
 import re
@@ -176,57 +141,6 @@ from parsers.bulk_order_parser import (
     COMPANY_SCOPE_TAIL_RE, EXPLICIT_COMPANY_SCOPE_RE,
     FIELD_CLAUSE_SCOPE_TAIL_RE, FIELD_CLAUSE_MARKER_WORDS,
 )
-
-
-def _person_scope_tokens(message: str) -> list:
-    """Name tokens to shield from typo correction in an ANALYTICS query.
-
-    Rep names are already protected store-wide: rep_name_tokens() unions every
-    project_rep display name into the fuzzy vocabulary's protected set in
-    build_fuzzy_vocab(). That works because the rep directory is small and
-    bounded.
-
-    Customers are not on that directory, and there is no bounded list of them
-    to union — so admin customer-analytics ("how many did <customer> order")
-    had no protection at all, and a customer surname could still be rewritten
-    toward a catalog term exactly as "Bullock" once became "Block". Org-chart
-    team members who are not on the project_rep select have the same gap.
-
-    So this protects per MESSAGE rather than per vocabulary, and it does it by
-    asking the evaluator itself which names it will read out of this text,
-    rather than re-implementing the name grammar here. That matters twice
-    over: the protected set is exactly the tokens that would otherwise break,
-    and it cannot drift from the extraction it is protecting.
-
-    Self-gating, so it is safe to run on every message: _extract_reps returns
-    names only for analytics-shaped phrasings, so "show me blue tiles for the
-    bathroom" yields nothing and ordinary catalog wording keeps full typo
-    correction. Deliberately narrower than _recipient_scope_tokens below,
-    which blanket-protects every for/at tail and is therefore gated to bulk
-    orders only.
-
-    Returned lowercase for correct_message(suppressed_tokens=...).
-    """
-    if not message:
-        return []
-    try:
-        from classifier.evaluators import OrderStatsEvaluator
-        names = OrderStatsEvaluator()._extract_reps(message)
-    except Exception as exc:
-        # Never block a turn on this. Losing the guard costs a possible
-        # mis-correction; raising here would cost the whole message.
-        logger.debug(f"_person_scope_tokens: skipped ({exc})")
-        return []
-
-    tokens = []
-    for name in names or []:
-        for tok in re.split(r'[^A-Za-z]+', str(name)):
-            # >= 3 chars, matching rep_name_tokens(): shorter fragments are
-            # initials and articles, and protecting those would start
-            # switching off correction for ordinary words.
-            if len(tok) >= 3:
-                tokens.append(tok.lower())
-    return tokens
 
 
 def _recipient_scope_tokens(message: str, is_bulk: bool = False) -> list:
@@ -478,7 +392,7 @@ def _merge_phase_entities(result):
 
 def _dispatch_bulk_action(action, message, role, store_loader, conversation, user_context, page, start_time, customer_id=None):
     """
-    Route a bulk-order or sales-rep flow action to its handler.
+    Route a bulk-order flow action to its handler.
     Returns a Flask response tuple, or None if the action is not recognised.
     """
     if action == "process_bulk_input":
@@ -489,78 +403,17 @@ def _dispatch_bulk_action(action, message, role, store_loader, conversation, use
         return handle_bulk_variant_selection_reply(
             message, store_loader, conversation, user_context, page, start_time
         )
-    elif action == "process_bulk_address_choice_reply":
-        return handle_bulk_address_choice_reply(
-            message, store_loader, conversation, user_context, page, start_time
-        )
-    elif action == "process_bulk_recipient_mode_reply":
-        return handle_bulk_recipient_mode_reply(
-            message, store_loader, conversation, user_context, page, start_time
-        )
-    elif action == "process_bulk_company_choice_reply":
-        return handle_bulk_company_choice_reply(
-            message, store_loader, conversation, user_context, page, start_time
-        )
-    elif action == "process_rep_choice_reply":
-        # Admin disambiguating which rep an order report refers to.
-        return handle_rep_choice_reply(
-            message, conversation, user_context, page, start_time, customer_id
-        )
-    elif action == "process_date_range_reply":
-        # Admin answering "which period should I cover?" for an order report.
-        # Returns a Flask response for the stats report, or a plain dict when
-        # the window belongs to the ALL-ORDERS list — that one is answered by
-        # the normal API-call pipeline further down, so it can't be completed
-        # from inside the handler. The dict is passed back to the caller.
-        return handle_date_range_reply(
-            message, conversation, user_context, page, start_time, customer_id
-        )
-    elif action == "process_bulk_recipient_reply":
-        return handle_bulk_recipient_reply(
-            message, store_loader, conversation, user_context, page, start_time
-        )
-    elif action == "process_bulk_company_reply":
-        return handle_bulk_company_reply(
-            message, store_loader, conversation, user_context, page, start_time
-        )
-    elif action == "process_bulk_email_reply":
-        return handle_bulk_email_reply(
-            message, store_loader, conversation, user_context, page, start_time
-        )
     elif action == "process_bulk_product_reply":
         return handle_bulk_product_reply(
             message, store_loader, conversation, user_context, page, start_time
-        )
-    elif action == "confirm_bulk_order":
-        return handle_bulk_order_confirmation(
-            user_context, conversation, page, start_time
         )
     elif action == "cancel_bulk_order":
         return handle_cancel_bulk_order(
             user_context, conversation, page, start_time
         )
-    elif action == "bulk_confirmation_unclear":
-        return handle_bulk_confirmation_unclear(
-            conversation, page, start_time
-        )
     elif action == "process_bulk_quantity_reply":
         return handle_bulk_quantity_reply(
             message, store_loader, conversation, user_context, page, start_time
-        )
-    elif action in (
-        "bulk_address_confirmed",
-        "bulk_address_change",
-        "bulk_address_override_text",
-        "bulk_address_override_structured",
-        "bulk_address_skip",
-    ):
-        return handle_bulk_address_confirmation_reply(
-            action, message, conversation, user_context, page, start_time
-        )
-    elif action == "resolve_order_for_email" and role in BULK_ORDER_ROLES:
-        return handle_order_for_email_reply(
-            message, conversation, user_context, page, start_time,
-            customer_id=customer_id,
         )
     return None
 
@@ -715,26 +568,10 @@ def _maybe_attach_address_proposal(
         if not parsed:
             return
 
-        # Fetch the customer's saved billing/shipping for the "existing_on_file" field.
-        # Skipped on Shopify: fetch_customer is an unimplemented shopify_admin
-        # stub (the woo_client backstop would block it anyway). The proposal
-        # still works — it just has no address on file to compare against.
+        # existing_on_file stays empty: the widget does not use it yet, and
+        # when it does, it can read the saved address from the Store API cart
+        # with no key.
         existing = None
-        if current_backend() != "shopify":
-            try:
-                from woo_client import woo_client as _woo
-                cust_resp = _woo.execute(endpoints.fetch_customer(
-                    customer_id=customer_id,
-                    description="Fetch customer address for PROPOSE_CHECKOUT_ADDRESS",
-                ))
-                if cust_resp.get("success") and isinstance(cust_resp.get("data"), dict):
-                    _billing  = cust_resp["data"].get("billing", {})
-                    _shipping = cust_resp["data"].get("shipping", {})
-                    existing  = _shipping if (_shipping.get("address_1") or _shipping.get("city")) else (
-                        _billing if (_billing.get("address_1") or _billing.get("city")) else None
-                    )
-            except Exception:
-                pass  # proceed without existing address
 
         action = build_propose_checkout_address(parsed=parsed, existing_on_file=existing)
         actions = response_data.get("actions")
@@ -772,22 +609,6 @@ def _display_message(content: str) -> str:
     if not isinstance(content, str):
         return content
     text = content.strip()
-
-    if text.startswith("__DATE_RANGE__"):
-        try:
-            payload = json.loads(text[len("__DATE_RANGE__"):] or "{}")
-        except (ValueError, TypeError):
-            payload = {}
-        if isinstance(payload, dict):
-            if payload.get("all_time"):
-                return "📅 All time"
-            after, before = payload.get("after"), payload.get("before")
-            if after and before:
-                return f"📅 {after} to {before}"
-        return "📅 Selected a date range"
-
-    if text.startswith("__BULK_ADDR__"):
-        return "✏️ Updated billing & shipping address"
 
     return content
 
@@ -1389,7 +1210,6 @@ _RESETTABLE_FLOW_STATES = frozenset({
     FlowState.AWAITING_PRODUCT_OR_CATEGORY.value,
     FlowState.AWAITING_QUANTITY.value,
     FlowState.AWAITING_VARIANT_SELECTION.value,
-    FlowState.AWAITING_ORDER_DETAIL.value,
     FlowState.AWAITING_REORDER_ID.value,
     FlowState.AWAITING_FILTER_CLARIFICATION.value,
     FlowState.AWAITING_REFINEMENT_CHOICE.value,
@@ -1564,15 +1384,11 @@ def _only_own_orders(order_data, intent, role, customer_id):
 
     "Track order #1234" fetches /wc/v3/orders/1234 with the store's admin
     keys, which returns ANY order — so without this, a customer could read
-    another customer's order, address and email by typing its number. Staff
-    roles (reps, admins — on stores with sales tools on) keep full access, by
-    design. Shopify is not filtered here: its order executor already verifies
-    ownership before returning contents.
+    another customer's order, address and email by typing its number. Applies
+    to every role. Shopify is not filtered here: its order executor already
+    verifies ownership before returning contents.
     """
-    from app_config import CUSTOM_ORDER_ROLES, ORDER_REPORT_ADMIN_ROLES, BULK_ORDER_ROLES
     if intent not in ORDER_INTENTS or not order_data or current_backend() == "shopify":
-        return order_data
-    if role in (CUSTOM_ORDER_ROLES | ORDER_REPORT_ADMIN_ROLES | BULK_ORDER_ROLES):
         return order_data
     own = str(customer_id or "")
     kept = [o for o in order_data
@@ -1952,41 +1768,12 @@ def _build_final_response(
     if intent in (Intent.ORDER_HISTORY, Intent.LAST_ORDER) and order_data:
         response["orders"]           = [format_order_for_frontend(o) for o in order_data]
         response["order_pagination"] = build_pagination(page, api_responses, api_calls_to_execute)
-        # Mirrors the admin gate in handle_order_status (order_handler.py) —
-        # without this the frontend never offers the CSV download control.
-        response["metadata"]["allow_order_download"] = is_order_report_admin(_sr_role)
 
     _sr_actions = response.get("actions", [])
 
-    # Rep-only affordances are WooCommerce-only: the bulk-order and CS-rep
-    # flows they open depend on custom-plugin endpoints with no Shopify
-    # implementation. Suppress them entirely rather than surfacing buttons
-    # that dead-end (SHOW_PRODUCT_RECENT_ORDERS also triggers a Woo call).
+    # The Bulk Order button (shopper multi-item ordering into the cart) is
+    # WooCommerce-only.
     _sr_rep_features = current_backend() != "shopify"
-
-    from app_config import CUSTOM_ORDER_ROLES, ORDER_REPORT_ADMIN_ROLES
-    _can_view_orders = CUSTOM_ORDER_ROLES | ORDER_REPORT_ADMIN_ROLES
-
-    # Bulk-order button: rep roles only (they place orders).
-    if _sr_rep_features and _sr_role in BULK_ORDER_ROLES and customer_id and products:
-        _sr_actions.append({"type": "SHOW_RECENTLY_ORDERED_BUTTON", "payload": {}})
-
-    # Product order history: any rep or admin can VIEW it.
-    # Gated separately so an administrator logged in for reporting doesn't miss
-    # it just because they're not in the bulk-order role set.
-    if _sr_rep_features and _sr_role in _can_view_orders and customer_id and products:
-        _searched_product_id = getattr(entities, "product_id", None)
-
-        # Show only when the user explicitly asks — not on every product search.
-        if _searched_product_id and intent in (Intent.ORDER_HISTORY, Intent.LAST_ORDER, Intent.HISTORICAL_SEARCH):
-            _recent_orders = _fetch_product_order_history(_searched_product_id, _sr_role)
-            if _recent_orders:
-                _sr_actions.append({
-                    "type": "SHOW_PRODUCT_RECENT_ORDERS",
-                    "payload": {
-                        "orders": _format_product_orders_for_action(_recent_orders),
-                    },
-                })
 
     if _sr_rep_features and customer_id:
         _sr_actions.append({"type": "SHOW_BULK_ORDER_BUTTON", "payload": {}})
@@ -2302,19 +2089,13 @@ def chat():
     _reset_stale_flow(conversation, user_context, last_activity)
 
     # Persist role into user_context so handlers can read it. Always set —
-    # never left over from an earlier turn. effective_role(): with this
-    # tenant's sales tools off, staff roles are served as a customer.
+    # never left over from an earlier turn. effective_role(): staff roles are
+    # served as a customer (the chat has no staff features).
     role = effective_role(ident.role)
     if role != ident.role:
-        logger.info(f"chat: role {ident.role!r} served as {role!r} (sales tools off for this tenant)")
+        logger.info(f"chat: role {ident.role!r} served as {role!r}")
     if user_context.get("role") != role:
         user_context["role"] = role
-        flag_modified(conversation, "context_data")
-
-    # Persist rep email so order creation can default project_rep to the
-    # logged-in rep (custom-api saves the rep's email into _billing_project_rep).
-    if user_context.get("rep_email") != ident.email:
-        user_context["rep_email"] = ident.email
         flag_modified(conversation, "context_data")
 
     if user_context is not conversation.context_data:
@@ -2411,15 +2192,9 @@ def chat():
         try:
             current_flow_state = FlowState(conversation.flow_state)
         except ValueError:
-            # Legacy flow-state strings whose enum value was renamed (see
-            # _LEGACY_FLOW_STATE_ALIASES) map onto their replacement so a
-            # session already mid-flow continues normally — the pending
-            # context (order_for_pending_name, etc.) is untouched by the
-            # rename and still sitting in conversation.context_data, so the
-            # rep's next reply is handled exactly as it would have been
-            # before. Anything not in the alias table falls back to IDLE,
-            # same as always: a genuinely stale or corrupt value should not
-            # crash the turn.
+            # A stored state that no longer exists (renamed, or a removed
+            # flow) maps through _LEGACY_FLOW_STATE_ALIASES, else falls back
+            # to IDLE: a stale or corrupt value must not crash the turn.
             current_flow_state = _LEGACY_FLOW_STATE_ALIASES.get(
                 conversation.flow_state, FlowState.IDLE
             )
@@ -2525,9 +2300,6 @@ def chat():
                     message, is_bulk=_is_inline_bulk_order(message, store_loader)
                 )
             )
-            # Computed on the RAW message, before correction — the whole point
-            # is to name the tokens the corrector must leave alone.
-            _suppressed.extend(_person_scope_tokens(message))
             # Timed separately: this runs BEFORE parse_csv_message, so it was
             # previously hidden in the "other" bucket rather than "classify".
             # It is the rapidfuzz Damerau-Levenshtein pass over the catalog
@@ -2538,18 +2310,6 @@ def chat():
                     message, store_loader,
                     suppressed_tokens=_suppressed,
                 )
-            # Rep and customer names are protected from being REWRITTEN by the
-            # typo corrector, not recovered afterwards. Two layers do it:
-            #   * rep names — vocabulary-wide, via rep_name_tokens() unioned
-            #     into the protected set in build_fuzzy_vocab().
-            #   * anyone else named in an analytics query (a CUSTOMER, an
-            #     org-chart team member) — per message, via
-            #     _person_scope_tokens() above, since there is no bounded
-            #     directory to union for those.
-            # This is what stops "Bullock" becoming "Block" (a mosaic
-            # attribute) and the lookup then searching for someone who does
-            # not exist.
-
             if _typo_corrections:
                 message = _corrected
                 user_msg.metadata_json = {
@@ -2588,22 +2348,6 @@ def chat():
                 return _ft(_typo_clarification_resp)
 
         # ── Product reorder intercept ──   ← MOVE HERE (after current_flow_state is set)
-        if message.startswith("__PRODUCT_REORDER__"):
-            try:
-                _reorder_payload = json.loads(message[len("__PRODUCT_REORDER__"):])
-            except (ValueError, TypeError):
-                _reorder_payload = {}
-            if _reorder_payload:
-                resp = handle_product_reorder(
-                    _reorder_payload, store_loader, conversation, user_context, page, start_time
-                )
-                if resp:
-                    return _finalize_turn(conversation, resp)  # no _proposal_message
-
-        # ── Bulk cancel intercept ──
-        # Fired by the "Cancel bulk process" button on BulkAddressConfirmationCard.
-        # Short-circuits before the flow state machine so all pending bulk state
-        # is cleared regardless of which sub-step the address flow is in.
         if message.strip() == "__BULK_CANCEL__":
             resp = handle_cancel_bulk_order(user_context, conversation, page, start_time)
             return _finalize_turn(conversation, resp)  # no address proposal on a cancel
@@ -2818,39 +2562,17 @@ def chat():
             if resp:
                 return _ft(resp)
 
-        _resume_order_list = None
-
         # ── Early action dispatch ──────────────────────────────────────────
         # Bulk/rep flow actions short-circuit here before classification so
         # replies like "Yes, confirm" or "Change address" are never misrouted
         # to the product-search or update_customer classifier paths.
         if _flow_action:
-            # A resume dict (not a response) means the flow resolved a date
-            # window for the all-orders list; fall through to classification
-            # with the window applied instead of returning here.
             resp = _dispatch_bulk_action(
                 _flow_action, message, role, store_loader,
                 conversation, user_context, page, start_time,
                 customer_id=customer_id,
             )
-            if isinstance(resp, dict) and resp.get("resume") == "order_list":
-                # Not a response — the admin picked a window for the
-                # all-orders list. Rewrite the turn as an order-history
-                # request carrying that window and let the normal pipeline
-                # answer it, so there is one code path building order lists
-                # rather than two that can drift apart.
-                #
-                # This rewrite destroys whatever scope wording ("my"/"all")
-                # the ORIGINAL turn had — re-classifying the literal string
-                # "view all orders" always derives scope="all". The real
-                # scope traveled through resp["scope"] (parked in
-                # pending_order_stats by prompt_for_order_list_range) and is
-                # reapplied to entities AFTER classification below, the same
-                # way date_after/date_before already are.
-                _resume_order_list = resp
-                message = "view all orders"
-                _skip_classification = False
-            elif resp is not None:
+            if resp is not None:
                 return _ft(resp)
 
         # ── Step 3: Classify ──
@@ -3058,92 +2780,6 @@ def chat():
                     flag_modified(conversation, "context_data")
                     return _ft(clarification_resp)
 
-        # Shopify: only the REP multi-recipient flow is unsupported — company
-        # scoping, recipient rosters, address pickers, "order for X at Y".
-        # That flow is out of scope entirely on Shopify (see the module intro
-        # to bulk_order_parser and app_config.BULK_ORDER_ROLES): there is no
-        # rep role on this deployment, and the app's widget block
-        # (shopify-app/.../miraq_widget.liquid) can only ever send
-        # data-customer-role="customer" or "guest" — never a rep role — so
-        # this branch is a backstop for a role that cannot currently reach
-        # here, not a live path.
-        #
-        # Deliberately still keyed on BULK_ORDER_ROLES (the true-rep set),
-        # NOT BULK_ORDER_FULL_SCOPE_ROLES, even though "customer" is now
-        # full-scope on WooCommerce (see below). Swapping this to the
-        # full-scope constant would turn every Shopify customer bulk order
-        # into an "unsupported" bounce — role="customer" is always in that
-        # set, and Shopify customer multi-line ordering is fully supported
-        # (see the next comment block). The actual Shopify safety net for the
-        # "customer" case lives in the parser itself (bulk_order_parser.py:
-        # forces self-scoped-only behavior whenever current_backend() ==
-        # "shopify" for any non-true-rep role), so a Shopify customer's "for
-        # Ashlynn at Beck LTD" is silently stripped as noise there rather than
-        # surfacing here as an error message.
-        #
-        # Customer multi-LINE ordering (several products + variants in one
-        # message, added to the shopper's own cart) is fully supported and
-        # must not be blocked here — it bypasses build_api_calls the same
-        # way the rep flow does (see the `_resolve_variant or intent ==
-        # Intent.BULK_ORDER` branch below), which is why this check has to
-        # happen before that branch rather than relying on the unsupported-
-        # call guard further down.
-        if (intent == Intent.BULK_ORDER and current_backend() == "shopify"
-                and role in BULK_ORDER_ROLES):
-            _msg, _sugg = unsupported_message_for(Intent.BULK_ORDER)
-            logger.info(
-                "Shopify: BULK_ORDER rep multi-recipient flow unsupported "
-                f"(role={role!r}) — returning guidance"
-            )
-            elapsed = round((time.time() - start_time) * 1000)
-            return _ft((jsonify({
-                "success":     True,
-                "bot_message": _msg,
-                "intent":      intent.value,
-                "products":    [],
-                "suggestions": _sugg,
-                "session_id":  str(conversation.id),
-                "metadata": {
-                    "response_time_ms": elapsed,
-                    "unsupported_on_shopify": True,
-                },
-                "flow_state":  FlowState.IDLE.value,
-                "pagination":  default_pagination(page),
-                "actions":     [],
-            }), 200))
-
-        # Bulk order is available to EVERY role, but it means different things.
-        # For true rep roles (BULK_ORDER_ROLES) it is the full multi-recipient
-        # flow: company scope, recipient resolution, address picking, and
-        # they must always resolve to a named company/recipient — no self
-        # fallback. "customer" (BULK_ORDER_FULL_SCOPE_ROLES) gets the same
-        # full flow WHEN they name a company/recipient/email, but falls back
-        # to plain self-scoped multi-line ordering — several products and
-        # quantities in one message, shipped to the person placing it — the
-        # moment they name nothing at all. Everyone else (guest, etc.) only
-        # ever gets the self-scoped behavior; there is no fallback to reach
-        # for since they were never full-scope to begin with. On Shopify,
-        # every non-true-rep role is forced into self-scoped-only regardless
-        # of what's named (see the parser-level guard, and the backstop
-        # above) since the backend has no company/roster support at all.
-        #
-        # Nothing extra is needed to make the WooCommerce customer case safe
-        # here. The parser gates company scope, recipient names and email
-        # extraction on BULK_ORDER_FULL_SCOPE_ROLES (`_is_rep` in
-        # bulk_order_parser) and every on-behalf-of step in
-        # bulk_order_handler is gated the same way — so a customer only ever
-        # reaches another person's roster or address book when they
-        # EXPLICITLY name a company, recipient, or email; naming nothing
-        # keeps them in their own self-order branch exactly as before.
-        if intent == Intent.BULK_ORDER and role not in BULK_ORDER_FULL_SCOPE_ROLES:
-            logger.info(
-                "BULK_ORDER: role %r has no full-scope bulk-order resolution — "
-                "proceeding as SELF-scoped multi-line order "
-                "(no company/recipient/address resolution)",
-                role,
-            )
-                
-        # ── Step 6: Empty order guard ──
         empty_resp = _check_empty_order(intent, entities, conversation, page, start_time)
         if empty_resp:
             return empty_resp
@@ -3151,47 +2787,6 @@ def chat():
         # ── Step 6.4: Order reporting fork ──
         # Answered from an aggregate endpoint, not the product/API-call path,
         # so it forks before Step 7 builds product calls.
-        if intent == Intent.ORDER_STATS_BY_REP:
-            _role = user_context.get("role") or user_context.get("user_role")
-            stats_resp = handle_order_stats(
-                entities, _role, customer_id, conversation, page, start_time,
-                user_context=user_context,
-            )
-            if stats_resp is not None:
-                conversation.context_data = user_context
-                flag_modified(conversation, "context_data")
-                return _ft(stats_resp)
-
-        # ── Step 6.4b: Admin all-orders list needs a window ──
-        # An administrator asking for orders gets the WHOLE store, which on a
-        # real catalog is thousands of rows. Same reasoning as the stats
-        # report: ask which period rather than silently picking one. Reuses
-        # the same picker, flow state, and reply handler.
-        if intent == Intent.ORDER_HISTORY:
-            _role = user_context.get("role") or user_context.get("user_role")
-            if is_order_report_admin(_role):
-                if _resume_order_list:
-                    # Window already chosen this turn — apply it and continue.
-                    # scope must be restored here too: the message rewrite
-                    # above always re-derives scope="all" from the literal
-                    # string "view all orders", which silently drops "my"
-                    # from the ORIGINAL turn (see the comment at the rewrite
-                    # site). The real scope rode through the resume dict.
-                    entities.date_after  = _resume_order_list.get("date_after")
-                    entities.date_before = _resume_order_list.get("date_before")
-                    entities.scope       = _resume_order_list.get("scope")
-                elif not getattr(entities, "date_after", None) \
-                        and not getattr(entities, "date_before", None) \
-                        and not getattr(entities, "date_range_resolved", False):
-                    list_resp = prompt_for_order_list_range(
-                        conversation, user_context, _role, start_time, page,
-                        scope=getattr(entities, "scope", None),
-                    )
-                    conversation.context_data = user_context
-                    flag_modified(conversation, "context_data")
-                    return _ft(list_resp)
-
-        # ── Step 6.5: Cart intent fork ──
         if intent in CART_INTENTS or intent == Intent.CHECKOUT:
             cart_resp = handle_cart_intent(
                 intent, entities, user_context, conversation, page, start_time
@@ -3670,21 +3265,6 @@ def chat():
         if cust_resp:
             return cust_resp
 
-        # ── Step 8.5: Bulk order intent (from classifier) ──
-        if (
-            role in BULK_ORDER_ROLES
-            and intent in (Intent.QUICK_ORDER, Intent.PLACE_ORDER, Intent.ORDER_ITEM)
-            and not user_context.get("order_for_customer_id")
-            and customer_id
-        ):
-            resp = handle_order_for_prompt(conversation, page, start_time)
-            if resp:
-                return _ft(resp)
-
-        # ── Intercept: PLACE_ORDER with no product specified — ask what to
-        # order instead of falling through to a literal text search for the
-        # raw command phrase (e.g. "place new order" searching for "place
-        # order" as if it were a product name — guaranteed zero results).
         if intent in (Intent.PLACE_ORDER, Intent.QUICK_ORDER) and not entities.product_id and not entities.product_name:
             elapsed = round((time.time() - start_time) * 1000)
             return _ft((jsonify({
@@ -3702,18 +3282,12 @@ def chat():
         # ── BULK_ORDER trigger (natural language path) ──
         # Handles the case where the classifier or LLM resolved intent=bulk_order
         # from a natural language message (e.g. "place bulk order") rather than
-        # the __BULK_CANCEL__ / __PRODUCT_REORDER__ magic string paths.
-        #
-        # Open to every role: reps get the full multi-recipient flow, everyone
-        # else gets self-scoped multi-line ordering (see the note at the
-        # non-rep branch above). This previously required a rep role, which
-        # left customers seeing a bulk-order button — SHOW_BULK_ORDER_BUTTON
-        # has never been role-gated — that did nothing when they typed their
-        # order as a sentence.
+        # the __BULK_CANCEL__ magic string path. Every role gets self-scoped
+        # multi-line ordering: the lines go into the shopper's own cart.
         if intent == Intent.BULK_ORDER:
             # If the triggering message ALREADY carries the order lines
             # (e.g. "Order Harmony Moon, Adams Grey, Aurora Taupe"), parse it now.
-            # Prompting would throw that message away and ask the rep to retype
+            # Prompting would throw that message away and ask the shopper to retype
             # exactly what they just sent.
             if _is_inline_bulk_order(message, store_loader):
                 logger.info(
@@ -3730,18 +3304,6 @@ def chat():
             if resp:
                 return _ft(resp)
 
-        # ── Step 9: Route through specialized handlers ──
-        # ── Email filter: narrow rep's orders to a specific recipient ──
-        # When a rep asks "status of the order I sent to <email>", keep only the
-        # orders whose billing email matches. The fetch is widened to 50 in
-        # _build_order_tracking when a lookup_email/date filter is present so the
-        # target isn't missed beyond the default page size.
-        if role in BULK_ORDER_ROLES and getattr(entities, "lookup_email", None) and order_data:
-            _want = entities.lookup_email.lower()
-            order_data = [
-                o for o in order_data
-                if (o.get("billing", {}).get("email") or "").lower() == _want
-            ]
         resp = handle_order_status(
             intent, entities, order_data, customer_id, str(conversation.id), page, start_time,
             role=user_context.get("role") or user_context.get("user_role"),
@@ -3750,10 +3312,6 @@ def chat():
             return _ft(resp)
 
         resp = handle_reorder(intent, entities, order_data, customer_id, str(conversation.id), page, start_time)
-        if resp:
-            return _ft(resp)
-
-        resp = handle_order_detail(current_flow_state, customer_id, user_context, str(conversation.id), page, start_time)
         if resp:
             return _ft(resp)
 

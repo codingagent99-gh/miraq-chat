@@ -2,13 +2,12 @@
 WooCommerce API client for executing API calls.
 """
 
-from typing import List
+from typing import List, Optional
 import json as _json
 import re as _re
 import threading as _threading
 import time as _health_time
 import requests as http_requests
-from requests.auth import HTTPBasicAuth
 
 from models import WooAPICall
 from store_registry import get_store_loader
@@ -220,19 +219,36 @@ def _parse_json_tolerant(resp, endpoint_short):
 # header profile (loader.http, see http_profiles.py), which is chosen at
 # provisioning and adapts at runtime when a firewall blocks it.
 
-def _build_auth(loader, is_custom_api: bool):
-    """Auth strategy, resolved per-call from the tenant's own credentials:
-      - custom-api/v1/*  → X-Consumer-Key / X-Consumer-Secret headers
-      - wc/v3/*          → HTTPBasicAuth (no credentials in query string)
-    Returns (auth, auth_headers); the profile headers are layered underneath
-    by http_profiles.send().
-    """
-    if is_custom_api:
-        return None, {
-            "X-Consumer-Key":    loader.consumer_key,
-            "X-Consumer-Secret": loader.consumer_secret,
-        }
-    return HTTPBasicAuth(loader.consumer_key, loader.consumer_secret), {}
+# Plugin routes that are public, so the backend calls them WITHOUT the key.
+# Path endings, so both miraq/v1/... and the legacy custom-api/v1/... match;
+# plus everything under /catalog/ (products, variations, categories, tags,
+# attribute terms, currency), whose paths carry ids.
+PUBLIC_PLUGIN_ROUTES = ("/products-advanced-new", "/all-attributes", "/catalog-version", "/branding")
+
+
+def is_public_route(endpoint) -> bool:
+    path = str(endpoint or "").split("?", 1)[0].rstrip("/")
+    return path.endswith(PUBLIC_PLUGIN_ROUTES) or "/catalog/" in path
+
+
+# Plugin routes that return the logged-in shopper's own data. They take no
+# key either: the shopper's identity token is forwarded instead, and the
+# plugin returns only that shopper's records. Without a token (a guest) the
+# call is not made at all.
+SHOPPER_PLUGIN_ROUTES = ("/my-orders",)
+
+
+def is_shopper_route(endpoint) -> bool:
+    path = str(endpoint or "").split("?", 1)[0].rstrip("/")
+    return any(path.endswith(r) or f"{r}/" in path for r in SHOPPER_PLUGIN_ROUTES)
+
+
+def _current_identity_token() -> str:
+    try:
+        from identity import current_identity
+        return current_identity().token or ""
+    except Exception:
+        return ""
 
 
 class WooClient:
@@ -244,8 +260,12 @@ class WooClient:
         # one tenant's profile into another's.
         self.session = http_requests.Session()
 
-    def execute(self, api_call: WooAPICall, loader=None) -> dict:
+    def execute(self, api_call: WooAPICall, loader=None, identity_token: Optional[str] = None) -> dict:
         """Execute a single API call and return raw response.
+
+        identity_token: the shopper's token for the shopper routes
+        (SHOPPER_PLUGIN_ROUTES). Defaults to the current request's verified
+        identity; execute_all() passes it explicitly to its worker threads.
 
         loader: the tenant StoreLoader to resolve credentials/URLs from.
         Defaults to get_store_loader() (the current request's bound tenant)
@@ -299,10 +319,8 @@ class WooClient:
         params = dict(api_call.params)
         is_custom_api = api_call.surface == "custom_plugin"
 
-        # Order creation (Row 5.4 — POST /orders, admin surface) gets its own
-        # logger per request, isolated from api.txt entirely. list_rep_orders /
-        # list_cs_orders also POST to "/orders" but on the custom_plugin
-        # surface, so the surface check keeps them out of this branch.
+        # Order creation (POST /orders, admin surface) gets its own logger per
+        # request, isolated from api.txt entirely.
         is_order_create = (
             api_call.method == "POST"
             and api_call.endpoint == "/orders"
@@ -317,15 +335,33 @@ class WooClient:
             base = loader.custom_api_base if is_custom_api else loader.base
             endpoint = base.rstrip("/") + endpoint
 
-        auth, headers = _build_auth(loader, is_custom_api)
+        # No call carries a WooCommerce key: the backend has none. Public plugin
+        # routes go out as they are; shopper routes carry the shopper's
+        # identity token instead. Anything else (a /wc/v3 call) would need a
+        # key, so it is refused here rather than sent and rejected by the store.
+        shopper = is_custom_api and is_shopper_route(api_call.endpoint)
+        auth, headers = None, {}
+        if not is_custom_api:
+            logger.error(
+                f"WooClient: refused {api_call.method} {api_call.endpoint} — /wc/v3 needs a "
+                f"WooCommerce key, which the backend no longer has | "
+                f"description={api_call.description!r}"
+            )
+            return {"success": False, "data": [], "error": "wc_v3_not_available"}
+        if shopper:
+            token = _current_identity_token() if identity_token is None else identity_token
+            if not token:
+                logger.info(
+                    f"WooClient: {api_call.endpoint} skipped — no shopper identity "
+                    f"(guest) | description={api_call.description!r}"
+                )
+                return {"success": False, "data": [], "error": "login_required"}
+            headers = {"X-MiraQ-Identity": token}
 
         # ── Logging ───────────────────────────────────────────────────────────
         sanitized_endpoint = sanitize_url(endpoint)
         endpoint_short     = sanitized_endpoint.split("/")[-1]
-        safe_params        = _redact_for_log(
-            {k: v for k, v in params.items()
-             if k not in ("consumer_key", "consumer_secret")}
-        )
+        safe_params        = _redact_for_log(params)
 
         context = ""
         if api_call.session_id or api_call.user_message:
@@ -464,6 +500,14 @@ class WooClient:
                 }
                 if data.get("or_group_breakdown"):
                     result["or_group_breakdown"] = data["or_group_breakdown"]
+                if data.get("or_group_breakdown_skipped"):
+                    # The plugin's per-request query budget was exceeded. Should
+                    # never happen for real chat searches; if it does, raise
+                    # MAX_BREAKDOWN_QUERIES in the plugin.
+                    api_logger.warning(
+                        f"products-advanced-new: OR-group breakdown skipped (over the "
+                        f"plugin's query budget) | {api_call.description}"
+                    )
                 return result
 
             return {
@@ -575,8 +619,12 @@ class WooClient:
                 "is X-MiraQ-License-Id missing from the request?"
             )
 
+        # Same for the shopper's identity token: read here, in the request
+        # thread, and passed to every worker.
+        identity_token = _current_identity_token()
+
         if len(api_calls) == 1:
-            return [self.execute(api_calls[0], loader=loader)]
+            return [self.execute(api_calls[0], loader=loader, identity_token=identity_token)]
 
         import timing_logger
         from concurrent.futures import ThreadPoolExecutor
@@ -592,7 +640,7 @@ class WooClient:
             # loader is captured from the enclosing scope — resolved once,
             # above, in the calling thread — never re-resolved in the worker.
             try:
-                return self.execute(call, loader=loader)
+                return self.execute(call, loader=loader, identity_token=identity_token)
             except Exception as exc:
                 logger.error(f"execute_all: call failed | error={exc}", exc_info=True)
                 return {"success": False, "error": str(exc), "call": call}

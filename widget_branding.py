@@ -33,7 +33,6 @@ from chat_logger import get_logger
 from http_profiles import HttpProfileState, send as http_send
 from plugin_routes import branding_url, detect_plugin_namespace, namespace_of, plugin_api_base
 from models import db, Tenant
-from tenant_crypto import decrypt_secret
 
 logger = get_logger("miraq_chat")
 
@@ -57,9 +56,9 @@ def fetch_and_store_widget_branding(tenant: Tenant) -> bool:
         return False
 
     wp_base = (tenant.wp_base_url or "").rstrip("/")
-    if not wp_base or not tenant.woo_key or not tenant.woo_secret_encrypted:
+    if not wp_base:
         logger.warning(
-            f"widget_branding: tenant missing wp_base_url/woo creds — skipping | "
+            f"widget_branding: tenant missing wp_base_url — skipping | "
             f"license_id={tenant.license_id}"
         )
         return False
@@ -78,12 +77,8 @@ def fetch_and_store_widget_branding(tenant: Tenant) -> bool:
         )
         _sync_loader_namespace(tenant, wp_base, namespace)
         target_url = branding_url(wp_base, namespace)
-        headers = {
-            "X-Consumer-Key":    tenant.woo_key,
-            "X-Consumer-Secret": decrypt_secret(tenant.woo_secret_encrypted),
-        }
-        resp = http_send(req.Session(), "GET", target_url, state=http,
-                         headers=headers, timeout=10)
+        # Public plugin route: no key is sent.
+        resp = http_send(req.Session(), "GET", target_url, state=http, timeout=10)
         resp.raise_for_status()
         data = resp.json()
 

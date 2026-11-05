@@ -65,9 +65,7 @@ def get_product(product_id: int):
     product["rating_count"] = raw.get("rating_count", 0)
     product["weight"] = raw.get("weight", "")
     product["dimensions"] = raw.get("dimensions", {})
-    product["total_sales"] = raw.get("total_sales", 0)
     product["stock_status"] = raw.get("stock_status", "")
-    product["stock_quantity"] = raw.get("stock_quantity")
 
     return jsonify({
         "success": True,
@@ -127,9 +125,9 @@ def get_similar_products(product_id: int):
     # Step 1: fetch the product
     api_call = WooAPICall(
         method="GET",
-        endpoint=f"/products/{product_id}",
+        endpoint=f"/catalog/products/{product_id}",
         params={},
-        surface="admin",
+        surface="custom_plugin",
         description=f"REST: Fetch product id={product_id} for similar lookup",
     )
     result = woo_client.execute(api_call)
@@ -148,9 +146,9 @@ def get_similar_products(product_id: int):
     if raw.get("type") == "variation" and raw.get("parent_id"):
         parent_call = WooAPICall(
             method="GET",
-            endpoint=f"/products/{raw['parent_id']}",
+            endpoint=f"/catalog/products/{raw['parent_id']}",
             params={},
-            surface="admin",
+            surface="custom_plugin",
             description=f"REST: Fetch parent id={raw['parent_id']} for similar lookup",
         )
         parent_result = woo_client.execute(parent_call)
@@ -184,12 +182,12 @@ def get_similar_products(product_id: int):
     # Step 4: fetch all similar products in one request
     bulk_call = WooAPICall(
         method="GET",
-        endpoint="/products",
+        endpoint="/catalog/products",
         params={
             "include": ",".join(str(i) for i in source_ids),
             "per_page": len(source_ids),
         },
-        surface="admin",
+        surface="custom_plugin",
         description=f"REST: Fetch similar products for id={product_id}",
     )
     bulk_result = woo_client.execute(bulk_call)

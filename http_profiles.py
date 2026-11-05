@@ -50,7 +50,6 @@ from typing import Dict, List, Optional
 from urllib.parse import urlsplit
 
 import requests
-from requests.auth import HTTPBasicAuth
 
 from chat_logger import get_logger
 
@@ -416,33 +415,28 @@ class ProbeResult:
         return "; ".join(f"{name}: {outcome}" for name, outcome in self.results.items())
 
 
-def probe_profiles(*, state: HttpProfileState, wc_base: str, custom_api_base: str,
-                   consumer_key: str, consumer_secret: str,
+def probe_profiles(*, state: HttpProfileState, custom_api_base: str,
                    timeout: int = 15, session: Optional[requests.Session] = None) -> ProbeResult:
     """Find the first profile this store's firewall lets through.
 
-    Three cheap requests per profile, covering both auth styles and both
-    methods (WAF rules often treat request bodies differently from GETs):
-      GET  wc/v3/data/currencies/current          (Basic Auth)
-      GET  custom-api/v1/catalog-version          (X-Consumer-* headers)
-      POST custom-api/v1/products-advanced-new    (read-only search, per_page=1)
+    Two cheap requests per profile, one per method (WAF rules often treat
+    request bodies differently from GETs), both to public plugin routes and
+    sent the way the backend sends them, with no key:
+      GET  <plugin>/catalog-version
+      POST <plugin>/products-advanced-new    (read-only search, per_page=1)
 
-    A profile passes when none of the three is a WAF block. Any WordPress
-    answer counts — a 404 from an older plugin or a 401 still proves the
-    headers got past the firewall; credential problems are the build's job
-    to report, not this probe's.
+    A profile passes when neither is a WAF block. Any WordPress answer
+    counts — a 404 from an older plugin still proves the headers got past the
+    firewall; anything else is the build's job to report, not this probe's.
 
     Starts with the tenant's current profile. A pinned tenant tests only its
     pinned profile.
     """
     session = session or requests.Session()
-    basic = HTTPBasicAuth(consumer_key, consumer_secret)
-    custom_headers = {"X-Consumer-Key": consumer_key, "X-Consumer-Secret": consumer_secret}
     checks = [
-        ("GET",  f"{wc_base.rstrip('/')}/data/currencies/current", {"auth": basic}, None),
-        ("GET",  f"{custom_api_base.rstrip('/')}/catalog-version", {}, custom_headers),
+        ("GET",  f"{custom_api_base.rstrip('/')}/catalog-version", {}, None),
         ("POST", f"{custom_api_base.rstrip('/')}/products-advanced-new",
-         {"json": {"page": 1, "per_page": 1}}, custom_headers),
+         {"json": {"page": 1, "per_page": 1}}, None),
     ]
 
     result = ProbeResult()
