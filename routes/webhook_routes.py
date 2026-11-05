@@ -17,9 +17,7 @@ g.tenant is already set and validated. The <license_id> path segment must
 match that header — otherwise a caller holding tenant A's credentials could
 post to tenant B's URL and have it silently applied to A. Auth: the request
 is signed with the store's own site key (site_key.py, purpose
-"branding-push"), or — LEGACY BRIDGE, a store set up before plugin 1.0.8 that
-has not registered its site key yet — carries its old X-Consumer-Key /
-X-Consumer-Secret.
+"branding-push").
 """
 
 from flask import Blueprint, g, jsonify, request
@@ -35,9 +33,6 @@ webhook_bp = Blueprint("webhooks", __name__)
 def _verify_store(tenant_row) -> bool:
     if site_key.verify_signed_request(tenant_row, "branding-push"):
         logger.info(f"BrandingPush: authenticated with the site key | tenant={tenant_row.license_id}")
-        return True
-    if site_key.verify_legacy_credentials(tenant_row):
-        logger.info(f"BrandingPush: authenticated with the old WooCommerce key | tenant={tenant_row.license_id}")
         return True
     return False
 

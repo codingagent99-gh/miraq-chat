@@ -14,9 +14,7 @@ leave:
      (site_key.py, purpose "deactivate-tenant"). This is the free-tier path: a
      free activation never receives a licence. Paid tenants may use this path
      too; the plugin falls back to it when a licence-signed call is rejected
-     after a licence rotation. A store set up before plugin 1.0.8 that has not
-     registered its site key yet may still send its old X-Consumer-Key /
-     X-Consumer-Secret instead (LEGACY BRIDGE).
+     after a licence rotation.
 
      tenant_uuid ALONE is deliberately not enough. It identifies, it does not
      authorise — it sits in wp_options, travels in site exports, and cannot be
@@ -48,13 +46,9 @@ logger = get_logger("miraq_chat")
 deactivation_bp = Blueprint("deactivation", __name__)
 
 def _verify_store(tenant) -> bool:
-    """The store proving it is the store: a request signed with its site
-    key, or (LEGACY BRIDGE) its old WooCommerce key while it still has one."""
+    """The store proving it is the store: a request signed with its site key."""
     if site_key.verify_signed_request(tenant, "deactivate-tenant"):
         logger.info(f"deactivate-tenant: authenticated with the site key | tenant_id={tenant.tenant_id}")
-        return True
-    if site_key.verify_legacy_credentials(tenant):
-        logger.info(f"deactivate-tenant: authenticated with the old WooCommerce key | tenant_id={tenant.tenant_id}")
         return True
     return False
 
@@ -221,11 +215,8 @@ def teardown_tenant(tenant, *, log_prefix: str = "teardown") -> dict:
         tenant.status = "archived"
         tenant.archived_at = datetime.now(timezone.utc)
         # The plugin deletes its site key at uninstall, so our public copy is
-        # dead; so is any pre-1.0.8 WooCommerce key. Keep neither.
-        # Re-activation sends a fresh site key and stores it again.
+        # dead. Re-activation sends a fresh site key and stores it again.
         site_key.clear_public_key(tenant)
-        tenant.woo_key = None
-        tenant.woo_secret_encrypted = None
         db.session.commit()
         logger.info(f"{log_prefix}: archived — database {db_name} kept for the grace period | {label}")
     except Exception as e:

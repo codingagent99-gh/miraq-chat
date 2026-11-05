@@ -16,7 +16,7 @@ customer messaged, never by anything the caller asserts about a tenant.
 
 Meta access tokens are deliberately NOT stored here yet: whether this backend
 or the webhook service holds them is still an open decision. If it lands here,
-add an encrypted column using tenant_crypto, as tenants.woo_secret_encrypted does.
+add an encrypted column using tenant_crypto, as shopify_apps.client_secret_encrypted does.
 """
 
 import uuid

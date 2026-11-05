@@ -9,18 +9,13 @@ POST /activate-free — self-serve free-tier activation, unauthenticated by
 design for now (see its own docstring for the accepted risk and the
 hardening path).
 
-POST /register-site-key — LEGACY BRIDGE: a store set up before plugin 1.0.8
-registers its site key once, authenticating with the old WooCommerce key,
-which is then wiped (see site_key.py).
-
 Activation carries the store's Ed25519 site PUBLIC key (site_public_key),
 never a WooCommerce key. The backend checks it against the key the site
 itself serves (site_key.check_site_key_matches) and stores only that public
 key.
 
-All three are exempt from tenant resolution (see store_registry._EXEMPT_PATHS)
-— the first two create the very tenant row that resolution would otherwise
-need.
+Both are exempt from tenant resolution (see store_registry._EXEMPT_PATHS)
+— they create the very tenant row that resolution would otherwise need.
 """
 
 import hashlib
@@ -440,51 +435,6 @@ def activate_free():
         "tenant_id": str(tenant.tenant_id),
         "status": tenant.status,
     }), 200
-
-
-@provisioning_bp.route("/register-site-key", methods=["POST"])
-def register_site_key():
-    """LEGACY BRIDGE — a store set up before plugin 1.0.8 registers its site key.
-
-    The plugin calls this once after updating, with
-      body:    {"license_id": <miraq_license_id>, "site_public_key": <base64>}
-      headers: its old X-Consumer-Key / X-Consumer-Secret, and a signature of
-               this request made with the new site key.
-    The old WooCommerce key authenticates the FIRST call and is then wiped.
-    A retry (the plugin never saw the first answer) authenticates with the
-    signature instead, and only succeeds for the key already registered.
-
-    Unknown store and wrong credentials get the same 401, so this cannot be
-    used to test which licence ids exist.
-    """
-    body = request.get_json(silent=True) or {}
-    license_id = (body.get("license_id") or "").strip()
-    public_key = site_key.normalize_public_key(body.get("site_public_key") or "")
-    if not license_id or not public_key:
-        return jsonify({"success": False, "error": "missing license_id or valid site_public_key"}), 400
-
-    tenant = Tenant.query.filter_by(license_id=license_id).first()
-    if tenant is None:
-        logger.warning(f"register-site-key: rejected | license_id={license_id!r}")
-        return jsonify({"success": False, "error": "unauthorized"}), 401
-
-    already = site_key.public_key_b64(tenant) == public_key
-    signed_ok = site_key.verify_signed_request(tenant, "register-site-key", public_key_b64_override=public_key)
-    if already and signed_ok:
-        logger.info(f"register-site-key: already registered | license_id={license_id!r}")
-        return jsonify({"success": True, "status": "registered"}), 200
-    if not (signed_ok and site_key.verify_legacy_credentials(tenant)):
-        logger.warning(f"register-site-key: rejected | license_id={license_id!r}")
-        return jsonify({"success": False, "error": "unauthorized"}), 401
-
-    allowed, _why = site_key.check_site_key_matches(tenant.wp_base_url, public_key, label=f"license_id={license_id}")
-    if not allowed:
-        return jsonify({"success": False, "error": "site key does not match the key this site serves"}), 403
-
-    site_key.store_public_key(tenant, public_key)
-    db.session.commit()
-    logger.info(f"register-site-key: site key registered, WooCommerce key wiped | license_id={license_id!r}")
-    return jsonify({"success": True, "status": "registered"}), 200
 
 
 def _select_http_profile(tenant, tenant_registry, app) -> None:

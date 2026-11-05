@@ -33,10 +33,6 @@ load_dotenv()
 #   WOO_BASE_URL        -> loader.base
 #   WOO_STORE_API_URL   -> loader.store_api_base
 #   CUSTOM_API_BASE_URL -> loader.custom_api_base
-#
-# seed_tenant_one.py still needs the pre-migration single-store values to
-# create tenant #1; it reads os.environ directly rather than importing from
-# here, so nothing has to keep these alive for its sake.
 
 PORT = int(os.getenv("PORT", 5009))
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"

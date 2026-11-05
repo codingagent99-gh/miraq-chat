@@ -34,17 +34,14 @@ Token format (WooCommerce): base64url(json payload) + "." + base64url(sig)
             "email": str, "iat": unix, "exp": unix}
   sig:     Ed25519(site private key, <payload part as ASCII>)
 
-  v1 (plugin before 1.0.8) signed with HMAC-SHA256 under a key derived from
-  the WooCommerce consumer secret. It is accepted only while the store still
-  has that secret on record (site_key.py, LEGACY BRIDGE). Without it a v1
-  token is answered as expired, so the widget fetches a fresh v2 one.
+  v1 tokens (plugin before 1.0.8, HMAC with the old WooCommerce secret) are
+  no longer verified. One from a page rendered by an old plugin is answered
+  as expired, so the widget fetches a fresh v2 one.
 """
 
 from __future__ import annotations
 
 import base64
-import hashlib
-import hmac
 import json
 import time
 from dataclasses import dataclass, field
@@ -59,8 +56,7 @@ logger = get_logger("miraq_chat")
 IDENTITY_HEADER = "X-MiraQ-Identity"
 CHANNEL_ENVIRON_KEY = "miraq.channel_identity"
 
-_KEY_CONTEXT = b"miraq-identity-v1"
-_TOKEN_V1 = 1   # HMAC, legacy — see the module docstring
+_TOKEN_V1 = 1   # pre-1.0.8, no longer verified — see the module docstring
 _TOKEN_V2 = 2   # Ed25519 site key
 # Tolerance for clock differences between the WordPress host and this server.
 _CLOCK_SKEW_S = 120
@@ -103,19 +99,6 @@ def _b64url_decode(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
-def _signing_key(consumer_secret: str) -> bytes:
-    # v1 only.
-    # Matches PHP: hash_hmac('sha256', 'miraq-identity-v1', $secret, true)
-    return hmac.new(consumer_secret.encode("utf-8"), _KEY_CONTEXT, hashlib.sha256).digest()
-
-
-def sign_woo_identity(payload: dict, consumer_secret: str) -> str:
-    """Build a v1 (legacy HMAC) token. Kept for tests of the legacy bridge."""
-    body = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-    sig = hmac.new(_signing_key(consumer_secret), body.encode("ascii"), hashlib.sha256).digest()
-    return f"{body}.{_b64url_encode(sig)}"
-
-
 def sign_woo_identity_v2(payload: dict, private_key) -> str:
     """Build a v2 token with an Ed25519 private key. The plugin does this in
     PHP; kept here for tests and so the two implementations can be checked
@@ -125,17 +108,15 @@ def sign_woo_identity_v2(payload: dict, private_key) -> str:
 
 
 def verify_woo_identity(token: str, *, license_id: str, public_key=None,
-                        consumer_secret: str = "", now: Optional[float] = None) -> Identity:
+                        now: Optional[float] = None) -> Identity:
     """Verified identity from a plugin-signed token.
 
-    public_key: the store's Ed25519 site key (v2 tokens).
-    consumer_secret: the store's legacy WooCommerce secret, while it still has
-    one (v1 tokens).
+    public_key: the store's Ed25519 site key.
 
     Returns GUEST for anything that fails verification (logged — a forged or
     foreign token is worth seeing). Raises IdentityExpired for a token that is
-    genuine but past its lifetime, and for a v1 token the store can no longer
-    verify, so the widget fetches a fresh one.
+    genuine but past its lifetime, and for a pre-1.0.8 (v1) token, so the
+    widget fetches a fresh one.
     """
     if not token:
         return GUEST
@@ -157,18 +138,9 @@ def verify_woo_identity(token: str, *, license_id: str, public_key=None,
             logger.warning("identity: token signature mismatch — treating as guest")
             return GUEST
     elif version == _TOKEN_V1:
-        if not consumer_secret:
-            # The store has moved to its site key; the widget refreshes.
-            logger.info("identity: v1 token after the store moved to its site key — asking the widget to refresh")
-            raise IdentityExpired()
-        try:
-            expected = hmac.new(_signing_key(consumer_secret), body.encode("ascii"), hashlib.sha256).digest()
-            if not hmac.compare_digest(expected, _b64url_decode(sig)):
-                logger.warning("identity: token signature mismatch — treating as guest")
-                return GUEST
-        except Exception as e:
-            logger.warning(f"identity: malformed token ({type(e).__name__}) — treating as guest")
-            return GUEST
+        # From a page an old plugin rendered; the widget refreshes.
+        logger.info("identity: v1 token from a pre-1.0.8 page — asking the widget to refresh")
+        raise IdentityExpired()
     else:
         logger.warning(f"identity: unsupported token version {version!r} — treating as guest")
         return GUEST
@@ -178,8 +150,7 @@ def verify_woo_identity(token: str, *, license_id: str, public_key=None,
     except Exception:
         return GUEST
 
-    # Bound to one store: a token from store A must not work on store B, even
-    # if both happened to share a secret.
+    # Bound to one store: a token from store A must not work on store B.
     if str(payload.get("lid") or "") != str(license_id or ""):
         logger.warning("identity: token issued for a different store — treating as guest")
         return GUEST
@@ -289,7 +260,6 @@ def resolve_identity(tenant) -> Identity:
         token,
         license_id=tenant.license_id,
         public_key=site_key.public_key_for(tenant),
-        consumer_secret=site_key.legacy_consumer_secret(tenant),
     )
 
 

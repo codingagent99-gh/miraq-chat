@@ -1,9 +1,7 @@
 """
-tenant_crypto.py — Encryption-at-rest for tenant WooCommerce credentials.
-
-Only the WooCommerce consumer SECRET is encrypted (stored as
-Tenant.woo_secret_encrypted). The consumer KEY is not secret on its own —
-it's the secret that grants write access, so that's what we protect.
+tenant_crypto.py — Fernet encryption-at-rest for secrets the backend has to
+keep: Shopify custom-app client secrets (shopify_apps.client_secret_encrypted)
+and short-lived values such as the channel sign-in code verifier.
 
 Key source: a urlsafe-base64 Fernet key in the TENANT_ENC_KEY environment
 variable. Generate one with:

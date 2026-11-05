@@ -51,7 +51,7 @@ _LICENSE_HEADER = "X-MiraQ-License-Id"
 # reach stores outside our own Partner organisation, which is why a
 # distributable app needs this authorization-code callback at all.
 _EXEMPT_PATHS = {
-    "/provision-tenant", "/activate-free", "/deactivate-tenant", "/register-site-key",
+    "/provision-tenant", "/activate-free", "/deactivate-tenant",
     "/customer-addresses", "/events/product-update", "/events/order-paid",
     "/events/app-uninstalled",
     # Shopify's mandatory privacy webhooks (routes/shopify.py). Signed with

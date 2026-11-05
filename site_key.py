@@ -16,8 +16,8 @@ SIGNED REQUESTS (plugin → backend)
   X-MiraQ-Timestamp: unix seconds
   X-MiraQ-Signature: base64url(Ed25519 signature of the message below)
       message = "miraq-request-v1\n<purpose>\n<timestamp>\n<sha256 hex of the raw body>"
-  The purpose is fixed per endpoint ("deactivate-tenant", "branding-push",
-  "register-site-key"), so a signature for one action is useless for another.
+  The purpose is fixed per endpoint ("deactivate-tenant", "branding-push"),
+  so a signature for one action is useless for another.
   Must match MiraQ_Site_Key::signed_headers() in the plugin exactly.
 
 SITE KEY CHECK AT ACTIVATION
@@ -25,13 +25,6 @@ SITE KEY CHECK AT ACTIVATION
   (GET <wp_base_url>/wp-json/miraq/v1/site-key) and refuses an activation
   whose key differs from the one the site serves. An unreachable site is
   NOT refused (some hosts block inbound calls) — that is logged instead.
-
-LEGACY BRIDGE
-  Stores set up before plugin 1.0.8 have a WooCommerce key/secret on record
-  and no site key. verify_legacy_credentials() lets them authenticate with it
-  until they register their site key (/register-site-key), which wipes the
-  stored key. Remove the bridge, and the woo_key / woo_secret_encrypted
-  columns, once every store has registered.
 """
 
 from __future__ import annotations
@@ -109,21 +102,16 @@ def public_key_for(tenant) -> Optional[Ed25519PublicKey]:
 
 
 def store_public_key(tenant, b64: str) -> None:
-    """Record the store's public key and drop its old WooCommerce key.
-    The caller commits."""
+    """Record the store's public key. The caller commits."""
     features = dict(getattr(tenant, "features", None) or {})
     features["site_key"] = {
         "public_key": normalize_public_key(b64),
         "registered_at": datetime.now(timezone.utc).isoformat(),
     }
     tenant.features = features  # reassign: plain JSONB has no in-place change tracking
-    had_old_key = bool(getattr(tenant, "woo_key", None) or getattr(tenant, "woo_secret_encrypted", None))
-    tenant.woo_key = None
-    tenant.woo_secret_encrypted = None
     logger.info(
         f"site_key: stored | tenant_id={getattr(tenant, 'tenant_id', '')} | "
-        f"site_key={fingerprint(features['site_key']['public_key'])} | "
-        f"old_woo_key={'wiped' if had_old_key else 'none'}"
+        f"site_key={fingerprint(features['site_key']['public_key'])}"
     )
 
 
@@ -171,10 +159,9 @@ def sign_request(private_key, purpose: str, body: bytes, timestamp: Optional[int
     }
 
 
-def verify_signed_request(tenant, purpose: str, *, public_key_b64_override: str = "",
-                          now: Optional[float] = None) -> bool:
+def verify_signed_request(tenant, purpose: str, *, now: Optional[float] = None) -> bool:
     """True when the current Flask request is signed by this tenant's site
-    key (or by public_key_b64_override, for the register call) for `purpose`."""
+    key for `purpose`."""
     from flask import request
 
     ts = request.headers.get(TIMESTAMP_HEADER, "").strip()
@@ -190,7 +177,7 @@ def verify_signed_request(tenant, purpose: str, *, public_key_b64_override: str 
         logger.warning(f"site_key: signed request outside the time window | purpose={purpose}")
         return False
 
-    key = parse_public_key(public_key_b64_override) if public_key_b64_override else public_key_for(tenant)
+    key = public_key_for(tenant)
     ok = verify(key, request_message(purpose, ts, request.get_data(cache=True)), sig)
     if not ok and key is not None:
         logger.warning(f"site_key: bad request signature | purpose={purpose}")
@@ -247,36 +234,3 @@ def check_site_key_matches(wp_base_url: str, submitted_b64: str, *, label: str =
         f"accepting | {label} | base={wp_base_url}"
     )
     return True, outcome
-
-
-# ── legacy bridge ────────────────────────────────────────────────────────────
-
-def legacy_consumer_secret(tenant) -> str:
-    """The pre-1.0.8 WooCommerce secret, while the store still has one."""
-    if not getattr(tenant, "woo_secret_encrypted", None):
-        return ""
-    from tenant_crypto import decrypt_secret
-    try:
-        return decrypt_secret(tenant.woo_secret_encrypted or "")
-    except Exception as e:
-        logger.error(f"site_key: cannot decrypt legacy secret | tenant_id={getattr(tenant, 'tenant_id', '')} | {e}")
-        return ""
-
-
-def verify_legacy_credentials(tenant) -> bool:
-    """Timing-safe X-Consumer-Key / X-Consumer-Secret check against the
-    tenant's stored pre-1.0.8 WooCommerce key. False once it is wiped."""
-    from flask import request
-
-    key = request.headers.get("X-Consumer-Key", "")
-    secret = request.headers.get("X-Consumer-Secret", "")
-    if not key or not secret:
-        return False
-    expected_key = getattr(tenant, "woo_key", None) or ""
-    expected_secret = legacy_consumer_secret(tenant)
-    if not expected_key or not expected_secret:
-        return False
-    # Both comparisons always run, so timing cannot reveal which half matched.
-    key_ok = hmac.compare_digest(key, expected_key)
-    secret_ok = hmac.compare_digest(secret, expected_secret)
-    return key_ok and secret_ok

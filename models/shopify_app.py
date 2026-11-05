@@ -20,8 +20,7 @@ _CONTROL_PLANE_TABLES so _TenantRoutingSession never routes it to a tenant DB).
                      admin API, so registering an app cannot redirect traffic
                      of a store that is already installed.
 
-The secret is stored Fernet-encrypted (tenant_crypto), like
-tenants.woo_secret_encrypted.
+The secret is stored Fernet-encrypted (tenant_crypto).
 """
 
 from datetime import datetime, timezone

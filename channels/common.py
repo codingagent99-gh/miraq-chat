@@ -320,17 +320,10 @@ def build_turn(data: dict, max_products: int, store_url: str = "",
                 url=payload["url"],
                 short_label=_short_channel_label(payload.get("channel")),
             ))
-        elif a_type == "SHOW_DATE_RANGE_PICKER":
-            # Typed windows ("This month") are handled by handle_date_range_reply.
-            suggestion_texts = list(payload.get("quick_options") or []) + suggestion_texts
         elif a_type == "SHOW_TOP_SELLERS_BY_COLLECTION":
             block = _top_sellers_text(payload)
             if block:
                 extra_text.append(block)
-        elif a_type == "SHOW_PRODUCT_RECENT_ORDERS":
-            orders = payload.get("orders") or []
-            if orders:
-                extra_text.append(f"You've ordered this before ({len(orders)} recent order(s)).")
 
     bot_message = data.get("bot_message") or ""
     action_types = {(a or {}).get("type") for a in data.get("actions") or []}
