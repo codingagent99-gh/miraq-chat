@@ -25,6 +25,7 @@ from store_registry import get_store_loader, register_before_request
 from models import db, Conversation
 from routes.webhook_routes import webhook_bp
 from routes.shopify_oauth import shopify_oauth_bp
+from routes.shopify_admin import shopify_admin_bp
 from routes.chat import chat_bp
 from routes.welcome import welcome_bp
 from routes.admin import admin_bp
@@ -179,6 +180,7 @@ app.register_blueprint(provisioning_bp)
 app.register_blueprint(deactivation_bp)
 app.register_blueprint(webhook_bp)
 app.register_blueprint(shopify_oauth_bp)
+app.register_blueprint(shopify_admin_bp)
 app.register_blueprint(channel_bp)
 app.register_blueprint(channel_link_bp)
 app.register_blueprint(instagram_connect_bp)

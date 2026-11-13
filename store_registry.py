@@ -65,6 +65,11 @@ _EXEMPT_PATHS = {
     # tenant exists — the callback is what creates it — and authenticate with
     # the app-level hmac + state nonce instead.
     "/shopify/install", "/shopify/auth/callback", "/installed",
+    # Embedded admin page (routes/shopify_admin.py). The page and its assets
+    # are static; the /shopify/admin/ JSON routes authenticate with a Shopify
+    # session token and, on first load, CREATE the tenant (token exchange), so
+    # like the install routes they must run before any tenant exists.
+    "/shopify/app",
     # Messaging channels (routes/channel.py). Called server-to-server by the
     # webhook service, which has no licence id to send: /chat/channel resolves
     # its tenant from the WhatsApp/Instagram account the customer messaged
@@ -102,7 +107,8 @@ _OPTIONAL_TENANT_PATHS = {"/health", "/status"}
 # only control-plane rows (tenants, channel_connections).
 _EXEMPT_PREFIXES = ("/static/", "/admin/translation/", "/admin/shopify-apps",
                     "/shopify/install/", "/shopify/auth/callback/",
-                    "/dev/shopify/", "/instagram/")
+                    "/dev/shopify/", "/instagram/",
+                    "/shopify/app-assets/", "/shopify/admin/")
 
 _tenant_registry = None
 _engine_registry = None

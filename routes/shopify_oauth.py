@@ -86,9 +86,11 @@ from routes.instagram_connect import instagram_section_html
 from shopify_apps import (
 
     app_for_install,
+    admin_app_url,
     app_for_shop,
     callback_path,
     install_path,
+    is_embedded,
     record_install,
 )
 
@@ -276,7 +278,13 @@ def _install_is_healthy(shop: str, app) -> bool:
 
 
 def _app_page_redirect(shop: str):
-    """The app page, carrying a signed owner token (merchant_session.py)."""
+    """
+    The app page. Embedded app: inside the Shopify admin. Custom app:
+    /installed, carrying a signed owner token (merchant_session.py).
+    """
+    app = app_for_shop(shop)
+    if is_embedded(app):
+        return redirect(admin_app_url(shop, app), code=302)
     query = urllib.parse.urlencode({"shop": shop, "t": merchant_session.issue(shop)})
     return redirect(_app_url(f"installed?{query}"), code=302)
 
@@ -297,6 +305,151 @@ def _app_or_error(client_id, shop: str, where: str):
         logger.warning(f"shopify {where}: custom app {app.client_id} is not set up for shop={shop!r}")
         return None, (jsonify({"error": "this app is not set up for this store"}), 403)
     return app, None
+
+
+# ── Install steps ────────────────────────────────────────────────────────────
+# Shared by the OAuth callback below and the embedded app's token exchange
+# (routes/shopify_admin.py). Both end up with the same kind of token — an
+# expiring offline token plus refresh token — and must provision the store the
+# same way, so the steps live here once.
+
+def token_payload_error(payload: dict, shop: str):
+    """None if `payload` is a usable expiring offline token, else an error response."""
+    if not payload.get("refresh_token") or not payload.get("expires_in"):
+        # Shopify returned a non-expiring token after all. It will be refused
+        # by the Admin API, so fail the install loudly here rather than let
+        # every catalog fetch 403 afterwards with no hint why.
+        logger.error(
+            f"shopify install: expected an expiring token (refresh_token + "
+            f"expires_in) but got keys={sorted(payload)} | shop={shop}"
+        )
+        return jsonify({"error": "shopify did not issue an expiring token"}), 502
+    if not payload.get("access_token"):
+        logger.error(f"shopify install: no access_token in response | shop={shop}")
+        return jsonify({"error": "token exchange returned no token"}), 502
+    return None
+
+
+def store_token(shop: str, payload: dict) -> None:
+    """Persist an expiring offline token (control-plane table, keyed by domain)."""
+    granted_scope = payload.get("scope", "")
+    expires_in = payload.get("expires_in")
+    refresh_expires_in = payload.get("refresh_token_expires_in")
+
+    logger.info(f"shopify install: token obtained | shop={shop} scope={granted_scope!r}")
+    _missing = missing_scopes(granted_scope)
+    if _missing:
+        # Not fatal: the install still works for what WAS granted. But it means
+        # SHOPIFY_SCOPES and the app's toml have drifted apart again.
+        logger.warning(
+            f"shopify install: granted scope is missing {sorted(_missing)} | shop={shop} "
+            f"requested={SHOPIFY_SCOPES!r} — check [access_scopes] in the app toml"
+        )
+
+    now = datetime.now(timezone.utc)
+    token_row = db.session.get(ShopifyToken, shop)
+    if token_row is None:
+        token_row = ShopifyToken(store_domain=shop, refresh_count=0)
+        db.session.add(token_row)
+    token_row.access_token  = payload["access_token"]
+    token_row.scope         = granted_scope
+    token_row.fetched_at    = now
+    token_row.expires_at    = now + timedelta(seconds=int(expires_in))
+    token_row.refresh_token = payload["refresh_token"]
+    token_row.refresh_token_expires_at = (
+        now + timedelta(seconds=int(refresh_expires_in)) if refresh_expires_in else None
+    )
+    token_row.refresh_count = (token_row.refresh_count or 0) + 1
+    token_row.last_error    = None
+    db.session.commit()
+    logger.info(
+        f"shopify install: token stored | shop={shop} "
+        f"access_expires_in={int(expires_in)}s refresh_expires_in={refresh_expires_in}"
+    )
+
+
+def provision_tenant(shop: str):
+    """
+    Create (or re-activate) the store's tenant and database, and start the
+    catalog build. Call after store_token + record_install. Returns None, or an
+    error response if the database could not be set up.
+    """
+    # ── Tenant row: one per shop domain ──────────────────────────────────────
+    # Keyed on shopify_domain, not on a UUID the client supplies: the shop
+    # domain is the only stable identifier Shopify gives us, and it is what
+    # every webhook and proxied request arrives with. A re-install of the same
+    # store must reuse its row and database, history included.
+    tenant = Tenant.query.filter_by(shopify_domain=shop).first()
+    reinstall = tenant is not None
+
+    if tenant is None:
+        tenant_id = uuid_mod.uuid4()
+        tenant = Tenant(
+            tenant_id=tenant_id,
+            license_id=_generate_shop_token(),
+            db_name=_derive_db_name(str(tenant_id)),
+            plan="free",
+            status="active",
+            features={},
+            ecommerce_backend="shopify",
+            shopify_domain=shop,
+            site_domain=shop,
+        )
+        db.session.add(tenant)
+        logger.info(f"shopify install: new tenant | shop={shop} tenant_id={tenant_id} db={tenant.db_name}")
+    else:
+        logger.info(
+            f"shopify install: re-install | shop={shop} tenant_id={tenant.tenant_id} "
+            f"current_status={tenant.status}"
+        )
+        if tenant.status == "archived":
+            # Uninstall archives but keeps the database for the grace period,
+            # so a re-install inside that window comes back with its history.
+            tenant.archived_at = None
+        tenant.ecommerce_backend = "shopify"
+        tenant.status = "active"
+        tenant.build_attempts = 0
+        if not tenant.license_id:
+            tenant.license_id = _generate_shop_token()
+
+    db.session.commit()
+
+    # ── Database + schema ────────────────────────────────────────────────────
+    base_dsn = current_app.config["SQLALCHEMY_DATABASE_URI"]
+    try:
+        ensure_tenant_database(base_dsn, tenant.db_name)
+        _create_tenant_schema(tenant.db_name, base_dsn)
+        tenant.schema_migrated_at = datetime.now(timezone.utc)
+    except (TenantDBProvisionError, Exception) as e:
+        logger.error(f"shopify install: database setup failed | shop={shop} | {e}", exc_info=True)
+        tenant.status = "provision_failed"
+        tenant.last_build_error = str(e)
+        db.session.commit()
+        return jsonify({"error": f"database setup failed: {e}"}), 500
+
+    tenant.status = "warming"
+    db.session.commit()
+
+    # Evict any loader already cached for this tenant. On a re-install the
+    # registry still holds the loader built with the PREVIOUS token — degraded,
+    # if that token stopped working — and the build thread's get_loader() is a
+    # cache hit that returns it untouched: no fetch, no use of the token just
+    # stored, straight to provision_failed. Evicting forces a real rebuild.
+    if reinstall:
+        from store_registry import get_tenant_registry
+        registry = get_tenant_registry()
+        if registry is not None:
+            registry.evict(str(tenant.tenant_id))
+            logger.info(f"shopify install: evicted cached loader | tenant_id={tenant.tenant_id}")
+
+    logger.info(f"shopify install: starting catalog build | shop={shop} tenant_id={tenant.tenant_id}")
+    _start_background_build(tenant.tenant_id, current_app._get_current_object())
+
+    logger.info(
+        f"shopify install: ✅ install complete | shop={shop} tenant_id={tenant.tenant_id} "
+        f"reinstall={reinstall} api_version={SHOPIFY_API_VERSION}"
+    )
+    return None
 
 
 @shopify_oauth_bp.route("/shopify/install", methods=["GET"], defaults={"client_id": None})
@@ -405,96 +558,10 @@ def shopify_auth_callback(client_id):
         logger.error(f"shopify callback: token exchange failed | shop={shop} | {e}", exc_info=True)
         return jsonify({"error": "token exchange failed"}), 502
 
-    access_token = payload.get("access_token")
-    granted_scope = payload.get("scope", "")
-    refresh_token = payload.get("refresh_token")
-    expires_in = payload.get("expires_in")
-    refresh_expires_in = payload.get("refresh_token_expires_in")
-
-    if not refresh_token or not expires_in:
-        # Shopify returned a non-expiring token after all. It will be refused
-        # by the Admin API, so fail the install loudly here rather than let
-        # every catalog fetch 403 afterwards with no hint why.
-        logger.error(
-            f"shopify callback: expected an expiring token (refresh_token + "
-            f"expires_in) but got keys={sorted(payload)} | shop={shop}"
-        )
-        return jsonify({"error": "shopify did not issue an expiring token"}), 502
-    if not access_token:
-        logger.error(f"shopify callback: no access_token in response | shop={shop}")
-        return jsonify({"error": "token exchange returned no token"}), 502
-
-    logger.info(f"shopify callback: token obtained | shop={shop} scope={granted_scope!r}")
-    _missing = missing_scopes(granted_scope)
-    if _missing:
-        # Not fatal: the install still works for what WAS granted. But it means
-        # SHOPIFY_SCOPES and the app's toml have drifted apart again.
-        logger.warning(
-            f"shopify callback: granted scope is missing {sorted(_missing)} | shop={shop} "
-            f"requested={SHOPIFY_SCOPES!r} — check [access_scopes] in the app toml"
-        )
-
-    # ── Tenant row: one per shop domain ──────────────────────────────────────
-    # Keyed on shopify_domain, not on a UUID the client supplies: the shop
-    # domain is the only stable identifier Shopify gives us, and it is what
-    # every webhook and proxied request arrives with. A re-install of the same
-    # store must reuse its row and database, history included.
-    tenant = Tenant.query.filter_by(shopify_domain=shop).first()
-    reinstall = tenant is not None
-
-    if tenant is None:
-        tenant_id = uuid_mod.uuid4()
-        tenant = Tenant(
-            tenant_id=tenant_id,
-            license_id=_generate_shop_token(),
-            db_name=_derive_db_name(str(tenant_id)),
-            plan="free",
-            status="active",
-            features={},
-            ecommerce_backend="shopify",
-            shopify_domain=shop,
-            site_domain=shop,
-        )
-        db.session.add(tenant)
-        logger.info(f"shopify callback: new tenant | shop={shop} tenant_id={tenant_id} db={tenant.db_name}")
-    else:
-        logger.info(
-            f"shopify callback: re-install | shop={shop} tenant_id={tenant.tenant_id} "
-            f"current_status={tenant.status}"
-        )
-        if tenant.status == "archived":
-            # Uninstall archives but keeps the database for the grace period,
-            # so a re-install inside that window comes back with its history.
-            tenant.archived_at = None
-        tenant.ecommerce_backend = "shopify"
-        tenant.status = "active"
-        tenant.build_attempts = 0
-        if not tenant.license_id:
-            tenant.license_id = _generate_shop_token()
-
-    db.session.commit()
-
-    # ── Store the token (control-plane table, keyed by domain) ───────────────
-    now = datetime.now(timezone.utc)
-    token_row = db.session.get(ShopifyToken, shop)
-    if token_row is None:
-        token_row = ShopifyToken(store_domain=shop, refresh_count=0)
-        db.session.add(token_row)
-    token_row.access_token  = access_token
-    token_row.scope         = granted_scope
-    token_row.fetched_at    = now
-    token_row.expires_at    = now + timedelta(seconds=int(expires_in))
-    token_row.refresh_token = refresh_token
-    token_row.refresh_token_expires_at = (
-        now + timedelta(seconds=int(refresh_expires_in)) if refresh_expires_in else None
-    )
-    token_row.refresh_count = (token_row.refresh_count or 0) + 1
-    token_row.last_error    = None
-    db.session.commit()
-    logger.info(
-        f"shopify callback: token stored | shop={shop} "
-        f"access_expires_in={int(expires_in)}s refresh_expires_in={refresh_expires_in}"
-    )
+    error = token_payload_error(payload, shop)
+    if error:
+        return error
+    store_token(shop, payload)
 
     # ── Which app this store now runs on ─────────────────────────────────────
     # From here on, its App Proxy signatures, webhook HMACs and token refreshes
@@ -502,41 +569,9 @@ def shopify_auth_callback(client_id):
     # verified callback like this one can set it.
     record_install(shop, app)
 
-    # ── Database + schema ────────────────────────────────────────────────────
-    base_dsn = current_app.config["SQLALCHEMY_DATABASE_URI"]
-    try:
-        ensure_tenant_database(base_dsn, tenant.db_name)
-        _create_tenant_schema(tenant.db_name, base_dsn)
-        tenant.schema_migrated_at = datetime.now(timezone.utc)
-    except (TenantDBProvisionError, Exception) as e:
-        logger.error(f"shopify callback: database setup failed | shop={shop} | {e}", exc_info=True)
-        tenant.status = "provision_failed"
-        tenant.last_build_error = str(e)
-        db.session.commit()
-        return jsonify({"error": f"database setup failed: {e}"}), 500
-
-    tenant.status = "warming"
-    db.session.commit()
-
-    # Evict any loader already cached for this tenant. On a re-install the
-    # registry still holds the loader built with the PREVIOUS token — degraded,
-    # if that token stopped working — and the build thread's get_loader() is a
-    # cache hit that returns it untouched: no fetch, no use of the token just
-    # stored, straight to provision_failed. Evicting forces a real rebuild.
-    if reinstall:
-        from store_registry import get_tenant_registry
-        registry = get_tenant_registry()
-        if registry is not None:
-            registry.evict(str(tenant.tenant_id))
-            logger.info(f"shopify callback: evicted cached loader | tenant_id={tenant.tenant_id}")
-
-    logger.info(f"shopify callback: starting catalog build | shop={shop} tenant_id={tenant.tenant_id}")
-    _start_background_build(tenant.tenant_id, current_app._get_current_object())
-
-    logger.info(
-        f"shopify callback: ✅ install complete | shop={shop} tenant_id={tenant.tenant_id} "
-        f"reinstall={reinstall} api_version={SHOPIFY_API_VERSION}"
-    )
+    error = provision_tenant(shop)
+    if error:
+        return error
     return _app_page_redirect(shop)
 
 
@@ -552,6 +587,13 @@ def installed():
     the page shows the general setup steps only.
     """
     shop = (request.args.get("shop") or "").strip().lower()
+    if _valid_shop(shop):
+        # A store on the embedded app has its page inside the Shopify admin;
+        # showing this standalone one too is an App Store rejection
+        # ("switches between embedded and not embedded versions").
+        app = app_for_shop(shop)
+        if is_embedded(app):
+            return redirect(admin_app_url(shop, app), code=302)
     is_owner = _valid_shop(shop) and merchant_session.verify(request.args.get("t") or "", shop)
     tenant = Tenant.query.filter_by(shopify_domain=shop).first() if _valid_shop(shop) else None
     catalog_note = (

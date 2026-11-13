@@ -135,3 +135,21 @@ def install_path(app: AppCredentials) -> str:
 
 def callback_path(app: AppCredentials) -> str:
     return f"shopify/auth/callback/{app.client_id}" if app.custom else "shopify/auth/callback"
+
+
+def is_embedded(app: AppCredentials) -> bool:
+    """
+    The public app is embedded in the Shopify admin (routes/shopify_admin.py).
+    Custom-distribution apps are not; their app page is /installed.
+
+    App Store review rejects an embedded app that also sends merchants to a
+    standalone version of itself, so for an embedded app every "back to MiraQ"
+    must lead into the admin (admin_app_url), never to /installed. If a custom
+    app is ever embedded too, this is the one place to change.
+    """
+    return not app.custom
+
+
+def admin_app_url(shop: str, app: AppCredentials) -> str:
+    """The app's page inside the Shopify admin. Shopify redirects this to admin.shopify.com."""
+    return f"https://{shop}/admin/apps/{app.client_id}"

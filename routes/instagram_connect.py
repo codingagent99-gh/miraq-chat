@@ -67,6 +67,7 @@ from flask import Blueprint, redirect, request
 import merchant_session
 from chat_logger import get_logger
 from models import db, ChannelConnection, Tenant
+from shopify_apps import admin_app_url, app_for_shop, is_embedded
 from tenant_crypto import decrypt_secret, encrypt_secret
 
 logger = get_logger("miraq_chat")
@@ -117,7 +118,14 @@ def _redirect_uri() -> str:
 
 
 def app_page_url(shop: str) -> str:
-    """The app page, with a fresh owner token, so the owner can act again."""
+    """
+    Where "Back to MiraQ" goes. Embedded app: its page inside the Shopify
+    admin. Custom app: /installed, with a fresh owner token so the owner can
+    act again.
+    """
+    app = app_for_shop(shop)
+    if is_embedded(app):
+        return admin_app_url(shop, app)
     return _url(
         "installed?" + urllib.parse.urlencode({"shop": shop, "t": merchant_session.issue(shop)})
     )
@@ -131,7 +139,12 @@ def _page(title: str, body: str, status: int = 200):
 
 
 def _back(shop: str) -> str:
-    return f"<p><a class='btn secondary' href='{html.escape(app_page_url(shop))}'>Back to MiraQ</a></p>"
+    link = f"<a class='btn secondary' href='{html.escape(app_page_url(shop))}'>Back to MiraQ</a>"
+    if is_embedded(app_for_shop(shop)):
+        # Opened in a new tab from the embedded page, which refreshes itself
+        # when the merchant returns to it.
+        return f"<p>You can close this tab and go back to MiraQ in your Shopify admin.</p><p>{link}</p>"
+    return f"<p>{link}</p>"
 
 
 def _tenant_for(shop: str):
