@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MiraQ Shopper Agent</title>
+    <!--
+      Filled in by the backend when it serves this page (routes/shopify_admin.py),
+      so one build works for staging and production. App Bridge reads it.
+    -->
+    <meta name="shopify-api-key" content="%SHOPIFY_API_KEY%" />
+    <!-- App Bridge must be the first script on the page, loaded from Shopify's CDN. -->
+    <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
+    <!-- Polaris 2.x stable channel, matching @shopify/polaris-types 2.x. The
+         unversioned polaris.js is the legacy 1.x line and never serves 2.x. -->
+    <script src="https://cdn.shopify.com/shopifycloud/polaris-2.js"></script>
+    <script type="module" crossorigin src="./app-assets/index-CJG1s_U5.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
