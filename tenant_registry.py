@@ -228,6 +228,14 @@ class TenantRegistry:
                 logger.error(f"TenantRegistry: wp_base_url is empty | tenant={tenant_row.license_id} — cannot fetch catalog")
                 raise RuntimeError(f"wp_base_url is empty for tenant {tenant_row.license_id}")
 
+            # Rows stored before activation checked the URL (SSRF guard) are
+            # stopped here, before any request is made to them.
+            from url_guard import check_store_url
+            _unsafe = check_store_url(_wp_base)
+            if _unsafe:
+                logger.error(f"TenantRegistry: wp_base_url refused | tenant={tenant_row.license_id} | {_unsafe}")
+                raise RuntimeError(f"wp_base_url not allowed for tenant {tenant_row.license_id}: {_unsafe}")
+
             logger.info(f"TenantRegistry: building TenantConfig (woocommerce) | tenant={tenant_row.license_id}")
             _features = dict(tenant_row.features or {})
 

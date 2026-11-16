@@ -52,6 +52,7 @@ from typing import Optional
 
 import requests as http_requests
 
+from app_config import SHOPIFY_API_VERSION
 from chat_logger import get_logger
 from models.shopify_token import ShopifyToken
 from api_builder import shopify_search_diag
@@ -176,7 +177,7 @@ def _slugify(s: str) -> str:
 
 def _gql(query, variables, token, domain):
     resp = http_requests.post(
-        f"https://{domain}/admin/api/2024-10/graphql.json",
+        f"https://{domain}/admin/api/{SHOPIFY_API_VERSION}/graphql.json",
         json={"query": query, "variables": variables},
         headers={
             "Content-Type":           "application/json",

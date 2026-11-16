@@ -46,6 +46,7 @@ import concurrent.futures
 import requests as http_requests
 from flask import Blueprint, jsonify, request
 
+from app_config import SHOPIFY_API_VERSION
 from chat_logger import get_logger
 from models.shopify_token import ShopifyToken
 from store_registry import get_store_loader
@@ -329,7 +330,7 @@ def _gql(query, variables, token, domain):
     Raises on HTTP errors or GraphQL-level errors.
     """
     resp = http_requests.post(
-        f"https://{domain}/admin/api/2024-10/graphql.json",
+        f"https://{domain}/admin/api/{SHOPIFY_API_VERSION}/graphql.json",
         json={"query": query, "variables": variables},
         headers={
             "Content-Type":             "application/json",

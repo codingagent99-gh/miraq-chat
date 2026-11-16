@@ -42,7 +42,7 @@ from typing import Optional, Tuple
 import requests as http_requests
 
 from chat_logger import get_logger
-from shopify_apps import AppCredentials, app_for_install, public_app
+from shopify_apps import AppCredentials, app_for_install, is_embedded, public_app
 
 logger = get_logger("miraq_chat")
 
@@ -80,13 +80,20 @@ def _host(url: str) -> str:
 
 
 def _app_for_audience(aud: str) -> Optional[AppCredentials]:
-    """The app a token was issued for. Public app first, else a registered custom app."""
+    """
+    The app a token was issued for. Only an EMBEDDED app's tokens are accepted:
+    session tokens come from App Bridge, and custom-distribution apps are not
+    embedded (shopify_apps.is_embedded), so a token naming one is refused.
+    Accepting them let anyone holding a registered custom app's secret sign a
+    token for any store.
+    """
     if not aud:
         return None
     pub = public_app()
     if pub.client_id and hmac.compare_digest(pub.client_id, aud):
         return pub
-    return app_for_install(aud)  # None for an unknown client id
+    app = app_for_install(aud)  # None for an unknown client id
+    return app if app is not None and is_embedded(app) else None
 
 
 def bearer_token(authorization_header: str) -> str:

@@ -192,14 +192,14 @@ def fetch_site_public_key(wp_base_url: str, *, timeout: int = 10, session=None) 
     Returns (outcome, key): outcome is "ok" (key is the site's key),
     "missing" (the site answered without one), or "unreachable".
     """
-    import requests
     from http_profiles import HttpProfileState, send
+    from url_guard import GuardedSession
 
     base = (wp_base_url or "").rstrip("/")
     if not base:
         return "unreachable", ""
     try:
-        resp = send(session or requests.Session(), "GET", f"{base}{SITE_KEY_ROUTE}",
+        resp = send(session or GuardedSession(), "GET", f"{base}{SITE_KEY_ROUTE}",
                     state=HttpProfileState(), timeout=timeout)
     except Exception as e:
         logger.warning(f"site_key: site key fetch failed | base={base} | {type(e).__name__}: {e}")

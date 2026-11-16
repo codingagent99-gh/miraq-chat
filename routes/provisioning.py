@@ -28,6 +28,7 @@ from flask import Blueprint, request, jsonify, current_app
 
 from chat_logger import get_logger
 import site_key
+from url_guard import check_store_url
 from models import db, Tenant
 from license_verifier import verify_license_payload, LicenseVerificationError
 from tenant_db_provisioner import ensure_tenant_database, TenantDBProvisionError
@@ -219,6 +220,12 @@ def provision_tenant():
 
     logger.info(f"provision-tenant: license_id={license_id}")
 
+    if wp_base_url:
+        unsafe = check_store_url(wp_base_url)
+        if unsafe:
+            logger.warning(f"provision-tenant: refused wp_base_url | license_id={license_id} | {unsafe}")
+            return jsonify({"success": False, "error": f"wp_base_url not allowed: {unsafe}"}), 400
+
     allowed, _why = site_key.check_site_key_matches(wp_base_url, public_key, label=f"license_id={license_id}")
     if not allowed:
         return jsonify({"success": False, "error": "site key does not match the key this site serves"}), 403
@@ -354,6 +361,12 @@ def activate_free():
         return jsonify({"success": False, "error": "missing tenant_uuid"}), 400
     if not wp_base_url:
         return jsonify({"success": False, "error": "missing wp_base_url"}), 400
+    # Checked before anything is fetched or stored: this route is
+    # unauthenticated, so wp_base_url is attacker-controlled (SSRF).
+    unsafe = check_store_url(wp_base_url)
+    if unsafe:
+        logger.warning(f"activate-free: refused wp_base_url | {unsafe}")
+        return jsonify({"success": False, "error": f"wp_base_url not allowed: {unsafe}"}), 400
     if not public_key:
         return jsonify({"success": False, "error": "missing or invalid site_public_key"}), 400
 

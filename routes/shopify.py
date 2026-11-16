@@ -31,6 +31,7 @@ from models.shopify_order_confirmation import ShopifyOrderConfirmation
 from ecommerce.shopify_endpoints import ShopifyEndpoints
 from ecommerce.shopify_proxy import resolve_shopify_customer_id, verify_events_hmac
 from app_config import (
+    SHOPIFY_API_VERSION,
     SHOPIFY_CUSTOMER_AUTH,
     SHOPIFY_PROXY_MAX_AGE,
 )
@@ -164,7 +165,7 @@ def get_customer_addresses():
 
     try:
         resp = requests.post(
-            f"https://{tenant.shopify_domain}/admin/api/2024-10/graphql.json",
+            f"https://{tenant.shopify_domain}/admin/api/{SHOPIFY_API_VERSION}/graphql.json",
             json={"query": _CUSTOMER_ADDRESSES_QUERY, "variables": {"id": customer_gid}},
             headers={
                 "Content-Type": "application/json",

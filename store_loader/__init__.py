@@ -10,7 +10,6 @@ import os
 import json
 import time
 import threading
-import requests
 from typing import List, Dict, Optional
 
 from chat_logger import get_logger
@@ -22,6 +21,7 @@ from store_loader.config import (
 )
 from tenant_config import TenantConfig
 from http_profiles import HttpProfileState
+from url_guard import GuardedSession
 from store_loader.cache import BoundedVariationCache
 from store_loader.fetcher import (
     load_from_local_files,
@@ -98,7 +98,9 @@ class StoreLoader(StoreQueryMixin):
         # from self.http, this tenant's header profile (see http_profiles.py).
         # woo_client reads the same state, so the catalog fetch and the chat
         # calls can no longer drift onto different header sets.
-        self.session = requests.Session()
+        # GuardedSession: every request (and redirect hop) must go to a public
+        # address — wp_base_url comes from an unauthenticated activation.
+        self.session = GuardedSession()
         self.http = HttpProfileState(
             tenant_id=config.tenant_id,
             license_id=config.license_id,

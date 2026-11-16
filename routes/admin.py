@@ -1,9 +1,15 @@
 from flask import Blueprint, jsonify
+from admin_auth import require_admin_key
 from store_registry import get_store_loader
 from chat_logger import get_logger
 
 logger = get_logger("miraq_admin")
 admin_bp = Blueprint("admin", __name__, url_prefix="/admin")
+# Operator-only: a forced reload re-reads the whole catalogue from the store, so
+# it must not be callable by any shopper (Shopify app proxy) or by anyone who
+# knows a WooCommerce licence id. Send Authorization: Bearer <MIRAQ_ADMIN_KEY>
+# as well as the store's X-MiraQ-License-Id (admin_auth.py).
+admin_bp.before_request(require_admin_key)
 
 # The conflict-scanner dashboard is retired. /taxonomies, /test-query and
 # /add-test-query went with it -- all three existed only to feed that UI, and

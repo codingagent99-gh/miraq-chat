@@ -18,9 +18,8 @@ The /admin/translation/ prefix is exempt from store_registry's tenant
 resolution (see _EXEMPT_PREFIXES): the tenant is named in the URL, and
 changing a language must not trigger a catalogue load for a cold tenant.
 
-AUTH: none, by decision. These routes are open to anyone who can reach the
-server. Restrict them at the proxy (nginx allow-list / internal-only
-listener) before this is internet-facing.
+AUTH: Authorization: Bearer <MIRAQ_ADMIN_KEY> on every request (admin_auth.py).
+Without MIRAQ_ADMIN_KEY set, every route here answers 404.
 """
 
 from __future__ import annotations
@@ -30,6 +29,7 @@ from datetime import datetime, timezone
 
 from flask import Blueprint, jsonify, request
 
+from admin_auth import require_admin_key
 from chat_logger import get_logger
 from models import db, Tenant
 from translation.base import TranslationUnavailable
@@ -41,6 +41,7 @@ from translation.turn import pick_input_language
 logger = get_logger("miraq_admin")
 
 translation_admin_bp = Blueprint("translation_admin", __name__, url_prefix="/admin/translation")
+translation_admin_bp.before_request(require_admin_key)
 
 
 def _find_tenant(key: str):

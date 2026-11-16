@@ -10,10 +10,10 @@ routes/shopify_apps_admin.py — register custom-distribution Shopify apps.
 The public app is NOT managed here; it stays in .env (SHOPIFY_CLIENT_ID /
 SHOPIFY_CLIENT_SECRET).
 
-AUTH: none, by decision. These routes are open to anyone who can reach the
-server. Restrict /admin/shopify-apps at the proxy before this is internet-facing.
+AUTH: Authorization: Bearer <MIRAQ_ADMIN_KEY> on every request (admin_auth.py).
+Without MIRAQ_ADMIN_KEY set, every route here answers 404.
 
-What keeps that from handing over a live store:
+What else keeps these routes from handing over a live store:
   * an app only takes over a store's traffic after that store completes a
     Shopify-verified OAuth install through it (installed_shops is written only
     by routes/shopify_oauth.py, never here);
@@ -31,6 +31,7 @@ import re
 from flask import Blueprint, jsonify, request
 from sqlalchemy.orm.attributes import flag_modified
 
+from admin_auth import require_admin_key
 from chat_logger import get_logger
 from models import db
 from models.shopify_app import ShopifyApp
@@ -39,6 +40,7 @@ from tenant_crypto import encrypt_secret
 logger = get_logger("miraq_admin")
 
 shopify_apps_admin_bp = Blueprint("shopify_apps_admin", __name__, url_prefix="/admin/shopify-apps")
+shopify_apps_admin_bp.before_request(require_admin_key)
 
 _CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{8,64}$")
 _SHOP_RE = re.compile(r"^[a-z0-9][a-z0-9\-]*\.myshopify\.com$")

@@ -34,6 +34,7 @@ from typing import Optional
 import requests
 
 from chat_logger import get_logger
+from url_guard import GuardedSession
 
 logger = get_logger("miraq_chat")
 
@@ -84,7 +85,7 @@ def detect_plugin_namespace(wp_base: str, *, state=None,
         return LEGACY_NAMESPACE
 
     url = plugin_api_base(wp_base, NEW_NAMESPACE) + _DETECT_PATH
-    session = session or requests.Session()
+    session = session or GuardedSession()
     try:
         if state is not None:
             from http_profiles import send as http_send

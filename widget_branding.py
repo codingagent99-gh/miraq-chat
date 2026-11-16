@@ -27,10 +27,9 @@ Deviations from the reference:
 
 from datetime import datetime, timezone
 
-import requests as req
-
 from chat_logger import get_logger
 from http_profiles import HttpProfileState, send as http_send
+from url_guard import GuardedSession
 from plugin_routes import branding_url, detect_plugin_namespace, namespace_of, plugin_api_base
 from models import db, Tenant
 
@@ -78,7 +77,7 @@ def fetch_and_store_widget_branding(tenant: Tenant) -> bool:
         _sync_loader_namespace(tenant, wp_base, namespace)
         target_url = branding_url(wp_base, namespace)
         # Public plugin route: no key is sent.
-        resp = http_send(req.Session(), "GET", target_url, state=http, timeout=10)
+        resp = http_send(GuardedSession(), "GET", target_url, state=http, timeout=10)
         resp.raise_for_status()
         data = resp.json()
 
