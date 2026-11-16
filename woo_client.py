@@ -7,11 +7,11 @@ import json as _json
 import re as _re
 import threading as _threading
 import time as _health_time
-import requests as http_requests
 
 from models import WooAPICall
 from store_registry import get_store_loader
 from http_profiles import send as http_send, is_waf_block
+from url_guard import GuardedSession
 from chat_logger import get_logger, get_api_logger, get_order_logger, sanitize_url
 
 logger = get_logger("miraq_chat")
@@ -258,7 +258,9 @@ class WooClient:
         # Shared by every tenant, so it must carry no headers of its own —
         # session-level headers are merged into every request and would leak
         # one tenant's profile into another's.
-        self.session = http_requests.Session()
+        # GuardedSession: the store URL came from an unauthenticated activation,
+        # so every request and redirect hop must go to a public address.
+        self.session = GuardedSession()
 
     def execute(self, api_call: WooAPICall, loader=None, identity_token: Optional[str] = None) -> dict:
         """Execute a single API call and return raw response.

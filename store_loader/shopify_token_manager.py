@@ -310,7 +310,11 @@ class ShopifyTokenManager:
                     }, timeout=15)
                 else:
                     grant = "client_credentials"
-                    resp = requests.post(url, params={
+                    # Form body, never the query string: requests puts the full
+                    # URL (query included) into HTTPError messages, which went
+                    # to the log, to shopify_tokens.last_error and from there
+                    # to /shopify-token-status — the app's client secret with it.
+                    resp = requests.post(url, data={
                         "grant_type":    "client_credentials",
                         "client_id":     self._client_id,
                         "client_secret": self._client_secret,
@@ -323,7 +327,11 @@ class ShopifyTokenManager:
                         f"ShopifyTokenManager: {grant} refresh refused | "
                         f"domain={self._domain} HTTP {resp.status_code} | body={resp.text[:500]!r}"
                     )
-                resp.raise_for_status()
+                    # Not raise_for_status(): its message carries the request
+                    # URL. This one says what failed and nothing else.
+                    raise RuntimeError(
+                        f"Shopify {grant} token request refused: HTTP {resp.status_code}"
+                    )
                 data = resp.json()
 
                 access_token = data["access_token"]

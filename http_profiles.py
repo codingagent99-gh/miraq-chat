@@ -432,7 +432,9 @@ def probe_profiles(*, state: HttpProfileState, custom_api_base: str,
     Starts with the tenant's current profile. A pinned tenant tests only its
     pinned profile.
     """
-    session = session or requests.Session()
+    # GuardedSession: the URL is the store's wp_base_url (SSRF guard, url_guard.py).
+    from url_guard import GuardedSession
+    session = session or GuardedSession()
     checks = [
         ("GET",  f"{custom_api_base.rstrip('/')}/catalog-version", {}, None),
         ("POST", f"{custom_api_base.rstrip('/')}/products-advanced-new",

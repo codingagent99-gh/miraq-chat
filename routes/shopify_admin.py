@@ -7,7 +7,7 @@ installation (use_legacy_install_flow = false), so Shopify opens
     GET  /shopify/app?shop=...&host=...&embedded=1&id_token=...
 
 inside the Shopify admin. That route serves the built React page
-(shopify-admin/ in this repo, built into shopify-admin/dist) and nothing else. The page
+(built from the separate shopify-admin source into shopify-admin/dist) and nothing else. The page
 then talks to the JSON routes below, every call carrying an App Bridge
 session token (shopify_session.py), which is the ONLY thing that identifies
 the store and the app:
@@ -16,6 +16,18 @@ the store and the app:
                                                 completes the install (below)
     POST /shopify/admin/retry                   re-run a failed setup
     POST /shopify/admin/instagram/disconnect    remove the Instagram link
+    GET  /shopify/admin/conversations           recent shopper chats (read-only)
+    GET  /shopify/admin/conversations/<id>      one chat's transcript
+
+CONVERSATIONS (App Store requirement 5.1.5)
+-------------------------------------------
+Chats shoppers have on the storefront are shown back to the merchant here.
+Read-only: deletion is the privacy webhooks (shopify_compliance.py) and the
+nightly purge (purge_chat_history.py, 30 days). Each store's chats live in
+that store's own database, bound from the session token's shop, so a merchant
+can only ever see their own store's chats. Only what MiraQ already stores is
+returned: the Shopify customer id (or none for guests) and the message text.
+No customer names or emails are fetched.
 
 INSTALL WITHOUT A CALLBACK
 --------------------------
@@ -46,15 +58,17 @@ import html
 import os
 import re
 import urllib.parse
+import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, abort, jsonify, make_response, request, send_from_directory
-from sqlalchemy import text
+from sqlalchemy import and_, func, or_, text
+from sqlalchemy.exc import SQLAlchemyError
 
 import merchant_session
 from chat_logger import get_logger
-from models import db, ChannelConnection, Tenant
+from models import db, ChannelConnection, Conversation, Message, Tenant
 from models.shopify_token import ShopifyToken
 from routes import instagram_connect
 from routes.shopify_oauth import (
@@ -352,3 +366,235 @@ def admin_instagram_disconnect():
     db.session.commit()
     logger.info(f"shopify admin: instagram disconnected | shop={shop} removed={removed}")
     return jsonify(_status_payload(shop, app)), 200
+
+
+# ── conversations (read-only) ────────────────────────────────────────────────
+
+_CONV_PAGE_DEFAULT = 25
+_CONV_PAGE_MAX = 50
+_PREVIEW_CHARS = 120
+_TRANSCRIPT_MAX_MESSAGES = 500
+
+
+def _bind_store_db(shop: str):
+    """
+    (tenant, None) with per-store models (Conversation, Message) pointed at
+    this store's database; (None, None) when the store has no database name
+    yet; (None, response) when the store is unknown or uninstalled (its
+    database is dropped after uninstall).
+
+    No database-exists check: tenant_db_provisioner.list_existing_databases
+    answers "none" when it can't connect, which would show a merchant an empty
+    list instead of an error. A missing database fails the query instead; see
+    _query_failed for what the route answers.
+    """
+    tenant = Tenant.query.filter_by(shopify_domain=shop).first()
+    if tenant is None or tenant.status == "archived":
+        return None, (jsonify({"error": "store not found"}), 404)
+    if not tenant.db_name:
+        return None, None
+    # Imported here, as in shopify_compliance._bind, to keep module load light.
+    from store_registry import bind_tenant_db
+    bind_tenant_db(tenant)
+    return tenant, None
+
+
+def _query_failed(shop: str, tenant, e: Exception, empty):
+    """
+    A store whose setup failed may never have got its database: that is "no
+    chats", not an error. For any other store a failed query is an outage, so
+    the page shows an error rather than an empty list.
+    """
+    db.session.rollback()
+    if tenant.status == "provision_failed":
+        logger.info(f"shopify admin: no chats for a store whose setup failed | shop={shop} | {type(e).__name__}")
+        return empty
+    logger.error(f"shopify admin: conversations unavailable | shop={shop} | {type(e).__name__}: {e}")
+    return jsonify({"error": "conversations_unavailable"}), 503
+
+
+def _preview(text_value: str) -> str:
+    """First question, whitespace collapsed and cut to _PREVIEW_CHARS."""
+    flat = " ".join((text_value or "").split())
+    if len(flat) <= _PREVIEW_CHARS:
+        return flat
+    return flat[: _PREVIEW_CHARS - 1].rstrip() + "…"
+
+
+def _iso(dt):
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_MICROSECOND = timedelta(microseconds=1)
+
+
+def _encode_cursor(conv) -> str:
+    """
+    "<microseconds since 1970>|<conversation id>": exact (Postgres keeps
+    microseconds) and URL-safe — an ISO time's "+00:00" turns into a space in
+    a query string.
+    """
+    at = conv.updated_at
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return f"{(at - _EPOCH) // _MICROSECOND}|{conv.id}"
+
+
+def _decode_cursor(raw: str):
+    """(updated_at, id) from a cursor, or None if it isn't one."""
+    micros, sep, conv_id = (raw or "").partition("|")
+    if not sep or not micros.isdigit():
+        return None
+    try:
+        return _EPOCH + int(micros) * _MICROSECOND, uuid.UUID(conv_id)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _page_size(raw) -> int:
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return _CONV_PAGE_DEFAULT
+    return max(1, min(n, _CONV_PAGE_MAX))
+
+
+def _list_conversations(cursor, limit: int):
+    """
+    One page of conversations, most recent activity first, plus has_more.
+    Only conversations where the shopper actually asked something. Must run
+    after _bind_store_db.
+    """
+    q = Conversation.query.filter(Conversation.messages.any(Message.role == "user"))
+    if cursor is not None:
+        at, conv_id = cursor
+        q = q.filter(or_(
+            Conversation.updated_at < at,
+            and_(Conversation.updated_at == at, Conversation.id < conv_id),
+        ))
+    rows = (q.order_by(Conversation.updated_at.desc(), Conversation.id.desc())
+             .limit(limit + 1).all())
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    ids = [c.id for c in rows]
+    if not ids:
+        return [], False
+
+    counts = dict(
+        db.session.query(Message.conversation_id, func.count(Message.id))
+        .filter(Message.conversation_id.in_(ids))
+        .group_by(Message.conversation_id)
+        .all()
+    )
+    ranked = (
+        db.session.query(
+            Message.conversation_id,
+            Message.content,
+            func.row_number().over(
+                partition_by=Message.conversation_id,
+                order_by=(Message.created_at, Message.id),
+            ).label("n"),
+        )
+        .filter(Message.conversation_id.in_(ids), Message.role == "user")
+        .subquery()
+    )
+    firsts = dict(
+        db.session.query(ranked.c.conversation_id, ranked.c.content)
+        .filter(ranked.c.n == 1)
+        .all()
+    )
+    return [
+        {
+            "id": str(c.id),
+            "started_at": _iso(c.created_at),
+            "last_active_at": _iso(c.updated_at),
+            "customer_id": c.customer_id or None,
+            "message_count": int(counts.get(c.id, 0)),
+            "first_question": _preview(firsts.get(c.id, "")),
+            "cursor": _encode_cursor(c),
+        }
+        for c in rows
+    ], has_more
+
+
+def _transcript(conv_id):
+    """The conversation and its messages, or None. Must run after _bind_store_db."""
+    conv = db.session.get(Conversation, conv_id)
+    if conv is None:
+        return None
+    msgs = (Message.query
+            .filter(Message.conversation_id == conv.id)
+            .order_by(Message.created_at, Message.id)
+            .limit(_TRANSCRIPT_MAX_MESSAGES + 1)
+            .all())
+    truncated = len(msgs) > _TRANSCRIPT_MAX_MESSAGES
+    out = []
+    for msg in msgs[:_TRANSCRIPT_MAX_MESSAGES]:
+        meta = msg.metadata_json if isinstance(msg.metadata_json, dict) else {}
+        products = meta.get("products")
+        out.append({
+            "from": "shopper" if msg.role == "user" else "miraq",
+            "text": msg.content or "",
+            "sent_at": _iso(msg.created_at),
+            # Product cards aren't sent, only how many the shopper saw.
+            "products_shown": len(products) if isinstance(products, list) else 0,
+        })
+    return {
+        "id": str(conv.id),
+        "started_at": _iso(conv.created_at),
+        "customer_id": conv.customer_id or None,
+        "messages": out,
+        "truncated": truncated,
+    }
+
+
+@shopify_admin_bp.route("/shopify/admin/conversations", methods=["GET"])
+def admin_conversations():
+    """?before=<cursor of the last row shown>&limit=<1..50>"""
+    shop, _app, token = _session()
+    if shop is None:
+        return token
+
+    raw_before = request.args.get("before")
+    cursor = _decode_cursor(raw_before) if raw_before else None
+    if raw_before and cursor is None:
+        return jsonify({"error": "invalid cursor"}), 400
+
+    tenant, error = _bind_store_db(shop)
+    if error:
+        return error
+    if tenant is None:
+        return jsonify({"conversations": [], "has_more": False}), 200
+
+    try:
+        rows, has_more = _list_conversations(cursor, _page_size(request.args.get("limit")))
+    except SQLAlchemyError as e:
+        return _query_failed(shop, tenant, e, (jsonify({"conversations": [], "has_more": False}), 200))
+    resp = jsonify({"conversations": rows, "has_more": has_more})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp, 200
+
+
+@shopify_admin_bp.route("/shopify/admin/conversations/<uuid:conversation_id>", methods=["GET"])
+def admin_conversation(conversation_id):
+    shop, _app, token = _session()
+    if shop is None:
+        return token
+
+    tenant, error = _bind_store_db(shop)
+    if error:
+        return error
+    try:
+        found = _transcript(conversation_id) if tenant is not None else None
+    except SQLAlchemyError as e:
+        return _query_failed(shop, tenant, e, (jsonify({"error": "conversation not found"}), 404))
+    if found is None:
+        return jsonify({"error": "conversation not found"}), 404
+    resp = jsonify(found)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp, 200

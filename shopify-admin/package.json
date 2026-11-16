@@ -1,0 +1,25 @@
+{
+  "name": "miraq-shopify-admin",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "MiraQ Shopper Agent embedded admin page (Shopify admin → Apps → MiraQ Shopper Agent). Built into the backend's shopify-admin/dist.",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && vite build"
+  },
+  "dependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@shopify/app-bridge-types": "^0.7.4",
+    "@shopify/polaris-types": "^2.0.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^6.0.0",
+    "typescript": "~5.9.0",
+    "vite": "^8.0.0"
+  }
+}

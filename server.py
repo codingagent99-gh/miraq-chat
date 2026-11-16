@@ -391,7 +391,11 @@ def shopify_token_status():
         "expires_at":      row.expires_at.isoformat(),
         "hours_remaining": round(hours_remaining, 2),
         "refresh_count":   row.refresh_count,
-        "last_error":      row.last_error,
+        # Whether the last refresh failed, not its text: rows written before
+        # the token-manager fix can hold the app's client secret in last_error
+        # (the old client_credentials request put it in the URL), and this
+        # route is reachable by any shopper through the App Proxy.
+        "has_error":       bool(row.last_error),
     }), http_code
 
 

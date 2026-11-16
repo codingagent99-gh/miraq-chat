@@ -292,6 +292,42 @@ def _bind_identity(tenant):
     return None
 
 
+def _is_channel_session_id(raw) -> bool:
+    """WhatsApp/Instagram conversation ids are uuid5 (routes/channel.py,
+    _session_id_for); website ids are uuid4. Same convention as
+    services/last_conversation.py."""
+    import uuid as _uuid
+    try:
+        return _uuid.UUID(str(raw).strip()).version == 5
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+def _refuse_channel_session():
+    """None, or a 400 when a web request presents a channel conversation id.
+
+    A channel conversation's id is derived from the sender's WhatsApp number
+    or Instagram id with a fixed namespace, so anyone who knows the number
+    could compute it. For a guest conversation that id is the only credential:
+    /chat/history, history search, /chat, /session/<id> and the message-append
+    routes would hand it over. Channel turns arrive as an in-process request
+    carrying CHANNEL_ENVIRON_KEY, which an HTTP client cannot set; every other
+    request is refused a uuid5 id.
+    """
+    from identity import CHANNEL_ENVIRON_KEY
+    if isinstance(request.environ.get(CHANNEL_ENVIRON_KEY), dict):
+        return None
+    candidates = [request.headers.get("X-MiraQ-Session"), request.args.get("session_id"),
+                  (request.view_args or {}).get("session_id")]
+    body = request.get_json(silent=True)
+    if isinstance(body, dict):
+        candidates.append(body.get("session_id"))
+    if any(c and _is_channel_session_id(c) for c in candidates):
+        logger.warning(f"refused a messaging-channel session id on a web request | path={request.path}")
+        return jsonify({"success": False, "error": "invalid session"}), 400
+    return None
+
+
 def register_before_request(app) -> None:
     @app.before_request
     def _resolve_tenant():
@@ -364,7 +400,7 @@ def register_before_request(app) -> None:
                 )
                 g.store_loader = None
             g.db_engine = _engine_registry.get_engine(tenant.db_name)
-            return _bind_identity(tenant)
+            return _bind_identity(tenant) or _refuse_channel_session()
 
         if not tenant.is_active:
             logger.warning(f"Inactive tenant={license_id!r} ({tenant.status}) → 403")
@@ -377,4 +413,4 @@ def register_before_request(app) -> None:
         g.ecommerce_backend = tenant.ecommerce_backend
         g.store_loader = _tenant_registry.get_loader(tenant)
         g.db_engine = _engine_registry.get_engine(tenant.db_name)
-        return _bind_identity(tenant)
+        return _bind_identity(tenant) or _refuse_channel_session()
