@@ -961,12 +961,37 @@ def _current_session_id():
         return None
 
 
+_SNIP_LINK_RE   = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")         # [label](url) → label
+_SNIP_TAG_RE    = re.compile(r"<[^>]+>")
+_SNIP_HEAD_RE   = re.compile(r"^\s{0,3}#{1,6}\s+", re.M)
+_SNIP_BULLET_RE = re.compile(r"^\s*[-*+]\s+", re.M)
+_SNIP_TBLSEP_RE = re.compile(r"^\s*\|?[\s:|-]*-{2,}[\s:|-]*\|?\s*$", re.M)
+_SNIP_BOLD_RE   = re.compile(r"(\*\*|__)(.+?)\1", re.S)
+_SNIP_ITAL_RE   = re.compile(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])")
+
+
+def _snippet_plain(text: str) -> str:
+    """Bot replies are markdown the widget renders; a search snippet is plain
+    text, so it showed the raw "**Allspice**". Stripped BEFORE the needle is
+    located, so the ±radius window is measured in characters the shopper sees."""
+    t = _SNIP_TAG_RE.sub(" ", str(text))
+    t = _SNIP_LINK_RE.sub(r"\1", t)
+    t = _SNIP_TBLSEP_RE.sub(" ", t)
+    t = _SNIP_HEAD_RE.sub("", t)
+    t = _SNIP_BULLET_RE.sub("", t)
+    t = _SNIP_BOLD_RE.sub(r"\2", t)
+    t = _SNIP_ITAL_RE.sub(r"\1", t)
+    # Fail-safe for unbalanced markers the patterns above leave behind.
+    t = t.replace("**", "").replace("`", "").replace("|", " ")
+    return t.replace("&amp;", "&")
+
+
 def _make_snippet(text: str, needle: str) -> str | None:
     """~100 chars of `text` centred on the first case-insensitive `needle`
     hit, or None when it isn't in there."""
     if not text:
         return None
-    flat = " ".join(str(text).split())
+    flat = " ".join(_snippet_plain(text).split())
     pos = flat.lower().find(needle.lower())
     if pos < 0:
         return None
@@ -1015,7 +1040,7 @@ def _describe_hit(msg, needle: str) -> tuple[str, str]:
             if name and needle.lower() in str(name).lower():
                 return "order", f"Order #{number}: {name}" if number else str(name)
 
-    flat = " ".join(str(shown or "").split())
+    flat = " ".join(_snippet_plain(shown or "").split())
     return "text", flat[: 2 * _SNIPPET_RADIUS] + ("…" if len(flat) > 2 * _SNIPPET_RADIUS else "")
 
 

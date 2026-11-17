@@ -330,6 +330,9 @@ def format_variation(raw: dict, parent: dict = None) -> dict:
         "images":          var_images,
         "attributes":      attrs,
         "variation_label": attr_label,
+        # Same as format_product: variation cards showed a bare "40" without it
+        # (Shopify never sets the widget's store-currency fallback).
+        "currency_symbol": _store_currency_symbol(),
     }
 
 def _filter_variations_by_entities(
