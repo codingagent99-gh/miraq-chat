@@ -7,3 +7,4 @@ logs/
 .dev_cache/
 .env.*
 !.env.example
+node_modules/
