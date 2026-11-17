@@ -106,6 +106,9 @@ shopify_oauth_bp = Blueprint("shopify_oauth", __name__)
 #   customer_read_customers                        Customer Account API — the
 #                                                  channel sign-in reads the
 #                                                  customer's id + email
+#   read_themes                                    the admin page reads the live
+#                                                  theme's settings to show
+#                                                  whether the chat embed is on
 #
 # write_draft_orders is deliberately NOT here: reorders go through a cart
 # permalink (shopify_orders_executor.build_reorder_checkout_url), and App Store
@@ -114,7 +117,7 @@ shopify_oauth_bp = Blueprint("shopify_oauth", __name__)
 # Public and custom apps share this list, so their tomls must declare the same
 # scopes. SHOPIFY_SCOPES in .env overrides it only for a deploy whose toml
 # genuinely differs — change both together.
-_DEFAULT_SHOPIFY_SCOPES = "read_customers,read_orders,read_products,customer_read_customers"
+_DEFAULT_SHOPIFY_SCOPES = "read_customers,read_orders,read_products,customer_read_customers,read_themes"
 SHOPIFY_SCOPES = ",".join(
     s.strip() for s in os.getenv("SHOPIFY_SCOPES", _DEFAULT_SHOPIFY_SCOPES).split(",") if s.strip()
 )

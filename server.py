@@ -163,11 +163,17 @@ with app.app_context():
     from models.shopify_token import ShopifyToken
     from models.channel_connection import ChannelConnection
     from models.shopify_app import ShopifyApp
+    from models.instagram_connect_attempt import InstagramConnectAttempt
     db.metadata.create_all(
         bind=db.engine,
         tables=[Tenant.__table__, ShopifyToken.__table__, ChannelConnection.__table__,
-                ShopifyApp.__table__],
+                ShopifyApp.__table__, InstagramConnectAttempt.__table__],
     )
+    # create_all never adds columns to an existing table (see channel_connection.py).
+    from models.channel_connection import ensure_columns as _ensure_channel_columns
+    _added = _ensure_channel_columns(db.engine)
+    if _added:
+        print(f"✅ channel_connections: added columns {', '.join(_added)}")
     _cors_manager.refresh_from_db()   # seed dynamic origins from existing tenants
 
 # Register blueprints

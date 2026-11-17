@@ -41,4 +41,7 @@ from models.channel_connection import ChannelConnection
 
 # ── Shopify custom-distribution apps (client id/secret per app) ──
 from models.shopify_app import ShopifyApp
+
+# ── Instagram connect from the embedded admin (pop-up outcome) ──
+from models.instagram_connect_attempt import InstagramConnectAttempt
 from models import db

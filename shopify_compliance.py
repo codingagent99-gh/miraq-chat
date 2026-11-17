@@ -208,7 +208,7 @@ def redact_shop(tenant) -> dict:
     The tenant row itself is kept, stripped of branding and settings, as the
     audit record that the redaction happened.
     """
-    from models import db, ChannelConnection
+    from models import db, ChannelConnection, InstagramConnectAttempt
     from models.shopify_token import ShopifyToken
     from store_registry import get_engine_registry
     from tenant_db_provisioner import drop_tenant_database
@@ -238,9 +238,16 @@ def redact_shop(tenant) -> dict:
         done["admin_tokens"] = (ShopifyToken.query
                                 .filter_by(store_domain=tenant.shopify_domain)
                                 .delete(synchronize_session=False))
+        # Best effort: Meta stops sending the store's Instagram messages.
+        from routes.instagram_connect import unsubscribe
+        for row in ChannelConnection.query.filter_by(tenant_id=tenant.tenant_id, channel="instagram").all():
+            unsubscribe(row)
         done["channel_connections"] = (ChannelConnection.query
                                        .filter_by(tenant_id=tenant.tenant_id)
                                        .delete(synchronize_session=False))
+        done["instagram_connect_attempts"] = (InstagramConnectAttempt.query
+                                              .filter_by(shop=tenant.shopify_domain)
+                                              .delete(synchronize_session=False))
         tenant.widget_logo_url = None
         tenant.widget_header_text = None
         tenant.features = {"shop_redacted_at": datetime.now(timezone.utc).isoformat()}

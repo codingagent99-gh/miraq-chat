@@ -16,6 +16,9 @@ the store and the app:
                                                 completes the install (below)
     POST /shopify/admin/retry                   re-run a failed setup
     POST /shopify/admin/instagram/disconnect    remove the Instagram link
+    POST /shopify/admin/instagram/settings      AI replies on/off, text only
+    GET  /shopify/admin/instagram/attempt       outcome of a connect started here
+    POST /shopify/admin/instagram/choose        choose one of several accounts
     GET  /shopify/admin/conversations           recent shopper chats (read-only)
     GET  /shopify/admin/conversations/<id>      one chat's transcript
 
@@ -55,6 +58,7 @@ CONFIG (.env)
 """
 
 import html
+import json
 import os
 import re
 import urllib.parse
@@ -62,11 +66,13 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
+import requests as http_requests
 from flask import Blueprint, abort, jsonify, make_response, request, send_from_directory
 from sqlalchemy import and_, func, or_, text
 from sqlalchemy.exc import SQLAlchemyError
 
 import merchant_session
+from app_config import SHOPIFY_API_VERSION
 from chat_logger import get_logger
 from models import db, ChannelConnection, Conversation, Message, Tenant
 from models.shopify_token import ShopifyToken
@@ -286,18 +292,96 @@ def _instagram(shop: str, tenant):
            .order_by(ChannelConnection.updated_at.desc())
            .first())
     # The connect flow is Facebook Login, which cannot run inside the admin
-    # iframe; the page opens this URL in a new tab. The owner token proves the
-    # browser is the store owner's (merchant_session.py), as on /installed.
+    # iframe; the page opens this URL in a pop-up, adding &attempt=<id>, and
+    # shows the outcome itself (instagram_connect: EMBEDDED ADMIN). The owner
+    # token proves the browser is the store owner's (merchant_session.py).
     connect_url = instagram_connect._url(
         "instagram/connect?" + urllib.parse.urlencode({"shop": shop, "t": merchant_session.issue(shop)})
     )
     connected = row is not None and row.is_active
+    if not connected:
+        return {"available": True, "connected": False, "account": None, "connect_url": connect_url}
     return {
         "available": True,
-        "connected": connected,
-        "account": (row.display_name or row.external_account_id) if connected else None,
+        "connected": True,
+        "account": row.display_name or row.external_account_id,
+        "page_name": row.page_name,
+        "connected_by": row.connected_by,
+        # No saved token, or Meta rejected it: replies can't be sent until
+        # the merchant connects again.
+        "needs_reconnect": row.needs_reconnect,
+        "settings": row.get_settings(),
         "connect_url": connect_url,
     }
+
+
+# ── is the chat embed on? ────────────────────────────────────────────────────
+# Read from the live theme's config/settings_data.json (read_themes). Theme app
+# embeds are blocks there whose type names our block handle, e.g.
+#   "shopify://apps/<app>/blocks/miraq_widget/<id>": {"type": ..., "disabled": false}
+# Any problem reading it is "unknown": the page then shows only the Turn on
+# link, never a wrong "Off".
+
+_THEME_SETTINGS_QUERY = """
+query MiraqEmbedState {
+  themes(first: 1, roles: [MAIN]) {
+    nodes {
+      files(filenames: ["config/settings_data.json"], first: 1) {
+        nodes { body { ... on OnlineStoreThemeFileBodyText { content } } }
+      }
+    }
+  }
+}
+"""
+
+
+def _strip_header_comment(text: str) -> str:
+    """Shopify writes a /* ... */ notice above the JSON in theme settings files."""
+    text = (text or "").lstrip()
+    if text.startswith("/*"):
+        end = text.find("*/")
+        text = text[end + 2:] if end != -1 else ""
+    return text
+
+
+def embed_on(settings_data: dict) -> bool:
+    current = settings_data.get("current")
+    if not isinstance(current, dict):
+        return False  # a preset name: no app embeds switched on
+    for block in (current.get("blocks") or {}).values():
+        if (isinstance(block, dict)
+                and f"/blocks/{_EMBED_BLOCK_HANDLE}/" in str(block.get("type") or "")
+                and not block.get("disabled", False)):
+            return True
+    return False
+
+
+def _widget_state(shop: str) -> str:
+    """"on" | "off" | "unknown" for the storefront chat embed in the live theme."""
+    try:
+        row = db.session.get(ShopifyToken, shop)
+        if row is None or "read_themes" not in (row.scope or ""):
+            return "unknown"
+        resp = http_requests.post(
+            f"https://{shop}/admin/api/{SHOPIFY_API_VERSION}/graphql.json",
+            json={"query": _THEME_SETTINGS_QUERY},
+            headers={"Content-Type": "application/json", "X-Shopify-Access-Token": row.access_token},
+            timeout=5,
+        )
+        data = resp.json() if resp.ok else {}
+        if not data or data.get("errors"):
+            logger.warning(f"shopify admin: theme settings unavailable | shop={shop} | "
+                           f"HTTP {resp.status_code} {str(data.get('errors'))[:200] if data else ''}")
+            return "unknown"
+        themes = ((data.get("data") or {}).get("themes") or {}).get("nodes") or []
+        files = ((themes[0].get("files") or {}).get("nodes") or []) if themes else []
+        content = (files[0].get("body") or {}).get("content") if files else None
+        if content is None:
+            return "unknown"
+        return "on" if embed_on(json.loads(_strip_header_comment(content))) else "off"
+    except Exception as e:  # never let this break the page
+        logger.warning(f"shopify admin: widget state check failed | shop={shop} | {e}")
+        return "unknown"
 
 
 def _status_payload(shop: str, app):
@@ -309,6 +393,7 @@ def _status_payload(shop: str, app):
             f"https://{shop}/admin/themes/current/editor?context=apps"
             f"&activateAppId={app.client_id}/{_EMBED_BLOCK_HANDLE}"
         ),
+        "widget": _widget_state(shop),
         "instagram": _instagram(shop, tenant),
         "support": {k: v for k, v in _SUPPORT.items() if v},
     }
@@ -360,12 +445,62 @@ def admin_instagram_disconnect():
     tenant = Tenant.query.filter_by(shopify_domain=shop).first()
     if tenant is None or tenant.status == "archived":
         return jsonify({"error": "store not found"}), 404
-    removed = (ChannelConnection.query
-               .filter_by(tenant_id=tenant.tenant_id, channel="instagram")
-               .delete(synchronize_session=False))
-    db.session.commit()
+    removed = instagram_connect.disconnect_store(tenant)  # unsubscribes the Page first
     logger.info(f"shopify admin: instagram disconnected | shop={shop} removed={removed}")
     return jsonify(_status_payload(shop, app)), 200
+
+
+@shopify_admin_bp.route("/shopify/admin/instagram/settings", methods=["POST"])
+def admin_instagram_settings():
+    """Save the Instagram switches. Body: any of {ai_replies, text_only} as booleans."""
+    shop, app, token = _session()
+    if shop is None:
+        return token
+    tenant = Tenant.query.filter_by(shopify_domain=shop).first()
+    if tenant is None or tenant.status == "archived":
+        return jsonify({"error": "store not found"}), 404
+    row = (ChannelConnection.query
+           .filter_by(tenant_id=tenant.tenant_id, channel="instagram")
+           .order_by(ChannelConnection.updated_at.desc())
+           .first())
+    if row is None:
+        return jsonify({"error": "instagram not connected"}), 404
+    row.update_settings(request.get_json(silent=True) or {})
+    db.session.commit()
+    logger.info(f"shopify admin: instagram settings | shop={shop} settings={row.get_settings()}")
+    return jsonify(_status_payload(shop, app)), 200
+
+
+@shopify_admin_bp.route("/shopify/admin/instagram/attempt", methods=["GET"])
+def admin_instagram_attempt():
+    """
+    Where a connect started from this page stands: waiting, expired, or its
+    outcome (connected, choose + account labels, cancelled, no_account,
+    taken, failed, error). The page asks every few seconds while it waits.
+    """
+    shop, app, token = _session()
+    if shop is None:
+        return token
+    attempt = instagram_connect.attempt_param(request.args.get("id"))
+    if not attempt:
+        return jsonify({"error": "bad_attempt"}), 400
+    return jsonify(instagram_connect.attempt_view(shop, attempt)), 200
+
+
+@shopify_admin_bp.route("/shopify/admin/instagram/choose", methods=["POST"])
+def admin_instagram_choose():
+    """Connect the account chosen from a "choose" outcome. Body: {attempt, account}."""
+    shop, app, token = _session()
+    if shop is None:
+        return token
+    body = request.get_json(silent=True) or {}
+    attempt = instagram_connect.attempt_param(body.get("attempt"))
+    account = str(body.get("account") or "").strip()
+    if not attempt or not account:
+        return jsonify({"error": "bad_request"}), 400
+    result = instagram_connect.choose_for_attempt(shop, attempt, account)
+    logger.info(f"shopify admin: instagram account chosen | shop={shop} status={result['status']}")
+    return jsonify({"attempt": result, "status": _status_payload(shop, app)}), 200
 
 
 # ── conversations (read-only) ────────────────────────────────────────────────

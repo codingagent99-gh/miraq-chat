@@ -4,17 +4,82 @@
  *  anything else (warming, transitional) -> indexing. */
 export type SetupState = "ready" | "indexing" | "failed";
 
+/** The merchant's Instagram switches (ChannelConnection.settings). */
+export interface InstagramSettings {
+  /** Off pauses MiraQ on Instagram. */
+  ai_replies: boolean;
+  /** Emoji-only messages get no reply. */
+  text_only: boolean;
+}
+
 /** _instagram(): only "available" when Instagram connect is configured
  *  on the backend and the store isn't archived. */
 export type InstagramStatus =
   | { available: false }
   | {
       available: true;
-      connected: boolean;
-      account: string | null;
-      /** Facebook Login can't run in the admin iframe — opened in a new tab. */
+      connected: false;
+      account: null;
+      /** Facebook Login can't run in the admin iframe — opened in a pop-up,
+       *  with &attempt=<id> added; the outcome is read back from
+       *  GET /shopify/admin/instagram/attempt. */
+      connect_url: string;
+    }
+  | {
+      available: true;
+      connected: true;
+      /** "@handle" */
+      account: string;
+      /** The Facebook Page linked to the account. */
+      page_name: string | null;
+      /** The Facebook user who connected it. */
+      connected_by: string | null;
+      /** No saved token, or Meta rejected it: replies can't be sent. */
+      needs_reconnect: boolean;
+      settings: InstagramSettings;
       connect_url: string;
     };
+
+/** Whether the chat app embed is switched on in the live theme. "unknown"
+ *  when the theme couldn't be read (e.g. read_themes not yet approved). */
+export type WidgetState = "on" | "off" | "unknown";
+
+// GET /shopify/admin/instagram/attempt and POST /shopify/admin/instagram/choose
+// (routes/shopify_admin.py, instagram_connect.attempt_view / choose_for_attempt).
+
+/** "waiting" until the pop-up's outcome is recorded; "expired" after 10 minutes. */
+export type InstagramAttemptStatus =
+  | "waiting"
+  | "expired"
+  | "connected"
+  | "choose"
+  | "cancelled"
+  | "no_account"
+  | "taken"
+  | "failed"
+  | "error";
+
+/** One account to choose from. No tokens ever reach the page. */
+export interface InstagramAccountChoice {
+  id: string;
+  /** "@handle" */
+  label: string;
+  /** The Facebook Page it is linked to. */
+  page: string;
+}
+
+export interface InstagramAttempt {
+  status: InstagramAttemptStatus;
+  /** "@handle" for connected / taken / failed. */
+  account?: string | null;
+  /** Only for "choose". */
+  accounts?: InstagramAccountChoice[];
+}
+
+export interface InstagramChooseResult {
+  attempt: InstagramAttempt;
+  status: Status;
+}
 
 /** Only the MIRAQ_SUPPORT_* / MIRAQ_PRIVACY_URL values that are set. */
 export interface Support {
@@ -28,6 +93,7 @@ export interface Status {
   setup: SetupState;
   /** Theme editor deep link that opens with the app embed switched on. */
   embed_url: string;
+  widget: WidgetState;
   instagram: InstagramStatus;
   support: Support;
 }

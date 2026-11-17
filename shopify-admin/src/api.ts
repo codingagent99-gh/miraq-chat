@@ -1,4 +1,11 @@
-import type { ConversationPage, Status, Transcript } from "./types";
+import type {
+  ConversationPage,
+  InstagramAttempt,
+  InstagramChooseResult,
+  InstagramSettings,
+  Status,
+  Transcript,
+} from "./types";
 
 // Calls to the backend's /shopify/admin/* routes.
 //
@@ -27,10 +34,14 @@ function resolve(path: string): string {
   return new URL(path, window.location.href).toString();
 }
 
-async function call<T>(path: string, method: "GET" | "POST"): Promise<T> {
+async function call<T>(path: string, method: "GET" | "POST", body?: unknown): Promise<T> {
   const res = await fetch(resolve(path), {
     method,
-    headers: { Accept: "application/json" },
+    headers:
+      body === undefined
+        ? { Accept: "application/json" }
+        : { Accept: "application/json", "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (res.status === 202) throw new SetupInProgress("setup in progress");
   if (!res.ok) {
@@ -50,6 +61,18 @@ export const fetchStatus = () => call<Status>("admin/status", "GET");
 export const retrySetup = () => call<Status>("admin/retry", "POST");
 export const disconnectInstagram = () =>
   call<Status>("admin/instagram/disconnect", "POST");
+
+/** Save Instagram switches; returns the fresh status. */
+export const saveInstagramSettings = (changes: Partial<InstagramSettings>) =>
+  call<Status>("admin/instagram/settings", "POST", changes);
+
+/** Where a connect started from this page stands (the pop-up writes its outcome there). */
+export const fetchInstagramAttempt = (id: string) =>
+  call<InstagramAttempt>(`admin/instagram/attempt?id=${encodeURIComponent(id)}`, "GET");
+
+/** Connect the account chosen from a "choose" outcome. */
+export const chooseInstagramAccount = (attempt: string, account: string) =>
+  call<InstagramChooseResult>("admin/instagram/choose", "POST", { attempt, account });
 
 /** One page of recent conversations; `before` is the cursor of the last row shown. */
 export const fetchConversations = (before?: string) => {

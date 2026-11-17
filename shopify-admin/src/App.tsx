@@ -3,6 +3,7 @@ import {
   ApiError,
   SetupInProgress,
   disconnectInstagram,
+  saveInstagramSettings,
   fetchStatus,
   retrySetup,
 } from "./api";
@@ -81,6 +82,11 @@ export default function App() {
     };
   }, []);
 
+  /** Stable callback for sections that need a status reload. */
+  const refresh = useCallback(() => {
+    void load.current();
+  }, []);
+
   /** Run a button action; on success show its toast and the new status. */
   const act = async (action: () => Promise<Status>, done: string) => {
     setWorking(true);
@@ -154,7 +160,7 @@ export default function App() {
           void act(retrySetup, "Setup restarted");
         }}
       />
-      <WidgetSection embedUrl={status.embed_url} />
+      <WidgetSection embedUrl={status.embed_url} state={status.widget} shop={status.shop} />
       <ConversationsSection />
       {status.instagram.available && (
         <InstagramSection
@@ -163,6 +169,11 @@ export default function App() {
           onDisconnect={() => {
             void act(disconnectInstagram, "Instagram disconnected");
           }}
+          onSaveSettings={(changes) => {
+            void act(() => saveInstagramSettings(changes), "Instagram settings saved");
+          }}
+          onStatus={showStatus}
+          onRefresh={refresh}
         />
       )}
       <HelpSection support={status.support} />

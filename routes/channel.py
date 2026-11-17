@@ -9,6 +9,15 @@ secret in X-MiraQ-Channel-Key (app_config.CHANNEL_API_KEY):
   GET    /channel-connections   list a store's connected accounts
   POST   /channel-connections   link a WhatsApp number / IG account to a store
   DELETE /channel-connections   unlink one
+  GET    /channel-connections/token          the Page token to reply with (Instagram)
+  POST   /channel-connections/token-invalid  Meta rejected that token (error 190)
+
+INSTAGRAM SETTINGS
+    The merchant's switches on the connection (ChannelConnection.settings)
+    are honoured before a turn runs. A message they rule out gets 200 with
+    "skipped": "<reason>" and no messages; the webhook service sends nothing.
+        ai_replies off   -> skipped "ai_paused"
+        text_only on     -> a message with no letters or digits is skipped "no_text"
 
 TENANT RESOLUTION
     Both paths are exempt from store_registry's X-MiraQ-License-Id resolution.
@@ -289,6 +298,13 @@ def _body_for_log(raw: str) -> str:
 
 # ── POST /chat/channel ───────────────────────────────────────────────────────
 
+def _skipped(channel: str, user_id: str, account_id: str, reason: str):
+    """A message the merchant's settings rule out: no reply, not an error."""
+    logger.info(f"POST /chat/channel | skipped={reason} | {channel}:{account_id}")
+    return jsonify({"success": True, "channel": channel, "user_id": user_id,
+                    "skipped": reason, "messages": []}), 200
+
+
 @channel_bp.route("/chat/channel", methods=["POST"])
 def channel_chat():
     if not CHANNEL_LOG_PAYLOADS:
@@ -357,6 +373,11 @@ def _channel_chat():
     if isinstance(enabled, list) and channel not in enabled:
         return _error(403, "CHANNEL_NOT_ENABLED", f"{channel} is not enabled for this store.")
 
+    # The merchant's Instagram switches (INSTAGRAM SETTINGS above).
+    settings = connection.get_settings() if channel == "instagram" else {}
+    if settings and not settings["ai_replies"]:
+        return _skipped(channel, user_id, account_id, "ai_paused")
+
     # Per-tenant models (Conversation, Message) now read that store's database.
     bind_tenant_db(tenant)
     channel_link.ensure_tables(tenant)
@@ -377,6 +398,11 @@ def _channel_chat():
 
     if not message:
         return _error(400, "EMPTY_MESSAGE", "message or a known reply_id is required.")
+
+    # Emoji-only and similar: nothing to answer. Tapped replies always pass.
+    if (settings.get("text_only") and not body.get("reply_id")
+            and not any(ch.isalnum() for ch in message)):
+        return _skipped(channel, user_id, account_id, "no_text")
 
     # ── "unlink" / "log out": handled here, never sent to the chat engine ──
     if message.strip().lower() in channel_link.UNLINK_COMMANDS:
@@ -540,7 +566,84 @@ def delete_connection():
         return _error(404, "UNKNOWN_CHANNEL_ACCOUNT", "No such connection.")
 
     tenant_id = row.tenant_id
-    db.session.delete(row)
+    from routes.instagram_connect import remove_connections
+    remove_connections([row])   # unsubscribes an Instagram Page first
     db.session.commit()
     logger.info(f"channel-connections: deleted | tenant={tenant_id} | {channel}:{account_id}")
+    return jsonify({"success": True})
+
+
+# ── Page tokens for the webhook service ──────────────────────────────────────
+# The webhook service sends each reply with the token of the account that was
+# messaged, fetched here (it may cache it in memory for a few minutes, never
+# on disk or in logs). Responses are never logged and never cached.
+
+def _token_row():
+    channel = _norm_channel(request.values.get("channel"))
+    account_id = str(request.values.get("external_account_id") or "").strip()
+    if channel != "instagram":
+        return None, _error(400, "INVALID_CHANNEL", "Tokens are kept for instagram only.")
+    if not account_id:
+        return None, _error(400, "MISSING_ACCOUNT_ID", "external_account_id is required.")
+    row = ChannelConnection.query.filter_by(channel=channel, external_account_id=account_id).first()
+    if row is None:
+        return None, _error(404, "UNKNOWN_CHANNEL_ACCOUNT", "This account is not connected to any store.")
+    return row, None
+
+
+@channel_bp.route("/channel-connections/token", methods=["GET"])
+def connection_token():
+    """
+    The Page token to reply from this account with.
+      200 {page_id, access_token, display_name}
+      404 UNKNOWN_CHANNEL_ACCOUNT   not connected to any store
+      403 STORE_INACTIVE            store uninstalled / inactive, or connection disabled
+      409 TOKEN_INVALID             Meta rejected the token; the merchant must reconnect
+      409 NO_TOKEN                  connected without a token (e.g. added by hand)
+    """
+    if not _authorized():
+        return _error(401, "UNAUTHORIZED", "Missing or invalid X-MiraQ-Channel-Key.")
+    row, error = _token_row()
+    if error:
+        return error
+    tenant = db.session.get(Tenant, row.tenant_id)
+    if tenant is None or tenant.status not in _SERVABLE_STATUSES or not row.is_active:
+        return _error(403, "STORE_INACTIVE", "The store for this account is not active.")
+    if row.token_status == "invalid":
+        return _error(409, "TOKEN_INVALID", "Meta rejected this account's token; the store must reconnect.")
+    token = row.access_token
+    if not token or not row.page_id:
+        return _error(409, "NO_TOKEN", "No token is saved for this account; the store must reconnect.")
+    resp = jsonify({"success": True, "channel": row.channel,
+                    "external_account_id": row.external_account_id,
+                    "page_id": row.page_id, "access_token": token,
+                    "display_name": row.display_name})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp, 200
+
+
+@channel_bp.route("/channel-connections/token-invalid", methods=["POST"])
+def connection_token_invalid():
+    """
+    The webhook service reports that Meta rejected the token (error 190,
+    after refetching it once). Marks it invalid; the admin then asks the
+    merchant to reconnect. Other Meta errors are not reported here.
+    """
+    if not _authorized():
+        return _error(401, "UNAUTHORIZED", "Missing or invalid X-MiraQ-Channel-Key.")
+    body = request.get_json(silent=True) or {}
+    if body.get("error_code") != 190:
+        return _error(400, "NOT_A_TOKEN_ERROR", "Only Meta error 190 marks a token invalid.")
+    row = ChannelConnection.query.filter_by(
+        channel=_norm_channel(body.get("channel")),
+        external_account_id=str(body.get("external_account_id") or "").strip(),
+    ).first()
+    if row is None or row.channel != "instagram":
+        return _error(404, "UNKNOWN_CHANNEL_ACCOUNT", "This account is not connected to any store.")
+    row.token_status = "invalid"
+    db.session.commit()
+    logger.warning(
+        f"channel-connections: token marked invalid | tenant={row.tenant_id} | "
+        f"instagram:{row.external_account_id} | subcode={body.get('error_subcode')}"
+    )
     return jsonify({"success": True})
