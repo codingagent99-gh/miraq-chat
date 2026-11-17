@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from models.chat_usage import ChatUsage
 from store_registry import get_tenant_features
 
-DAILY_FREE_LIMIT = 25
+DAILY_FREE_LIMIT = 50
 
 # States where the user is replying to a bot-initiated prompt —
 # derived directly from FlowState enum in conversation_flow.py
