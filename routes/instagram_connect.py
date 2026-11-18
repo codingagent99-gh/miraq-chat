@@ -666,14 +666,23 @@ def _connect(tenant, shop: str, page: dict):
     label = _label(page)
 
     # Same rule as POST /channel-connections: never take an account from
-    # another store silently.
+    # another store silently. A store that uninstalled MiraQ (archived) or no
+    # longer exists can't use the account, so its stale row moves to this store.
     existing = ChannelConnection.query.filter_by(channel=_CHANNEL, external_account_id=ig_id).first()
     if existing is not None and existing.tenant_id != tenant.tenant_id:
-        logger.warning(
-            f"instagram connect: {ig_id} already connected to tenant={existing.tenant_id} | "
-            f"refused for shop={shop}"
+        owner = Tenant.query.filter_by(tenant_id=existing.tenant_id).first()
+        if owner is not None and owner.status != "archived":
+            logger.warning(
+                f"instagram connect: {ig_id} already connected to tenant={existing.tenant_id} | "
+                f"refused for shop={shop}"
+            )
+            return "taken", label
+        logger.info(
+            f"instagram connect: {ig_id} moved from inactive tenant={existing.tenant_id} "
+            f"(status={owner.status if owner else 'missing'}) to shop={shop}"
         )
-        return "taken", label
+        existing.tenant_id = tenant.tenant_id
+        existing.settings = None   # start from the defaults, not the old store's
 
     # 1. Subscribe the Page, so Meta sends this account's DMs to the webhook.
     ok, data = _graph("POST", f"{page['page_id']}/subscribed_apps",

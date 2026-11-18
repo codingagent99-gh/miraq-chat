@@ -651,6 +651,6 @@ def installed():
         "</ol>"
         + button +
         "<p>To turn it off later: theme editor → <strong>App embeds</strong> → "
-        "switch off <strong>Miraq Shopper Agent</strong> → Save.</p>"
+        "switch off <strong>MiraQ Shopper Agent</strong> → Save.</p>"
         + instagram_html
     ), 200
