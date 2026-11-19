@@ -285,7 +285,8 @@ def _setup_state(tenant) -> str:
 
 
 def _instagram(shop: str, tenant):
-    if tenant is None or tenant.status == "archived" or not instagram_connect.is_configured():
+    if (tenant is None or tenant.status == "archived" or not instagram_connect.is_configured()
+            or not instagram_connect.is_offered(shop)):
         return {"available": False}
     row = (ChannelConnection.query
            .filter_by(tenant_id=tenant.tenant_id, channel="instagram")

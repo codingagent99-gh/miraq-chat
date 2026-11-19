@@ -110,6 +110,11 @@ META_PAGE_SUBSCRIBED_FIELDS = os.getenv(
 ).strip()
 
 _BASE_URL = os.getenv("SHOPIFY_APP_BASE_URL", "").rstrip("/")
+
+# Instagram in the public (App Store) app. Off unless set: the public app
+# doesn't offer Instagram until Meta has approved it. Custom apps always offer
+# it. Set INSTAGRAM_PUBLIC_APP=1 in .env and restart to turn it on.
+INSTAGRAM_PUBLIC_APP = os.getenv("INSTAGRAM_PUBLIC_APP", "").strip().lower() in ("1", "true", "yes", "on")
 _GRAPH = "https://graph.facebook.com"
 _CHANNEL = "instagram"
 _PICK_MAX_AGE = 10 * 60  # seconds a pick list stays valid
@@ -130,6 +135,12 @@ _STYLE = (
 
 def is_configured() -> bool:
     return bool(META_APP_ID and META_APP_SECRET)
+
+
+def is_offered(shop: str) -> bool:
+    """Whether this store's app offers Instagram: custom apps always, the public
+    app only with INSTAGRAM_PUBLIC_APP. Hides the section and refuses the flow."""
+    return INSTAGRAM_PUBLIC_APP or app_for_shop(shop).custom
 
 
 def _url(path: str) -> str:
@@ -415,6 +426,8 @@ def instagram_connect():
         return error
     # Opened from the embedded admin page: the outcome is shown there, not
     # here (EMBEDDED ADMIN above). Custom apps never send an attempt.
+    if not is_offered(shop):
+        return _page("Not found", "<h1>Page not found</h1>", 404)
     attempt = attempt_param(request.args.get("attempt")) if is_embedded(app_for_shop(shop)) else ""
     if attempt:
         _start_attempt(shop, attempt)
