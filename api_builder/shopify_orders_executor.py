@@ -96,19 +96,6 @@ _CURRENCY_SYMBOLS = {
 # GraphQL queries
 # ══════════════════════════════════════════════════════════════
 
-_CUSTOMER_ADDRESS_GQL = """
-query CustomerAddress($customer_gid: ID!) {
-  customer(id: $customer_gid) {
-    defaultAddress {
-      firstName lastName
-      address1 address2
-      city province zip country
-      phone
-    }
-  }
-}
-"""
-
 # Shop-wide order scan for the windowed best-seller ranking. Not customer
 # scoped, unlike _CUSTOMER_ORDERS_GQL above.
 _TOP_SELLING_ORDERS_GQL = """
@@ -163,9 +150,7 @@ query CustomerOrders($customer_gid: ID!, $first: Int!, $after: String) {
           paymentGatewayNames
           customer { id }
           shippingAddress {
-            firstName lastName
-            address1 address2
-            city province zip country
+            city province country
           }
           lineItems(first: 50) {
             edges {
@@ -207,9 +192,7 @@ query OrderByName($query: String!) {
         paymentGatewayNames
         customer { id }
         shippingAddress {
-          firstName lastName
-          address1 address2
-          city province zip country
+          city province country
         }
         lineItems(first: 50) {
           edges {
@@ -246,9 +229,7 @@ query FetchOrder($order_gid: ID!) {
     paymentGatewayNames
     customer { id }
     shippingAddress {
-      firstName lastName
-      address1 address2
-      city province zip country
+      city province country
     }
     lineItems(first: 50) {
       edges {
@@ -303,7 +284,12 @@ def _money(price_set: Optional[dict]) -> str:
 
 
 def _address(addr: Optional[dict]) -> dict:
-    """Normalise a Shopify MailingAddress node to the neutral 8-key shape."""
+    """Normalise a Shopify MailingAddress node to the neutral 8-key shape.
+
+    The order queries ask only for city, province and country. Name, street,
+    zip and phone are Level 2 protected customer data, which the public app
+    does not request, so those keys stay empty.
+    """
     if not addr:
         return {
             "first_name": "", "last_name": "",
