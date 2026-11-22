@@ -54,9 +54,21 @@ logger = get_logger("miraq_chat")
 
 CHANNEL_LINK_TTL_DAYS = int(os.getenv("CHANNEL_LINK_TTL_DAYS", "90"))
 LINK_REQUEST_MINUTES = 10
+# Shopify requires this exact scope string for customer sign-in.
 CUSTOMER_SCOPE = "openid email customer-account-api:full"
 CALLBACK_PATH = "/channel-link/shopify/callback"
 START_PATH = "/channel-link/start"
+
+
+# The public App Store app reads only the customer ID from the Customer
+# Account API, so it needs no access to customers' names, emails, phones or
+# addresses (protected customer data level 2). The custom app also reads the
+# email, masked to r***@… in the "Signed in as" notice; on the public app
+# that notice says "your account" instead.
+def _reads_email(shop_domain: str) -> bool:
+    from shopify_apps import app_for_shop
+    return bool(app_for_shop(shop_domain).custom)
+
 
 # Messages that sign the customer out of this chat (compared lower-cased, trimmed).
 UNLINK_COMMANDS = frozenset({"unlink", "log out", "logout", "sign out", "signout"})
@@ -281,7 +293,10 @@ def authorize_url(tenant, state: str, request_row) -> str:
 
 
 def complete_sign_in(tenant, request_row, code: str) -> Tuple[str, str]:
-    """Exchange the code and read the signed-in customer. Returns (customer_id, email)."""
+    """Exchange the code and read the signed-in customer. Returns (customer_id, email).
+
+    email is always "" on the public app, which reads only the ID.
+    """
     from shopify_apps import app_for_shop
     from tenant_crypto import decrypt_secret
     client_id = app_for_shop(tenant.shopify_domain).client_id
@@ -305,7 +320,9 @@ def complete_sign_in(tenant, request_row, code: str) -> Tuple[str, str]:
     try:
         resp = http_requests.post(
             api["graphql_api"],
-            json={"query": "query { customer { id emailAddress { emailAddress } } }"},
+            json={"query": ("query { customer { id emailAddress { emailAddress } } }"
+                            if _reads_email(tenant.shopify_domain)
+                            else "query { customer { id } }")},
             headers={"Content-Type": "application/json", "Authorization": access_token},
             timeout=_HTTP_TIMEOUT,
         )

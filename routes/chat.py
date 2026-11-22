@@ -558,6 +558,10 @@ def _maybe_attach_address_proposal(
     """
     if not customer_id:
         return
+    # Shopify shoppers enter their address on Shopify's own checkout page;
+    # the chat has nowhere to use one, so it never offers to.
+    if current_backend() == "shopify":
+        return
     # Only propose addresses from a clean conversational turn — never from
     # a guided flow reply (variant text, quantity, "Yes, add it", etc.)
     if current_flow_state is not None and current_flow_state != FlowState.IDLE:
