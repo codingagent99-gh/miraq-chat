@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.dialects.postgresql import UUID
 
+from customer_crypto import EncryptedID, EncryptedString
 from models.db_models import db
 
 
@@ -32,11 +33,13 @@ class ChannelLink(db.Model):
     id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     channel = db.Column(db.String(32), nullable=False)
     # The sender's ID on that channel (Instagram-scoped user ID, WhatsApp number).
-    channel_user_id = db.Column(db.String(128), nullable=False)
+    # Encrypted (deterministic), so the unique constraint and lookups still work.
+    channel_user_id = db.Column(EncryptedID(128), nullable=False)
     # Numeric Shopify customer ID, the same form conversations.customer_id holds.
-    customer_id = db.Column(db.String(64), nullable=False, index=True)
+    # Encrypted it is ~45-55 characters for up to 20 digits, so 64 still fits.
+    customer_id = db.Column(EncryptedID(64), nullable=False, index=True)
     # Masked (r***@gmail.com) — shown back to the customer, never used to look up.
-    email_display = db.Column(db.String(255), nullable=True)
+    email_display = db.Column(EncryptedString(255), nullable=True)
     linked_at = db.Column(db.DateTime(timezone=True), nullable=False, default=_utcnow)
     expires_at = db.Column(db.DateTime(timezone=True), nullable=False)
     # Shown once on the customer's next message ("Linked to r***@…"), then cleared.
@@ -60,7 +63,7 @@ class ChannelLinkRequest(db.Model):
     id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     state_hash = db.Column(db.String(64), nullable=False, unique=True)
     channel = db.Column(db.String(32), nullable=False)
-    channel_user_id = db.Column(db.String(128), nullable=False)
+    channel_user_id = db.Column(EncryptedID(128), nullable=False)
     conversation_id = db.Column(UUID(as_uuid=True), nullable=True)
     code_verifier_encrypted = db.Column(db.Text, nullable=False)
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=_utcnow)

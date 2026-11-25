@@ -28,3 +28,6 @@ wordfreq
 
 Flask-SQLAlchemy
 psycopg2-binary
+
+# AES-SIV (customer_crypto.py) needs 37+. Also used by tenant_crypto.py.
+cryptography>=37.0

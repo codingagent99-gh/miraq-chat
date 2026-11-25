@@ -68,6 +68,9 @@ class DBEngineRegistry:
                 pool_recycle=_POOL_RECYCLE,
                 pool_pre_ping=True,
                 future=True,
+                # Error messages would otherwise include the statement's values
+                # (shopper data) and end up in logs. customer_crypto.py.
+                hide_parameters=True,
             )
             self._engines[db_name] = eng
             logger.info(f"DBEngineRegistry: created engine | db={db_name}")

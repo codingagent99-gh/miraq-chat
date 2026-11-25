@@ -53,7 +53,35 @@ def sanitize_log_string(text: str) -> str:
 
 
 class _MillisecondFormatter(logging.Formatter):
-    """Formatter that appends milliseconds to the timestamp."""
+    """Formatter that appends milliseconds to the timestamp.
+
+    Encrypts the line when ENCRYPT_CUSTOMER_DATA=1 (customer_crypto.py): log
+    lines carry shopper messages, order details and customer IDs. The time and
+    level stay readable so files can still be skimmed and grepped by time;
+    the rest becomes one enc1: token (one line even for a traceback). Read
+    them with:  python logview.py chat --today
+    encrypt=False only for logs that hold no shopper data (timing.txt).
+    """
+    def __init__(self, *args, encrypt: bool = True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._encrypt = encrypt
+
+    def format(self, record):
+        line = super().format(record)
+        if not self._encrypt:
+            return line
+        import customer_crypto  # lazy: customer_crypto must not import this module
+        if not customer_crypto.encryption_on():
+            return line
+        stamp = self.formatTime(record, self.datefmt)
+        try:
+            body = customer_crypto.encrypt_text(line)
+        except Exception:
+            # Never fall back to the plain line, and never raise: logging's
+            # own error report would print the record's arguments in clear.
+            body = "[log line withheld: CUSTOMER_DATA_KEY missing or invalid]"
+        return f"[{stamp}] [{record.levelname}] {body}"
+
     def formatTime(self, record, datefmt=None):
         if datefmt:
             import time
@@ -321,9 +349,12 @@ def get_timing_logger() -> logging.Logger:
         logger.setLevel(logging.DEBUG)
         logger.propagate = False
 
+        # Not encrypted: timing lines hold durations and message LENGTHS only
+        # (timing_logger.py), never shopper text.
         formatter = _MillisecondFormatter(
             fmt="[%(asctime)s] %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
+            encrypt=False,
         )
 
         try:
@@ -335,3 +366,30 @@ def get_timing_logger() -> logging.Logger:
             print(f"[chat_logger] WARNING: Could not create timing log file: {exc}")
 
         return logger
+
+
+def _install_root_handler() -> None:
+    """Give the root logger an (encrypting) stderr handler.
+
+    A few modules log through logging.getLogger(__name__), which has no
+    handler of its own. Without one on the root logger, Python's last-resort
+    handler prints their WARNING+ lines to stderr (PM2's error log) as plain
+    text. Same level as that fallback, so nothing new appears; it just goes
+    through _MillisecondFormatter and is encrypted when the switch is ON.
+    Left alone if something (a test runner, a dev script) already configured
+    the root logger.
+    """
+    root = logging.getLogger()
+    with _handler_setup_lock:
+        if root.handlers:
+            return
+        handler = logging.StreamHandler()
+        handler.setLevel(logging.WARNING)
+        handler.setFormatter(_MillisecondFormatter(
+            fmt="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        root.addHandler(handler)
+
+
+_install_root_handler()

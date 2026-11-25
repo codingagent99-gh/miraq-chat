@@ -140,10 +140,18 @@ def export_customer_data(tenant, payload: dict) -> dict:
 
     folder = os.path.join(COMPLIANCE_EXPORT_DIR, tenant.shopify_domain or "unknown-shop")
     os.makedirs(folder, mode=0o700, exist_ok=True)
-    path = os.path.join(folder, f"data_request_{request_id}.json")
+    # Encrypted at rest like the rest of the shopper data (customer_crypto.py).
+    # Support opens it with: python read_export.py <file> --out <plain.json>
+    import customer_crypto
+    body = json.dumps(export, ensure_ascii=False, indent=2)
+    if customer_crypto.encryption_on():
+        path = os.path.join(folder, f"data_request_{request_id}.json.enc")
+        body = customer_crypto.encrypt_text(body)
+    else:
+        path = os.path.join(folder, f"data_request_{request_id}.json")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(export, f, ensure_ascii=False, indent=2)
+        f.write(body)
 
     counts = {"conversations": len(export["conversations"]),
               "order_confirmations": len(export["order_confirmations"]),
@@ -152,8 +160,8 @@ def export_customer_data(tenant, payload: dict) -> dict:
     # within 30 days. No personal data in the log line itself.
     logger.error(
         f"compliance: customers/data_request export ready — send to the merchant "
-        f"within 30 days | shop={tenant.shopify_domain} | request={request_id} | "
-        f"file={path} | {counts}"
+        f"within 30 days (open it with read_export.py) | shop={tenant.shopify_domain} | "
+        f"request={request_id} | file={path} | {counts}"
     )
     return {"exported": counts, "file": path}
 

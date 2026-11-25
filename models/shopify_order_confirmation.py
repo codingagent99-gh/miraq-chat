@@ -10,6 +10,8 @@ doesn't duplicate the confirmation message in the conversation.
 """
 
 from datetime import datetime, timezone
+
+from customer_crypto import EncryptedID, EncryptedString
 from models import db
 
 
@@ -20,8 +22,10 @@ class ShopifyOrderConfirmation(db.Model):
     # everywhere else, e.g. Conversation.id / X-MiraQ-Session).
     session_id   = db.Column(db.String(255), primary_key=True)
 
-    order_id     = db.Column(db.String(255), nullable=False)
-    order_number = db.Column(db.String(255), nullable=True)
+    # order_id is looked up by Shopify's redact / data-request webhooks
+    # (shopify_compliance.py), so it is encrypted deterministically.
+    order_id     = db.Column(EncryptedID(255), nullable=False)
+    order_number = db.Column(EncryptedString(255), nullable=True)
 
     # False until /chat/order-status has consumed it and written the
     # Message row — prevents re-posting the same confirmation on repeat

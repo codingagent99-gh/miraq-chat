@@ -87,6 +87,9 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     "pool_pre_ping": True,
     "pool_recycle": 280,
+    # Keep statement values (shopper data) out of database error messages,
+    # which are logged. See customer_crypto.py.
+    "hide_parameters": True,
 
     # Pool sizing. SQLAlchemy's defaults are pool_size=5 / max_overflow=10,
     # i.e. 15 connections per process -- never enough for concurrent chat
@@ -164,11 +167,18 @@ with app.app_context():
     from models.channel_connection import ChannelConnection
     from models.shopify_app import ShopifyApp
     from models.instagram_connect_attempt import InstagramConnectAttempt
+    from models.customer_data_encryption import CustomerDataEncryption
     db.metadata.create_all(
         bind=db.engine,
         tables=[Tenant.__table__, ShopifyToken.__table__, ChannelConnection.__table__,
-                ShopifyApp.__table__, InstagramConnectAttempt.__table__],
+                ShopifyApp.__table__, InstagramConnectAttempt.__table__,
+                CustomerDataEncryption.__table__],
     )
+    # Shopper data encryption (customer_crypto.py). Raises - and so stops the
+    # server - when the key is missing or wrong, rather than serve chats that
+    # can't be read or write shopper data as plain text by mistake.
+    import customer_crypto
+    print(f"🔐 {customer_crypto.check_startup(db.session, CustomerDataEncryption)}")
     # create_all never adds columns to an existing table (see channel_connection.py).
     from models.channel_connection import ensure_columns as _ensure_channel_columns
     _added = _ensure_channel_columns(db.engine)

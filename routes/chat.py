@@ -890,41 +890,59 @@ _HISTORY_WINDOW_DEFAULT = 20
 _HISTORY_WINDOW_MAX     = 50
 _SNIPPET_RADIUS         = 50
 
-# One predicate for everything a search can hit. Raw SQL because the JSONB
-# array walks have no clean ORM spelling. Every jsonb_array_elements input is
-# guarded by jsonb_typeof: older rows can hold null or a non-array there, and
-# jsonb_array_elements raises on those, failing the whole search.
-# User rows starting "__" are structured-card sentinels ("__DATE_RANGE__{json}")
-# — their raw JSON is never shown, so it must not produce hits either.
-_HISTORY_MATCH_SQL = sa.text("""(
-    (
-        (messages.role <> 'user' OR left(messages.content, 2) <> '__')
-        AND messages.content ILIKE :hs_pat ESCAPE '!'
-    )
-    OR (messages.metadata_json -> 'i18n' ->> 'original')    ILIKE :hs_pat ESCAPE '!'
-    OR (messages.metadata_json -> 'i18n' ->> 'bot_message') ILIKE :hs_pat ESCAPE '!'
-    OR EXISTS (
-        SELECT 1 FROM jsonb_array_elements(
-            CASE WHEN jsonb_typeof(messages.metadata_json -> 'products') = 'array'
-                 THEN messages.metadata_json -> 'products' ELSE '[]'::jsonb END
-        ) AS hs_p
-        WHERE hs_p ->> 'name' ILIKE :hs_pat ESCAPE '!'
-    )
-    OR EXISTS (
-        SELECT 1 FROM jsonb_array_elements(
-            CASE WHEN jsonb_typeof(messages.metadata_json -> 'orders') = 'array'
-                 THEN messages.metadata_json -> 'orders' ELSE '[]'::jsonb END
-        ) AS hs_o
-        WHERE hs_o ->> 'order_number' ILIKE :hs_pat ESCAPE '!'
-           OR EXISTS (
-                SELECT 1 FROM jsonb_array_elements(
-                    CASE WHEN jsonb_typeof(hs_o -> 'items') = 'array'
-                         THEN hs_o -> 'items' ELSE '[]'::jsonb END
-                ) AS hs_li
-                WHERE hs_li ->> 'name' ILIKE :hs_pat ESCAPE '!'
-           )
-    )
-)""")
+# Search matches in Python, not SQL: message text and metadata are encrypted
+# when ENCRYPT_CUSTOMER_DATA=1 (customer_crypto.py), so SQL can't see inside
+# them. The scope query (the caller's own conversations, newest first) still
+# runs in SQL; each message is decrypted as it loads and _history_matches()
+# applies the rules the old SQL predicate did. One shopper's messages are
+# bounded by the 30-day retention, so this reads tens to a few hundred rows;
+# _HISTORY_SEARCH_SCAN_MAX caps it for very heavy users.
+_HISTORY_SEARCH_SCAN_MAX = 5000
+_HISTORY_SEARCH_BATCH    = 200
+
+
+def _history_matches(msg, needle_lower: str) -> bool:
+    """True if `msg` contains the needle anywhere a search can hit.
+
+    The same places the old SQL predicate looked:
+      - the stored text, except user rows starting "__" (structured-card
+        sentinels such as "__DATE_RANGE__{json}" whose raw JSON is never shown)
+      - metadata i18n.original and i18n.bot_message (translated turns)
+      - metadata products[].name
+      - metadata orders[].order_number and orders[].items[].name
+    Older rows can hold null or a non-list in those places; they're skipped.
+    """
+    def has(value) -> bool:
+        # SQL's ->> turned numbers into text too (order numbers can be ints).
+        if value is None or isinstance(value, (dict, list)):
+            return False
+        return needle_lower in str(value).lower()
+
+    content = msg.content or ""
+    if not (msg.role == "user" and content.startswith("__")) and has(content):
+        return True
+
+    meta = msg.metadata_json if isinstance(msg.metadata_json, dict) else {}
+    i18n = meta.get("i18n") if isinstance(meta.get("i18n"), dict) else {}
+    if has(i18n.get("original")) or has(i18n.get("bot_message")):
+        return True
+
+    products = meta.get("products")
+    for p in products if isinstance(products, list) else []:
+        if isinstance(p, dict) and has(p.get("name")):
+            return True
+
+    orders = meta.get("orders")
+    for o in orders if isinstance(orders, list) else []:
+        if not isinstance(o, dict):
+            continue
+        if has(o.get("order_number")):
+            return True
+        items = o.get("items")
+        for li in items if isinstance(items, list) else []:
+            if isinstance(li, dict) and has(li.get("name")):
+                return True
+    return False
 
 
 def _history_scope_filter():
@@ -1005,13 +1023,13 @@ def _make_snippet(text: str, needle: str) -> str | None:
 
 
 def _describe_hit(msg, needle: str) -> tuple[str, str]:
-    """(matched_in, snippet) for a row the SQL predicate already matched.
+    """(matched_in, snippet) for a row _history_matches() already matched.
 
     Looks in the same places in the same order of usefulness: what the
     customer saw, then the stored English (a translated turn matched on it),
-    then product names, then orders. SQL ILIKE and Python lower() can
-    disagree on exotic case mappings, so a row that matched in SQL but not
-    here still gets a snippet — the start of its text — rather than vanishing.
+    then product names, then orders. A row that matched but whose hit isn't
+    found again here (e.g. it was in the translation the customer didn't
+    see) still gets a snippet — the start of its text — rather than vanishing.
     """
     meta = msg.metadata_json or {}
     i18n = meta.get("i18n") or {}
@@ -1061,22 +1079,27 @@ def search_chat_history():
     if scope is None:
         return jsonify(empty), 200
 
-    # The query is literal text, not a pattern: escape LIKE's own wildcards
-    # so "50%" or "a_b" mean what the customer typed. "!" is the escape
-    # character (see ESCAPE '!' in _HISTORY_MATCH_SQL) rather than backslash,
-    # whose meaning inside a SQL literal depends on standard_conforming_strings.
-    escaped = q.replace("!", "!!").replace("%", "!%").replace("_", "!_")
-    pattern = f"%{escaped}%"
-
-    rows = (
+    # The caller's messages, newest first, read in batches; matching happens
+    # in Python (see _history_matches). The query text is matched literally,
+    # so "50%" or "a_b" mean what the customer typed.
+    needle = q.lower()
+    base = (
         db.session.query(Message)
         .join(Conversation, Conversation.id == Message.conversation_id)
         .filter(scope)
-        .filter(_HISTORY_MATCH_SQL.bindparams(hs_pat=pattern))
         .order_by(Message.created_at.desc(), Message.id.desc())
-        .limit(_HISTORY_SEARCH_LIMIT + 1)
-        .all()
     )
+    rows, scanned = [], 0
+    while scanned < _HISTORY_SEARCH_SCAN_MAX and len(rows) <= _HISTORY_SEARCH_LIMIT:
+        batch = base.offset(scanned).limit(_HISTORY_SEARCH_BATCH).all()
+        if not batch:
+            break
+        scanned += len(batch)
+        for msg in batch:
+            if _history_matches(msg, needle):
+                rows.append(msg)
+                if len(rows) > _HISTORY_SEARCH_LIMIT:
+                    break
     has_more = len(rows) > _HISTORY_SEARCH_LIMIT
     rows = rows[:_HISTORY_SEARCH_LIMIT]
 
@@ -1096,7 +1119,9 @@ def search_chat_history():
 
     logger.info(
         f"history search | q_len={len(q)} | hits={len(results)}"
-        f"{'+' if has_more else ''} | customer={current_identity().customer_id or 'guest'}"
+        f"{'+' if has_more else ''} | scanned={scanned}"
+        f"{' (capped)' if scanned >= _HISTORY_SEARCH_SCAN_MAX else ''}"
+        f" | customer={current_identity().customer_id or 'guest'}"
     )
     return jsonify({"results": results, "has_more": has_more}), 200
 

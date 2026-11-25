@@ -79,7 +79,13 @@ def record_visit(tenant, customer_id: str) -> Optional[datetime]:
     now = datetime.now(timezone.utc)
     try:
         _ensure_table(tenant)
-        row = db.session.get(CustomerVisit, customer_id)
+        # Not session.get(): == also matches a row written before encryption
+        # was switched on (or while it was off), so one shopper never gets two
+        # rows. Newest first in case both forms exist.
+        row = (CustomerVisit.query
+               .filter(CustomerVisit.customer_id == customer_id)
+               .order_by(CustomerVisit.last_seen_at.desc())
+               .first())
         if row is None:
             # ON CONFLICT: two tabs opening at once must not 500 one of them.
             db.session.execute(

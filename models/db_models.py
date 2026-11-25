@@ -17,8 +17,12 @@ from sqlalchemy import inspect as sa_inspect
 from flask import g, has_request_context
 from flask_sqlalchemy.session import Session as FSASession
 
+# Shopper data is encrypted by the column types when ENCRYPT_CUSTOMER_DATA=1.
+# Postgres column types are unchanged (TEXT / VARCHAR / JSONB), so no migration.
+from customer_crypto import EncryptedID, EncryptedJSON, EncryptedText
+
 _CONTROL_PLANE_TABLES = frozenset({"tenants", "shopify_tokens", "channel_connections", "shopify_apps",
-                                   "instagram_connect_attempts"})
+                                   "instagram_connect_attempts", "customer_data_encryption"})
 
 def _targets_control_plane(mapper) -> bool:
     """True if this ORM operation is for a control-plane model"""
@@ -74,11 +78,12 @@ class Conversation(db.Model):
     __tablename__ = "conversations"
 
     id = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    customer_id = db.Column(db.String, nullable=True, index=True)
+    customer_id = db.Column(EncryptedID, nullable=True, index=True)
 
     flow_state = db.Column(db.String(50), nullable=False, default="idle")
+    # Read in Python only: nothing may query inside it in SQL (encrypted).
     context_data = db.Column(
-        JSONB, nullable=False, default=lambda: copy.deepcopy(DEFAULT_CONTEXT)
+        EncryptedJSON, nullable=False, default=lambda: copy.deepcopy(DEFAULT_CONTEXT)
     )
 
     created_at = db.Column(
@@ -114,9 +119,11 @@ class Message(db.Model):
     )
 
     role = db.Column(db.String(10), nullable=False)
-    content = db.Column(db.Text, nullable=False)
+    # Both encrypted: match on them in Python, never in SQL (see
+    # routes/chat.py search_chat_history).
+    content = db.Column(EncryptedText, nullable=False)
     intent = db.Column(db.String(50), nullable=True)
-    metadata_json = db.Column(JSONB, nullable=True, default=dict)
+    metadata_json = db.Column(EncryptedJSON, nullable=True, default=dict)
 
     created_at = db.Column(
         db.DateTime(timezone=True),

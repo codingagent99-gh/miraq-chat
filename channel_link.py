@@ -140,7 +140,8 @@ def ensure_tables(tenant) -> None:
 def find_link(channel: str, channel_user_id: str):
     """The valid link for this channel user in the bound store, or None."""
     from models.channel_link import ChannelLink
-    link = ChannelLink.query.filter_by(channel=channel, channel_user_id=channel_user_id).first()
+    link = (ChannelLink.query.filter_by(channel=channel, channel_user_id=channel_user_id)
+            .order_by(ChannelLink.linked_at.desc()).first())
     return link if link is not None and link.is_valid() else None
 
 
@@ -149,7 +150,10 @@ def save_link(channel: str, channel_user_id: str, customer_id: str, email: str):
     from models import db
     from models.channel_link import ChannelLink
     now = _utcnow()
-    link = ChannelLink.query.filter_by(channel=channel, channel_user_id=channel_user_id).first()
+    # channel_user_id is encrypted when ENCRYPT_CUSTOMER_DATA=1; filter_by matches
+    # the row in either form, so an existing link is updated, never duplicated.
+    link = (ChannelLink.query.filter_by(channel=channel, channel_user_id=channel_user_id)
+            .order_by(ChannelLink.linked_at.desc()).first())
     replaced = link is not None and link.customer_id != customer_id
     if link is None:
         link = ChannelLink(channel=channel, channel_user_id=channel_user_id)

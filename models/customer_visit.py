@@ -1,5 +1,6 @@
 # models/customer_visit.py
 
+from customer_crypto import EncryptedID
 from models.db_models import db
 
 
@@ -21,6 +22,8 @@ class CustomerVisit(db.Model):
     """
     __tablename__ = "customer_visits"
 
-    customer_id       = db.Column(db.String, primary_key=True)
+    # Encrypted (deterministic). Look rows up with ==, not session.get(): only
+    # == also finds a row written while encryption was off (customer_crypto).
+    customer_id       = db.Column(EncryptedID, primary_key=True)
     last_seen_at      = db.Column(db.DateTime(timezone=True), nullable=False)
     previous_visit_at = db.Column(db.DateTime(timezone=True), nullable=True)
