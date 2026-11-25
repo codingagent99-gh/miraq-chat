@@ -398,7 +398,19 @@ def check_startup(session, model) -> str:
         row = model(id=1, canary=new_canary(),
                     first_enabled_at=datetime.now(timezone.utc))
         session.add(row)
-        session.commit()
+        try:
+            session.commit()
+        except Exception:
+            # Several gunicorn workers start at once: another one saved the
+            # row first. Use theirs, and check it was made with this key.
+            session.rollback()
+            row = session.get(model, 1)
+            if row is None:
+                raise
+            if not canary_ok(row.canary):
+                raise CustomerCryptoError(
+                    f"{KEY_ENV} does not match the key another worker just recorded. "
+                    f"Refusing to start.") from None
 
     if on:
         return "customer data encryption: ON"
