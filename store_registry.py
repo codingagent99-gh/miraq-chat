@@ -74,8 +74,11 @@ _EXEMPT_PATHS = {
     # webhook service, which has no licence id to send: /chat/channel resolves
     # its tenant from the WhatsApp/Instagram account the customer messaged
     # (channel_connections) and binds it with bind_tenant_db, the same way the
-    # Shopify webhooks above do. Both authenticate with X-MiraQ-Channel-Key.
+    # Shopify webhooks above do. All authenticate with X-MiraQ-Channel-Key.
+    # The two token routes are listed separately because this set is matched
+    # by exact path: "/channel-connections" alone does not cover them.
     "/chat/channel", "/channel-connections",
+    "/channel-connections/token", "/channel-connections/token-invalid",
 }
 
 
