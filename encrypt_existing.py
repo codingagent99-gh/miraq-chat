@@ -271,7 +271,10 @@ def main() -> int:
 
     verb = ("would decrypt" if decrypt else "still plain") if dry_run else ("decrypted" if decrypt else "encrypted")
     leftover = 0
-    tenants = cdb.list_tenants(args.shop, include_inactive=True)
+    missing: list = []
+    tenants = cdb.list_tenants(args.shop, include_inactive=True, missing=missing)
+    for t in missing:
+        print(f"{t.shop} ({t.db_name}, {t.status}): skipped, its database no longer exists")
     if not tenants:
         print("no matching store", file=sys.stderr)
         return 1

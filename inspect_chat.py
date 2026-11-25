@@ -96,7 +96,7 @@ def main() -> int:
         except ValueError:
             ap.error("session id must be a UUID")
 
-    tenants = cdb.list_tenants(args.shop, include_inactive=True)
+    tenants = cdb.list_tenants(args.shop, include_inactive=True)  # only stores whose database exists
     if not tenants:
         print("no matching store", file=sys.stderr)
         return 1

@@ -47,10 +47,18 @@ def control_engine():
     return create_engine(base_dsn(), pool_pre_ping=True, hide_parameters=True, future=True)
 
 
-def list_tenants(shop: Optional[str] = None, include_inactive: bool = False) -> List[TenantDB]:
-    """Stores to work on. `shop` matches shopify_domain, site_domain or db_name."""
+def list_tenants(shop: Optional[str] = None, include_inactive: bool = False,
+                 missing: Optional[List[TenantDB]] = None) -> List[TenantDB]:
+    """Stores to work on. `shop` matches shopify_domain, site_domain or db_name.
+
+    Only stores whose database actually exists on the server: a tenants row
+    can outlive its database (a removed or half-provisioned store). Pass a
+    list as `missing` to get those rows back, for reporting.
+    """
     sql = ("SELECT tenant_id::text, db_name, "
-           "COALESCE(shopify_domain, site_domain, db_name), status FROM tenants")
+           "COALESCE(shopify_domain, site_domain, db_name), status, "
+           "EXISTS (SELECT 1 FROM pg_database d WHERE d.datname = tenants.db_name) "
+           "FROM tenants")
     where, params = [], {}
     if not include_inactive:
         where.append("status = 'active'")
@@ -62,9 +70,13 @@ def list_tenants(shop: Optional[str] = None, include_inactive: bool = False) -> 
     eng = control_engine()
     try:
         with eng.connect() as conn:
-            return [TenantDB(*row) for row in conn.execute(text(sql + " ORDER BY db_name"), params)]
+            rows = conn.execute(text(sql + " ORDER BY db_name"), params).all()
     finally:
         eng.dispose()
+    found = []
+    for *fields, exists in rows:
+        (found if exists else (missing if missing is not None else [])).append(TenantDB(*fields))
+    return found
 
 
 def has_table(conn, table: str) -> bool:
