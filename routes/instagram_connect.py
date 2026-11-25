@@ -139,8 +139,21 @@ def is_configured() -> bool:
 
 def is_offered(shop: str) -> bool:
     """Whether this store's app offers Instagram: custom apps always, the public
-    app only with INSTAGRAM_PUBLIC_APP. Hides the section and refuses the flow."""
-    return INSTAGRAM_PUBLIC_APP or app_for_shop(shop).custom
+    app only with INSTAGRAM_PUBLIC_APP. Hides the section and refuses the flow.
+
+    One store can be opted out with tenants.features["instagram_connect"] = false
+    (set by hand, no deploy):
+        UPDATE tenants SET features = features || '{"instagram_connect": false}'
+        WHERE shopify_domain = '<store>.myshopify.com';
+    Remove the key (features - 'instagram_connect') to offer it again. This only
+    hides connecting; an account already connected keeps working (routing and
+    replies don't look at this flag) - disconnect it first if that's the aim.
+    """
+    if not (INSTAGRAM_PUBLIC_APP or app_for_shop(shop).custom):
+        return False
+    tenant = Tenant.query.filter_by(shopify_domain=shop).first()
+    flag = (tenant.features or {}).get("instagram_connect") if tenant is not None else None
+    return not (flag is False or str(flag).strip().lower() in ("false", "0", "off", "no"))
 
 
 def _url(path: str) -> str:
@@ -376,7 +389,7 @@ def instagram_section_html(shop: str) -> str:
     The Instagram block of the app page. Call only for a shop whose owner
     token has already been verified.
     """
-    if not is_configured():
+    if not is_configured() or not is_offered(shop):
         return ""
     tenant = _tenant_for(shop)
     if tenant is None:

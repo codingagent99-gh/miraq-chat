@@ -82,7 +82,7 @@ from routes.provisioning import (
 )
 from tenant_db_provisioner import ensure_tenant_database, TenantDBProvisionError
 import merchant_session
-from routes.instagram_connect import instagram_section_html
+from routes.instagram_connect import instagram_section_html, is_offered as instagram_offered
 from shopify_apps import (
 
     app_for_install,
@@ -607,7 +607,7 @@ def installed():
     )
     if is_owner:
         instagram_html = instagram_section_html(shop)
-    elif _valid_shop(shop):
+    elif _valid_shop(shop) and instagram_offered(shop):
         instagram_html = (
             "<h2>Instagram</h2><p>To connect Instagram, open <strong>MiraQ</strong> "
             "from your Shopify admin (<strong>Apps</strong>).</p>"
