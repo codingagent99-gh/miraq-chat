@@ -123,6 +123,13 @@ _BR_RE        = re.compile(r"<br\s*/?>", re.I)
 _TAG_RE       = re.compile(r"</?[a-zA-Z][^>]*>")
 _BULLET_RE    = re.compile(r"^(\s*)[-*]\s+", re.M)
 
+# The order-list headers end with a line written for the web widget, whose
+# order cards can be tapped (response_generator._format_order_history_message,
+# order_handler's lookup list). A channel gets plain text lines instead, so the
+# line is swapped for how to open one: send "show order <number>", which
+# classifier.extractors.extract_order_id reads.
+_ORDER_TAP_RE = re.compile(r"\s*Tap (?:any|one) to see (?:full details|its status)\.", re.I)
+
 
 def _link_repl(m: "re.Match") -> str:
     label, url = m.group(1).strip(), m.group(2)
@@ -257,7 +264,7 @@ def _order_lines(orders: list, symbol: str) -> str:
         total = _money(o.get("total"), o.get("currency") or symbol)
         date = (o.get("date_created") or "")[:10]
         status = str(o.get("status") or "").replace("-", " ").title()
-        parts = [f"#{o.get('order_number') or o.get('id')}", status, total, date]
+        parts = [f"Order {o.get('order_number') or o.get('id')}", status, total, date]
         lines.append("• " + " · ".join(x for x in parts if x))
     if len(orders) > MAX_ORDER_LINES:
         lines.append(f"…and {len(orders) - MAX_ORDER_LINES} more")
@@ -301,6 +308,11 @@ def build_turn(data: dict, max_products: int, store_url: str = "",
 
     if data.get("orders"):
         extra_text.append(_order_lines(data["orders"], symbol))
+        first = data["orders"][0]
+        extra_text.append(
+            'To see one in full, send "show order" and its number, like '
+            f'"show order {first.get("order_number") or first.get("id")}".'
+        )
 
     for action in data.get("actions") or []:
         a_type = (action or {}).get("type")
@@ -326,6 +338,8 @@ def build_turn(data: dict, max_products: int, store_url: str = "",
                 extra_text.append(block)
 
     bot_message = data.get("bot_message") or ""
+    if data.get("orders"):
+        bot_message = _ORDER_TAP_RE.sub("", bot_message)
     action_types = {(a or {}).get("type") for a in data.get("actions") or []}
 
     if store_url and cart is not None:

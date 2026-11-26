@@ -19,6 +19,7 @@ Limits enforced (Meta docs):
                       button title 20
 """
 
+import re
 from typing import List
 
 from channels.common import (
@@ -34,6 +35,16 @@ ELEMENT_SUBTITLE   = 80
 BUTTON_TITLE       = 20
 
 OPTIONS_PROMPT = "What would you like to do next?"
+
+# Instagram turns "#1304" into a hashtag link that opens a hashtag search, so
+# order numbers lose their "#" here ("Order #1304" -> "Order 1304"). Only a
+# "#" that starts a word and is followed by a digit; a "#" inside a word or a
+# URL ("page#2") and every other hashtag are left as they are.
+_HASH_NUMBER_RE = re.compile(r"(?<![^\s(\[*])#(?=\d)")
+
+
+def _no_hashtag_numbers(text: str) -> str:
+    return _HASH_NUMBER_RE.sub("", text or "")
 
 
 def _envelope(recipient: str, message: dict) -> dict:
@@ -72,7 +83,7 @@ def _link_element(link) -> dict:
 def render_instagram(turn: ChannelTurn, recipient: str) -> List[dict]:
     messages: List[dict] = []
 
-    for chunk in split_text(markdown_to_plain(turn.text), TEXT_LIMIT):
+    for chunk in split_text(_no_hashtag_numbers(markdown_to_plain(turn.text)), TEXT_LIMIT):
         messages.append({"text": chunk})
 
     if turn.products:
@@ -86,7 +97,7 @@ def render_instagram(turn: ChannelTurn, recipient: str) -> List[dict]:
         if not messages:
             messages.append({"text": OPTIONS_PROMPT})
         messages[-1]["quick_replies"] = [
-            {"content_type": "text", "title": truncate(o.title, QUICK_REPLY_TITLE), "payload": o.id}
+            {"content_type": "text", "title": truncate(_no_hashtag_numbers(o.title), QUICK_REPLY_TITLE), "payload": o.id}
             for o in options
         ]
 
