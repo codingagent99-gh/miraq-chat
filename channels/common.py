@@ -20,6 +20,7 @@ decodes it:
 
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import List, Optional, Tuple
 
 from app_config import get_currency_symbol
@@ -46,6 +47,12 @@ WIDGET_ONLY_ACTIONS = frozenset({
 })
 
 MAX_ORDER_LINES = 5
+# Items listed per order in an order list; the rest show as "…and N more".
+# "show me order #N" (the order's own option) lists them all.
+MAX_ORDER_ITEMS = 6
+# What tapping an order card in the widget sends (ChatWidget onOrderClick);
+# each listed order gets a reply option that sends the same.
+ORDER_DETAIL_QUERY = "show me order #{number}"
 
 
 # ── Neutral turn shape ────────────────────────────────────────────────────────
@@ -123,12 +130,11 @@ _BR_RE        = re.compile(r"<br\s*/?>", re.I)
 _TAG_RE       = re.compile(r"</?[a-zA-Z][^>]*>")
 _BULLET_RE    = re.compile(r"^(\s*)[-*]\s+", re.M)
 
-# The order-list headers end with a line written for the web widget, whose
-# order cards can be tapped (response_generator._format_order_history_message,
-# order_handler's lookup list). A channel gets plain text lines instead, so the
-# line is swapped for how to open one: send "show order <number>", which
-# classifier.extractors.extract_order_id reads.
-_ORDER_TAP_RE = re.compile(r"\s*Tap (?:any|one) to see (?:full details|its status)\.", re.I)
+# The order-list headers say "Tap any/one to see ..." (response_generator.
+# _format_order_history_message, order_handler's lookup list): words for the
+# widget's tappable cards. A channel lists the orders as text and gives each
+# one a reply option instead, so the words point at those options.
+_ORDER_TAP_RE = re.compile(r"\bTap (?:any|one) to see\b", re.I)
 
 
 def _link_repl(m: "re.Match") -> str:
@@ -258,17 +264,62 @@ def _product_card(p: dict, symbol: str) -> Optional[ProductCard]:
     )
 
 
+def _order_number(o: dict) -> str:
+    return str(o.get("order_number") or o.get("id") or "")
+
+
+def _order_date(value) -> str:
+    raw = str(value or "")
+    try:
+        d = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw[:10]
+    return f"{d:%b} {d.day}, {d.year}"
+
+
+def _order_place(shipping) -> str:
+    # The same line as the widget's order card (OrderListCards.tsx): Shopify
+    # orders carry only town, region and country.
+    s = shipping if isinstance(shipping, dict) else {}
+    if not (s.get("address_1") or s.get("city")):
+        return ""
+    name = " ".join(str(x) for x in (s.get("first_name"), s.get("last_name")) if x)
+    parts = [name, s.get("address_1"), s.get("city"), s.get("state"), s.get("postcode"),
+             "" if s.get("address_1") else s.get("country")]
+    return ", ".join(str(x) for x in parts if x)
+
+
 def _order_lines(orders: list, symbol: str) -> str:
-    lines = []
+    """One block per order, laid out like the widget's order cards."""
+    blocks = []
     for o in orders[:MAX_ORDER_LINES]:
-        total = _money(o.get("total"), o.get("currency") or symbol)
-        date = (o.get("date_created") or "")[:10]
         status = str(o.get("status") or "").replace("-", " ").title()
-        parts = [f"Order {o.get('order_number') or o.get('id')}", status, total, date]
-        lines.append("• " + " · ".join(x for x in parts if x))
+        lines = [" · ".join(x for x in [f"**Order #{_order_number(o)}**", status] if x)]
+        date = _order_date(o.get("date_created"))
+        if date:
+            lines.append(date)
+        items = o.get("items") or []
+        for it in items[:MAX_ORDER_ITEMS]:
+            line = f"• {it.get('name') or 'Item'} × {it.get('quantity') or 1}"
+            attrs = " · ".join(str(a.get("value")) for a in it.get("variation_attributes") or []
+                               if isinstance(a, dict) and a.get("value"))
+            lines.append(f"{line} ({attrs})" if attrs else line)
+        if len(items) > MAX_ORDER_ITEMS:
+            lines.append(f"…and {len(items) - MAX_ORDER_ITEMS} more")
+        place = _order_place(o.get("shipping"))
+        if place:
+            lines.append(place)
+        count = o.get("item_count")
+        count = len(items) if count is None else count
+        try:
+            total = _money(o.get("total"), o.get("currency") or symbol) if float(o.get("total") or 0) > 0 else ""
+        except (TypeError, ValueError):
+            total = ""
+        lines.append(" · ".join(x for x in [f"{count} item{'' if count == 1 else 's'}", total] if x))
+        blocks.append("\n".join(lines))
     if len(orders) > MAX_ORDER_LINES:
-        lines.append(f"…and {len(orders) - MAX_ORDER_LINES} more")
-    return "\n".join(lines)
+        blocks.append(f"…and {len(orders) - MAX_ORDER_LINES} more")
+    return "\n\n".join(blocks)
 
 
 def _top_sellers_text(payload: dict) -> str:
@@ -308,11 +359,6 @@ def build_turn(data: dict, max_products: int, store_url: str = "",
 
     if data.get("orders"):
         extra_text.append(_order_lines(data["orders"], symbol))
-        first = data["orders"][0]
-        extra_text.append(
-            'To see one in full, send "show order" and its number, like '
-            f'"show order {first.get("order_number") or first.get("id")}".'
-        )
 
     for action in data.get("actions") or []:
         a_type = (action or {}).get("type")
@@ -339,7 +385,7 @@ def build_turn(data: dict, max_products: int, store_url: str = "",
 
     bot_message = data.get("bot_message") or ""
     if data.get("orders"):
-        bot_message = _ORDER_TAP_RE.sub("", bot_message)
+        bot_message = _ORDER_TAP_RE.sub("Pick one below to see", bot_message)
     action_types = {(a or {}).get("type") for a in data.get("actions") or []}
 
     if store_url and cart is not None:
@@ -386,6 +432,17 @@ def build_turn(data: dict, max_products: int, store_url: str = "",
     if pagination.get("has_more"):
         next_page = int(pagination.get("page") or 1) + 1
         suggestions.insert(0, ReplyOption(encode_reply_id("p", next_page), SHOW_MORE_TITLE))
+
+    # One option per listed order, first, like the widget's tappable cards.
+    order_options = []
+    for o in (data.get("orders") or [])[:MAX_ORDER_LINES]:
+        number = _order_number(o)
+        title = f"Order #{number}"
+        if number and title.lower() not in seen:
+            seen.add(title.lower())
+            order_options.append(ReplyOption(
+                encode_reply_id("s", ORDER_DETAIL_QUERY.format(number=number)), title))
+    suggestions = order_options + suggestions
 
     categories = []
     for c in data.get("categories") or []:
