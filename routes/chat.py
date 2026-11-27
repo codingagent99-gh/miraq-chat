@@ -130,6 +130,12 @@ def _apply_generic_word_synonyms(text: str) -> str:
     return text
 
 logger = get_logger("miraq_chat")
+
+# "Continue shopping" is the chip after an add to cart (widget and channels).
+# No classifier rule covers it, so it fell to the LLM fallback and got a
+# different answer each time; it now opens the catalog, as "view catalog" does.
+_CONTINUE_SHOPPING_RE = re.compile(r"(?i)^\s*continue\s+shopping[\s.!]*$")
+CONTINUE_SHOPPING_QUERY = "view catalog"
 chat_bp = Blueprint("chat", __name__)
 
 
@@ -2227,7 +2233,11 @@ def chat():
         )
         db.session.add(user_msg)
         db.session.commit()
-        
+
+        # History keeps what the shopper sent; the pipeline answers the catalog.
+        if _CONTINUE_SHOPPING_RE.match(message):
+            message = CONTINUE_SHOPPING_QUERY
+
         # ── Single store_loader fetch for the whole request ──
         store_loader = get_store_loader()
 

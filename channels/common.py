@@ -14,7 +14,8 @@ The full intent rides in the id/payload instead, and routes/channel.py
 decodes it:
 
     s:<text>     a suggestion chip  -> message = <text>
-    c:<name>     a category         -> message = CATEGORY_QUERY_TEMPLATE
+                 (catalog entries too: s:<category_request(name, kind)>)
+    c:<name>     a category (older replies) -> message = category_request(name)
     p:<page>     "Show more"        -> re-run the last user query at <page>
 """
 
@@ -28,9 +29,11 @@ from channels import cart as cart_mod
 
 SUPPORTED_CHANNELS = frozenset({"whatsapp", "instagram"})
 
-# What a tapped category sends as the user's message. The widget's own category
-# click text lives in the frontend; keep this in step with it.
-CATEGORY_QUERY_TEMPLATE = "Show me {name}"
+# Catalog names written into the message text, like the widget's tile grid:
+# the reply options can't hold them all (Instagram 13, WhatsApp 10). Kept to
+# one Instagram message (1000 chars); a bigger catalog lists its largest
+# entries by item count and says how many more there are.
+MAX_CATALOG_TEXT = 800
 
 SHOW_MORE_TITLE = "Show more"
 
@@ -109,10 +112,23 @@ def decode_reply_id(reply_id: str) -> Tuple[Optional[str], Optional[int]]:
     if kind == "s":
         return value, None
     if kind == "c":
-        return CATEGORY_QUERY_TEMPLATE.format(name=value), None
+        return category_request(value), None
     if kind == "p" and value.isdigit():
         return None, int(value)
     return None, None
+
+
+def category_request(name: str, kind: str = "category") -> str:
+    """What tapping a catalog tile sends in the widget (MessageRow.tsx
+    categoryRequest) — keep the two in step. The word "category" or "tag" next
+    to the name is the backend's signal for which one is meant: "Sale category"
+    is the Sale collection, while "Show me Sale" read as every product on sale."""
+    name = (name or "").strip()
+    if kind == "tag":
+        return name if re.search(r"\b(?:tags?|tagged)\s*$", name, re.I) else f"{name} tag"
+    if re.search(r"\b(?:categor(?:y|ies)|collections?)\s*$", name, re.I):
+        return name
+    return f"{name} category"
 
 
 # ── Text helpers ──────────────────────────────────────────────────────────────
@@ -264,6 +280,47 @@ def _product_card(p: dict, symbol: str) -> Optional[ProductCard]:
     )
 
 
+def _catalog_text(categories: list) -> str:
+    """Every catalog name with its item count, categories then tags, like the
+    widget's tiles. Over MAX_CATALOG_TEXT, the entries with the most items are
+    kept (in their usual order) and the rest are counted."""
+    entries = []
+    for i, c in enumerate(categories):
+        name = (c.get("name") or "").replace("&amp;", "&").strip()
+        if not name:
+            continue
+        try:
+            count = int(c.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        entries.append((i, name, count, "tag" if c.get("type") == "tag" else "category"))
+    if not entries:
+        return ""
+
+    def render(chosen) -> str:
+        groups = []
+        for kind, header in (("category", "Categories"), ("tag", "Tags")):
+            names = [f"{n} ({k})" if k > 0 else n for _, n, k, t in chosen if t == kind]
+            if names:
+                groups.append((header, " · ".join(names)))
+        if len(groups) == 1:
+            return groups[0][1]
+        return "\n\n".join(f"{h}\n{body}" for h, body in groups)
+
+    text = render(entries)
+    if len(text) <= MAX_CATALOG_TEXT:
+        return text + "\n\nPick one below, or send a name from the list."
+    chosen = []
+    for e in sorted(entries, key=lambda e: -e[2]):
+        trial = sorted(chosen + [e])
+        if len(render(trial)) > MAX_CATALOG_TEXT:
+            break
+        chosen = trial
+    more = len(entries) - len(chosen)
+    return (render(chosen) +
+            f"\n\n…and {more} more. Pick one below, or send a category name to find it.")
+
+
 def _order_number(o: dict) -> str:
     return str(o.get("order_number") or o.get("id") or "")
 
@@ -359,6 +416,8 @@ def build_turn(data: dict, max_products: int, store_url: str = "",
 
     if data.get("orders"):
         extra_text.append(_order_lines(data["orders"], symbol))
+    if data.get("categories"):
+        extra_text.append(_catalog_text(data["categories"]))
 
     for action in data.get("actions") or []:
         a_type = (action or {}).get("type")
@@ -448,7 +507,8 @@ def build_turn(data: dict, max_products: int, store_url: str = "",
     for c in data.get("categories") or []:
         name = (c.get("name") or "").replace("&amp;", "&").strip()
         if name:
-            categories.append(ReplyOption(encode_reply_id("c", name), name))
+            kind = "tag" if c.get("type") == "tag" else "category"
+            categories.append(ReplyOption(encode_reply_id("s", category_request(name, kind)), name))
 
     return ChannelTurn(
         text=text,
